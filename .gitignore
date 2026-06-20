@@ -1,0 +1,46 @@
+# Whitelist: ignore everything by default. Nothing is tracked unless a
+# `!` entry below explicitly allows it.
+*
+
+# Repository files.
+!/.gitignore
+!/.github/
+!/.github/**
+!/README.md
+!/docs/
+!/docs/**
+!/LICENSE*
+!/NOTICE
+!/Cargo.toml
+!/Cargo.lock
+!/dist.toml
+!/dist-workspace.toml
+
+# Rust source and tooling.
+!/.cargo/
+!/.cargo/**
+!/rust-toolchain
+!/rust-toolchain.toml
+!/rustfmt.toml
+!/clippy.toml
+!/deny.toml
+!/build.rs
+!/src/
+!/src/**
+!/crates/
+!/crates/**
+!/tests/
+!/tests/**
+!/benches/
+!/benches/**
+!/examples/
+!/examples/**
+!/fixtures/
+!/fixtures/**
+
+# Dogfooding configuration: only the config file is tracked. The local
+# queue (projects/, tickets/) stays ignored by the default `*`; do not
+# force-add it.
+!/.agents/
+!/.agents/sloop/
+!/.agents/sloop/config.yaml
