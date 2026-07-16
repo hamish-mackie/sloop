@@ -1,0 +1,39 @@
+[package]
+name = "sloop-daemon"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Hamish Mackie"]
+description = "A small daemon that schedules coding agents"
+repository = "https://github.com/hamish-mackie/sloop"
+homepage = "https://github.com/hamish-mackie/sloop"
+license = "Apache-2.0"
+keywords = ["agents", "automation", "daemon", "scheduler"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "sloop"
+
+[[bin]]
+name = "sloop"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+fs2 = "0.4"
+libc = "0.2"
+rusqlite = { version = "0.39", default-features = false, features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+time = { version = "=0.3.41", features = ["formatting"] }
+tokio = { version = "1.46", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3.20"
+
+# The profile that `dist` uses for release artifacts.
+[profile.dist]
+inherits = "release"
+lto = "thin"

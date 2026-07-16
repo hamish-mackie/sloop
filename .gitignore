@@ -1,0 +1,53 @@
+# Ignore everything by default.
+*
+
+# Repository files.
+!/.gitignore
+!/.github/
+!/.github/**
+!/*.md
+!/LICENSE*
+!/NOTICE
+!/Cargo.toml
+!/Cargo.lock
+!/dist.toml
+!/dist-workspace.toml
+
+# Repository-local documents and agent configuration.
+/AGENTS.md
+/CHANGELOG.md
+/CLAUDE.md
+/RELEASING.md
+/opencode-test.json
+/opencode.json
+/project-description.md
+/sloop-tests.md
+/sloop-verbs-4.md
+/task.json
+
+# Rust source and tooling.
+!/.cargo/
+!/.cargo/**
+!/rust-toolchain
+!/rust-toolchain.toml
+!/rustfmt.toml
+!/clippy.toml
+!/deny.toml
+!/build.rs
+!/src/
+!/src/**
+!/crates/
+!/crates/**
+!/tests/
+!/tests/**
+!/benches/
+!/benches/**
+!/examples/
+!/examples/**
+!/fixtures/
+!/fixtures/**
+
+# Local state must never be committed.
+/.sloop/
+/.agents/sloop/projects/
+/.agents/sloop/tickets/

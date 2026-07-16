@@ -1,0 +1,23 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+installers = ["shell", "homebrew"]
+formula = "sloop"
+publish-jobs = ["./publish-crates"]
+publish-prereleases = false
+github-attestations = true
+github-attestations-phase = "host"
+github-custom-job-permissions = { "publish-crates" = { contents = "read" } }
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-musl",
+]
+checksum = "sha256"
+unix-archive = ".tar.gz"
+install-path = ["$SLOOP_INSTALL_DIR/", "~/.local/bin/"]
+install-success-msg = "sloop is installed. A running daemon continues using its previous version until restarted."
