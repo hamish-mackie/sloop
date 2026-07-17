@@ -1547,7 +1547,8 @@ impl Store {
 
     /// Checkpoints the agent's exit before aftercare starts. The lease and
     /// ticket remain claimed until final settlement, but recovery can now
-    /// resume with the exact exit and commit facts.
+    /// resume with the exact exit and commit facts. Only the caller that
+    /// wins this transition owns exit processing and aftercare for the run.
     pub(crate) fn record_agent_exit(
         &mut self,
         run_id: &str,
@@ -1555,16 +1556,31 @@ impl Store {
         capture_complete: bool,
         commits_json: &str,
         now_ms: i64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<ExitClaim, StoreError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
+        let changed = transaction.execute(
             "UPDATE runs
              SET state = 'aftercare', exit_code = ?2, updated_at_ms = ?3
              WHERE id = ?1 AND state = 'running' AND exited_at_ms IS NULL",
             params![run_id, exit_code, now_ms],
         )?;
+        if changed == 0 {
+            let state: Option<String> = transaction
+                .query_row(
+                    "SELECT state FROM runs WHERE id = ?1",
+                    params![run_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            return match state {
+                Some(state) => Ok(ExitClaim::AlreadyClaimed { state }),
+                None => Err(StoreError::RunNotFound {
+                    run_id: run_id.into(),
+                }),
+            };
+        }
         for (kind, data_json) in [
             (
                 "exit_classified",
@@ -1589,7 +1605,7 @@ impl Store {
             )?;
         }
         transaction.commit()?;
-        Ok(())
+        Ok(ExitClaim::Claimed)
     }
 
     pub(crate) fn record_aftercare_evidence(
@@ -2092,6 +2108,14 @@ impl Store {
     }
 }
 
+/// Whether the caller won the `running` → `aftercare` transition and with it
+/// ownership of exit processing and aftercare for the run.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ExitClaim {
+    Claimed,
+    AlreadyClaimed { state: String },
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     Open {
@@ -2190,7 +2214,10 @@ impl std::error::Error for StoreError {}
 mod tests {
     use tempfile::tempdir;
 
-    use super::{ActivationKind, ClaimRequest, NewActivation, Store, StoreError, TicketState};
+    use super::{
+        ActivationKind, ClaimRequest, ExitClaim, NewActivation, Store, StoreError, TicketState,
+    };
+    use crate::outcome::Outcome;
 
     fn open_seeded(path: &std::path::Path) -> Store {
         let store = Store::open(path, 1_000).unwrap();
@@ -2541,6 +2568,104 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn running_r1(store: &mut Store) {
+        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        store
+            .mark_run_running(
+                "R1",
+                "branch",
+                "/worktree",
+                123,
+                Some(456),
+                123,
+                "token",
+                "/runtime/R1.sock",
+                2_100,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn agent_exit_checkpoint_is_an_exclusive_ownership_handoff() {
+        let directory = tempdir().unwrap();
+        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        running_r1(&mut store);
+
+        let first = store
+            .record_agent_exit("R1", Some(0), true, r#"{"count":1,"oids":["abc"]}"#, 2_200)
+            .unwrap();
+        assert_eq!(first, ExitClaim::Claimed);
+        assert_eq!(store.run("R1").unwrap().unwrap().state, "aftercare");
+        let evidence = store.run_evidence("R1").unwrap();
+        assert!(evidence.iter().any(|(kind, _)| kind == "exit_classified"));
+        assert!(evidence.iter().any(|(kind, _)| kind == "commits_observed"));
+
+        let second = store
+            .record_agent_exit("R1", Some(1), false, r#"{"count":0,"oids":[]}"#, 2_300)
+            .unwrap();
+        assert_eq!(
+            second,
+            ExitClaim::AlreadyClaimed {
+                state: "aftercare".into()
+            }
+        );
+        let run = store.run("R1").unwrap().unwrap();
+        assert_eq!(run.state, "aftercare");
+        assert_eq!(run.exit_code, Some(0));
+        assert_eq!(store.run_evidence("R1").unwrap(), evidence);
+    }
+
+    #[test]
+    fn agent_exit_checkpoint_reports_terminal_and_missing_runs() {
+        let directory = tempdir().unwrap();
+        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        running_r1(&mut store);
+        store
+            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, 2_200)
+            .unwrap();
+
+        let claim = store
+            .record_agent_exit("R1", Some(0), true, r#"{"count":0,"oids":[]}"#, 2_300)
+            .unwrap();
+        assert_eq!(
+            claim,
+            ExitClaim::AlreadyClaimed {
+                state: "merged".into()
+            }
+        );
+        assert_eq!(store.run("R1").unwrap().unwrap().state, "merged");
+
+        let missing =
+            store.record_agent_exit("R9", Some(0), true, r#"{"count":0,"oids":[]}"#, 2_300);
+        assert!(matches!(missing, Err(StoreError::RunNotFound { .. })));
+    }
+
+    #[test]
+    fn finish_run_settles_exactly_once() {
+        let directory = tempdir().unwrap();
+        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        running_r1(&mut store);
+        store
+            .record_agent_exit("R1", Some(0), true, r#"{"count":1,"oids":["abc"]}"#, 2_200)
+            .unwrap();
+
+        store
+            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, 2_300)
+            .unwrap();
+        assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("merged"));
+        assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
+        let evidence = store.run_evidence("R1").unwrap();
+
+        store
+            .finish_run("R1", "T1", Some(1), Outcome::Failed, &[], None, 2_400)
+            .unwrap();
+        let run = store.run("R1").unwrap().unwrap();
+        assert_eq!(run.state, "merged");
+        assert_eq!(run.exit_code, Some(0));
+        assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("merged"));
+        assert_eq!(store.run_evidence("R1").unwrap(), evidence);
     }
 
     #[test]

@@ -33,8 +33,8 @@ use crate::protocol::{
 };
 use crate::run_log::{OutputSource, OutputStream, RunLogWriter};
 use crate::store::{
-    ActivationKind, ClaimRequest, EvidenceRecord, NewActivation, QueuedActivation, RecoverableRun,
-    StageRecord, Store, StoreError, TicketState,
+    ActivationKind, ClaimRequest, EvidenceRecord, ExitClaim, NewActivation, QueuedActivation,
+    RecoverableRun, StageRecord, Store, StoreError, TicketState,
 };
 
 use runner::{
@@ -1547,7 +1547,7 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
                             None
                         }
                     };
-                    let (commits, tests, merge) = gather_exit_evidence(
+                    let Some((commits, tests, merge)) = gather_exit_evidence(
                         &exited_run,
                         &root,
                         &worktree,
@@ -1559,7 +1559,9 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
                         capture_complete,
                         checkpoint_store.as_mut(),
                         &supervisor_log,
-                    );
+                    ) else {
+                        return;
+                    };
                     let _ = events.blocking_send(RunEvent::Exited {
                         run_id: exited_run,
                         exit_code,
@@ -1682,7 +1684,7 @@ fn gather_exit_evidence(
     capture_complete: bool,
     mut checkpoint_store: Option<&mut Store>,
     operational_log: &OperationalLog,
-) -> (Vec<String>, Option<StageResult>, Option<MergeOutcome>) {
+) -> Option<(Vec<String>, Option<StageResult>, Option<MergeOutcome>)> {
     let exit = classify_exit(exit_code);
     let commits = commits_on_branch(root, branch);
     let commit_count = commits.len() as u64;
@@ -1694,7 +1696,16 @@ fn gather_exit_evidence(
             &json!({"count": commit_count, "oids": commits}).to_string(),
             clock.now_ms(),
         ) {
-            Ok(()) => true,
+            Ok(ExitClaim::Claimed) => true,
+            Ok(ExitClaim::AlreadyClaimed { state }) => {
+                operational_log.emit_with_fields(
+                    LogLevel::Info,
+                    "sloop::supervisor",
+                    "exit_checkpoint_already_claimed",
+                    json!({"run_id": run_id, "state": state}),
+                );
+                return None;
+            }
             Err(error) => {
                 operational_log.emit_with_fields(
                     LogLevel::Error,
@@ -1716,7 +1727,7 @@ fn gather_exit_evidence(
             .as_deref()
             .is_some_and(|store| aftercare_cancelled(store, run_id, operational_log))
     {
-        return (commits, None, None);
+        return Some((commits, None, None));
     }
 
     let tests = match test_cmd {
@@ -1748,7 +1759,7 @@ fn gather_exit_evidence(
                 true
             };
             if !test_checkpointed {
-                return (commits, Some(stage), None);
+                return Some((commits, Some(stage), None));
             }
             Some(stage)
         }
@@ -1790,7 +1801,7 @@ fn gather_exit_evidence(
     } else {
         None
     };
-    (commits, tests, merge)
+    Some((commits, tests, merge))
 }
 
 fn aftercare_cancelled(store: &Store, run_id: &str, log: &OperationalLog) -> bool {
