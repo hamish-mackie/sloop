@@ -45,6 +45,17 @@ outcome from the process exit and aftercare evidence:
 - **Exit 0, no commits** → the ticket completes as a successful no-op.
 - **Exit 0, tests or merge fail** → the branch is kept for human review.
 - **Nonzero exit** → the ticket fails, regardless of commit count.
+- **The vendor rejects authentication or configuration** → the ticket fails
+  with a safe diagnostic.
+- **The vendor rate-limits or returns an unknown rejection** → the ticket
+  returns to ready and its agent target cools down for five minutes. The
+  queued activation retries after the cooldown, which survives daemon
+  restarts. Any commits from a rejected run stay on the preserved run branch.
+
+Sloop recognizes these failures from built-in, versioned vendor rule catalogs.
+It matches only captured agent output, never test or merge output, and stores
+the matched class, vendor, rule ID, and catalog-authored diagnostic as evidence.
+Raw output remains in the run log rather than being copied into diagnostics.
 
 Commit OIDs are recorded for the project activity view, using the run branch's
 creation point as their baseline. They are metadata, not an outcome gate, so a

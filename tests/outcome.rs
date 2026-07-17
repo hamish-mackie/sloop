@@ -3,6 +3,7 @@ mod support;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 use support::{World, process_alive, wait_until};
 
@@ -509,4 +510,328 @@ fn straggler_group_members_are_killed_and_the_run_still_settles() {
         let output = world.sloop(&["status"]);
         World::json_stdout(&output)["data"]["gate"]["active_agents"] == 0
     });
+}
+
+#[test]
+fn authentication_and_configuration_rejections_fail_without_aftercare() {
+    let cases = [
+        (
+            "auth.md",
+            "printf '%s\n' 'status 401 Missing bearer or basic authentication in header' >&2\nexit 1\n",
+            "authentication_required",
+            "codex.authentication.missing-header",
+        ),
+        (
+            "config.md",
+            "printf '%s\n' 'status 400 model is not supported when using Codex with a ChatGPT account' >&2\nexit 1\n",
+            "invalid_configuration",
+            "codex.configuration.unsupported-chatgpt-model",
+        ),
+    ];
+
+    for (ticket_name, body, class, rule_id) in cases {
+        let world = World::configured();
+        let aftercare_marker = world.root().join("aftercare-ran");
+        configure(
+            &world,
+            body,
+            Some(&format!("touch {}", aftercare_marker.display())),
+        );
+        world.commit_all("initial");
+        world.start_daemon();
+        let ticket = post_and_run(&world, ticket_name);
+
+        wait_until("the rejected run fails", || tickets(&world)["failed"] == 1);
+        assert!(!aftercare_marker.exists());
+        let evidence = world
+            .run_evidence("R1", "vendor_error_classified")
+            .expect("vendor classification evidence");
+        assert_eq!(evidence["class"], class);
+        assert_eq!(evidence["vendor"], "codex");
+        assert_eq!(evidence["rule_id"], rule_id);
+        let encoded = evidence.to_string();
+        assert!(
+            !encoded.contains("Missing bearer"),
+            "unsafe evidence: {encoded}"
+        );
+        assert!(
+            !encoded.contains("ChatGPT account"),
+            "unsafe evidence: {encoded}"
+        );
+
+        let shown = world.sloop(&["show", &ticket]);
+        assert!(shown.status.success());
+        assert_eq!(
+            World::json_stdout(&shown)["data"]["value"]["classification"]["class"],
+            class
+        );
+        assert!(world.sloop(&["retry", &ticket]).status.success());
+        let shown = world.sloop(&["show", &ticket]);
+        assert!(World::json_stdout(&shown)["data"]["value"]["classification"].is_null());
+    }
+}
+
+#[test]
+fn retryable_and_unknown_rejections_release_under_a_target_cooldown() {
+    let cases = [
+        (
+            "rate.md",
+            "printf \"You've hit your limit\\n\" >&2\nexit 1\n",
+            "rate_limited",
+        ),
+        (
+            "unknown.md",
+            "printf '%s\n' 'Unexpected server error. Check server logs for details.' >&2\nexit 1\n",
+            "unknown_rejection",
+        ),
+    ];
+
+    for (ticket_name, body, class) in cases {
+        let world = World::configured();
+        configure(&world, body, None);
+        world.commit_all("initial");
+        world.start_daemon();
+        post_and_run(&world, ticket_name);
+
+        wait_until("the rejected ticket is released", || {
+            let counts = tickets(&world);
+            counts["ready"] == 1 && counts["claimed"] == 0
+        });
+        let waited = world.sloop(&["wait", "R1", "--timeout", "5"]);
+        assert!(!waited.status.success());
+        let response = World::json_stdout_or_stderr(&waited);
+        assert_eq!(response["data"]["state"], "rate_limited");
+        assert_eq!(response["data"]["classification"]["class"], class);
+
+        let status = world.sloop(&["status"]);
+        assert_eq!(
+            World::json_stdout(&status)["data"]["gate"]["cooldowns"][0]["target"],
+            "fake"
+        );
+
+        let listed = world.sloop(&["list"]);
+        let reason = World::json_stdout(&listed)["data"]["tickets"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(reason.contains("cooling down"), "{reason}");
+    }
+}
+
+#[test]
+fn cooldown_and_automatic_retry_survive_a_daemon_restart() {
+    let world = World::configured();
+    let first_run = world.root().join("first-run-finished");
+    let body = format!(
+        "if [ ! -e {marker} ]; then touch {marker}; printf \"You've hit your limit\\n\" >&2; exit 1; fi\n\
+         echo recovered > work.txt\n\
+         git add work.txt\n\
+         git -c user.name=agent -c user.email=agent@example.invalid commit --quiet -m recovered\n",
+        marker = first_run.display(),
+    );
+    configure(&world, &body, None);
+    world.commit_all("initial");
+    let daemon = world.start_daemon();
+    let ticket = post_and_run(&world, "restart-cooldown.md");
+    wait_until("the first run enters cooldown", || {
+        tickets(&world)["ready"] == 1
+            && world
+                .run_evidence("R1", "vendor_error_classified")
+                .is_some()
+    });
+
+    let pid = daemon["data"]["pid"].as_u64().unwrap() as u32;
+    world.kill_daemon(pid);
+    world.start_daemon();
+    let connection = rusqlite::Connection::open(world.db_path()).unwrap();
+    let run_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(run_count, 1, "the cooldown must gate restart dispatch");
+    drop(connection);
+
+    let listed = world.sloop(&["list"]);
+    let rows = World::json_stdout(&listed);
+    let row = rows["data"]["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == ticket)
+        .unwrap();
+    assert!(row["reason"].as_str().unwrap().contains("cooling down"));
+
+    world.tick(Duration::from_secs(301));
+    wait_until("the released activation retries after cooldown", || {
+        tickets(&world)["merged"] == 1
+    });
+    assert!(world.root().join("work.txt").is_file());
+}
+
+#[test]
+fn a_recognized_rejection_with_commits_never_tests_or_merges_the_work() {
+    let world = World::configured();
+    let aftercare_marker = world.root().join("rejected-aftercare");
+    configure(
+        &world,
+        concat!(
+            "echo preserved > rejected-work.txt\n",
+            "git add rejected-work.txt\n",
+            "git -c user.name=agent -c user.email=agent@example.invalid commit --quiet -m preserved\n",
+            "printf '%s\n' 'Unexpected server error. Check server logs for details.' >&2\n",
+            "exit 0\n",
+        ),
+        Some(&format!("touch {}", aftercare_marker.display())),
+    );
+    world.commit_all("initial");
+    world.start_daemon();
+    post_and_run(&world, "preserve-rejected.md");
+
+    wait_until("the rejected ticket is released under a cooldown", || {
+        tickets(&world)["ready"] == 1
+    });
+    assert!(!aftercare_marker.exists());
+    assert!(!world.root().join("rejected-work.txt").exists());
+    assert_eq!(
+        world.run_evidence("R1", "vendor_error_classified").unwrap()["class"],
+        "unknown_rejection"
+    );
+    let waited = world.sloop_plain(&["wait", "R1", "--timeout", "5"]);
+    let text = String::from_utf8_lossy(&waited.stderr);
+    assert!(text.contains("OpenCode rejected the request"), "{text}");
+}
+
+#[test]
+fn a_target_cooldown_does_not_block_other_agent_targets() {
+    let world = World::configured();
+    let limited = world.root().join("limited.sh");
+    let healthy = world.root().join("healthy.sh");
+    fs::write(
+        &limited,
+        "#!/bin/sh\nprintf \"You've hit your limit\\n\" >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::write(
+        &healthy,
+        concat!(
+            "#!/bin/sh\n",
+            "echo healthy > healthy.txt\n",
+            "git add healthy.txt\n",
+            "git -c user.name=agent -c user.email=agent@example.invalid commit --quiet -m healthy\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        world.root().join(".agents/sloop/config.yaml"),
+        format!(
+            "version: 1\nscheduler:\n  max_parallel_tasks: 1\nagent:\n  default_target: limited\n  targets:\n    limited:\n      cmd: [\"sh\", \"{}\", \"{{prompt}}\"]\n    healthy:\n      cmd: [\"sh\", \"{}\", \"{{prompt}}\"]\n",
+            limited.display(),
+            healthy.display(),
+        ),
+    )
+    .unwrap();
+    world.commit_all("initial");
+    world.start_daemon();
+    post_and_run(&world, "limited.md");
+    wait_until("the limited target cools down", || {
+        tickets(&world)["ready"] == 1
+    });
+
+    let healthy_ticket = world.write_ticket(
+        "healthy.md",
+        "---\ntarget: healthy\n---\n# Healthy target\n",
+    );
+    let posted = world.sloop(&["post", healthy_ticket.to_str().unwrap(), "--manual"]);
+    assert!(posted.status.success());
+    let id = World::json_stdout(&posted)["data"]["ticket"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(world.sloop(&["run", &id]).status.success());
+
+    wait_until("the healthy target runs during the other cooldown", || {
+        tickets(&world)["merged"] == 1
+    });
+    assert!(world.root().join("healthy.txt").is_file());
+}
+
+#[test]
+fn cancellation_after_rejection_checkpoint_wins_without_a_cooldown() {
+    const HOOK: &str = "after-agent-exit-checkpoint";
+
+    let world = World::configured();
+    world.arm_test_hook(HOOK);
+    configure(
+        &world,
+        "printf \"You've hit your limit\\n\" >&2\nexit 1\n",
+        None,
+    );
+    world.commit_all("initial");
+    world.start_daemon();
+    post_and_run(&world, "cancel-rejection.md");
+    wait_until("the rejection checkpoint is durable", || {
+        world.test_hook_reached(HOOK)
+            && world
+                .run_evidence("R1", "vendor_error_classified")
+                .is_some()
+    });
+
+    assert!(world.sloop(&["cancel", "R1"]).status.success());
+    world.release_test_hook(HOOK);
+    wait_until("cancellation settles", || tickets(&world)["ready"] == 1);
+    let waited = world.sloop(&["wait", "R1", "--timeout", "5"]);
+    assert_eq!(
+        World::json_stdout_or_stderr(&waited)["data"]["state"],
+        "cancelled"
+    );
+    let connection = rusqlite::Connection::open(world.db_path()).unwrap();
+    let cooldowns: i64 = connection
+        .query_row("SELECT COUNT(*) FROM cooldowns", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(cooldowns, 0);
+}
+
+#[test]
+fn recovery_preserves_the_checkpointed_cooldown_deadline() {
+    const HOOK: &str = "after-agent-exit-checkpoint";
+
+    let world = World::configured();
+    world.arm_test_hook(HOOK);
+    configure(
+        &world,
+        "printf \"You've hit your limit\\n\" >&2\nexit 1\n",
+        None,
+    );
+    world.commit_all("initial");
+    let daemon = world.start_daemon();
+    post_and_run(&world, "recover-deadline.md");
+    wait_until("the rejection deadline is checkpointed", || {
+        world.test_hook_reached(HOOK)
+            && world
+                .run_evidence("R1", "vendor_error_classified")
+                .is_some()
+    });
+    let deadline =
+        world.run_evidence("R1", "vendor_error_classified").unwrap()["cooldown_until_ms"]
+            .as_i64()
+            .unwrap();
+
+    world.kill_daemon(daemon["data"]["pid"].as_u64().unwrap() as u32);
+    world.tick(Duration::from_secs(240));
+    world.start_daemon();
+    wait_until("recovery settles the rejected run", || {
+        tickets(&world)["ready"] == 1
+    });
+
+    let connection = rusqlite::Connection::open(world.db_path()).unwrap();
+    let persisted: i64 = connection
+        .query_row("SELECT until_ms FROM cooldowns", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(persisted, deadline);
+    let run_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        run_count, 1,
+        "recovery must not dispatch before the deadline"
+    );
 }

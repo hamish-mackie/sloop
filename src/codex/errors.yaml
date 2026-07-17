@@ -1,0 +1,19 @@
+version: 1
+vendor: codex
+rules:
+  - id: codex.authentication.missing-header
+    class: authentication_required
+    diagnostic: Codex authentication is missing or expired
+    match:
+      stream: stderr
+      status_code: 401
+      message_signatures:
+        - Missing bearer or basic authentication in header
+  - id: codex.configuration.unsupported-chatgpt-model
+    class: invalid_configuration
+    diagnostic: The configured model is unavailable for this Codex account
+    match:
+      stream: stderr
+      status_code: 400
+      message_signatures:
+        - model is not supported when using Codex with a ChatGPT account

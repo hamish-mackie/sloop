@@ -1,0 +1,10 @@
+version: 1
+vendor: claude
+rules:
+  - id: claude.rate-limit.usage-limit
+    class: rate_limited
+    diagnostic: Claude usage limit reached
+    match:
+      stream: stderr
+      message_signatures:
+        - You've hit your limit

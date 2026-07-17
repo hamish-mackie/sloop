@@ -55,6 +55,7 @@ pub(super) struct LaunchedRun {
     pub(super) worktree: PathBuf,
     pub(super) branch: String,
     pub(super) output_log: RunLogWriter,
+    pub(super) target: String,
     /// The bound per-run worker socket, handed to an accept-loop task once
     /// the launch is registered.
     pub(super) worker_listener: UnixListener,
@@ -197,6 +198,7 @@ pub(super) fn launch_agent(
         worktree,
         branch,
         output_log,
+        target: target.to_owned(),
         worker_listener,
         worker_token,
         worker_socket_path: socket_path,

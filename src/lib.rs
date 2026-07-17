@@ -16,3 +16,4 @@ pub mod reindex;
 pub mod render;
 pub mod run_log;
 pub mod store;
+pub mod vendor_error;
