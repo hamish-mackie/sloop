@@ -301,6 +301,20 @@ pub struct EvidenceRecord {
     pub data_json: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CooldownUpdate<'a> {
+    pub target: &'a str,
+    pub until_ms: i64,
+    pub reason: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CooldownRecord {
+    pub target: String,
+    pub until_ms: i64,
+    pub reason: String,
+}
+
 /// One executed aftercare stage, persisted alongside the run's outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageRecord {
@@ -349,6 +363,7 @@ pub struct RunRecord {
 pub(crate) struct RecoverableRun {
     pub(crate) id: String,
     pub(crate) ticket_id: String,
+    pub(crate) target: String,
     pub(crate) state: String,
     pub(crate) branch: Option<String>,
     pub(crate) worktree_path: Option<String>,
@@ -859,25 +874,19 @@ impl Store {
 
         let mut rows_dropped = 0;
         for run_id in &doomed_runs {
+            transaction.execute(
+                "UPDATE cooldowns SET source_run_id = NULL WHERE source_run_id = ?1",
+                params![run_id],
+            )?;
             for table in [
                 "leases",
                 "run_evidence",
                 "aftercare_stages",
-                "cooldowns",
                 "budget_reservations",
                 "notes",
             ] {
-                let column = if table == "leases" || table == "cooldowns" {
-                    if table == "leases" {
-                        "run_id"
-                    } else {
-                        "source_run_id"
-                    }
-                } else {
-                    "run_id"
-                };
                 rows_dropped += transaction.execute(
-                    &format!("DELETE FROM {table} WHERE {column} = ?1"),
+                    &format!("DELETE FROM {table} WHERE run_id = ?1"),
                     params![run_id],
                 )?;
             }
@@ -1331,6 +1340,7 @@ impl Store {
     pub fn select_ready_ticket(
         &self,
         activation: &QueuedActivation,
+        now_ms: i64,
     ) -> Result<Option<String>, StoreError> {
         let ticket = self
             .connection
@@ -1343,13 +1353,16 @@ impl Store {
                                    JOIN tickets bt ON bt.id = b.blocker_id
                                    WHERE b.ticket_id = t.id
                                      AND bt.state != 'merged')
-                   AND (NOT EXISTS (SELECT 1 FROM activation_filters f
+                    AND (NOT EXISTS (SELECT 1 FROM activation_filters f
                                     WHERE f.activation_id = ?2)
                         OR EXISTS (SELECT 1 FROM activation_filters f
-                                   WHERE f.activation_id = ?2 AND f.ticket_id = t.id))
-                 ORDER BY t.created_at_ms, t.id
-                 LIMIT 1",
-                params![activation.project_id, activation.id],
+                                    WHERE f.activation_id = ?2 AND f.ticket_id = t.id))
+                   AND NOT EXISTS (SELECT 1 FROM cooldowns c
+                                   WHERE c.key = 'agent_target:' || t.target
+                                     AND c.until_ms > ?3)
+                  ORDER BY t.created_at_ms, t.id
+                  LIMIT 1",
+                params![activation.project_id, activation.id, now_ms],
                 |row| row.get(0),
             )
             .optional()?;
@@ -1468,6 +1481,7 @@ impl Store {
         outcome: crate::outcome::Outcome,
         evidence: &[EvidenceRecord],
         stage: Option<&StageRecord>,
+        cooldown: Option<&CooldownUpdate<'_>>,
         now_ms: i64,
     ) -> Result<(), StoreError> {
         use crate::outcome::Outcome;
@@ -1515,6 +1529,7 @@ impl Store {
             Outcome::Failed => TicketState::Failed,
             Outcome::NeedsReview => TicketState::NeedsReview,
             Outcome::Cancelled => TicketState::Ready,
+            Outcome::RateLimited => TicketState::Ready,
             Outcome::Orphaned => TicketState::Ready,
         };
         transaction.execute(
@@ -1522,6 +1537,17 @@ impl Store {
              WHERE id = ?1 AND state = 'claimed'",
             params![ticket_id, ticket_state.as_str(), now_ms],
         )?;
+        if outcome == Outcome::RateLimited {
+            transaction.execute(
+                "UPDATE activations SET state = 'queued', updated_at_ms = ?2
+                 WHERE id = (SELECT activation_id FROM runs WHERE id = ?1)",
+                params![run_id, now_ms],
+            )?;
+        }
+
+        if let Some(cooldown) = cooldown {
+            upsert_cooldown(&transaction, run_id, cooldown, now_ms)?;
+        }
 
         for record in evidence {
             transaction.execute(
@@ -1560,12 +1586,15 @@ impl Store {
     /// ticket remain claimed until final settlement, but recovery can now
     /// resume with the exact exit and branch-activity facts. Only the caller that
     /// wins this transition owns exit processing and aftercare for the run.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_agent_exit(
         &mut self,
         run_id: &str,
         exit_code: Option<i32>,
         capture_complete: bool,
         commits_json: &str,
+        vendor_error: Option<&crate::vendor_error::VendorErrorMatch>,
+        cooldown_until_ms: Option<i64>,
         now_ms: i64,
     ) -> Result<ExitClaim, StoreError> {
         let transaction = self
@@ -1604,6 +1633,19 @@ impl Store {
                      (run_id, kind, observed_at_ms, dedupe_key, data_json)
                  VALUES (?1, ?2, ?3, 'settlement:' || ?1 || ':' || ?2, ?4)",
                 params![run_id, kind, now_ms, data_json],
+            )?;
+        }
+        if let Some(vendor_error) = vendor_error {
+            transaction.execute(
+                "INSERT OR IGNORE INTO run_evidence
+                     (run_id, kind, observed_at_ms, dedupe_key, data_json)
+                 VALUES (?1, 'vendor_error_classified', ?2,
+                         'settlement:' || ?1 || ':vendor_error_classified', ?3)",
+                params![
+                    run_id,
+                    now_ms,
+                    vendor_error.evidence_json(cooldown_until_ms)
+                ],
             )?;
         }
         if !capture_complete {
@@ -1755,6 +1797,44 @@ impl Store {
         Ok(rows)
     }
 
+    pub fn vendor_error_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::vendor_error::VendorErrorMatch>, StoreError> {
+        let data: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT data_json FROM run_evidence
+                 WHERE run_id = ?1 AND kind = 'vendor_error_classified'
+                 ORDER BY sequence DESC LIMIT 1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(data.and_then(|data| serde_json::from_str(&data).ok()))
+    }
+
+    pub fn latest_vendor_error_for_ticket(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<crate::vendor_error::VendorErrorMatch>, StoreError> {
+        let data: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT e.data_json FROM run_evidence e
+                 JOIN runs r ON r.id = e.run_id
+                 WHERE r.id = (SELECT latest.id FROM runs latest
+                               WHERE latest.ticket_id = ?1
+                               ORDER BY latest.created_at_ms DESC, latest.id DESC LIMIT 1)
+                   AND e.kind = 'vendor_error_classified'
+                 ORDER BY e.sequence DESC LIMIT 1",
+                params![ticket_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(data.and_then(|data| serde_json::from_str(&data).ok()))
+    }
+
     /// Rolls back a claim whose launch failed before a process existed: the
     /// lease is released, the run is closed, and the ticket returns to
     /// `ready`. The consumed attempt is kept as evidence of the try.
@@ -1850,11 +1930,12 @@ impl Store {
     /// must classify all of these before making another spawn decision.
     pub(crate) fn recoverable_runs(&self) -> Result<Vec<RecoverableRun>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT r.id, r.ticket_id, r.state, r.branch, r.worktree_path,
+            "SELECT r.id, r.ticket_id, t.target, r.state, r.branch, r.worktree_path,
                     r.pid, r.pid_start_time, r.process_group_id, r.worker_token,
                     r.worker_socket_path, r.exit_code, l.expires_at_ms
              FROM runs r
              JOIN leases l ON l.run_id = r.id
+             JOIN tickets t ON t.id = r.ticket_id
              WHERE r.exited_at_ms IS NULL
                AND r.state IN ('claimed', 'running', 'aftercare')
              ORDER BY r.created_at_ms, r.id",
@@ -1864,16 +1945,17 @@ impl Store {
                 Ok(RecoverableRun {
                     id: row.get(0)?,
                     ticket_id: row.get(1)?,
-                    state: row.get(2)?,
-                    branch: row.get(3)?,
-                    worktree_path: row.get(4)?,
-                    pid: row.get(5)?,
-                    pid_start_time: row.get(6)?,
-                    process_group_id: row.get(7)?,
-                    worker_token: row.get(8)?,
-                    worker_socket_path: row.get(9)?,
-                    exit_code: row.get(10)?,
-                    lease_expires_at_ms: row.get(11)?,
+                    target: row.get(2)?,
+                    state: row.get(3)?,
+                    branch: row.get(4)?,
+                    worktree_path: row.get(5)?,
+                    pid: row.get(6)?,
+                    pid_start_time: row.get(7)?,
+                    process_group_id: row.get(8)?,
+                    worker_token: row.get(9)?,
+                    worker_socket_path: row.get(10)?,
+                    exit_code: row.get(11)?,
+                    lease_expires_at_ms: row.get(12)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -2114,6 +2196,56 @@ impl Store {
         Ok(paused != 0)
     }
 
+    pub fn active_cooldown_for_target(
+        &self,
+        target: &str,
+        now_ms: i64,
+    ) -> Result<Option<CooldownRecord>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT ?1, until_ms, reason FROM cooldowns
+                 WHERE key = 'agent_target:' || ?1 AND until_ms > ?2",
+                params![target, now_ms],
+                |row| {
+                    Ok(CooldownRecord {
+                        target: row.get(0)?,
+                        until_ms: row.get(1)?,
+                        reason: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn active_cooldowns(&self, now_ms: i64) -> Result<Vec<CooldownRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT SUBSTR(key, 14), until_ms, reason FROM cooldowns
+             WHERE key LIKE 'agent_target:%' AND until_ms > ?1
+             ORDER BY key",
+        )?;
+        statement
+            .query_map(params![now_ms], |row| {
+                Ok(CooldownRecord {
+                    target: row.get(0)?,
+                    until_ms: row.get(1)?,
+                    reason: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn next_active_cooldown(&self, now_ms: i64) -> Result<Option<i64>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT MIN(until_ms) FROM cooldowns WHERE until_ms > ?1",
+                params![now_ms],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
+    }
+
     pub fn set_paused(&self, paused: bool, now_ms: i64) -> Result<(), StoreError> {
         self.connection.execute(
             "UPDATE scheduler_state SET paused = ?1, updated_at_ms = ?2 WHERE singleton = 1",
@@ -2172,6 +2304,33 @@ impl Store {
 pub(crate) enum ExitClaim {
     Claimed,
     AlreadyClaimed { state: String },
+}
+
+fn upsert_cooldown(
+    transaction: &rusqlite::Transaction<'_>,
+    run_id: &str,
+    cooldown: &CooldownUpdate<'_>,
+    now_ms: i64,
+) -> Result<(), rusqlite::Error> {
+    transaction.execute(
+        "INSERT INTO cooldowns (key, until_ms, reason, source_run_id, updated_at_ms)
+         VALUES ('agent_target:' || ?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(key) DO UPDATE SET
+             until_ms = MAX(cooldowns.until_ms, excluded.until_ms),
+             reason = CASE WHEN excluded.until_ms >= cooldowns.until_ms
+                           THEN excluded.reason ELSE cooldowns.reason END,
+             source_run_id = CASE WHEN excluded.until_ms >= cooldowns.until_ms
+                                  THEN excluded.source_run_id ELSE cooldowns.source_run_id END,
+             updated_at_ms = excluded.updated_at_ms",
+        params![
+            cooldown.target,
+            cooldown.until_ms,
+            cooldown.reason,
+            run_id,
+            now_ms
+        ],
+    )?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -2392,7 +2551,7 @@ mod tests {
             eligible_at_ms: None,
             interval_ms: None,
         };
-        assert_eq!(store.select_ready_ticket(&activation).unwrap(), None);
+        assert_eq!(store.select_ready_ticket(&activation, 2_000).unwrap(), None);
         match store.claim_ticket(&claim_t1("R1"), 2_000).unwrap_err() {
             StoreError::TicketNotReady { state, .. } => {
                 assert_eq!(state.as_deref(), Some("missing"));
@@ -2409,7 +2568,10 @@ mod tests {
 
         store.clear_ticket_missing("T1", 6_000).unwrap();
         assert_eq!(
-            store.select_ready_ticket(&activation).unwrap().as_deref(),
+            store
+                .select_ready_ticket(&activation, 6_000)
+                .unwrap()
+                .as_deref(),
             Some("T1")
         );
     }
@@ -2445,7 +2607,10 @@ mod tests {
 
         assert_eq!(store.unmerged_blockers("T2").unwrap(), ["T1"]);
         assert_eq!(
-            store.select_ready_ticket(&activation).unwrap().as_deref(),
+            store
+                .select_ready_ticket(&activation, 2_000)
+                .unwrap()
+                .as_deref(),
             Some("T1")
         );
         assert_eq!(store.ticket_counts().unwrap().blocked, 1);
@@ -2454,7 +2619,7 @@ mod tests {
             .connection
             .execute("UPDATE tickets SET state = 'failed' WHERE id = 'T1'", [])
             .unwrap();
-        assert_eq!(store.select_ready_ticket(&activation).unwrap(), None);
+        assert_eq!(store.select_ready_ticket(&activation, 2_000).unwrap(), None);
         match store
             .claim_ticket(
                 &ClaimRequest {
@@ -2482,7 +2647,10 @@ mod tests {
             .unwrap();
         assert!(store.unmerged_blockers("T2").unwrap().is_empty());
         assert_eq!(
-            store.select_ready_ticket(&activation).unwrap().as_deref(),
+            store
+                .select_ready_ticket(&activation, 2_000)
+                .unwrap()
+                .as_deref(),
             Some("T2")
         );
         let counts = store.ticket_counts().unwrap();
@@ -2643,7 +2811,7 @@ mod tests {
         );
 
         store
-            .finish_run("R1", "T1", Some(1), Outcome::Failed, &[], None, 2_200)
+            .finish_run("R1", "T1", Some(1), Outcome::Failed, &[], None, None, 2_200)
             .unwrap();
         assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
     }
@@ -2719,7 +2887,15 @@ mod tests {
             .unwrap();
 
         store
-            .record_agent_exit("R1", Some(0), true, r#"{"count":1,"oids":["abc"]}"#, 2_200)
+            .record_agent_exit(
+                "R1",
+                Some(0),
+                true,
+                r#"{"count":1,"oids":["abc"]}"#,
+                None,
+                None,
+                2_200,
+            )
             .unwrap();
         store
             .record_aftercare_evidence(
@@ -2776,7 +2952,15 @@ mod tests {
         running_r1(&mut store);
 
         let first = store
-            .record_agent_exit("R1", Some(0), true, r#"{"oids":["abc"]}"#, 2_200)
+            .record_agent_exit(
+                "R1",
+                Some(0),
+                true,
+                r#"{"oids":["abc"]}"#,
+                None,
+                None,
+                2_200,
+            )
             .unwrap();
         assert_eq!(first, ExitClaim::Claimed);
         assert_eq!(store.run("R1").unwrap().unwrap().state, "aftercare");
@@ -2785,7 +2969,7 @@ mod tests {
         assert!(evidence.iter().any(|(kind, _)| kind == "commits_observed"));
 
         let second = store
-            .record_agent_exit("R1", Some(1), false, r#"{"oids":[]}"#, 2_300)
+            .record_agent_exit("R1", Some(1), false, r#"{"oids":[]}"#, None, None, 2_300)
             .unwrap();
         assert_eq!(
             second,
@@ -2805,11 +2989,19 @@ mod tests {
         let mut store = open_seeded(&directory.path().join("sloop.db"));
         running_r1(&mut store);
         store
-            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, 2_200)
+            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, None, 2_200)
             .unwrap();
 
         let claim = store
-            .record_agent_exit("R1", Some(0), true, r#"{"count":0,"oids":[]}"#, 2_300)
+            .record_agent_exit(
+                "R1",
+                Some(0),
+                true,
+                r#"{"count":0,"oids":[]}"#,
+                None,
+                None,
+                2_300,
+            )
             .unwrap();
         assert_eq!(
             claim,
@@ -2819,8 +3011,15 @@ mod tests {
         );
         assert_eq!(store.run("R1").unwrap().unwrap().state, "merged");
 
-        let missing =
-            store.record_agent_exit("R9", Some(0), true, r#"{"count":0,"oids":[]}"#, 2_300);
+        let missing = store.record_agent_exit(
+            "R9",
+            Some(0),
+            true,
+            r#"{"count":0,"oids":[]}"#,
+            None,
+            None,
+            2_300,
+        );
         assert!(matches!(missing, Err(StoreError::RunNotFound { .. })));
     }
 
@@ -2830,18 +3029,26 @@ mod tests {
         let mut store = open_seeded(&directory.path().join("sloop.db"));
         running_r1(&mut store);
         store
-            .record_agent_exit("R1", Some(0), true, r#"{"count":1,"oids":["abc"]}"#, 2_200)
+            .record_agent_exit(
+                "R1",
+                Some(0),
+                true,
+                r#"{"count":1,"oids":["abc"]}"#,
+                None,
+                None,
+                2_200,
+            )
             .unwrap();
 
         store
-            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, 2_300)
+            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, None, 2_300)
             .unwrap();
         assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("merged"));
         assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
         let evidence = store.run_evidence("R1").unwrap();
 
         store
-            .finish_run("R1", "T1", Some(1), Outcome::Failed, &[], None, 2_400)
+            .finish_run("R1", "T1", Some(1), Outcome::Failed, &[], None, None, 2_400)
             .unwrap();
         let run = store.run("R1").unwrap().unwrap();
         assert_eq!(run.state, "merged");
@@ -2898,7 +3105,7 @@ mod tests {
         let first = store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
         assert_eq!(first.attempt, 1);
         store
-            .finish_run("R1", "T1", Some(0), Outcome::Failed, &[], None, 2_100)
+            .finish_run("R1", "T1", Some(0), Outcome::Failed, &[], None, None, 2_100)
             .unwrap();
 
         assert_eq!(store.retry_ticket("T1", 2_200).unwrap(), "failed");
@@ -3060,13 +3267,19 @@ mod tests {
 
         // T1 was registered first, so it wins despite T0 sorting lower.
         assert_eq!(
-            store.select_ready_ticket(&activation).unwrap().as_deref(),
+            store
+                .select_ready_ticket(&activation, 2_000)
+                .unwrap()
+                .as_deref(),
             Some("T1")
         );
 
         store.insert_activation_filter("A2", "T0").unwrap();
         assert_eq!(
-            store.select_ready_ticket(&activation).unwrap().as_deref(),
+            store
+                .select_ready_ticket(&activation, 2_000)
+                .unwrap()
+                .as_deref(),
             Some("T0")
         );
 
@@ -3074,7 +3287,7 @@ mod tests {
             project_id: Some("elsewhere".into()),
             ..activation
         };
-        assert_eq!(store.select_ready_ticket(&scoped).unwrap(), None);
+        assert_eq!(store.select_ready_ticket(&scoped, 2_000).unwrap(), None);
     }
 
     #[test]
@@ -3209,13 +3422,16 @@ mod tests {
             interval_ms: None,
         };
         // T1 is claimed and T2's blocker has not merged: nothing is ready.
-        assert_eq!(store.select_ready_ticket(&activation).unwrap(), None);
+        assert_eq!(store.select_ready_ticket(&activation, 2_000).unwrap(), None);
 
         store
-            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, 3_000)
+            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, None, 3_000)
             .unwrap();
         assert_eq!(
-            store.select_ready_ticket(&activation).unwrap().as_deref(),
+            store
+                .select_ready_ticket(&activation, 3_000)
+                .unwrap()
+                .as_deref(),
             Some("T2")
         );
     }
@@ -3244,6 +3460,7 @@ mod tests {
                     finished_at_ms: 2_900,
                     exit_code: Some(0),
                 }),
+                None,
                 3_000,
             )
             .unwrap();
@@ -3271,10 +3488,28 @@ mod tests {
         }];
 
         store
-            .finish_run("R1", "T1", Some(1), Outcome::Failed, &evidence, None, 3_000)
+            .finish_run(
+                "R1",
+                "T1",
+                Some(1),
+                Outcome::Failed,
+                &evidence,
+                None,
+                None,
+                3_000,
+            )
             .unwrap();
         store
-            .finish_run("R1", "T1", Some(1), Outcome::Failed, &evidence, None, 3_100)
+            .finish_run(
+                "R1",
+                "T1",
+                Some(1),
+                Outcome::Failed,
+                &evidence,
+                None,
+                None,
+                3_100,
+            )
             .unwrap();
 
         assert_eq!(store.run_evidence("R1").unwrap().len(), 1);
@@ -3289,7 +3524,7 @@ mod tests {
         store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
 
         store
-            .finish_run("R1", "T1", None, Outcome::Orphaned, &[], None, 3_000)
+            .finish_run("R1", "T1", None, Outcome::Orphaned, &[], None, None, 3_000)
             .unwrap();
 
         assert_eq!(store.run("R1").unwrap().unwrap().state, "orphaned");
@@ -3309,7 +3544,7 @@ mod tests {
         assert!(store.cancellation_requested("R1").unwrap());
 
         store
-            .finish_run("R1", "T1", None, Outcome::Cancelled, &[], None, 3_000)
+            .finish_run("R1", "T1", None, Outcome::Cancelled, &[], None, None, 3_000)
             .unwrap();
         assert_eq!(store.ticket_state("T1").unwrap().unwrap(), "ready");
         assert_eq!(store.ticket_counts().unwrap().ready, 1);

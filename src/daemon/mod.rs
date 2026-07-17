@@ -34,10 +34,11 @@ use crate::protocol::{
 };
 use crate::run_log::{OutputSource, OutputStream, RunLogWriter};
 use crate::store::{
-    ActivationKind, ClaimRequest, EvidenceRecord, ExitClaim, NewActivation, QueuedActivation,
-    RecoverableRun, StageRecord, Store, StoreError, TicketState,
+    ActivationKind, ClaimRequest, CooldownUpdate, EvidenceRecord, ExitClaim, NewActivation,
+    QueuedActivation, RecoverableRun, StageRecord, Store, StoreError, TicketState,
 };
 
+use crate::vendor_error::{CatalogError, VendorErrorClassifier, VendorErrorMatch};
 use runner::{
     LaunchedRun, launch_agent, process_start_time, run_output_path, spawn_output_reader,
     worker_socket_path,
@@ -48,6 +49,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 const DISPATCH_CHANNEL_CAPACITY: usize = 64;
 const DEFAULT_LEASE_MS: i64 = 10 * 60 * 1000;
+const VENDOR_COOLDOWN_MS: i64 = 5 * 60 * 1000;
 pub(crate) const WORKER_BOOTSTRAP_PROMPT: &str =
     include_str!("../worker-instructions.md").trim_ascii();
 /// One `logs` page; chunks are ≤8KiB, so a page stays well inside the
@@ -107,6 +109,7 @@ pub fn serve_current_project() -> Result<(), DaemonError> {
     let cwd = std::env::current_dir().map_err(DaemonError::CurrentDirectory)?;
     let project = Project::discover(&cwd)?;
     let config = Config::load(&project)?;
+    let classifier = Arc::new(VendorErrorClassifier::built_in().map_err(DaemonError::Catalog)?);
     fs::create_dir_all(&project.state_dir).map_err(|source| DaemonError::Io {
         path: project.state_dir.clone(),
         source,
@@ -235,7 +238,15 @@ pub fn serve_current_project() -> Result<(), DaemonError> {
         .enable_all()
         .build()
         .map_err(DaemonError::Runtime)?;
-    runtime.block_on(serve(project, config, store, lock, legacy_lock, clock))
+    runtime.block_on(serve(
+        project,
+        config,
+        store,
+        lock,
+        legacy_lock,
+        clock,
+        classifier,
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -423,6 +434,7 @@ async fn serve(
     _lock: fs::File,
     _legacy_lock: fs::File,
     clock: Arc<dyn Clock>,
+    classifier: Arc<VendorErrorClassifier>,
 ) -> Result<(), DaemonError> {
     if project.operator_socket.exists() {
         fs::remove_file(&project.operator_socket).map_err(|source| DaemonError::Io {
@@ -484,6 +496,7 @@ async fn serve(
         requests_tx: dispatcher_tx.clone(),
         log: log.clone(),
         clock,
+        classifier,
         shutdown: shutdown_tx.clone(),
         shutdown_flag: shutdown_flag.clone(),
     };
@@ -726,6 +739,7 @@ struct DispatcherState {
     requests_tx: mpsc::Sender<DispatcherMessage>,
     log: OperationalLog,
     clock: Arc<dyn Clock>,
+    classifier: Arc<VendorErrorClassifier>,
     /// Signals the accept loop to end the process; used by daemon-side
     /// exits such as the project-root liveness check.
     shutdown: mpsc::Sender<()>,
@@ -744,6 +758,7 @@ struct StageResult {
 enum RunEvent {
     Exited {
         run_id: String,
+        target: String,
         exit_code: Option<i32>,
         /// False when a pipe reader failed to durably record every chunk;
         /// the loss becomes explicit run evidence instead of silence.
@@ -753,6 +768,8 @@ enum RunEvent {
         commits: Vec<String>,
         tests: Option<StageResult>,
         merge: Option<MergeOutcome>,
+        vendor_error: Option<VendorErrorMatch>,
+        cooldown_until_ms: Option<i64>,
         recovery: Option<RecoveryClassification>,
     },
 }
@@ -874,11 +891,14 @@ fn try_settle_run_exit(
 ) -> Result<crate::outcome::Outcome, StoreError> {
     let RunEvent::Exited {
         run_id,
+        target,
         exit_code,
         capture_complete,
         commits,
         tests,
         merge,
+        vendor_error,
+        cooldown_until_ms,
         recovery,
     } = event;
 
@@ -887,10 +907,14 @@ fn try_settle_run_exit(
     let evidence = RunEvidence {
         cancelled,
         exit: classify_exit(*exit_code),
+        vendor_error: vendor_error.as_ref().map(|error| error.class),
         tests: tests.as_ref().map(|stage| stage.outcome),
         merge: *merge,
     };
-    let outcome = if *recovery == Some(RecoveryClassification::Orphaned) && !cancelled {
+    let outcome = if *recovery == Some(RecoveryClassification::Orphaned)
+        && !cancelled
+        && vendor_error.is_none()
+    {
         crate::outcome::Outcome::Orphaned
     } else {
         derive_outcome(&evidence)
@@ -940,6 +964,12 @@ fn try_settle_run_exit(
             data_json: json!({}).to_string(),
         });
     }
+    if let Some(vendor_error) = vendor_error {
+        records.push(EvidenceRecord {
+            kind: "vendor_error_classified",
+            data_json: vendor_error.evidence_json(*cooldown_until_ms),
+        });
+    }
     let stage_row = tests.as_ref().map(|stage| StageRecord {
         stage: "test",
         state: match stage.outcome {
@@ -958,6 +988,15 @@ fn try_settle_run_exit(
             run_id: run_id.clone(),
         })?
         .ticket_id;
+    let cooldown = vendor_error
+        .as_ref()
+        .filter(|error| error.class.requires_cooldown() && !cancelled)
+        .and_then(|error| cooldown_until_ms.map(|until_ms| (error, until_ms)))
+        .map(|(error, until_ms)| CooldownUpdate {
+            target,
+            until_ms,
+            reason: &error.diagnostic,
+        });
     state.store.finish_run(
         run_id,
         &ticket_id,
@@ -965,6 +1004,7 @@ fn try_settle_run_exit(
         outcome,
         &records,
         stage_row.as_ref(),
+        cooldown.as_ref(),
         state.clock.now_ms(),
     )?;
     Ok(outcome)
@@ -1075,6 +1115,9 @@ fn monitor_recovered_run(
     run: RecoverableRun,
 ) {
     let root = state.root.clone();
+    let state_dir = state.state_dir.clone();
+    let classifier = state.classifier.clone();
+    let clock = state.clock.clone();
     let log = state.log.clone();
     let shutdown = state.shutdown_flag.clone();
     tokio::task::spawn_blocking(move || {
@@ -1085,7 +1128,7 @@ fn monitor_recovered_run(
             std::thread::sleep(Duration::from_millis(100));
         }
         while !shutdown.load(Ordering::Acquire) {
-            match recovered_exit_event(&root, &run) {
+            match recovered_exit_event(&root, &state_dir, &classifier, clock.now_ms(), &run) {
                 Ok(event) => {
                     let _ = events.blocking_send(event);
                     break;
@@ -1111,10 +1154,13 @@ fn spawn_dead_run_recovery(
     log: OperationalLog,
 ) {
     let root = state.root.clone();
+    let state_dir = state.state_dir.clone();
+    let classifier = state.classifier.clone();
+    let clock = state.clock.clone();
     let shutdown = state.shutdown_flag.clone();
     tokio::task::spawn_blocking(move || {
         while !shutdown.load(Ordering::Acquire) {
-            match recovered_exit_event(&root, &run) {
+            match recovered_exit_event(&root, &state_dir, &classifier, clock.now_ms(), &run) {
                 Ok(event) => {
                     let _ = events.blocking_send(event);
                     break;
@@ -1133,20 +1179,35 @@ fn spawn_dead_run_recovery(
     });
 }
 
-fn recovered_exit_event(root: &Path, run: &RecoverableRun) -> Result<RunEvent, String> {
+fn recovered_exit_event(
+    root: &Path,
+    state_dir: &Path,
+    classifier: &VendorErrorClassifier,
+    now_ms: i64,
+    run: &RecoverableRun,
+) -> Result<RunEvent, String> {
     let commits = run
         .branch
         .as_deref()
         .map(|branch| try_commits_on_branch(root, branch))
         .transpose()?
         .unwrap_or_default();
+    let exit_code = run.exit_code.and_then(|code| i32::try_from(code).ok());
+    let vendor_error = classify_run_output(classifier, state_dir, &run.id, exit_code)?;
+    let cooldown_until_ms = vendor_error
+        .as_ref()
+        .filter(|error| error.class.requires_cooldown())
+        .map(|_| now_ms + VENDOR_COOLDOWN_MS);
     Ok(RunEvent::Exited {
         run_id: run.id.clone(),
-        exit_code: None,
+        target: run.target.clone(),
+        exit_code,
         capture_complete: false,
         commits,
         tests: None,
         merge: None,
+        vendor_error,
+        cooldown_until_ms,
         recovery: Some(RecoveryClassification::Orphaned),
     })
 }
@@ -1230,6 +1291,10 @@ fn resume_aftercare(
     let (commits, commit_observation_complete) = commit_observation;
     let exit_code = run.exit_code.and_then(|code| i32::try_from(code).ok());
     let exit = classify_exit(exit_code);
+    let vendor_error = value("vendor_error_classified")
+        .and_then(|data| serde_json::from_value::<VendorErrorMatch>(data).ok());
+    let cooldown_until_ms =
+        value("vendor_error_classified").and_then(|data| data["cooldown_until_ms"].as_i64());
     let output_log = RunLogWriter::open(&run_output_path(state_dir, &run.id))
         .map_err(|error| format!("cannot open run output: {error}"))?;
 
@@ -1252,16 +1317,19 @@ fn resume_aftercare(
     if aftercare_cancelled(store, &run.id, log) {
         return Ok(RunEvent::Exited {
             run_id: run.id.clone(),
+            target: run.target.clone(),
             exit_code,
             capture_complete: !rows.iter().any(|(kind, _)| kind == "capture_incomplete"),
             commits,
             tests,
             merge: None,
+            vendor_error,
+            cooldown_until_ms,
             recovery: Some(RecoveryClassification::Aftercare),
         });
     }
     if tests.is_none()
-        && wants_tests(exit)
+        && wants_tests(exit, vendor_error.is_some())
         && let Some(cmd) = test_cmd
     {
         stop_interrupted_process(&rows, "test_process")?;
@@ -1298,7 +1366,11 @@ fn resume_aftercare(
     });
     if !aftercare_cancelled(store, &run.id, log)
         && merge.is_none()
-        && wants_merge(exit, tests.as_ref().map(|stage| stage.outcome))
+        && wants_merge(
+            exit,
+            tests.as_ref().map(|stage| stage.outcome),
+            vendor_error.is_some(),
+        )
         && let Some(branch) = run.branch.as_deref()
     {
         stop_interrupted_process(&rows, "merge_process")?;
@@ -1324,11 +1396,14 @@ fn resume_aftercare(
 
     Ok(RunEvent::Exited {
         run_id: run.id.clone(),
+        target: run.target.clone(),
         exit_code,
         capture_complete: !rows.iter().any(|(kind, _)| kind == "capture_incomplete"),
         commits,
         tests,
         merge,
+        vendor_error,
+        cooldown_until_ms,
         recovery: Some(RecoveryClassification::Aftercare),
     })
 }
@@ -1470,7 +1545,7 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
         if state.active.len() >= state.max_agents {
             break;
         }
-        let Some(ticket_id) = eligible_ticket(&state.store, &activation) else {
+        let Some(ticket_id) = eligible_ticket(&state.store, &activation, now_ms) else {
             continue;
         };
 
@@ -1550,7 +1625,9 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
                 let root = state.root.clone();
                 let test_cmd = state.aftercare_test_cmd.clone();
                 let clock = state.clock.clone();
+                let classifier = state.classifier.clone();
                 let supervisor_log = log.clone();
+                let state_dir = state.state_dir.clone();
                 let db_path = state.state_dir.join("sloop.db");
                 let LaunchedRun {
                     mut child,
@@ -1558,6 +1635,7 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
                     worktree,
                     branch,
                     output_log,
+                    target,
                     worker_listener,
                     worker_token,
                     worker_socket_path,
@@ -1599,9 +1677,32 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
                     }
                     // Capture must be complete on disk before the exit is
                     // reported; the readers end when the pipes close.
-                    let capture_complete = readers
-                        .into_iter()
-                        .all(|reader| reader.join().unwrap_or(false));
+                    let mut capture_complete = true;
+                    for reader in readers {
+                        capture_complete &= reader.join().unwrap_or(false);
+                    }
+                    let vendor_error = match classify_run_output(
+                        &classifier,
+                        &state_dir,
+                        &exited_run,
+                        exit_code,
+                    ) {
+                        Ok(classification) => classification,
+                        Err(error) => {
+                            capture_complete = false;
+                            supervisor_log.emit_with_fields(
+                                LogLevel::Error,
+                                "sloop::supervisor",
+                                "vendor_error_classification_failed",
+                                json!({"run_id": exited_run, "error": error}),
+                            );
+                            None
+                        }
+                    };
+                    let cooldown_until_ms = vendor_error
+                        .as_ref()
+                        .filter(|error| error.class.requires_cooldown())
+                        .map(|_| clock.now_ms() + VENDOR_COOLDOWN_MS);
                     let mut checkpoint_store = match Store::open(&db_path, clock.now_ms()) {
                         Ok(store) => Some(store),
                         Err(error) => {
@@ -1624,6 +1725,8 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
                         &output_log,
                         exit_code,
                         capture_complete,
+                        vendor_error.as_ref(),
+                        cooldown_until_ms,
                         checkpoint_store.as_mut(),
                         &supervisor_log,
                     ) else {
@@ -1631,11 +1734,14 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
                     };
                     let _ = events.blocking_send(RunEvent::Exited {
                         run_id: exited_run,
+                        target,
                         exit_code,
                         capture_complete,
                         commits,
                         tests,
                         merge,
+                        vendor_error,
+                        cooldown_until_ms,
                         recovery: None,
                     });
                 });
@@ -1693,27 +1799,34 @@ fn running_hours_open(state: &DispatcherState, now_ms: i64) -> bool {
 
 fn next_dispatch_deadline(state: &DispatcherState) -> Option<i64> {
     let now_ms = state.clock.now_ms();
+    let cooldown_deadline = state.store.next_active_cooldown(now_ms).ok().flatten();
     let next_eligible = state
         .store
         .next_activation_eligible_at_ms(now_ms)
         .ok()
         .flatten();
-    let Some(hours) = state.running_hours.as_ref() else {
-        return next_eligible;
+    let hours_deadline = 'hours: {
+        let Some(hours) = state.running_hours.as_ref() else {
+            break 'hours next_eligible;
+        };
+        if hours.is_open(state.clock.local_minute(now_ms)) {
+            break 'hours next_eligible;
+        }
+        let opening = hours.next_opening_ms(state.clock.as_ref(), now_ms);
+        let has_due_demand = state
+            .store
+            .dispatchable_activations(now_ms)
+            .is_ok_and(|activations| !activations.is_empty());
+        if has_due_demand || next_eligible.is_some_and(|deadline| deadline <= opening) {
+            Some(opening)
+        } else {
+            next_eligible
+        }
     };
-    if hours.is_open(state.clock.local_minute(now_ms)) {
-        return next_eligible;
-    }
-    let opening = hours.next_opening_ms(state.clock.as_ref(), now_ms);
-    let has_due_demand = state
-        .store
-        .dispatchable_activations(now_ms)
-        .is_ok_and(|activations| !activations.is_empty());
-    if has_due_demand || next_eligible.is_some_and(|deadline| deadline <= opening) {
-        Some(opening)
-    } else {
-        next_eligible
-    }
+    [hours_deadline, cooldown_deadline]
+        .into_iter()
+        .flatten()
+        .min()
 }
 
 /// Advances a recurring cadence to its first future slot. Missed slots are
@@ -1728,13 +1841,20 @@ fn rearm_every_at(eligible_at_ms: i64, interval_ms: i64, now_ms: i64) -> Option<
     eligible_at_ms.checked_add(interval_ms.checked_mul(steps)?)
 }
 
-fn eligible_ticket(store: &Store, activation: &QueuedActivation) -> Option<String> {
+fn eligible_ticket(store: &Store, activation: &QueuedActivation, now_ms: i64) -> Option<String> {
     match &activation.ticket_id {
         Some(ticket) if store.ticket_is_dispatchable(ticket).unwrap_or(false) => {
-            Some(ticket.clone())
+            let record = store.ticket(ticket).ok().flatten()?;
+            let target = record.target.as_deref()?;
+            store
+                .active_cooldown_for_target(target, now_ms)
+                .ok()
+                .flatten()
+                .is_none()
+                .then(|| ticket.clone())
         }
         Some(_) => None,
-        None => store.select_ready_ticket(activation).ok().flatten(),
+        None => store.select_ready_ticket(activation, now_ms).ok().flatten(),
     }
 }
 
@@ -1752,6 +1872,8 @@ fn gather_exit_evidence(
     output_log: &RunLogWriter,
     exit_code: Option<i32>,
     capture_complete: bool,
+    vendor_error: Option<&VendorErrorMatch>,
+    cooldown_until_ms: Option<i64>,
     mut checkpoint_store: Option<&mut Store>,
     operational_log: &OperationalLog,
 ) -> Option<(Vec<String>, Option<StageResult>, Option<MergeOutcome>)> {
@@ -1765,6 +1887,8 @@ fn gather_exit_evidence(
             exit_code,
             capture_complete,
             &json!({"complete": commit_observation_complete, "oids": commits}).to_string(),
+            vendor_error,
+            cooldown_until_ms,
             clock.now_ms(),
         ) {
             Ok(ExitClaim::Claimed) => true,
@@ -1790,6 +1914,9 @@ fn gather_exit_evidence(
     } else {
         false
     };
+    if checkpointed {
+        wait_for_test_hook("after-agent-exit-checkpoint");
+    }
     // Tests and merge can have side effects. Without the pre-aftercare
     // checkpoint, preserve the run branch for review rather than performing
     // an action that recovery could no longer prove or resume.
@@ -1802,7 +1929,7 @@ fn gather_exit_evidence(
     }
 
     let tests = match test_cmd {
-        Some(cmd) if wants_tests(exit) => {
+        Some(cmd) if wants_tests(exit, vendor_error.is_some()) => {
             let stage = run_test_stage(
                 worktree,
                 cmd,
@@ -1840,8 +1967,11 @@ fn gather_exit_evidence(
     let merge = if !checkpoint_store
         .as_deref()
         .is_some_and(|store| aftercare_cancelled(store, run_id, operational_log))
-        && wants_merge(exit, tests.as_ref().map(|stage| stage.outcome))
-    {
+        && wants_merge(
+            exit,
+            tests.as_ref().map(|stage| stage.outcome),
+            vendor_error.is_some(),
+        ) {
         let outcome = attempt_merge(
             root,
             branch,
@@ -2148,6 +2278,23 @@ fn attempt_merge(
     }
 }
 
+fn classify_run_output(
+    classifier: &VendorErrorClassifier,
+    state_dir: &Path,
+    run_id: &str,
+    exit_code: Option<i32>,
+) -> Result<Option<VendorErrorMatch>, String> {
+    let mut scanner = classifier.scanner(exit_code);
+    crate::run_log::visit_agent_output(&run_output_path(state_dir, run_id), |stream, bytes| {
+        match stream {
+            OutputStream::Stdout => scanner.feed_stdout(bytes),
+            OutputStream::Stderr => scanner.feed_stderr(bytes),
+        }
+    })
+    .map_err(|error| format!("cannot read captured agent output: {error}"))?;
+    Ok(scanner.finish())
+}
+
 /// Identity of the daemon owning a project's lockfile: PID plus process start
 /// time, mirroring the identity rule used for supervised agents.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2309,10 +2456,15 @@ fn handle_show(
     }
     let ticket = lookup(state, |store| store.ticket(&run.ticket_id))?
         .ok_or_else(|| internal("the ticket for this run no longer exists"))?;
-    Ok(ticket_show(reference, &ticket))
+    let vendor_error = current_ticket_vendor_error(state, &ticket)?;
+    Ok(ticket_show(reference, &ticket, vendor_error.as_ref()))
 }
 
-fn ticket_show(reference: &str, ticket: &crate::store::TicketRecord) -> serde_json::Value {
+fn ticket_show(
+    reference: &str,
+    ticket: &crate::store::TicketRecord,
+    vendor_error: Option<&VendorErrorMatch>,
+) -> serde_json::Value {
     json!({
         "ref": reference,
         "kind": "ticket",
@@ -2327,8 +2479,30 @@ fn ticket_show(reference: &str, ticket: &crate::store::TicketRecord) -> serde_js
             "target": ticket.target,
             "model": ticket.model,
             "effort": ticket.effort,
+            "reason": vendor_error.map(|error| error.diagnostic.as_str()),
+            "classification": vendor_error,
         },
     })
+}
+
+fn current_ticket_vendor_error(
+    state: &DispatcherState,
+    ticket: &crate::store::TicketRecord,
+) -> Result<Option<VendorErrorMatch>, ErrorBody> {
+    let vendor_error = lookup(state, |store| {
+        store.latest_vendor_error_for_ticket(&ticket.id)
+    })?;
+    if ticket.state != "ready" {
+        return Ok(vendor_error);
+    }
+    let cooldown_active = match ticket.target.as_deref() {
+        Some(target) => lookup(state, |store| {
+            store.active_cooldown_for_target(target, state.clock.now_ms())
+        })?
+        .is_some(),
+        None => false,
+    };
+    Ok(vendor_error.filter(|error| error.class.requires_cooldown() && cooldown_active))
 }
 
 fn handle_operator_show(
@@ -2336,11 +2510,18 @@ fn handle_operator_show(
     reference: &str,
 ) -> Result<serde_json::Value, ErrorBody> {
     if let Some(ticket) = lookup(state, |store| store.ticket(reference))? {
-        return Ok(ticket_show(reference, &ticket));
+        let vendor_error = current_ticket_vendor_error(state, &ticket)?;
+        return Ok(ticket_show(reference, &ticket, vendor_error.as_ref()));
     }
     let project = lookup(state, |store| store.project(reference))?
         .ok_or_else(|| not_found(&format!("reference `{reference}` is not indexed")))?;
     let tickets = lookup(state, |store| store.tickets_for_project(reference))?;
+    let mut vendor_errors = HashMap::new();
+    for ticket in &tickets {
+        if let Some(error) = current_ticket_vendor_error(state, ticket)? {
+            vendor_errors.insert(ticket.id.clone(), error);
+        }
+    }
 
     let mut notes: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
     for note in lookup(state, |store| store.notes_for_project(reference))? {
@@ -2380,12 +2561,15 @@ fn handle_operator_show(
         .map(|ticket| {
             let ticket_notes = notes.remove(&ticket.id).unwrap_or_default();
             let ticket_commits = commits.remove(&ticket.id).unwrap_or_default();
+            let vendor_error = vendor_errors.remove(&ticket.id);
             json!({
                 "id": ticket.id,
                 "name": ticket.name,
                 "state": ticket.state,
                 "notes": ticket_notes,
                 "commits": ticket_commits,
+                "reason": vendor_error.as_ref().map(|error| error.diagnostic.as_str()),
+                "classification": vendor_error,
             })
         })
         .collect::<Vec<_>>();
@@ -2572,6 +2756,25 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
                     "open": hours.is_open(state.clock.local_minute(now_ms)),
                 });
             }
+            let cooldowns = match state.store.active_cooldowns(now_ms) {
+                Ok(cooldowns) => cooldowns
+                    .into_iter()
+                    .map(|cooldown| {
+                        json!({
+                            "target": cooldown.target,
+                            "until_ms": cooldown.until_ms,
+                            "reason": cooldown.reason,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                Err(error) => {
+                    return ResponseEnvelope::failure(
+                        Some(id),
+                        internal(&format!("cannot read cooldowns: {error}")),
+                    );
+                }
+            };
+            gate["cooldowns"] = json!(cooldowns);
             let mut snapshot = json!({
                 "daemon": {"pid": state.pid, "paused": state.paused},
                 "gate": gate,
@@ -2676,20 +2879,57 @@ fn handle_list(state: &DispatcherState) -> Result<serde_json::Value, ErrorBody> 
     for ticket in lookup(state, Store::tickets)? {
         let active_run = lookup(state, |store| store.active_run_for_ticket(&ticket.id))?;
         let blockers = lookup(state, |store| store.unmerged_blockers(&ticket.id))?;
-        let reason = crate::eligibility::ticket_ineligibility(
+        let mut vendor_error = lookup(state, |store| {
+            store.latest_vendor_error_for_ticket(&ticket.id)
+        })?;
+        let cooldown = match ticket.target.as_deref() {
+            Some(target) => lookup(state, |store| {
+                store.active_cooldown_for_target(target, now_ms)
+            })?,
+            None => None,
+        };
+        if ticket.state == "ready"
+            && !vendor_error
+                .as_ref()
+                .is_some_and(|error| error.class.requires_cooldown() && cooldown.is_some())
+        {
+            vendor_error = None;
+        }
+        let ineligibility = crate::eligibility::ticket_ineligibility(
             &ticket.state,
             ticket.attempts,
             active_run.as_deref(),
             &blockers,
             &gates,
         );
+        let display_state =
+            crate::eligibility::display_state(&ticket.state, ineligibility.as_ref());
+        let mut reason = ineligibility.map(|reason| reason.describe());
+        if ticket.state == "failed"
+            && let Some(error) = &vendor_error
+        {
+            reason = Some(format!(
+                "{}; failed after {} attempt(s); requeue with `sloop retry`",
+                error.diagnostic, ticket.attempts
+            ));
+        } else if ticket.state == "ready"
+            && let (Some(target), Some(cooldown)) = (ticket.target.as_deref(), cooldown.as_ref())
+        {
+            reason = Some(format!(
+                "target `{target}` is cooling down until {}: {}",
+                format_timestamp(cooldown.until_ms)
+                    .unwrap_or_else(|| cooldown.until_ms.to_string()),
+                cooldown.reason
+            ));
+        }
         rows.push(json!({
             "id": ticket.id,
             "name": ticket.name,
             "project": ticket.project_id,
-            "state": crate::eligibility::display_state(&ticket.state, reason.as_ref()),
+            "state": display_state,
             "run": active_run,
-            "reason": reason.map(|reason| reason.describe()),
+            "reason": reason,
+            "classification": vendor_error,
         }));
     }
     Ok(json!({"tickets": rows}))
@@ -2970,13 +3210,22 @@ fn handle_wait(
     };
     let terminal = matches!(
         run.state.as_str(),
-        "merged" | "failed" | "needs_review" | "cancelled" | "orphaned" | "aborted"
+        "merged"
+            | "failed"
+            | "needs_review"
+            | "cancelled"
+            | "rate_limited"
+            | "orphaned"
+            | "aborted"
     );
+    let vendor_error = lookup(state, |store| store.vendor_error_for_run(&run.id))?;
     Ok(json!({
         "run": run.id,
         "state": run.state,
         "terminal": terminal,
         "exit_code": run.exit_code,
+        "reason": vendor_error.as_ref().map(|error| error.diagnostic.as_str()),
+        "classification": vendor_error,
     }))
 }
 
@@ -3233,6 +3482,7 @@ fn internal(message: &str) -> ErrorBody {
 #[derive(Debug)]
 pub enum DaemonError {
     Config(ConfigError),
+    Catalog(CatalogError),
     Store(StoreError),
     CurrentDirectory(io::Error),
     CurrentExecutable(io::Error),
@@ -3286,6 +3536,7 @@ impl std::fmt::Display for DaemonError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Config(error) => error.fmt(formatter),
+            Self::Catalog(error) => error.fmt(formatter),
             Self::Store(error) => error.fmt(formatter),
             Self::CurrentDirectory(error) => {
                 write!(formatter, "cannot read current directory: {error}")
@@ -3329,6 +3580,7 @@ mod tests {
         RecoverableRun {
             id: "R1".into(),
             ticket_id: "T1".into(),
+            target: "fake".into(),
             state: "running".into(),
             branch: None,
             worktree_path: None,

@@ -4,6 +4,8 @@
 
 use serde::Serialize;
 
+use crate::vendor_error::VendorErrorClass;
+
 /// Classification of how the agent process ended. This is the adapter-level
 /// reading of the raw wait status; vendor-specific classifications such as
 /// rate limits join in a later phase.
@@ -48,6 +50,8 @@ pub struct RunEvidence {
     /// An operator recorded cancellation intent before the exit was handled.
     pub cancelled: bool,
     pub exit: ExitClass,
+    /// A rejection recognized from the adapter's captured output.
+    pub vendor_error: Option<VendorErrorClass>,
     /// `None` when no test stage ran: either the exit did not justify testing,
     /// or no test command is configured.
     pub tests: Option<StageOutcome>,
@@ -64,6 +68,8 @@ pub enum Outcome {
     Failed,
     NeedsReview,
     Cancelled,
+    /// A retryable vendor rejection released the ticket under a cooldown.
+    RateLimited,
     /// Recovery found no live process before the agent exit was checkpointed.
     /// The worktree stays available for inspection and the ticket is released.
     Orphaned,
@@ -76,21 +82,24 @@ impl Outcome {
             Self::Failed => "failed",
             Self::NeedsReview => "needs_review",
             Self::Cancelled => "cancelled",
+            Self::RateLimited => "rate_limited",
             Self::Orphaned => "orphaned",
         }
     }
 }
 
-/// Whether the process exit justifies running the test stage.
-pub fn wants_tests(exit: ExitClass) -> bool {
-    exit == ExitClass::Success
+/// Whether the process exit justifies running the test stage. A recognized
+/// vendor rejection means the "successful" exit is a refusal transcript, so
+/// it never qualifies for testing.
+pub fn wants_tests(exit: ExitClass, vendor_error: bool) -> bool {
+    !vendor_error && exit == ExitClass::Success
 }
 
 /// Whether the evidence so far justifies attempting a merge. A test stage
 /// that ran and failed blocks the merge; an unconfigured test stage does
 /// not, because the operator chose auto-merge policy without one.
-pub fn wants_merge(exit: ExitClass, tests: Option<StageOutcome>) -> bool {
-    wants_tests(exit) && tests != Some(StageOutcome::Failed)
+pub fn wants_merge(exit: ExitClass, tests: Option<StageOutcome>, vendor_error: bool) -> bool {
+    wants_tests(exit, vendor_error) && tests != Some(StageOutcome::Failed)
 }
 
 /// Maps complete evidence to the run's terminal outcome.
@@ -112,6 +121,13 @@ pub fn derive_outcome(evidence: &RunEvidence) -> Outcome {
     if evidence.cancelled {
         return Outcome::Cancelled;
     }
+    if let Some(class) = evidence.vendor_error {
+        return if class.requires_cooldown() {
+            Outcome::RateLimited
+        } else {
+            Outcome::Failed
+        };
+    }
     if evidence.merge == Some(MergeOutcome::Merged) {
         return Outcome::Merged;
     }
@@ -129,6 +145,7 @@ mod tests {
         RunEvidence {
             cancelled: false,
             exit: ExitClass::Success,
+            vendor_error: None,
             tests: None,
             merge: None,
         }
@@ -181,6 +198,7 @@ mod tests {
         let outcome = derive_outcome(&RunEvidence {
             cancelled: true,
             exit: ExitClass::KilledBySignal,
+            vendor_error: None,
             tests: Some(StageOutcome::Passed),
             merge: Some(MergeOutcome::Merged),
         });
@@ -196,13 +214,51 @@ mod tests {
 
     #[test]
     fn test_and_merge_gates_follow_the_evidence() {
-        assert!(wants_tests(ExitClass::Success));
-        assert!(!wants_tests(ExitClass::Failure(1)));
-        assert!(!wants_tests(ExitClass::KilledBySignal));
+        assert!(wants_tests(ExitClass::Success, false));
+        assert!(!wants_tests(ExitClass::Failure(1), false));
+        assert!(!wants_tests(ExitClass::KilledBySignal, false));
+        assert!(!wants_tests(ExitClass::Success, true));
 
-        assert!(wants_merge(ExitClass::Success, Some(StageOutcome::Passed)));
-        assert!(wants_merge(ExitClass::Success, None));
-        assert!(!wants_merge(ExitClass::Success, Some(StageOutcome::Failed)));
-        assert!(!wants_merge(ExitClass::Failure(1), None));
+        assert!(wants_merge(
+            ExitClass::Success,
+            Some(StageOutcome::Passed),
+            false
+        ));
+        assert!(wants_merge(ExitClass::Success, None, false));
+        assert!(!wants_merge(
+            ExitClass::Success,
+            Some(StageOutcome::Failed),
+            false
+        ));
+        assert!(!wants_merge(ExitClass::Failure(1), None, false));
+        assert!(!wants_merge(ExitClass::Success, None, true));
+    }
+
+    #[test]
+    fn vendor_rejections_follow_code_owned_policy() {
+        for class in [
+            VendorErrorClass::AuthenticationRequired,
+            VendorErrorClass::InvalidConfiguration,
+        ] {
+            assert_eq!(
+                derive_outcome(&RunEvidence {
+                    vendor_error: Some(class),
+                    ..evidence()
+                }),
+                Outcome::Failed
+            );
+        }
+        for class in [
+            VendorErrorClass::RateLimited,
+            VendorErrorClass::UnknownRejection,
+        ] {
+            assert_eq!(
+                derive_outcome(&RunEvidence {
+                    vendor_error: Some(class),
+                    ..evidence()
+                }),
+                Outcome::RateLimited
+            );
+        }
     }
 }

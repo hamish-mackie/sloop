@@ -188,6 +188,50 @@ pub struct OutputPage {
     pub complete: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Reassembles each agent stream from every complete captured record. Test
+/// and merge output is deliberately excluded from vendor classification.
+pub fn read_agent_output(path: &Path) -> io::Result<AgentOutput> {
+    let mut output = AgentOutput::default();
+    visit_agent_output(path, |stream, bytes| {
+        let destination = match stream {
+            OutputStream::Stdout => &mut output.stdout,
+            OutputStream::Stderr => &mut output.stderr,
+        };
+        destination.extend_from_slice(bytes);
+    })?;
+    Ok(output)
+}
+
+/// Visits decoded agent chunks in capture order without retaining the whole
+/// log. A malformed or crash-truncated record does not hide earlier evidence.
+pub fn visit_agent_output(
+    path: &Path,
+    mut visitor: impl FnMut(OutputStream, &[u8]),
+) -> io::Result<()> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    for line in BufReader::new(file).lines() {
+        if let Ok(record) = serde_json::from_str::<OutputRecord>(&line?)
+            && record.source == OutputSource::Agent
+        {
+            let bytes = record.chunk.into_bytes();
+            visitor(record.stream, &bytes);
+        }
+    }
+    Ok(())
+}
+
 /// Reads a finite page of records with `sequence > after`, in order. A
 /// missing file is an empty page: the run may exist before any output does.
 pub fn read_page(path: &Path, after: u64, limit: usize) -> io::Result<OutputPage> {
@@ -233,7 +277,9 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::tempdir;
 
-    use super::{OutputChunk, OutputSource, OutputStream, RunLogWriter, read_page};
+    use super::{
+        OutputChunk, OutputSource, OutputStream, RunLogWriter, read_agent_output, read_page,
+    };
 
     #[test]
     fn utf8_and_binary_chunks_serialize_to_the_documented_shapes() {
@@ -402,5 +448,46 @@ mod tests {
         );
         let decoded: super::OutputRecord = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn agent_streams_are_reassembled_across_utf8_and_binary_chunks() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("output.ndjson");
+        let writer = RunLogWriter::open(&path).unwrap();
+        writer
+            .append(OutputSource::Agent, None, OutputStream::Stderr, b"rate li")
+            .unwrap();
+        writer
+            .append(
+                OutputSource::Aftercare,
+                Some("test"),
+                OutputStream::Stderr,
+                b"must not match",
+            )
+            .unwrap();
+        writer
+            .append(
+                OutputSource::Agent,
+                None,
+                OutputStream::Stdout,
+                &[0xff, b'o', b'k'],
+            )
+            .unwrap();
+        writer
+            .append(OutputSource::Agent, None, OutputStream::Stderr, b"mited")
+            .unwrap();
+        drop(writer);
+
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"{\"sequence\":99").unwrap();
+
+        let output = read_agent_output(&path).unwrap();
+        assert_eq!(output.stderr, b"rate limited");
+        assert_eq!(output.stdout, [0xff, b'o', b'k']);
     }
 }

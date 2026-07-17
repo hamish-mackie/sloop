@@ -1,22 +1,10 @@
-# Observed opencode error codes and message signatures.
-#
-# Record each distinct vendor error here as it is encountered.
-# `signature` is the stable part of the message suitable for matching;
-# volatile parts (refs, ids) are noted separately.
-
-errors:
-  - name: UnknownError
-    signature: "Unexpected server error. Check server logs for details."
-    volatile_fields:
-      - "data.ref (e.g. err_106e1db4, changes per occurrence)"
-    observed: 2026-07-17
-    observed_cause: >
-      Invalid model identifier in the run configuration (model
-      "openai/gpt-5.6" instead of "openai/gpt-5.6-sol"). opencode surfaces
-      this as a generic server error rather than a model-not-found error,
-      so the signature alone cannot distinguish a bad model from a real
-      server-side failure.
-    classification: >
-      Not retryable as-is when caused by configuration; per policy,
-      unknown vendor rejections are otherwise treated conservatively as
-      rate limits.
+version: 1
+vendor: opencode
+rules:
+  - id: opencode.rejection.unexpected-server-error
+    class: unknown_rejection
+    diagnostic: OpenCode rejected the request with an unclassified server error
+    match:
+      stream: stderr
+      message_signatures:
+        - Unexpected server error. Check server logs for details.

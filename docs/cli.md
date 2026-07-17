@@ -79,20 +79,23 @@ tickets are skipped by selection and rejected by named runs.
 
 Every ticket's name and state, and for each ticket that is not running,
 the scheduler's current reason (paused, outside running hours, at capacity,
-blocked, held, ...).
+blocked, held, target cooldown, ...). Failed and cooled-down tickets include
+the safe vendor diagnostic when a built-in rule recognized the rejection.
 
 ### sloop show <REF>
 
 Read-only lookup. For a ticket, the structured ticket payload. For a
 project, its tickets with each ticket's recent notes (from runtime state)
-and commits (rendered from Git). Never writes generated activity into
+and commits (rendered from Git). Recognized vendor failures include their
+classification and safe diagnostic. Never writes generated activity into
 committed files.
 
 ### sloop status
 
 Snapshot of daemon state: active runs, ready and queued work, gate state,
-and the next wake time. The gate state includes database writability; a full
-database blocks new dispatch until a write probe succeeds.
+active target cooldowns, and the next wake time. The gate state includes
+database writability; a full database blocks new dispatch until a write
+probe succeeds.
 
 ### sloop pause / sloop resume
 
@@ -115,8 +118,9 @@ spawned), release its ticket, and preserve the worktree for inspection.
 
 Block until the run reaches a terminal state. The exit code is the
 outcome: `0` only for `merged`, `1` for any other terminal state, `2` on
-timeout (default 3600 seconds). Lets scripts and CI gate on a run
-directly.
+timeout (default 3600 seconds). Lets scripts and CI gate on a run directly.
+Recognized vendor failures include their classification and safe diagnostic
+in the response.
 
 ### sloop logs <RUN>
 

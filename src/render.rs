@@ -265,11 +265,15 @@ fn render_stop(data: &Value) -> String {
 }
 
 fn render_wait(data: &Value) -> String {
-    format!(
+    let mut rendered = format!(
         "run {} {}\n",
         data["run"].as_str().unwrap_or("?"),
         data["state"].as_str().unwrap_or("?"),
-    )
+    );
+    if let Some(reason) = data["reason"].as_str() {
+        let _ = writeln!(rendered, "reason: {reason}");
+    }
+    rendered
 }
 
 fn render_cancel(data: &Value) -> String {
