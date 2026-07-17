@@ -735,7 +735,7 @@ mod tests {
             Err(PostError::UnknownTarget(target)) if target == "missing"
         ));
         assert!(store.ticket_ids().unwrap().is_empty());
-        assert!(store.queued_dispatchable_activations().unwrap().is_empty());
+        assert!(store.queued_activations().unwrap().is_empty());
     }
 
     #[test]

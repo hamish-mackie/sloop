@@ -42,7 +42,7 @@ the file. The activation modes are mutually exclusive:
 Reposting an edited file updates the ticket in place without queuing a
 duplicate run.
 
-### sloop run [TICKET] [--project P] [--only T1,T2]
+### sloop run [TICKET] [--project P] [--only T1,T2] [--at TIME | --every INTERVAL | --overnight]
 
 Enqueue a run. Naming a ticket or a project says *which* work, not
 *whether* the gates apply:
@@ -56,10 +56,14 @@ Enqueue a run. Naming a ticket or a project says *which* work, not
 Ticket and `--project` are mutually exclusive. Every run, named or not,
 passes the same gates: pause, running hours, and capacity.
 
-`--at`, `--every`, and `--overnight` are accepted on the command line but
-time-based dispatch is not implemented yet; such runs are recorded and
-never started. Use plain `sloop run` together with `running_hours` in the
-configuration to defer work to a nightly window.
+Time-based activations use the same scheduler gates as an immediate run:
+
+- `--at HH:MM` queues one run for the next occurrence of that local time.
+- `--every INTERVAL` queues recurring work, first due after the interval.
+  Missed intervals advance on the original cadence rather than causing a
+  burst of catch-up runs.
+- `--overnight` queues one run for the next open `running_hours` window. If
+  no window is configured, it is dispatchable immediately.
 
 ### sloop retry <TICKET>
 

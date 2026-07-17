@@ -584,6 +584,120 @@ fn running_hours_hold_queued_work_until_the_opening_boundary() {
 }
 
 #[test]
+fn overnight_dispatches_once_inside_the_window() {
+    let world = World::configured();
+    let current = SystemClock.local_minute(world.now_ms());
+    let start = (current + 2) % (24 * 60);
+    let end = (start + 4) % (24 * 60);
+    configure_fake_agent_with_hours(&world, 2, true, Some((start, end)));
+    world.commit_all("initial");
+    world.start_daemon();
+    let first = post_manual(&world, "overnight-first.md", "# Overnight first\n");
+    let second = post_manual(&world, "overnight-second.md", "# Overnight second\n");
+
+    let output = world.sloop(&["run", "--overnight", "--only", &format!("{first},{second}")]);
+    assert!(output.status.success());
+    assert_eq!(
+        World::json_stdout(&output)["data"]["activation"]["kind"],
+        "overnight"
+    );
+    assert!(!worktree_marker(&world, "R1").exists());
+
+    world.tick(Duration::from_secs(2 * 60));
+    wait_until("overnight work starts after the window opens", || {
+        worktree_marker(&world, "R1").is_file()
+    });
+    assert_eq!(
+        fs::read_to_string(worktree_marker(&world, "R1"))
+            .unwrap()
+            .trim(),
+        first
+    );
+    assert!(!worktree_marker(&world, "R2").exists());
+
+    fs::write(world.root().join("release"), "go\n").unwrap();
+    wait_until("the overnight run settles", || {
+        status(&world)["gate"]["active_agents"] == 0
+    });
+    world.tick(Duration::from_secs(60));
+    assert!(!worktree_marker(&world, "R2").exists());
+    assert_eq!(status(&world)["tickets"]["ready"], 1);
+}
+
+#[test]
+fn overnight_without_running_hours_dispatches_immediately() {
+    let world = World::configured();
+    configure_fake_agent(&world, 1, false);
+    world.commit_all("initial");
+    world.start_daemon();
+    let ticket = post_manual(&world, "overnight-now.md", "# Overnight now\n");
+
+    let output = world.sloop(&["run", &ticket, "--overnight"]);
+    assert!(output.status.success());
+    wait_until("overnight work starts without configured hours", || {
+        worktree_marker(&world, "R1").is_file()
+    });
+}
+
+#[test]
+fn every_waits_for_the_window_rearms_and_dispatches_again() {
+    let world = World::configured();
+    let current = SystemClock.local_minute(world.now_ms());
+    let start = (current + 5) % (24 * 60);
+    let end = (start + 10) % (24 * 60);
+    configure_fake_agent_with_hours(&world, 2, true, Some((start, end)));
+    world.commit_all("initial");
+    world.start_daemon();
+    let first = post_manual(&world, "every-first.md", "# Every first\n");
+    let second = post_manual(&world, "every-second.md", "# Every second\n");
+
+    let output = world.sloop(&[
+        "run",
+        "--every",
+        "2m",
+        "--only",
+        &format!("{first},{second}"),
+    ]);
+    assert!(output.status.success());
+    let response = World::json_stdout(&output);
+    assert_eq!(response["data"]["activation"]["kind"], "every");
+    assert_eq!(response["data"]["activation"]["interval_ms"], 120_000);
+
+    world.tick(Duration::from_secs(2 * 60));
+    assert!(!worktree_marker(&world, "R1").exists());
+    world.tick(Duration::from_secs(3 * 60));
+    wait_until("the overdue recurring run starts at opening", || {
+        worktree_marker(&world, "R1").is_file()
+    });
+    assert_eq!(
+        fs::read_to_string(worktree_marker(&world, "R1"))
+            .unwrap()
+            .trim(),
+        first
+    );
+    assert!(!worktree_marker(&world, "R2").exists());
+
+    fs::write(world.root().join("release"), "go\n").unwrap();
+    wait_until("the first recurring run settles", || {
+        status(&world)["gate"]["active_agents"] == 0
+    });
+    assert!(!worktree_marker(&world, "R2").exists());
+
+    // The original two-minute cadence makes the next slot one minute after
+    // this delayed dispatch, rather than immediately or two minutes from now.
+    world.tick(Duration::from_secs(60));
+    wait_until("the rearmed recurring activation dispatches again", || {
+        worktree_marker(&world, "R2").is_file()
+    });
+    assert_eq!(
+        fs::read_to_string(worktree_marker(&world, "R2"))
+            .unwrap()
+            .trim(),
+        second
+    );
+}
+
+#[test]
 fn closing_time_does_not_cancel_active_work_or_start_the_next_run() {
     let world = World::configured();
     let current = SystemClock.local_minute(world.now_ms());
