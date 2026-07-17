@@ -6,6 +6,7 @@
 #[derive(Debug, Clone, Copy)]
 pub struct Gates {
     pub paused: bool,
+    pub storage_writable: bool,
     pub agent_configured: bool,
     pub hours_open: bool,
     pub at_capacity: bool,
@@ -20,6 +21,7 @@ pub enum Ineligible {
     Claimed { run: String },
     NoAgentConfigured,
     Paused,
+    StorageFull,
     OutsideRunningHours,
     AtCapacity,
     NoActivation,
@@ -36,6 +38,9 @@ impl Ineligible {
             Self::Claimed { run } => format!("claimed by run {run}"),
             Self::NoAgentConfigured => "no agent targets configured".into(),
             Self::Paused => "scheduler is paused; resume with `sloop resume`".into(),
+            Self::StorageFull => {
+                "database storage is full; free disk space to resume dispatch".into()
+            }
             Self::OutsideRunningHours => "outside configured running hours".into(),
             Self::AtCapacity => "all agent slots are busy".into(),
             Self::NoActivation => "ready but no queued activation; enqueue with `sloop run`".into(),
@@ -67,6 +72,8 @@ pub fn ticket_ineligibility(
         Some(Ineligible::NoAgentConfigured)
     } else if gates.paused {
         Some(Ineligible::Paused)
+    } else if !gates.storage_writable {
+        Some(Ineligible::StorageFull)
     } else if !gates.hours_open {
         Some(Ineligible::OutsideRunningHours)
     } else if gates.at_capacity {
@@ -85,6 +92,7 @@ mod tests {
     fn open_gates() -> Gates {
         Gates {
             paused: false,
+            storage_writable: true,
             agent_configured: true,
             hours_open: true,
             at_capacity: false,
@@ -134,6 +142,13 @@ mod tests {
         assert!(matches!(
             ticket_ineligibility("ready", 0, None, &gates),
             Some(Ineligible::Paused)
+        ));
+
+        let mut gates = open_gates();
+        gates.storage_writable = false;
+        assert!(matches!(
+            ticket_ineligibility("ready", 0, None, &gates),
+            Some(Ineligible::StorageFull)
         ));
 
         let mut gates = open_gates();

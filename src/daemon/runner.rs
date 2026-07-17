@@ -12,6 +12,37 @@ use tokio::net::UnixListener;
 use super::{DispatcherState, WORKER_BOOTSTRAP_PROMPT};
 use crate::config::expand_agent_cmd;
 use crate::run_log::{OutputSource, OutputStream, RunLogWriter};
+use crate::store::StoreError;
+
+#[derive(Debug)]
+pub(super) enum LaunchError {
+    Message(String),
+    Store(StoreError),
+}
+
+impl LaunchError {
+    pub(super) fn store_error(&self) -> Option<&StoreError> {
+        match self {
+            Self::Store(error) => Some(error),
+            Self::Message(_) => None,
+        }
+    }
+}
+
+impl From<String> for LaunchError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl std::fmt::Display for LaunchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(message) => formatter.write_str(message),
+            Self::Store(error) => error.fmt(formatter),
+        }
+    }
+}
 
 /// A supervised agent process plus the reader threads draining its pipes;
 /// the readers finish when the pipes close, and joining them guarantees
@@ -38,7 +69,7 @@ pub(super) fn launch_agent(
     run_id: &str,
     ticket_id: &str,
     attempt: i64,
-) -> Result<LaunchedRun, String> {
+) -> Result<LaunchedRun, LaunchError> {
     let agent = state
         .agent
         .as_ref()
@@ -46,7 +77,7 @@ pub(super) fn launch_agent(
     let ticket = state
         .store
         .ticket(ticket_id)
-        .map_err(|error| error.to_string())?
+        .map_err(LaunchError::Store)?
         .ok_or_else(|| format!("ticket `{ticket_id}` no longer exists"))?;
     let target = ticket
         .target
@@ -91,7 +122,8 @@ pub(super) fn launch_agent(
         return Err(format!(
             "git worktree add failed: {}",
             String::from_utf8_lossy(&git.stderr).trim()
-        ));
+        )
+        .into());
     }
 
     let output_log = RunLogWriter::open(&run_output_path(&state.state_dir, run_id))
@@ -157,7 +189,7 @@ pub(super) fn launch_agent(
         for reader in readers {
             let _ = reader.join();
         }
-        return Err(error.to_string());
+        return Err(LaunchError::Store(error));
     }
     Ok(LaunchedRun {
         child,

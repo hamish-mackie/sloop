@@ -127,8 +127,17 @@ impl RunLogWriter {
         };
         let mut line = serde_json::to_vec(&record).map_err(io::Error::other)?;
         line.push(b'\n');
-        inner.file.write_all(&line)?;
-        inner.file.sync_data()?;
+        let original_len = inner.file.metadata()?.len();
+        if let Err(error) = inner
+            .file
+            .write_all(&line)
+            .and_then(|()| inner.file.sync_data())
+        {
+            // Keep the previous complete-record boundary after a short write,
+            // especially ENOSPC, so future appends cannot join corrupt JSON.
+            let _ = inner.file.set_len(original_len);
+            return Err(error);
+        }
         inner.next_sequence += 1;
         Ok(record.sequence)
     }
