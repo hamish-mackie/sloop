@@ -61,9 +61,17 @@ impl OperationalLog {
         let Ok(mut file) = self.file.lock() else {
             return;
         };
-        if serde_json::to_writer(&mut *file, &record).is_ok() {
-            let _ = file.write_all(b"\n");
-            let _ = file.flush();
+        let Ok(mut line) = serde_json::to_vec(&record) else {
+            return;
+        };
+        line.push(b'\n');
+        let Ok(original_len) = file.metadata().map(|metadata| metadata.len()) else {
+            return;
+        };
+        if file.write_all(&line).and_then(|()| file.flush()).is_err() {
+            // A full filesystem can leave a short write. Remove it so a later
+            // successful record still begins on a valid NDJSON boundary.
+            let _ = file.set_len(original_len);
         }
     }
 }

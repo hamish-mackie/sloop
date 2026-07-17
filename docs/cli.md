@@ -90,7 +90,8 @@ committed files.
 ### sloop status
 
 Snapshot of daemon state: active runs, ready and queued work, gate state,
-and the next wake time.
+and the next wake time. The gate state includes database writability; a full
+database blocks new dispatch until a write probe succeeds.
 
 ### sloop pause / sloop resume
 

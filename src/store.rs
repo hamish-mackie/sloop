@@ -2084,6 +2084,16 @@ impl Store {
         Ok(())
     }
 
+    /// Performs a small committed write used to detect when SQLite can make
+    /// progress again after returning `SQLITE_FULL`.
+    pub(crate) fn probe_writable(&self, now_ms: i64) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE scheduler_state SET updated_at_ms = ?1 WHERE singleton = 1",
+            params![now_ms],
+        )?;
+        Ok(())
+    }
+
     pub fn ticket_counts(&self) -> Result<TicketCounts, StoreError> {
         let mut statement = self
             .connection
@@ -2151,6 +2161,20 @@ pub enum StoreError {
         state: Option<String>,
         requested: String,
     },
+}
+
+impl StoreError {
+    pub(crate) fn is_disk_full(&self) -> bool {
+        let source = match self {
+            Self::Open { source, .. } | Self::Sqlite(source) => source,
+            _ => return false,
+        };
+        matches!(
+            source,
+            rusqlite::Error::SqliteFailure(error, _)
+                if error.code == rusqlite::ffi::ErrorCode::DiskFull
+        )
+    }
 }
 
 impl From<rusqlite::Error> for StoreError {
@@ -2259,6 +2283,40 @@ mod tests {
             )
             .unwrap();
         store
+    }
+
+    #[test]
+    fn sqlite_full_errors_are_classified_for_backpressure() {
+        let sqlite = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            None,
+        );
+        assert!(StoreError::from(sqlite).is_disk_full());
+        assert!(
+            !StoreError::TicketNotFound {
+                ticket_id: "T1".into()
+            }
+            .is_disk_full()
+        );
+    }
+
+    #[test]
+    fn writable_probe_commits_without_changing_pause_state() {
+        let directory = tempdir().unwrap();
+        let store = open_seeded(&directory.path().join("sloop.db"));
+
+        store.probe_writable(2_000).unwrap();
+
+        assert!(!store.paused().unwrap());
+        let updated_at_ms: i64 = store
+            .connection
+            .query_row(
+                "SELECT updated_at_ms FROM scheduler_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated_at_ms, 2_000);
     }
 
     fn claim_t1<'a>(run_id: &'a str) -> ClaimRequest<'a> {

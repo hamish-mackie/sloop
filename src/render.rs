@@ -134,6 +134,9 @@ fn render_status(data: &Value) -> String {
         "agents: {} active of {} max",
         data["gate"]["active_agents"], data["gate"]["max_agents"]
     );
+    if data["gate"]["storage"]["writable"] == Value::Bool(false) {
+        text.push_str("storage: database full (dispatch blocked until space is available)\n");
+    }
     if let Some(hours) = data["gate"]["running_hours"].as_object() {
         let state = if hours.get("open") == Some(&Value::Bool(true)) {
             "open"
@@ -449,6 +452,30 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("queued: none"), "{text}");
+    }
+
+    #[test]
+    fn status_renders_a_full_database_as_a_dispatch_gate() {
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "daemon": {"pid": 42, "paused": false},
+                "gate": {
+                    "active_agents": 0,
+                    "max_agents": 1,
+                    "storage": {"writable": false, "reason": "database_full"}
+                },
+                "runs": [],
+                "queued_activations": [],
+                "tickets": {}
+            }),
+        );
+
+        let text = render(Some("status"), &response);
+        assert!(
+            text.contains("storage: database full (dispatch blocked"),
+            "{text}"
+        );
     }
 
     #[test]

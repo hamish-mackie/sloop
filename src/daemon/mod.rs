@@ -1,5 +1,6 @@
 mod runner;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -473,6 +474,7 @@ async fn serve(
         socket: project.operator_socket.clone(),
         daemon_log: project.daemon_log.clone(),
         store,
+        storage_full: Cell::new(false),
         active: HashSet::new(),
         cancelling: HashSet::new(),
         worker_tokens: HashMap::new(),
@@ -702,6 +704,9 @@ struct DispatcherState {
     socket: PathBuf,
     daemon_log: PathBuf,
     store: Store,
+    /// `SQLITE_FULL` is a dispatcher gate. The daemon retains active and
+    /// pending run evidence in memory until a committed probe succeeds.
+    storage_full: Cell<bool>,
     /// Run IDs with a live supervised process; its size is the capacity gate.
     active: HashSet<String>,
     /// Run IDs whose cancellation was requested but whose exit has not been
@@ -822,7 +827,9 @@ fn settle_run_exit(state: &mut DispatcherState, event: RunEvent, log: &Operation
         RunEvent::Exited { run_id, .. } => run_id.clone(),
     };
     state.pending_exits.insert(run_id, event);
-    settle_pending_exits(state, log);
+    if !state.storage_full.get() {
+        settle_pending_exits(state, log);
+    }
 }
 
 fn settle_pending_exits(state: &mut DispatcherState, log: &OperationalLog) {
@@ -844,6 +851,8 @@ fn settle_pending_exits(state: &mut DispatcherState, log: &OperationalLog) {
                 );
             }
             Err(error) => {
+                let disk_full = error.is_disk_full();
+                mark_storage_full(state, &error);
                 log.emit_with_fields(
                     LogLevel::Error,
                     "sloop::dispatcher",
@@ -851,6 +860,9 @@ fn settle_pending_exits(state: &mut DispatcherState, log: &OperationalLog) {
                     json!({"run_id": run_id, "error": error.to_string()}),
                 );
                 state.pending_exits.insert(run_id, event);
+                if disk_full {
+                    break;
+                }
             }
         }
     }
@@ -1394,13 +1406,50 @@ fn kill_straggler_process_group(group: u32) -> bool {
     stragglers_present
 }
 
+fn mark_storage_full(state: &DispatcherState, error: &StoreError) {
+    if error.is_disk_full() && !state.storage_full.replace(true) {
+        state.log.emit_with_fields(
+            LogLevel::Error,
+            "sloop::dispatcher",
+            "storage_full",
+            json!({"error": error.to_string()}),
+        );
+    }
+}
+
+fn recover_storage(state: &DispatcherState, now_ms: i64) -> bool {
+    if !state.storage_full.get() {
+        return true;
+    }
+    match state.store.probe_writable(now_ms) {
+        Ok(()) => {
+            state.storage_full.set(false);
+            state
+                .log
+                .emit(LogLevel::Info, "sloop::dispatcher", "storage_recovered");
+            true
+        }
+        Err(error) => {
+            mark_storage_full(state, &error);
+            false
+        }
+    }
+}
+
 /// The single spawn decision point: every queued activation passes the same
 /// pause and capacity gates, selects deterministically, claims conditionally,
 /// and only then touches Git and processes.
 fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: &OperationalLog) {
-    settle_pending_exits(state, log);
     let now_ms = state.clock.now_ms();
-    if state.paused || state.agent.is_none() || !running_hours_open(state, now_ms) {
+    if !recover_storage(state, now_ms) {
+        return;
+    }
+    settle_pending_exits(state, log);
+    if state.storage_full.get()
+        || state.paused
+        || state.agent.is_none()
+        || !running_hours_open(state, now_ms)
+    {
         return;
     }
     let activations = match state.store.dispatchable_activations(now_ms) {
@@ -1425,8 +1474,21 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
         };
 
         let now_ms = state.clock.now_ms();
-        let Ok(run_ordinal) = state.store.next_run_ordinal() else {
-            continue;
+        let run_ordinal = match state.store.next_run_ordinal() {
+            Ok(ordinal) => ordinal,
+            Err(error) => {
+                mark_storage_full(state, &error);
+                log.emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::dispatcher",
+                    "run_id_reservation_failed",
+                    json!({"error": error.to_string()}),
+                );
+                if error.is_disk_full() {
+                    break;
+                }
+                continue;
+            }
         };
         let run_id = format!("R{run_ordinal}");
         let owner = format!("daemon-{}", state.pid);
@@ -1461,6 +1523,7 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
             // Not ready right now; the activation stays queued for later.
             Err(StoreError::TicketNotReady { .. }) => continue,
             Err(error) => {
+                mark_storage_full(state, &error);
                 log.emit_with_fields(
                     LogLevel::Error,
                     "sloop::dispatcher",
@@ -1472,6 +1535,9 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
                         "error": error.to_string(),
                     }),
                 );
+                if error.is_disk_full() {
+                    break;
+                }
                 continue;
             }
         };
@@ -1580,11 +1646,15 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
                 );
             }
             Err(error) => {
+                if let Some(store_error) = error.store_error() {
+                    mark_storage_full(state, store_error);
+                }
                 if let Err(abort_error) =
                     state
                         .store
                         .abort_claim(&run_id, &ticket_id, state.clock.now_ms())
                 {
+                    mark_storage_full(state, &abort_error);
                     log.emit_with_fields(
                         LogLevel::Error,
                         "sloop::dispatcher",
@@ -1605,7 +1675,7 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
                     json!({
                         "run_id": run_id,
                         "ticket_id": ticket_id,
-                        "error": error,
+                        "error": error.to_string(),
                     }),
                 );
             }
@@ -2351,7 +2421,10 @@ fn handle_note(
     state
         .store
         .insert_note(&note_id, run_id, text, state.clock.now_ms())
-        .map_err(|error| internal(&format!("cannot record note: {error}")))?;
+        .map_err(|error| {
+            mark_storage_full(state, &error);
+            internal(&format!("cannot record note: {error}"))
+        })?;
     Ok(json!({"note": {"id": note_id, "run": run_id, "text": text}}))
 }
 
@@ -2387,6 +2460,9 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
             ) {
                 Ok(data) => data,
                 Err(error) => {
+                    if let crate::post::PostError::Store(store_error) = &error {
+                        mark_storage_full(state, store_error);
+                    }
                     return ResponseEnvelope::failure(Some(id), post_error_body(&error));
                 }
             }
@@ -2447,6 +2523,10 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
             let mut gate = json!({
                 "active_agents": state.active.len(),
                 "max_agents": state.max_agents,
+                "storage": {
+                    "writable": !state.storage_full.get(),
+                    "reason": state.storage_full.get().then_some("database_full"),
+                },
             });
             if let Some(hours) = &state.running_hours {
                 gate["running_hours"] = json!({
@@ -2479,6 +2559,7 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
         }
         Request::Pause(_) => {
             if let Err(error) = state.store.set_paused(true, state.clock.now_ms()) {
+                mark_storage_full(state, &error);
                 return ResponseEnvelope::failure(
                     Some(id),
                     internal(&format!("cannot pause scheduler: {error}")),
@@ -2489,6 +2570,7 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
         }
         Request::Resume(_) => {
             if let Err(error) = state.store.set_paused(false, state.clock.now_ms()) {
+                mark_storage_full(state, &error);
                 return ResponseEnvelope::failure(
                     Some(id),
                     internal(&format!("cannot resume scheduler: {error}")),
@@ -2547,6 +2629,7 @@ fn handle_list(state: &DispatcherState) -> Result<serde_json::Value, ErrorBody> 
     let now_ms = state.clock.now_ms();
     let gates = crate::eligibility::Gates {
         paused: state.paused,
+        storage_writable: !state.storage_full.get(),
         agent_configured: state.agent.is_some(),
         hours_open: running_hours_open(state, now_ms),
         at_capacity: state.active.len() >= state.max_agents,
@@ -2779,7 +2862,10 @@ fn handle_hold(
         .map_err(|error| match error {
             StoreError::TicketNotFound { .. } => not_found(&error.to_string()),
             StoreError::TicketStateConflict { .. } => conflict(&error.to_string()),
-            _ => internal(&error.to_string()),
+            _ => {
+                mark_storage_full(state, &error);
+                internal(&error.to_string())
+            }
         })?;
     Ok(json!({
         "ticket": args.ticket,
@@ -2800,7 +2886,10 @@ fn handle_ready(
         .map_err(|error| match error {
             StoreError::TicketNotFound { .. } => not_found(&error.to_string()),
             StoreError::TicketStateConflict { .. } => conflict(&error.to_string()),
-            _ => internal(&error.to_string()),
+            _ => {
+                mark_storage_full(state, &error);
+                internal(&error.to_string())
+            }
         })?;
     Ok(json!({
         "ticket": args.ticket,
@@ -2820,7 +2909,10 @@ fn handle_retry(
         .map_err(|error| match error {
             StoreError::TicketNotFound { .. } => not_found(&error.to_string()),
             StoreError::TicketStateConflict { .. } => conflict(&error.to_string()),
-            _ => internal(&error.to_string()),
+            _ => {
+                mark_storage_full(state, &error);
+                internal(&error.to_string())
+            }
         })?;
     Ok(json!({
         "ticket": args.ticket,
@@ -3015,7 +3107,10 @@ fn lookup<T>(
     state: &DispatcherState,
     query: impl FnOnce(&Store) -> Result<T, StoreError>,
 ) -> Result<T, ErrorBody> {
-    query(&state.store).map_err(|error| internal(&error.to_string()))
+    query(&state.store).map_err(|error| {
+        mark_storage_full(state, &error);
+        internal(&error.to_string())
+    })
 }
 
 fn invalid_arguments(message: &str) -> ErrorBody {

@@ -93,6 +93,13 @@ live agent. At startup, every in-flight run is classified:
 A lock file guarantees at most one daemon per repository; a second
 `sloop daemon` connects to the first instead of racing it.
 
+If SQLite reports that its storage is full, the daemon keeps active and
+finished runs reserved, blocks new dispatch, and reports the storage gate in
+`sloop status` and `sloop list`. It periodically attempts a small committed
+write; after space becomes available, pending outcomes settle and dispatch
+resumes automatically. If the pre-aftercare checkpoint could not be written,
+Sloop skips side-effecting aftercare and preserves committed work for review.
+
 ## Files versus runtime state
 
 Anything a human writes lives in committed files: tickets, projects, flows,
