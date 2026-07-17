@@ -87,6 +87,23 @@ pub fn format_timestamp(timestamp_ms: i64) -> Option<String> {
         .ok()
 }
 
+/// Finds the next real instant whose local wall clock matches `minute`.
+/// Starting at the next whole minute makes the current minute mean its next
+/// occurrence, while scanning real instants handles DST transitions.
+pub fn next_local_minute_ms(clock: &dyn Clock, now_ms: i64, minute: u16) -> Option<i64> {
+    let mut candidate = now_ms
+        .div_euclid(60_000)
+        .checked_add(1)?
+        .checked_mul(60_000)?;
+    for _ in 0..=(49 * 60) {
+        if clock.local_minute(candidate) == minute {
+            return Some(candidate);
+        }
+        candidate = candidate.checked_add(60_000)?;
+    }
+    None
+}
+
 fn local_minute(timestamp_ms: i64) -> u16 {
     let seconds = timestamp_ms.div_euclid(1_000) as libc::time_t;
     let mut local = unsafe { std::mem::zeroed::<libc::tm>() };

@@ -275,6 +275,7 @@ pub struct ClaimRequest<'a> {
     pub activation_id: &'a str,
     pub owner_id: &'a str,
     pub lease_ms: i64,
+    pub next_activation_eligible_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +319,8 @@ pub struct QueuedActivation {
     pub kind: String,
     pub ticket_id: Option<String>,
     pub project_id: Option<String>,
+    pub eligible_at_ms: Option<i64>,
+    pub interval_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1265,13 +1268,10 @@ impl Store {
         Ok(())
     }
 
-    /// Queued activations the dispatcher may act on right now, oldest first.
-    /// Time-gated kinds (`at`, `every`, `overnight`) stay invisible until the
-    /// scheduler grows clock support.
-    pub fn queued_dispatchable_activations(&self) -> Result<Vec<QueuedActivation>, StoreError> {
+    pub fn queued_activations(&self) -> Result<Vec<QueuedActivation>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, kind, ticket_id, project_id FROM activations
-             WHERE state = 'queued' AND kind IN ('immediate', 'auto')
+            "SELECT id, kind, ticket_id, project_id, eligible_at_ms, interval_ms
+             FROM activations WHERE state = 'queued'
              ORDER BY created_at_ms, id",
         )?;
         let activations = statement
@@ -1281,10 +1281,50 @@ impl Store {
                     kind: row.get(1)?,
                     ticket_id: row.get(2)?,
                     project_id: row.get(3)?,
+                    eligible_at_ms: row.get(4)?,
+                    interval_ms: row.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(activations)
+    }
+
+    /// Queued activations whose time gate is open, oldest first.
+    pub fn dispatchable_activations(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<QueuedActivation>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, kind, ticket_id, project_id, eligible_at_ms, interval_ms
+             FROM activations
+             WHERE state = 'queued'
+               AND (kind IN ('immediate', 'auto') OR eligible_at_ms <= ?1)
+             ORDER BY created_at_ms, id",
+        )?;
+        let activations = statement
+            .query_map(params![now_ms], |row| {
+                Ok(QueuedActivation {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    ticket_id: row.get(2)?,
+                    project_id: row.get(3)?,
+                    eligible_at_ms: row.get(4)?,
+                    interval_ms: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(activations)
+    }
+
+    pub fn next_activation_eligible_at_ms(&self, now_ms: i64) -> Result<Option<i64>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT MIN(eligible_at_ms) FROM activations
+                 WHERE state = 'queued' AND eligible_at_ms > ?1",
+                params![now_ms],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
     }
 
     /// Deterministic ready-work selection within an activation's scope:
@@ -1318,12 +1358,23 @@ impl Store {
         Ok(ticket)
     }
 
-    pub fn complete_activation(&self, id: &str, now_ms: i64) -> Result<(), StoreError> {
-        self.connection.execute(
-            "UPDATE activations SET state = 'completed', updated_at_ms = ?2 WHERE id = ?1",
-            params![id, now_ms],
-        )?;
-        Ok(())
+    pub fn ticket_is_dispatchable(&self, ticket_id: &str) -> Result<bool, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM tickets t
+                     WHERE t.id = ?1
+                       AND t.state = 'ready'
+                       AND t.missing_at_ms IS NULL
+                       AND NOT EXISTS (SELECT 1 FROM ticket_blockers b
+                                       JOIN tickets bt ON bt.id = b.blocker_id
+                                       WHERE b.ticket_id = t.id
+                                         AND bt.state != 'merged')
+                 )",
+                params![ticket_id],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
     }
 
     /// Returns the next run ordinal. A successful claim advances the durable
@@ -1878,7 +1929,11 @@ impl Store {
         let changed = transaction.execute(
             "UPDATE tickets
              SET state = 'claimed', attempts = attempts + 1, updated_at_ms = ?2
-             WHERE id = ?1 AND state = 'ready' AND missing_at_ms IS NULL",
+             WHERE id = ?1 AND state = 'ready' AND missing_at_ms IS NULL
+               AND NOT EXISTS (SELECT 1 FROM ticket_blockers b
+                               JOIN tickets bt ON bt.id = b.blocker_id
+                               WHERE b.ticket_id = tickets.id
+                                 AND bt.state != 'merged')",
             params![claim.ticket_id, now_ms],
         )?;
         if changed != 1 {
@@ -1893,6 +1948,25 @@ impl Store {
             return Err(StoreError::TicketNotReady {
                 ticket_id: claim.ticket_id.into(),
                 state,
+            });
+        }
+
+        let activation_changed = match claim.next_activation_eligible_at_ms {
+            Some(eligible_at_ms) => transaction.execute(
+                "UPDATE activations
+                 SET eligible_at_ms = ?2, updated_at_ms = ?3
+                 WHERE id = ?1 AND state = 'queued' AND kind = 'every'",
+                params![claim.activation_id, eligible_at_ms, now_ms],
+            )?,
+            None => transaction.execute(
+                "UPDATE activations SET state = 'completed', updated_at_ms = ?2
+                 WHERE id = ?1 AND state = 'queued' AND kind != 'every'",
+                params![claim.activation_id, now_ms],
+            )?,
+        };
+        if activation_changed != 1 {
+            return Err(StoreError::ActivationNotQueued {
+                activation_id: claim.activation_id.into(),
             });
         }
 
@@ -2038,6 +2112,9 @@ pub enum StoreError {
         state: String,
         requested: String,
     },
+    ActivationNotQueued {
+        activation_id: String,
+    },
     LeaseNotHeld {
         ticket_id: String,
         run_id: String,
@@ -2082,6 +2159,10 @@ impl fmt::Display for StoreError {
             } => write!(
                 formatter,
                 "ticket `{ticket_id}` is `{state}` and cannot be changed to `{requested}`"
+            ),
+            Self::ActivationNotQueued { activation_id } => write!(
+                formatter,
+                "activation `{activation_id}` is not queued for dispatch"
             ),
             Self::LeaseNotHeld { ticket_id, run_id } => write!(
                 formatter,
@@ -2160,6 +2241,7 @@ mod tests {
             activation_id: "A1",
             owner_id: "daemon-1",
             lease_ms: 60_000,
+            next_activation_eligible_at_ms: None,
         }
     }
 
@@ -2174,6 +2256,8 @@ mod tests {
             kind: "immediate".into(),
             ticket_id: None,
             project_id: None,
+            eligible_at_ms: None,
+            interval_ms: None,
         };
         assert_eq!(store.select_ready_ticket(&activation).unwrap(), None);
         match store.claim_ticket(&claim_t1("R1"), 2_000).unwrap_err() {
@@ -2512,7 +2596,28 @@ mod tests {
 
         assert_eq!(store.retry_ticket("T1", 2_200).unwrap(), "failed");
         assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("ready"));
-        let retried = store.claim_ticket(&claim_t1("R2"), 2_300).unwrap();
+        store
+            .insert_activation(
+                &NewActivation {
+                    id: "A2",
+                    kind: ActivationKind::Immediate,
+                    ticket_id: Some("T1"),
+                    project_id: None,
+                    eligible_at_ms: None,
+                    interval_ms: None,
+                },
+                2_300,
+            )
+            .unwrap();
+        let retried = store
+            .claim_ticket(
+                &ClaimRequest {
+                    activation_id: "A2",
+                    ..claim_t1("R2")
+                },
+                2_300,
+            )
+            .unwrap();
         assert_eq!(retried.attempt, 1);
 
         assert!(matches!(
@@ -2642,6 +2747,8 @@ mod tests {
             kind: "immediate".into(),
             ticket_id: None,
             project_id: None,
+            eligible_at_ms: None,
+            interval_ms: None,
         };
 
         // T1 was registered first, so it wins despite T0 sorting lower.
@@ -2791,6 +2898,8 @@ mod tests {
             kind: "immediate".into(),
             ticket_id: None,
             project_id: None,
+            eligible_at_ms: None,
+            interval_ms: None,
         };
         // T1 is claimed and T2's blocker has not merged: nothing is ready.
         assert_eq!(store.select_ready_ticket(&activation).unwrap(), None);

@@ -18,8 +18,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as Async
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::clock::{Clock, FileClock, SystemClock, format_timestamp};
-use crate::config::{AgentConfig, Config, ConfigError, Project, RunningHours};
+use crate::clock::{Clock, FileClock, SystemClock, format_timestamp, next_local_minute_ms};
+use crate::config::{AgentConfig, Config, ConfigError, Project, RunningHours, parse_local_time};
 use crate::flow::Flow;
 use crate::frontmatter::{Frontmatter, FrontmatterError};
 use crate::ids::{IdError, next_id};
@@ -1390,7 +1390,7 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
     if state.paused || state.agent.is_none() || !running_hours_open(state, now_ms) {
         return;
     }
-    let activations = match state.store.queued_dispatchable_activations() {
+    let activations = match state.store.dispatchable_activations(now_ms) {
         Ok(activations) => activations,
         Err(error) => {
             log.emit_with_fields(
@@ -1423,7 +1423,26 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
             activation_id: &activation.id,
             owner_id: &owner,
             lease_ms: DEFAULT_LEASE_MS,
+            next_activation_eligible_at_ms: if activation.kind == "every" {
+                match (activation.eligible_at_ms, activation.interval_ms) {
+                    (Some(eligible_at_ms), Some(interval_ms)) => {
+                        rearm_every_at(eligible_at_ms, interval_ms, now_ms)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            },
         };
+        if activation.kind == "every" && claim.next_activation_eligible_at_ms.is_none() {
+            log.emit_with_fields(
+                LogLevel::Error,
+                "sloop::dispatcher",
+                "invalid_recurring_activation",
+                json!({"activation_id": activation.id}),
+            );
+            continue;
+        }
         let claimed = match state.store.claim_ticket(&claim, now_ms) {
             Ok(claimed) => claimed,
             // Not ready right now; the activation stays queued for later.
@@ -1443,17 +1462,6 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
                 continue;
             }
         };
-        // Immediate and auto activations are one-shot: producing a run
-        // consumes them, even if the launch below fails.
-        if let Err(error) = state.store.complete_activation(&activation.id, now_ms) {
-            log.emit_with_fields(
-                LogLevel::Error,
-                "sloop::dispatcher",
-                "activation_update_failed",
-                json!({"activation_id": activation.id, "error": error.to_string()}),
-            );
-        }
-
         match launch_agent(state, &run_id, &ticket_id, claimed.attempt) {
             Ok(launched) => {
                 state.active.insert(run_id.clone());
@@ -1588,21 +1596,48 @@ fn running_hours_open(state: &DispatcherState, now_ms: i64) -> bool {
 }
 
 fn next_dispatch_deadline(state: &DispatcherState) -> Option<i64> {
-    let hours = state.running_hours.as_ref()?;
     let now_ms = state.clock.now_ms();
+    let next_eligible = state
+        .store
+        .next_activation_eligible_at_ms(now_ms)
+        .ok()
+        .flatten();
+    let Some(hours) = state.running_hours.as_ref() else {
+        return next_eligible;
+    };
     if hours.is_open(state.clock.local_minute(now_ms)) {
+        return next_eligible;
+    }
+    let opening = hours.next_opening_ms(state.clock.as_ref(), now_ms);
+    let has_due_demand = state
+        .store
+        .dispatchable_activations(now_ms)
+        .is_ok_and(|activations| !activations.is_empty());
+    if has_due_demand || next_eligible.is_some_and(|deadline| deadline <= opening) {
+        Some(opening)
+    } else {
+        next_eligible
+    }
+}
+
+/// Advances a recurring cadence to its first future slot. Missed slots are
+/// skipped deterministically so reopening a dispatch window cannot cause a
+/// burst of catch-up runs.
+fn rearm_every_at(eligible_at_ms: i64, interval_ms: i64, now_ms: i64) -> Option<i64> {
+    if interval_ms <= 0 || eligible_at_ms > now_ms {
         return None;
     }
-    let has_demand = state
-        .store
-        .queued_dispatchable_activations()
-        .is_ok_and(|activations| !activations.is_empty());
-    has_demand.then(|| hours.next_opening_ms(state.clock.as_ref(), now_ms))
+    let missed = now_ms.checked_sub(eligible_at_ms)?.div_euclid(interval_ms);
+    let steps = missed.checked_add(1)?;
+    eligible_at_ms.checked_add(interval_ms.checked_mul(steps)?)
 }
 
 fn eligible_ticket(store: &Store, activation: &QueuedActivation) -> Option<String> {
     match &activation.ticket_id {
-        Some(ticket) => Some(ticket.clone()),
+        Some(ticket) if store.ticket_is_dispatchable(ticket).unwrap_or(false) => {
+            Some(ticket.clone())
+        }
+        Some(_) => None,
         None => store.select_ready_ticket(activation).ok().flatten(),
     }
 }
@@ -2355,7 +2390,7 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
                     );
                 }
             };
-            let queued: Vec<_> = match state.store.queued_dispatchable_activations() {
+            let queued: Vec<_> = match state.store.queued_activations() {
                 Ok(activations) => activations
                     .into_iter()
                     .map(|activation| {
@@ -2481,7 +2516,7 @@ fn handle_list(state: &DispatcherState) -> Result<serde_json::Value, ErrorBody> 
         agent_configured: state.agent.is_some(),
         hours_open: running_hours_open(state, now_ms),
         at_capacity: state.active.len() >= state.max_agents,
-        has_queued_activation: !lookup(state, Store::queued_dispatchable_activations)?.is_empty(),
+        has_queued_activation: !lookup(state, Store::queued_activations)?.is_empty(),
     };
     let mut rows = Vec::new();
     for ticket in lookup(state, Store::tickets)? {
@@ -2612,15 +2647,48 @@ fn handle_run(
         }
     }
 
-    if !matches!(args.activation, RunActivation::Now) {
-        return Err(invalid_arguments(
-            "time-based runs (--at, --every, --overnight) are not implemented yet; \
-             run without a time or configure scheduler.running_hours",
-        ));
-    }
-    let (kind, echo_kind, interval_ms) = (ActivationKind::Immediate, "now", None::<i64>);
-
     let now_ms = state.clock.now_ms();
+    let (kind, echo_kind, eligible_at_ms, interval_ms) = match &args.activation {
+        RunActivation::Now => (ActivationKind::Immediate, "now", None, None),
+        RunActivation::At { local_time } => {
+            let minute = parse_local_time(local_time).ok_or_else(|| {
+                invalid_arguments(&format!("time `{local_time}` must use a valid HH:MM value"))
+            })?;
+            let eligible_at_ms = next_local_minute_ms(state.clock.as_ref(), now_ms, minute)
+                .ok_or_else(|| invalid_arguments("the requested local time is out of range"))?;
+            (ActivationKind::At, "at", Some(eligible_at_ms), None)
+        }
+        RunActivation::Every { interval_ms } => {
+            let interval_ms = i64::try_from(*interval_ms)
+                .ok()
+                .filter(|interval_ms| *interval_ms > 0)
+                .ok_or_else(|| invalid_arguments("--every requires a positive interval"))?;
+            let eligible_at_ms = now_ms
+                .checked_add(interval_ms)
+                .ok_or_else(|| invalid_arguments("--every interval is too large"))?;
+            (
+                ActivationKind::Every,
+                "every",
+                Some(eligible_at_ms),
+                Some(interval_ms),
+            )
+        }
+        RunActivation::Overnight => {
+            let eligible_at_ms = state.running_hours.as_ref().map_or(now_ms, |hours| {
+                if hours.is_open(state.clock.local_minute(now_ms)) {
+                    now_ms
+                } else {
+                    hours.next_opening_ms(state.clock.as_ref(), now_ms)
+                }
+            });
+            (
+                ActivationKind::Overnight,
+                "overnight",
+                Some(eligible_at_ms),
+                None,
+            )
+        }
+    };
     let activation_id = format!(
         "A{}",
         lookup(state, |store| store.next_activation_ordinal())?
@@ -2632,7 +2700,7 @@ fn handle_run(
                 kind,
                 ticket_id: args.ticket.as_deref(),
                 project_id: args.project.as_deref(),
-                eligible_at_ms: None,
+                eligible_at_ms,
                 interval_ms,
             },
             now_ms,
@@ -2654,6 +2722,14 @@ fn handle_run(
     }
     if let Some(project) = &args.project {
         activation["project"] = json!(project);
+    }
+    if let Some(eligible_at_ms) = eligible_at_ms {
+        activation["eligible_at_ms"] = json!(eligible_at_ms);
+    }
+    match &args.activation {
+        RunActivation::At { local_time } => activation["local_time"] = json!(local_time),
+        RunActivation::Every { .. } => activation["interval_ms"] = json!(interval_ms),
+        RunActivation::Now | RunActivation::Overnight => {}
     }
     Ok(json!({"activation": activation}))
 }
@@ -3077,7 +3153,8 @@ mod tests {
 
     use super::runner::compose_worker_prompt;
     use super::{
-        WORKER_BOOTSTRAP_PROMPT, index_projects, process_start_time, recoverable_process_matches,
+        WORKER_BOOTSTRAP_PROMPT, index_projects, process_start_time, rearm_every_at,
+        recoverable_process_matches,
     };
     use crate::config::expand_agent_cmd;
     use crate::store::{RecoverableRun, Store};
@@ -3113,6 +3190,14 @@ mod tests {
         assert!(!recoverable_process_matches(&recoverable_current_process(
             None
         )));
+    }
+
+    #[test]
+    fn recurring_rearm_preserves_cadence_and_skips_missed_slots() {
+        assert_eq!(rearm_every_at(1_000, 500, 1_000), Some(1_500));
+        assert_eq!(rearm_every_at(1_000, 500, 2_200), Some(2_500));
+        assert_eq!(rearm_every_at(1_000, 0, 1_000), None);
+        assert_eq!(rearm_every_at(2_000, 500, 1_000), None);
     }
 
     #[test]

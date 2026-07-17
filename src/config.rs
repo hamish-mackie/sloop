@@ -506,9 +506,14 @@ fn validate_running_hours(
     })
 }
 
-fn parse_local_time(value: &str) -> Option<u16> {
+pub(crate) fn parse_local_time(value: &str) -> Option<u16> {
     let (hour, minute) = value.split_once(':')?;
     if hour.len() != 2 || minute.len() != 2 {
+        return None;
+    }
+    if !hour.bytes().all(|byte| byte.is_ascii_digit())
+        || !minute.bytes().all(|byte| byte.is_ascii_digit())
+    {
         return None;
     }
     let hour = hour.parse::<u16>().ok()?;
