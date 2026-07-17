@@ -433,3 +433,29 @@ fn a_finished_run_cannot_be_cancelled() {
     let response = json_stderr(&missing);
     assert_eq!(response["error"]["code"], "not_found");
 }
+
+#[test]
+fn straggler_group_members_are_killed_and_the_run_still_settles() {
+    let world = World::configured();
+    let straggler_pid = world.root().join("straggler-pid");
+    let agent = format!(
+        "sleep 600 &\necho $! > {pid_file}\n{committing}",
+        pid_file = straggler_pid.display(),
+        committing = COMMITTING_AGENT,
+    );
+    configure(&world, &agent, Some("echo tests passed"));
+    world.commit_all("initial");
+    world.start_daemon();
+    post_and_run(&world, "straggler.md");
+
+    // Without the straggler kill, the background sleep keeps the agent's
+    // stdout pipe open and the run never leaves `running`.
+    wait_until("the ticket reaches merged", || {
+        tickets(&world)["merged"] == 1
+    });
+    wait_for_processes_to_exit(read_process_ids(straggler_pid));
+    wait_until("no agents remain active", || {
+        let output = world.sloop(&["status"]);
+        World::json_stdout(&output)["data"]["gate"]["active_agents"] == 0
+    });
+}

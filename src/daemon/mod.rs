@@ -1381,6 +1381,19 @@ fn process_identity_matches(pid: u32, expected_start_time: Option<i64>) -> bool 
     )
 }
 
+/// SIGKILLs whatever is still alive in an exited run's process group and
+/// returns whether live members were found; ESRCH is the clean common case.
+fn kill_straggler_process_group(group: u32) -> bool {
+    let group = -(group as libc::pid_t);
+    let stragglers_present = unsafe { libc::kill(group, 0) } == 0;
+    if stragglers_present {
+        unsafe {
+            libc::kill(group, libc::SIGKILL);
+        }
+    }
+    stragglers_present
+}
+
 /// The single spawn decision point: every queued activation passes the same
 /// pause and capacity gates, selects deterministically, claims conditionally,
 /// and only then touches Git and processes.
@@ -1507,6 +1520,16 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
                             None
                         }
                     };
+                    // Stragglers inherit the pipes and would keep the
+                    // readers below from ever reaching EOF.
+                    if kill_straggler_process_group(pid) {
+                        supervisor_log.emit_with_fields(
+                            LogLevel::Info,
+                            "sloop::supervisor",
+                            "stragglers_killed",
+                            json!({"run_id": exited_run, "process_group_id": pid}),
+                        );
+                    }
                     // Capture must be complete on disk before the exit is
                     // reported; the readers end when the pipes close.
                     let capture_complete = readers
