@@ -2675,20 +2675,21 @@ fn handle_list(state: &DispatcherState) -> Result<serde_json::Value, ErrorBody> 
     let mut rows = Vec::new();
     for ticket in lookup(state, Store::tickets)? {
         let active_run = lookup(state, |store| store.active_run_for_ticket(&ticket.id))?;
+        let blockers = lookup(state, |store| store.unmerged_blockers(&ticket.id))?;
         let reason = crate::eligibility::ticket_ineligibility(
             &ticket.state,
             ticket.attempts,
             active_run.as_deref(),
+            &blockers,
             &gates,
-        )
-        .map(|reason| reason.describe());
+        );
         rows.push(json!({
             "id": ticket.id,
             "name": ticket.name,
             "project": ticket.project_id,
-            "state": ticket.state,
+            "state": crate::eligibility::display_state(&ticket.state, reason.as_ref()),
             "run": active_run,
-            "reason": reason,
+            "reason": reason.map(|reason| reason.describe()),
         }));
     }
     Ok(json!({"tickets": rows}))
