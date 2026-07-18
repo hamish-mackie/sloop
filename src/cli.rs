@@ -22,8 +22,8 @@ const TICKET_STATES_HELP: &str = "Ticket states:
   blocked       Waiting for every ticket in `blocked_by` to be merged.
   claimed       Owned by an active run, including aftercare or recovery.
   merged        Terminal: completed work was integrated into the default branch.
-  failed        Terminal: no commits were produced; requeue with `sloop retry`.
-  needs_review  Terminal: commits were preserved but not merged; inspect manually.";
+  failed        Terminal: the agent exited unsuccessfully; requeue with `sloop retry`.
+  needs_review  Terminal: aftercare could not merge the run; inspect manually.";
 
 #[derive(Debug, Parser)]
 #[command(

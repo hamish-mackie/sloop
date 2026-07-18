@@ -15,6 +15,14 @@ fn configure_fake_agent(world: &World, max_parallel_tasks: usize, blocking: bool
     configure_fake_agent_with_hours(world, max_parallel_tasks, blocking, None);
 }
 
+fn configure_failing_fake_agent(world: &World, max_parallel_tasks: usize, blocking: bool) {
+    configure_fake_agent(world, max_parallel_tasks, blocking);
+    let script = world.root().join("fake-agent.sh");
+    let body = fs::read_to_string(&script).expect("read fake agent script");
+    fs::write(script, body.replace("exit 0\n", "exit 1\n"))
+        .expect("write failing fake agent script");
+}
+
 fn configure_fake_agent_with_hours(
     world: &World,
     max_parallel_tasks: usize,
@@ -120,11 +128,10 @@ fn run_executes_the_fake_agent_in_an_isolated_worktree() {
         let data = status(&world);
         data["gate"]["active_agents"] == 0 && data["runs"].as_array().unwrap().is_empty()
     });
-    // Exit zero without commits is not successful work; the evidence
-    // pipeline settles the ticket as failed, never leaves it claimed.
+    // A successful no-op settles normally and never leaves the ticket claimed.
     let tickets = status(&world)["tickets"].clone();
     assert_eq!(tickets["claimed"], 0);
-    assert_eq!(tickets["failed"], 1);
+    assert_eq!(tickets["merged"], 1);
 }
 
 #[test]
@@ -268,7 +275,7 @@ fn tickets_launch_the_command_for_their_snapshotted_target() {
 #[test]
 fn retry_requeues_a_failed_ticket_and_allows_another_run() {
     let world = World::configured();
-    configure_fake_agent(&world, 1, false);
+    configure_failing_fake_agent(&world, 1, false);
     world.commit_all("initial");
     world.start_daemon();
     let ticket = post_manual(&world, "retry.md", "# Retry failed work\n");
@@ -281,7 +288,7 @@ fn retry_requeues_a_failed_ticket_and_allows_another_run() {
     );
 
     assert!(world.sloop(&["run", &ticket]).status.success());
-    wait_until("the first run fails without commits", || {
+    wait_until("the first run fails", || {
         status(&world)["tickets"]["failed"] == 1
     });
 
@@ -305,7 +312,7 @@ fn retry_requeues_a_failed_ticket_and_allows_another_run() {
 #[test]
 fn list_explains_paused_failed_held_and_claimed_tickets() {
     let world = World::configured();
-    configure_fake_agent(&world, 1, true);
+    configure_failing_fake_agent(&world, 1, true);
     world.commit_all("initial");
     world.start_daemon();
 
@@ -550,14 +557,14 @@ fn a_held_ticket_rejects_named_runs_until_an_operator_releases_it() {
         worktree_marker(&world, "R1").is_file()
     });
     wait_until("the ticket reaches its derived outcome", || {
-        status(&world)["tickets"]["failed"] == 1
+        status(&world)["tickets"]["merged"] == 1
     });
     let rejected = world.sloop(&["hold", &ticket]);
     assert!(!rejected.status.success());
     let error: serde_json::Value =
         serde_json::from_slice(&rejected.stderr).expect("stderr is JSON");
     assert_eq!(error["error"]["code"], "conflict");
-    assert_eq!(status(&world)["tickets"]["failed"], 1);
+    assert_eq!(status(&world)["tickets"]["merged"], 1);
 }
 
 #[test]
@@ -841,7 +848,7 @@ fn restart_readopts_a_matching_live_process_until_it_exits() {
 }
 
 #[test]
-fn restart_preserves_committed_work_from_a_dead_process_for_review() {
+fn restart_orphans_a_dead_process_without_using_commits_as_a_verdict() {
     let world = World::configured();
     world.configure_fake_agent(
         FakeAgent::new()
@@ -864,15 +871,15 @@ fn restart_preserves_committed_work_from_a_dead_process_for_review() {
     world.kill_process_group(agent_pid);
     world.start_daemon();
 
-    wait_until("the committed run is classified", || {
+    wait_until("the dead run is classified", || {
         let snapshot = status(&world);
-        snapshot["gate"]["active_agents"] == 0 && snapshot["tickets"]["needs_review"] == 1
+        snapshot["gate"]["active_agents"] == 0 && snapshot["tickets"]["ready"] == 1
     });
     let waited = world.sloop(&["wait", "R1", "--timeout", "5"]);
     assert!(!waited.status.success());
     assert_eq!(
         World::json_stdout_or_stderr(&waited)["data"]["state"],
-        "needs_review"
+        "orphaned"
     );
 }
 
@@ -939,7 +946,7 @@ fn the_daemon_exits_when_its_project_root_disappears() {
 #[test]
 fn wait_blocks_until_a_run_finishes_and_reports_the_outcome() {
     let world = World::configured();
-    configure_fake_agent(&world, 1, false);
+    configure_failing_fake_agent(&world, 1, false);
     let ticket = world.write_ticket("t1.md", "# T1\nwork\n");
     world.commit_all("seed");
     world.start_daemon();
@@ -951,8 +958,8 @@ fn wait_blocks_until_a_run_finishes_and_reports_the_outcome() {
             || status(&world)["tickets"]["needs_review"].as_u64() == Some(1)
     });
 
-    // The fake agent makes no commits, so the derived outcome is `failed`;
-    // wait must return nonzero with the terminal state in the envelope.
+    // The fake agent exits nonzero, so the derived outcome is `failed`; wait
+    // must return nonzero with the terminal state in the envelope.
     let output = world.sloop(&["wait", "R1", "--timeout", "30"]);
     assert!(!output.status.success());
     let response = World::json_stdout_or_stderr(&output);

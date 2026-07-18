@@ -109,7 +109,7 @@ fn expanded_help_explains_every_ticket_state() {
         );
     }
     assert!(
-        help.contains("Terminal: commits were preserved but not merged; inspect manually."),
+        help.contains("Terminal: aftercare could not merge the run; inspect manually."),
         "needs_review meaning missing"
     );
 }

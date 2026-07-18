@@ -70,8 +70,8 @@ pub struct Config {
     pub flows: BTreeMap<String, Flow>,
     pub default_flow: String,
     /// The single test aftercare stage: an argv run in the worktree after a
-    /// successful exit with commits. Absent means committed work merges
-    /// without a test gate.
+    /// successful exit. Absent means the run branch merges without a test
+    /// gate; an unchanged branch completes as a no-op.
     pub aftercare_test_cmd: Option<Vec<String>>,
     /// Repository-scoped prefixes for durable IDs stamped into committed
     /// files. These deliberately do not inherit user defaults.

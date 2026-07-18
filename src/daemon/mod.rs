@@ -748,8 +748,8 @@ enum RunEvent {
         /// False when a pipe reader failed to durably record every chunk;
         /// the loss becomes explicit run evidence instead of silence.
         capture_complete: bool,
-        /// Commits on the run branch that were not on the default branch at
-        /// agent exit, before aftercare could fast-forward the default branch.
+        /// Commits made after the run branch was created. This is activity
+        /// metadata only; it does not determine the run's outcome.
         commits: Vec<String>,
         tests: Option<StageResult>,
         merge: Option<MergeOutcome>,
@@ -884,11 +884,9 @@ fn try_settle_run_exit(
 
     let cancelled =
         state.cancelling.contains(run_id) || state.store.cancellation_requested(run_id)?;
-    let commit_count = commits.len() as u64;
     let evidence = RunEvidence {
         cancelled,
         exit: classify_exit(*exit_code),
-        commit_count,
         tests: tests.as_ref().map(|stage| stage.outcome),
         merge: *merge,
     };
@@ -905,7 +903,7 @@ fn try_settle_run_exit(
         },
         EvidenceRecord {
             kind: "commits_observed",
-            data_json: json!({"count": commit_count, "oids": commits}).to_string(),
+            data_json: json!({"oids": commits}).to_string(),
         },
     ];
     if let Some(classification) = recovery {
@@ -1142,11 +1140,6 @@ fn recovered_exit_event(root: &Path, run: &RecoverableRun) -> Result<RunEvent, S
         .map(|branch| try_commits_on_branch(root, branch))
         .transpose()?
         .unwrap_or_default();
-    let recovery = if commits.is_empty() {
-        RecoveryClassification::Orphaned
-    } else {
-        RecoveryClassification::Aftercare
-    };
     Ok(RunEvent::Exited {
         run_id: run.id.clone(),
         exit_code: None,
@@ -1154,7 +1147,7 @@ fn recovered_exit_event(root: &Path, run: &RecoverableRun) -> Result<RunEvent, S
         commits,
         tests: None,
         merge: None,
-        recovery: Some(recovery),
+        recovery: Some(RecoveryClassification::Orphaned),
     })
 }
 
@@ -1222,15 +1215,19 @@ fn resume_aftercare(
             .find(|(candidate, _)| candidate == kind)
             .and_then(|(_, data)| serde_json::from_str::<serde_json::Value>(data).ok())
     };
-    let commits = value("commits_observed")
+    let commit_observation = value("commits_observed")
         .and_then(|data| {
             data["oids"].as_array().map(|oids| {
-                oids.iter()
+                let complete = data["complete"].as_bool().unwrap_or(true);
+                let commits = oids
+                    .iter()
                     .filter_map(|oid| oid.as_str().map(str::to_owned))
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                (commits, complete)
             })
         })
         .ok_or_else(|| "the aftercare checkpoint has no valid commit evidence".to_owned())?;
+    let (commits, commit_observation_complete) = commit_observation;
     let exit_code = run.exit_code.and_then(|code| i32::try_from(code).ok());
     let exit = classify_exit(exit_code);
     let output_log = RunLogWriter::open(&run_output_path(state_dir, &run.id))
@@ -1264,7 +1261,7 @@ fn resume_aftercare(
         });
     }
     if tests.is_none()
-        && wants_tests(exit, commits.len() as u64)
+        && wants_tests(exit)
         && let Some(cmd) = test_cmd
     {
         stop_interrupted_process(&rows, "test_process")?;
@@ -1301,15 +1298,19 @@ fn resume_aftercare(
     });
     if !aftercare_cancelled(store, &run.id, log)
         && merge.is_none()
-        && wants_merge(
-            exit,
-            commits.len() as u64,
-            tests.as_ref().map(|stage| stage.outcome),
-        )
+        && wants_merge(exit, tests.as_ref().map(|stage| stage.outcome))
         && let Some(branch) = run.branch.as_deref()
     {
         stop_interrupted_process(&rows, "merge_process")?;
-        let outcome = attempt_merge(root, branch, Some(store), &run.id, clock, log);
+        let outcome = attempt_merge(
+            root,
+            branch,
+            commit_observation_complete && commits.is_empty(),
+            Some(store),
+            &run.id,
+            clock,
+            log,
+        );
         store
             .record_aftercare_evidence(
                 &run.id,
@@ -1738,9 +1739,8 @@ fn eligible_ticket(store: &Store, activation: &QueuedActivation) -> Option<Strin
 }
 
 /// Gathers post-exit evidence in the supervisor thread, keeping slow Git and
-/// test work out of the dispatcher: commits on the run branch, the configured
-/// test stage when the exit and commits justify it, and the merge attempt
-/// when policy allows.
+/// test work out of the dispatcher: run-branch activity for display, the
+/// configured test stage after a successful exit, and the policy merge.
 #[allow(clippy::too_many_arguments)]
 fn gather_exit_evidence(
     run_id: &str,
@@ -1756,14 +1756,15 @@ fn gather_exit_evidence(
     operational_log: &OperationalLog,
 ) -> Option<(Vec<String>, Option<StageResult>, Option<MergeOutcome>)> {
     let exit = classify_exit(exit_code);
-    let commits = commits_on_branch(root, branch);
-    let commit_count = commits.len() as u64;
+    let commit_observation = try_commits_on_branch(root, branch);
+    let commit_observation_complete = commit_observation.is_ok();
+    let commits = commit_observation.unwrap_or_default();
     let checkpointed = if let Some(store) = checkpoint_store.as_deref_mut() {
         match store.record_agent_exit(
             run_id,
             exit_code,
             capture_complete,
-            &json!({"count": commit_count, "oids": commits}).to_string(),
+            &json!({"complete": commit_observation_complete, "oids": commits}).to_string(),
             clock.now_ms(),
         ) {
             Ok(ExitClaim::Claimed) => true,
@@ -1790,7 +1791,7 @@ fn gather_exit_evidence(
         false
     };
     // Tests and merge can have side effects. Without the pre-aftercare
-    // checkpoint, preserve committed work for review rather than performing
+    // checkpoint, preserve the run branch for review rather than performing
     // an action that recovery could no longer prove or resume.
     if !checkpointed
         || checkpoint_store
@@ -1801,7 +1802,7 @@ fn gather_exit_evidence(
     }
 
     let tests = match test_cmd {
-        Some(cmd) if wants_tests(exit, commit_count) => {
+        Some(cmd) if wants_tests(exit) => {
             let stage = run_test_stage(
                 worktree,
                 cmd,
@@ -1839,14 +1840,12 @@ fn gather_exit_evidence(
     let merge = if !checkpoint_store
         .as_deref()
         .is_some_and(|store| aftercare_cancelled(store, run_id, operational_log))
-        && wants_merge(
-            exit,
-            commit_count,
-            tests.as_ref().map(|stage| stage.outcome),
-        ) {
+        && wants_merge(exit, tests.as_ref().map(|stage| stage.outcome))
+    {
         let outcome = attempt_merge(
             root,
             branch,
+            commit_observation_complete && commits.is_empty(),
             checkpoint_store.as_deref(),
             run_id,
             clock,
@@ -1903,25 +1902,35 @@ fn merge_result_json(outcome: MergeOutcome) -> String {
     json!({"merged": outcome == MergeOutcome::Merged}).to_string()
 }
 
-/// Commits on the run branch that the root checkout does not have. A Git
-/// failure reads as no commits: evidence that cannot be observed is not claimed.
-fn commits_on_branch(root: &Path, branch: &str) -> Vec<String> {
-    try_commits_on_branch(root, branch).unwrap_or_default()
+/// Commits made since the run branch was created. The branch's own reflog is
+/// the stable baseline, so rewriting the default branch cannot change this
+/// activity metadata.
+fn try_commits_on_branch(root: &Path, branch: &str) -> Result<Vec<String>, String> {
+    let start = git_stdout(root, &["reflog", "show", "--format=%H", branch])?
+        .lines()
+        .last()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("branch `{branch}` has no reflog"))?;
+    git_stdout(
+        root,
+        &["rev-list", "--reverse", &format!("{start}..{branch}")],
+    )
+    .map(|output| output.lines().map(str::to_owned).collect())
 }
 
-fn try_commits_on_branch(root: &Path, branch: &str) -> Result<Vec<String>, String> {
+fn git_stdout(root: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
-        .args(["rev-list", "--reverse", &format!("HEAD..{branch}")])
+        .args(args)
         .current_dir(root)
         .output()
         .map_err(|error| error.to_string())?;
     match output {
-        output if output.status.success() => Ok(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::to_owned)
-            .collect()),
+        output if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        }
         output => Err(format!(
-            "git rev-list failed: {}",
+            "git {} failed: {}",
+            args.join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
         )),
     }
@@ -2052,11 +2061,15 @@ fn run_test_stage(
 fn attempt_merge(
     root: &Path,
     branch: &str,
+    branch_unchanged: bool,
     checkpoint_store: Option<&Store>,
     run_id: &str,
     clock: &dyn Clock,
     operational_log: &OperationalLog,
 ) -> MergeOutcome {
+    if branch_unchanged {
+        return MergeOutcome::Merged;
+    }
     let Ok(_guard) = MERGE_LOCK.lock() else {
         return MergeOutcome::Diverged;
     };

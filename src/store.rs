@@ -1547,7 +1547,7 @@ impl Store {
 
     /// Checkpoints the agent's exit before aftercare starts. The lease and
     /// ticket remain claimed until final settlement, but recovery can now
-    /// resume with the exact exit and commit facts. Only the caller that
+    /// resume with the exact exit and branch-activity facts. Only the caller that
     /// wins this transition owns exit processing and aftercare for the run.
     pub(crate) fn record_agent_exit(
         &mut self,
@@ -2652,7 +2652,7 @@ mod tests {
         running_r1(&mut store);
 
         let first = store
-            .record_agent_exit("R1", Some(0), true, r#"{"count":1,"oids":["abc"]}"#, 2_200)
+            .record_agent_exit("R1", Some(0), true, r#"{"oids":["abc"]}"#, 2_200)
             .unwrap();
         assert_eq!(first, ExitClaim::Claimed);
         assert_eq!(store.run("R1").unwrap().unwrap().state, "aftercare");
@@ -2661,7 +2661,7 @@ mod tests {
         assert!(evidence.iter().any(|(kind, _)| kind == "commits_observed"));
 
         let second = store
-            .record_agent_exit("R1", Some(1), false, r#"{"count":0,"oids":[]}"#, 2_300)
+            .record_agent_exit("R1", Some(1), false, r#"{"oids":[]}"#, 2_300)
             .unwrap();
         assert_eq!(
             second,
@@ -3111,7 +3111,7 @@ mod tests {
                 Outcome::Merged,
                 &[super::EvidenceRecord {
                     kind: "commits_observed",
-                    data_json: "{\"count\":2}".into(),
+                    data_json: "{\"oids\":[\"abc\",\"def\"]}".into(),
                 }],
                 Some(&super::StageRecord {
                     stage: "test",

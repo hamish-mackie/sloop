@@ -17,8 +17,8 @@ result and merges it when it passes.
   re-run.
 
 Under the hood it's a small Rust daemon — an agent harness that supervises
-each run, enforces shared rate limits, and judges outcomes from commits and
-tests rather than trusting the agent's word.
+each run, enforces shared rate limits, and judges outcomes from process exit
+and tests rather than trusting the agent's word.
 
 Full documentation lives in [docs/](docs/).
 
