@@ -10,14 +10,17 @@ use crate::logging::LogLevel;
 use crate::protocol::ErrorBody;
 use crate::store::{ActivationKind, NewActivation, Store, StoreError, TicketState};
 
-use super::recovery::{aftercare_process_identity, process_identity_matches};
-use super::runner::run_output_path;
-use super::worker_api::{current_ticket_vendor_error, ticket_show};
-use super::{
-    DispatcherState, LOGS_PAGE_LIMIT, PersistedProcessStop, conflict, index_projects, internal,
-    invalid_arguments, mark_storage_full, not_found, running_hours_open,
+use super::dispatcher::{
+    DispatcherState, LOGS_PAGE_LIMIT, conflict, internal, invalid_arguments, mark_storage_full,
+    not_found,
+};
+use super::recovery::{
+    PersistedProcessStop, aftercare_process_identity, process_identity_matches,
     stop_persisted_process_group,
 };
+use super::runner::run_output_path;
+use super::scheduler::{index_projects, running_hours_open};
+use super::worker_api::{current_ticket_vendor_error, ticket_show};
 
 pub(super) fn handle_operator_show(
     state: &DispatcherState,

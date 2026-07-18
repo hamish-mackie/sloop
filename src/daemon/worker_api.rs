@@ -6,7 +6,7 @@ use crate::protocol::{ErrorBody, Request, RequestId, ResponseEnvelope};
 use crate::vendor_error::VendorErrorMatch;
 
 use super::commands::lookup;
-use super::{DispatcherState, internal, mark_storage_full, unauthorized};
+use super::dispatcher::{DispatcherState, internal, mark_storage_full, unauthorized};
 
 /// Serves a worker verb after proving the caller holds the run's token.
 /// Everything an agent can reach flows through here: `brief` and `show` are
