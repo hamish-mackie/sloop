@@ -619,7 +619,8 @@ mod tests {
         OrphanDisposition::{Delete, Keep, MarkMissing},
         index_projects, orphan_disposition, rearm_every_at, reconcile_tickets,
     };
-    use crate::store::{Store, TicketState};
+    use crate::domain::ticket::TicketState;
+    use crate::store::Store;
 
     #[test]
     fn recurring_rearm_preserves_cadence_and_skips_missed_slots() {

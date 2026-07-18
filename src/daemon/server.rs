@@ -17,7 +17,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::clock::{Clock, FileClock, SystemClock};
-use crate::config::{Config, ConfigError, Project};
+use crate::config::{Config, ConfigError, Repository};
 use crate::frontmatter::FrontmatterError;
 use crate::ids::IdError;
 use crate::logging::{LogLevel, OperationalLog};
@@ -49,20 +49,20 @@ pub struct ClientResponse {
 
 pub fn request(request: Request) -> Result<ClientResponse, DaemonError> {
     let cwd = std::env::current_dir().map_err(DaemonError::CurrentDirectory)?;
-    let project = Project::discover(&cwd)?;
-    Config::load(&project)?;
+    let repository = Repository::discover(&cwd)?;
+    Config::load(&repository)?;
 
-    if let Ok(response) = send_existing(&project, request.clone()) {
+    if let Ok(response) = send_existing(&repository, request.clone()) {
         return Ok(ClientResponse {
             response,
             started: false,
         });
     }
 
-    spawn_daemon(&project)?;
+    spawn_daemon(&repository)?;
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
-        match send_existing(&project, request.clone()) {
+        match send_existing(&repository, request.clone()) {
             Ok(response) => {
                 return Ok(ClientResponse {
                     response,
@@ -79,31 +79,31 @@ pub fn request(request: Request) -> Result<ClientResponse, DaemonError> {
 /// no daemon. Never spawns one.
 pub fn request_running(request: Request) -> Result<Option<ResponseEnvelope>, DaemonError> {
     let cwd = std::env::current_dir().map_err(DaemonError::CurrentDirectory)?;
-    let project = Project::discover(&cwd)?;
-    Config::load(&project)?;
-    match send_existing(&project, request) {
+    let repository = Repository::discover(&cwd)?;
+    Config::load(&repository)?;
+    match send_existing(&repository, request) {
         Ok(response) => Ok(Some(response)),
         Err(DaemonError::Connect(_)) => Ok(None),
         Err(error) => Err(error),
     }
 }
 
-pub fn serve_current_project() -> Result<(), DaemonError> {
+pub fn serve_current_repository() -> Result<(), DaemonError> {
     let cwd = std::env::current_dir().map_err(DaemonError::CurrentDirectory)?;
-    let project = Project::discover(&cwd)?;
-    let config = Config::load(&project)?;
+    let repository = Repository::discover(&cwd)?;
+    let config = Config::load(&repository)?;
     let classifier = Arc::new(VendorErrorClassifier::built_in().map_err(DaemonError::Catalog)?);
-    fs::create_dir_all(&project.state_dir).map_err(|source| DaemonError::Io {
-        path: project.state_dir.clone(),
+    fs::create_dir_all(&repository.state_dir).map_err(|source| DaemonError::Io {
+        path: repository.state_dir.clone(),
         source,
     })?;
-    fs::set_permissions(&project.state_dir, fs::Permissions::from_mode(0o700)).map_err(
+    fs::set_permissions(&repository.state_dir, fs::Permissions::from_mode(0o700)).map_err(
         |source| DaemonError::Io {
-            path: project.state_dir.clone(),
+            path: repository.state_dir.clone(),
             source,
         },
     )?;
-    let runtime_root = project
+    let runtime_root = repository
         .runtime_dir
         .parent()
         .expect("repository runtime directories have a parent");
@@ -117,7 +117,7 @@ pub fn serve_current_project() -> Result<(), DaemonError> {
             source,
         }
     })?;
-    fs::create_dir(&project.runtime_dir)
+    fs::create_dir(&repository.runtime_dir)
         .or_else(|source| {
             if source.kind() == io::ErrorKind::AlreadyExists {
                 Ok(())
@@ -126,12 +126,12 @@ pub fn serve_current_project() -> Result<(), DaemonError> {
             }
         })
         .map_err(|source| DaemonError::Io {
-            path: project.runtime_dir.clone(),
+            path: repository.runtime_dir.clone(),
             source,
         })?;
-    fs::set_permissions(&project.runtime_dir, fs::Permissions::from_mode(0o700)).map_err(
+    fs::set_permissions(&repository.runtime_dir, fs::Permissions::from_mode(0o700)).map_err(
         |source| DaemonError::Io {
-            path: project.runtime_dir.clone(),
+            path: repository.runtime_dir.clone(),
             source,
         },
     )?;
@@ -141,9 +141,9 @@ pub fn serve_current_project() -> Result<(), DaemonError> {
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&project.lock_path)
+        .open(&repository.lock_path)
         .map_err(|source| DaemonError::Io {
-            path: project.lock_path.clone(),
+            path: repository.lock_path.clone(),
             source,
         })?;
     lock.try_lock_exclusive().map_err(|source| {
@@ -151,7 +151,7 @@ pub fn serve_current_project() -> Result<(), DaemonError> {
             DaemonError::AlreadyRunning
         } else {
             DaemonError::Io {
-                path: project.lock_path.clone(),
+                path: repository.lock_path.clone(),
                 source,
             }
         }
@@ -159,7 +159,7 @@ pub fn serve_current_project() -> Result<(), DaemonError> {
     // Hold the pre-v7 runtime lock as well during the lock-location
     // transition, preventing an already-running older daemon in this runtime
     // root from sharing the database with the new process.
-    let legacy_lock_path = project.runtime_dir.join("daemon.lock");
+    let legacy_lock_path = repository.runtime_dir.join("daemon.lock");
     let legacy_lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -185,7 +185,7 @@ pub fn serve_current_project() -> Result<(), DaemonError> {
     let identity = json!({
         "pid": std::process::id(),
         "started_at_ms": process_start_time(std::process::id()),
-        "socket": project.operator_socket,
+        "socket": repository.operator_socket,
     });
     let _ = lock.set_len(0);
     let _ = {
@@ -197,21 +197,21 @@ pub fn serve_current_project() -> Result<(), DaemonError> {
         Some(path) => Arc::new(FileClock::new(path.into())),
         None => Arc::new(SystemClock),
     };
-    let store = Store::open(&project.db_path, clock.now_ms()).map_err(DaemonError::Store)?;
+    let store = Store::open(&repository.db_path, clock.now_ms()).map_err(DaemonError::Store)?;
     if let Some(agent) = &config.agent {
         store
             .backfill_ticket_targets(&agent.default_target, clock.now_ms())
             .map_err(DaemonError::Store)?;
     }
     let _ = index_projects(
-        &project.root,
+        &repository.root,
         &config.project_dir,
         &store,
         clock.now_ms(),
         &config.project_prefix,
     )?;
     reconcile_tickets(
-        &project.root,
+        &repository.root,
         &store,
         clock.now_ms(),
         config.delete_missing_after_ms,
@@ -222,7 +222,7 @@ pub fn serve_current_project() -> Result<(), DaemonError> {
         .build()
         .map_err(DaemonError::Runtime)?;
     runtime.block_on(serve(
-        project,
+        repository,
         config,
         store,
         lock,
@@ -233,7 +233,7 @@ pub fn serve_current_project() -> Result<(), DaemonError> {
 }
 
 async fn serve(
-    project: Project,
+    repository: Repository,
     config: Config,
     store: Store,
     _lock: fs::File,
@@ -241,27 +241,29 @@ async fn serve(
     clock: Arc<dyn Clock>,
     classifier: Arc<VendorErrorClassifier>,
 ) -> Result<(), DaemonError> {
-    if project.operator_socket.exists() {
-        fs::remove_file(&project.operator_socket).map_err(|source| DaemonError::Io {
-            path: project.operator_socket.clone(),
+    if repository.operator_socket.exists() {
+        fs::remove_file(&repository.operator_socket).map_err(|source| DaemonError::Io {
+            path: repository.operator_socket.clone(),
             source,
         })?;
     }
 
     let listener =
-        UnixListener::bind(&project.operator_socket).map_err(|source| DaemonError::Io {
-            path: project.operator_socket.clone(),
+        UnixListener::bind(&repository.operator_socket).map_err(|source| DaemonError::Io {
+            path: repository.operator_socket.clone(),
             source,
         })?;
-    fs::set_permissions(&project.operator_socket, fs::Permissions::from_mode(0o600)).map_err(
-        |source| DaemonError::Io {
-            path: project.operator_socket.clone(),
-            source,
-        },
-    )?;
+    fs::set_permissions(
+        &repository.operator_socket,
+        fs::Permissions::from_mode(0o600),
+    )
+    .map_err(|source| DaemonError::Io {
+        path: repository.operator_socket.clone(),
+        source,
+    })?;
 
-    let log = OperationalLog::open(&project.daemon_log).map_err(|source| DaemonError::Io {
-        path: project.daemon_log.clone(),
+    let log = OperationalLog::open(&repository.daemon_log).map_err(|source| DaemonError::Io {
+        path: repository.daemon_log.clone(),
         source,
     })?;
     log.emit(LogLevel::Info, "sloop::daemon", "daemon_started");
@@ -282,14 +284,14 @@ async fn serve(
         flows: config.flows.clone(),
         default_flow: config.default_flow.clone(),
         aftercare_test_cmd: config.aftercare_test_cmd.clone(),
-        root: project.root.clone(),
+        root: repository.root.clone(),
         project_dir: config.project_dir.clone(),
         ticket_dir: config.ticket_dir.clone(),
-        worktree_dir: project.root.join(&config.worktree_dir),
-        state_dir: project.state_dir.clone(),
-        runtime_dir: project.runtime_dir.clone(),
-        socket: project.operator_socket.clone(),
-        daemon_log: project.daemon_log.clone(),
+        worktree_dir: repository.root.join(&config.worktree_dir),
+        state_dir: repository.state_dir.clone(),
+        runtime_dir: repository.runtime_dir.clone(),
+        socket: repository.operator_socket.clone(),
+        daemon_log: repository.daemon_log.clone(),
         store,
         storage_full: Cell::new(false),
         reconciliation_blocked: false,
@@ -322,7 +324,7 @@ async fn serve(
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted.map_err(|source| DaemonError::Io {
-                    path: project.operator_socket.clone(),
+                    path: repository.operator_socket.clone(),
                     source,
                 })?;
                 let dispatcher_tx = dispatcher_tx.clone();
@@ -342,7 +344,7 @@ async fn serve(
             _ = shutdown_rx.recv() => {
                 shutdown_flag.store(true, Ordering::Release);
                 log.emit(LogLevel::Info, "sloop::daemon", "daemon_stopped");
-                let _ = fs::remove_file(&project.operator_socket);
+                let _ = fs::remove_file(&repository.operator_socket);
                 return Ok(());
             }
         }
@@ -517,11 +519,11 @@ pub(super) async fn serve_worker_socket(
     }
 }
 
-fn spawn_daemon(project: &Project) -> Result<(), DaemonError> {
+fn spawn_daemon(repository: &Repository) -> Result<(), DaemonError> {
     let executable = std::env::current_exe().map_err(DaemonError::CurrentExecutable)?;
     Command::new(executable)
         .args(["daemon", "--foreground"])
-        .current_dir(&project.root)
+        .current_dir(&repository.root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -530,11 +532,14 @@ fn spawn_daemon(project: &Project) -> Result<(), DaemonError> {
         .map_err(DaemonError::Spawn)
 }
 
-fn send_existing(project: &Project, request: Request) -> Result<ResponseEnvelope, DaemonError> {
-    match send(&project.operator_socket, request.clone()) {
+fn send_existing(
+    repository: &Repository,
+    request: Request,
+) -> Result<ResponseEnvelope, DaemonError> {
+    match send(&repository.operator_socket, request.clone()) {
         Ok(response) => Ok(response),
         Err(current_error) => {
-            let Some(identity) = read_lock_identity(&project.lock_path) else {
+            let Some(identity) = read_lock_identity(&repository.lock_path) else {
                 return Err(current_error);
             };
             if !process_identity_matches(identity.pid, identity.started_at_ms) {
@@ -543,7 +548,7 @@ fn send_existing(project: &Project, request: Request) -> Result<ResponseEnvelope
             let Some(socket) = identity.socket else {
                 return Err(current_error);
             };
-            if socket == project.operator_socket {
+            if socket == repository.operator_socket {
                 return Err(current_error);
             }
             send(&socket, request)
@@ -580,7 +585,7 @@ fn send(socket: &Path, request: Request) -> Result<ResponseEnvelope, DaemonError
     serde_json::from_str(line.trim_end()).map_err(DaemonError::Decode)
 }
 
-/// Identity of the daemon owning a project's lockfile: PID plus process start
+/// Identity of the daemon owning a repository's lockfile: PID plus process start
 /// time, mirroring the identity rule used for supervised agents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockIdentity {

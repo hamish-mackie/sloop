@@ -6,9 +6,10 @@ use serde_json::json;
 
 use crate::clock::{format_timestamp, next_local_minute_ms};
 use crate::config::parse_local_time;
+use crate::domain::ticket::TicketState;
 use crate::logging::LogLevel;
 use crate::protocol::ErrorBody;
-use crate::store::{ActivationKind, NewActivation, Store, StoreError, TicketState};
+use crate::store::{ActivationKind, NewActivation, Store, StoreError};
 
 use super::dispatcher::{
     DispatcherState, LOGS_PAGE_LIMIT, conflict, internal, invalid_arguments, mark_storage_full,
