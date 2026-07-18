@@ -318,11 +318,13 @@ pub struct CooldownRecord {
 /// One executed aftercare stage, persisted alongside the run's outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageRecord {
-    pub stage: &'static str,
-    pub state: &'static str,
+    pub stage_index: usize,
+    pub stage: String,
+    pub state: String,
     pub started_at_ms: i64,
     pub finished_at_ms: i64,
     pub exit_code: Option<i32>,
+    pub output_ref: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1469,7 +1471,7 @@ impl Store {
     }
 
     /// Terminates a run in one transaction: the raw exit and derived outcome
-    /// land on the run, evidence and stage rows are appended, the lease is
+    /// land on the run, evidence is appended, the lease is
     /// freed, and the ticket moves to its terminal state or back to `ready`
     /// when cancellation or recovery releases it.
     #[allow(clippy::too_many_arguments)]
@@ -1480,7 +1482,6 @@ impl Store {
         exit_code: Option<i32>,
         outcome: crate::outcome::Outcome,
         evidence: &[EvidenceRecord],
-        stage: Option<&StageRecord>,
         cooldown: Option<&CooldownUpdate<'_>>,
         now_ms: i64,
     ) -> Result<(), StoreError> {
@@ -1557,29 +1558,70 @@ impl Store {
                 params![run_id, record.kind, now_ms, record.data_json],
             )?;
         }
-        if let Some(stage) = stage {
-            transaction.execute(
-                "INSERT INTO aftercare_stages
-                     (run_id, stage_index, stage, state, started_at_ms, finished_at_ms, exit_code)
-                 VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(run_id, stage_index, attempt) DO UPDATE SET
-                     stage = excluded.stage,
-                     state = excluded.state,
-                     started_at_ms = excluded.started_at_ms,
-                     finished_at_ms = excluded.finished_at_ms,
-                     exit_code = excluded.exit_code",
-                params![
-                    run_id,
-                    stage.stage,
-                    stage.state,
-                    stage.started_at_ms,
-                    stage.finished_at_ms,
-                    stage.exit_code,
-                ],
-            )?;
-        }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Records one completed flow stage. The flow index is the idempotency
+    /// key, so recovery can re-derive the first stage still lacking a verdict.
+    pub(crate) fn record_aftercare_stage(
+        &self,
+        run_id: &str,
+        stage: &StageRecord,
+    ) -> Result<(), StoreError> {
+        let evidence_json = serde_json::json!({"output": stage.output_ref}).to_string();
+        self.connection.execute(
+            "INSERT INTO aftercare_stages
+                 (run_id, stage_index, stage, state, started_at_ms, finished_at_ms, exit_code,
+                  evidence_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(run_id, stage_index, attempt) DO UPDATE SET
+                 stage = excluded.stage,
+                 state = excluded.state,
+                 started_at_ms = excluded.started_at_ms,
+                 finished_at_ms = excluded.finished_at_ms,
+                 exit_code = excluded.exit_code,
+                 evidence_json = excluded.evidence_json",
+            params![
+                run_id,
+                stage.stage_index as i64,
+                stage.stage,
+                stage.state,
+                stage.started_at_ms,
+                stage.finished_at_ms,
+                stage.exit_code,
+                evidence_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn aftercare_stages(&self, run_id: &str) -> Result<Vec<StageRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT stage_index, stage, state, started_at_ms, finished_at_ms, exit_code,
+                    evidence_json
+             FROM aftercare_stages WHERE run_id = ?1 ORDER BY stage_index",
+        )?;
+        statement
+            .query_map(params![run_id], |row| {
+                let evidence_json: Option<String> = row.get(6)?;
+                let output_ref = evidence_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+                    .and_then(|value| value["output"].as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                Ok(StageRecord {
+                    stage_index: row.get::<_, i64>(0)? as usize,
+                    stage: row.get(1)?,
+                    state: row.get(2)?,
+                    started_at_ms: row.get(3)?,
+                    finished_at_ms: row.get(4)?,
+                    exit_code: row.get(5)?,
+                    output_ref,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     /// Checkpoints the agent's exit before aftercare starts. The lease and
@@ -1664,7 +1706,7 @@ impl Store {
     pub(crate) fn record_aftercare_evidence(
         &self,
         run_id: &str,
-        kind: &'static str,
+        kind: &str,
         data_json: &str,
         now_ms: i64,
     ) -> Result<(), StoreError> {
@@ -1676,6 +1718,15 @@ impl Store {
                  observed_at_ms = excluded.observed_at_ms,
                  data_json = excluded.data_json",
             params![run_id, kind, now_ms, data_json],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_aftercare_process(&self, run_id: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "DELETE FROM run_evidence
+             WHERE run_id = ?1 AND dedupe_key = 'settlement:' || ?1 || ':aftercare_process'",
+            params![run_id],
         )?;
         Ok(())
     }
@@ -2811,7 +2862,7 @@ mod tests {
         );
 
         store
-            .finish_run("R1", "T1", Some(1), Outcome::Failed, &[], None, None, 2_200)
+            .finish_run("R1", "T1", Some(1), Outcome::Failed, &[], None, 2_200)
             .unwrap();
         assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
     }
@@ -2989,7 +3040,7 @@ mod tests {
         let mut store = open_seeded(&directory.path().join("sloop.db"));
         running_r1(&mut store);
         store
-            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, None, 2_200)
+            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, 2_200)
             .unwrap();
 
         let claim = store
@@ -3041,14 +3092,14 @@ mod tests {
             .unwrap();
 
         store
-            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, None, 2_300)
+            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, 2_300)
             .unwrap();
         assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("merged"));
         assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
         let evidence = store.run_evidence("R1").unwrap();
 
         store
-            .finish_run("R1", "T1", Some(1), Outcome::Failed, &[], None, None, 2_400)
+            .finish_run("R1", "T1", Some(1), Outcome::Failed, &[], None, 2_400)
             .unwrap();
         let run = store.run("R1").unwrap().unwrap();
         assert_eq!(run.state, "merged");
@@ -3105,7 +3156,7 @@ mod tests {
         let first = store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
         assert_eq!(first.attempt, 1);
         store
-            .finish_run("R1", "T1", Some(0), Outcome::Failed, &[], None, None, 2_100)
+            .finish_run("R1", "T1", Some(0), Outcome::Failed, &[], None, 2_100)
             .unwrap();
 
         assert_eq!(store.retry_ticket("T1", 2_200).unwrap(), "failed");
@@ -3425,7 +3476,7 @@ mod tests {
         assert_eq!(store.select_ready_ticket(&activation, 2_000).unwrap(), None);
 
         store
-            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, None, 3_000)
+            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, 3_000)
             .unwrap();
         assert_eq!(
             store
@@ -3442,6 +3493,20 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
         store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        store
+            .record_aftercare_stage(
+                "R1",
+                &super::StageRecord {
+                    stage_index: 0,
+                    stage: "test".into(),
+                    state: "passed".into(),
+                    started_at_ms: 2_500,
+                    finished_at_ms: 2_900,
+                    exit_code: Some(0),
+                    output_ref: "runs/R1/output.ndjson".into(),
+                },
+            )
+            .unwrap();
 
         store
             .finish_run(
@@ -3453,13 +3518,6 @@ mod tests {
                     kind: "commits_observed",
                     data_json: "{\"oids\":[\"abc\",\"def\"]}".into(),
                 }],
-                Some(&super::StageRecord {
-                    stage: "test",
-                    state: "passed",
-                    started_at_ms: 2_500,
-                    finished_at_ms: 2_900,
-                    exit_code: Some(0),
-                }),
                 None,
                 3_000,
             )
@@ -3472,6 +3530,7 @@ mod tests {
         assert_eq!(run.exited_at_ms, Some(3_000));
         let evidence = store.run_evidence("R1").unwrap();
         assert_eq!(evidence[0].0, "commits_observed");
+        assert_eq!(store.aftercare_stages("R1").unwrap()[0].stage, "test");
         // The lease is gone: the same run cannot renew it.
         assert!(store.renew_lease("T1", "R1", 60_000, 3_100).is_err());
     }
@@ -3488,28 +3547,10 @@ mod tests {
         }];
 
         store
-            .finish_run(
-                "R1",
-                "T1",
-                Some(1),
-                Outcome::Failed,
-                &evidence,
-                None,
-                None,
-                3_000,
-            )
+            .finish_run("R1", "T1", Some(1), Outcome::Failed, &evidence, None, 3_000)
             .unwrap();
         store
-            .finish_run(
-                "R1",
-                "T1",
-                Some(1),
-                Outcome::Failed,
-                &evidence,
-                None,
-                None,
-                3_100,
-            )
+            .finish_run("R1", "T1", Some(1), Outcome::Failed, &evidence, None, 3_100)
             .unwrap();
 
         assert_eq!(store.run_evidence("R1").unwrap().len(), 1);
@@ -3524,7 +3565,7 @@ mod tests {
         store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
 
         store
-            .finish_run("R1", "T1", None, Outcome::Orphaned, &[], None, None, 3_000)
+            .finish_run("R1", "T1", None, Outcome::Orphaned, &[], None, 3_000)
             .unwrap();
 
         assert_eq!(store.run("R1").unwrap().unwrap().state, "orphaned");
@@ -3544,7 +3585,7 @@ mod tests {
         assert!(store.cancellation_requested("R1").unwrap());
 
         store
-            .finish_run("R1", "T1", None, Outcome::Cancelled, &[], None, None, 3_000)
+            .finish_run("R1", "T1", None, Outcome::Cancelled, &[], None, 3_000)
             .unwrap();
         assert_eq!(store.ticket_state("T1").unwrap().unwrap(), "ready");
         assert_eq!(store.ticket_counts().unwrap().ready, 1);

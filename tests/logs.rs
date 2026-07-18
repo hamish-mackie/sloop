@@ -5,6 +5,12 @@ use std::fs;
 use support::{World, wait_until};
 
 fn configure_agent_script(world: &World, script_body: &str) {
+    fs::create_dir_all(world.root().join(".agents/sloop/flows")).unwrap();
+    fs::write(
+        world.root().join(".agents/sloop/flows/default.yaml"),
+        "stages:\n  - { name: build, kind: build }\n  - { name: merge, kind: merge }\n",
+    )
+    .unwrap();
     let script = world.root().join("fake-agent.sh");
     fs::write(&script, format!("#!/bin/sh\n{script_body}")).expect("write fake agent script");
     fs::write(

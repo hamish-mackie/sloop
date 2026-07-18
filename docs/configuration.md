@@ -155,11 +155,11 @@ The filename is the flow name. Tickets bind to a flow at post time with
 `flow: <name>` in frontmatter or `sloop post --flow <name>`; the binding is
 validated against the flow files that exist.
 
-> **Current limitation:** flow definitions are validated and recorded, but
-> the daemon does not yet execute `exec` stages. Today every run performs
-> the built-in pipeline — build, then the configured `aftercare.test_cmd`
-> (if any), then merge. Use `aftercare.test_cmd` for gating; treat `exec`
-> stages such as the scaffolded review step as not yet active.
+After the build agent exits, Sloop executes the bound flow's remaining stages
+in order. `exec` commands run in the run worktree and halt the flow when they
+fail; `merge` applies the run branch using Sloop's merge policy. A configured
+`aftercare.test_cmd` is inserted as an implicit stage named `test` immediately
+after `build`, before the flow's own `exec` stages.
 
 ## Worker instructions
 

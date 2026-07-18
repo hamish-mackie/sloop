@@ -82,41 +82,17 @@ pub(crate) fn parse(name: &str, contents: &str) -> Result<Flow, String> {
     })
 }
 
-pub(crate) fn built_in_default(
-    default_agent_cmd: Option<&[String]>,
-    test_cmd: Option<&[String]>,
-) -> Flow {
-    let review_cmd = default_agent_cmd
-        .map(|cmd| {
-            cmd.iter()
-                .map(|argument| argument.replace("{prompt}", REVIEW_PROMPT_INSTRUCTION))
-                .collect()
-        })
-        // Dispatch is already disabled without an agent target. Keep the
-        // resolved flow structurally valid for status and post-gate consumers.
-        .unwrap_or_else(|| vec!["sloop-agent".into(), REVIEW_PROMPT_INSTRUCTION.into()]);
-
-    let mut stages = vec![
+pub(crate) fn built_in_default() -> Flow {
+    let stages = vec![
         Stage {
             name: "build".into(),
             kind: StageKind::Build,
         },
         Stage {
-            name: "review".into(),
-            kind: StageKind::Exec { cmd: review_cmd },
+            name: "merge".into(),
+            kind: StageKind::Merge,
         },
     ];
-    if let Some(cmd) = test_cmd {
-        stages.push(Stage {
-            name: "test".into(),
-            kind: StageKind::Exec { cmd: cmd.to_vec() },
-        });
-    }
-    stages.push(Stage {
-        name: "merge".into(),
-        kind: StageKind::Merge,
-    });
-
     Flow {
         name: DEFAULT_FLOW_NAME.into(),
         stages,

@@ -27,13 +27,6 @@ pub fn classify_exit(exit_code: Option<i32>) -> ExitClass {
     }
 }
 
-/// Result of one executed aftercare stage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StageOutcome {
-    Passed,
-    Failed,
-}
-
 /// Result of an attempted merge of the run branch into the default branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeOutcome {
@@ -52,9 +45,12 @@ pub struct RunEvidence {
     pub exit: ExitClass,
     /// A rejection recognized from the adapter's captured output.
     pub vendor_error: Option<VendorErrorClass>,
-    /// `None` when no test stage ran: either the exit did not justify testing,
-    /// or no test command is configured.
-    pub tests: Option<StageOutcome>,
+    /// Commits are activity metadata except when aftercare fails: committed
+    /// work is then preserved for review, while a known unchanged branch
+    /// failed. `None` means commit enumeration was incomplete.
+    pub commit_count: Option<usize>,
+    /// Whether a flow stage after build failed.
+    pub aftercare_failed: bool,
     /// `None` when a merge was never attempted.
     pub merge: Option<MergeOutcome>,
 }
@@ -88,20 +84,6 @@ impl Outcome {
     }
 }
 
-/// Whether the process exit justifies running the test stage. A recognized
-/// vendor rejection means the "successful" exit is a refusal transcript, so
-/// it never qualifies for testing.
-pub fn wants_tests(exit: ExitClass, vendor_error: bool) -> bool {
-    !vendor_error && exit == ExitClass::Success
-}
-
-/// Whether the evidence so far justifies attempting a merge. A test stage
-/// that ran and failed blocks the merge; an unconfigured test stage does
-/// not, because the operator chose auto-merge policy without one.
-pub fn wants_merge(exit: ExitClass, tests: Option<StageOutcome>, vendor_error: bool) -> bool {
-    wants_tests(exit, vendor_error) && tests != Some(StageOutcome::Failed)
-}
-
 /// Maps complete evidence to the run's terminal outcome.
 ///
 /// Constraints fixed by the design documents:
@@ -111,12 +93,12 @@ pub fn wants_merge(exit: ExitClass, tests: Option<StageOutcome>, vendor_error: b
 ///   (`Some(MergeOutcome::Merged)`).
 ///
 /// Policy decisions taken here:
-/// - A successful exit whose tests or merge failed is `NeedsReview`; its run
-///   branch is retained for inspection.
+/// - A successful exit whose aftercare failed is `NeedsReview` when its run
+///   branch has commits, otherwise `Failed`.
 /// - A nonzero or killed exit is `Failed`; Git history does not upgrade or
 ///   downgrade the verdict.
-/// - A merge attempt that conflicted is `NeedsReview`: the work passed
-///   tests, only integration needs a human.
+/// - A merge attempt that conflicted is `NeedsReview`: the work passed its
+///   preceding stages, only integration needs a human.
 pub fn derive_outcome(evidence: &RunEvidence) -> Outcome {
     if evidence.cancelled {
         return Outcome::Cancelled;
@@ -134,6 +116,9 @@ pub fn derive_outcome(evidence: &RunEvidence) -> Outcome {
     if evidence.exit != ExitClass::Success {
         return Outcome::Failed;
     }
+    if evidence.aftercare_failed && evidence.commit_count == Some(0) {
+        return Outcome::Failed;
+    }
     Outcome::NeedsReview
 }
 
@@ -146,7 +131,8 @@ mod tests {
             cancelled: false,
             exit: ExitClass::Success,
             vendor_error: None,
-            tests: None,
+            commit_count: Some(0),
+            aftercare_failed: false,
             merge: None,
         }
     }
@@ -160,14 +146,14 @@ mod tests {
     #[test]
     fn a_successful_merge_is_the_only_path_to_merged() {
         let merged = derive_outcome(&RunEvidence {
-            tests: Some(StageOutcome::Passed),
+            commit_count: Some(1),
             merge: Some(MergeOutcome::Merged),
             ..evidence()
         });
         assert_eq!(merged, Outcome::Merged);
 
         let diverged = derive_outcome(&RunEvidence {
-            tests: Some(StageOutcome::Passed),
+            commit_count: Some(1),
             merge: Some(MergeOutcome::Diverged),
             ..evidence()
         });
@@ -175,13 +161,32 @@ mod tests {
     }
 
     #[test]
-    fn failed_tests_never_reach_merged() {
+    fn failed_aftercare_with_commits_needs_review() {
         let outcome = derive_outcome(&RunEvidence {
-            tests: Some(StageOutcome::Failed),
+            commit_count: Some(1),
+            aftercare_failed: true,
             ..evidence()
         });
-        assert_ne!(outcome, Outcome::Merged);
-        assert_ne!(outcome, Outcome::Cancelled);
+        assert_eq!(outcome, Outcome::NeedsReview);
+    }
+
+    #[test]
+    fn failed_aftercare_without_commits_fails() {
+        let outcome = derive_outcome(&RunEvidence {
+            aftercare_failed: true,
+            ..evidence()
+        });
+        assert_eq!(outcome, Outcome::Failed);
+    }
+
+    #[test]
+    fn failed_aftercare_with_unknown_commits_needs_review() {
+        let outcome = derive_outcome(&RunEvidence {
+            commit_count: None,
+            aftercare_failed: true,
+            ..evidence()
+        });
+        assert_eq!(outcome, Outcome::NeedsReview);
     }
 
     #[test]
@@ -199,7 +204,8 @@ mod tests {
             cancelled: true,
             exit: ExitClass::KilledBySignal,
             vendor_error: None,
-            tests: Some(StageOutcome::Passed),
+            commit_count: Some(5),
+            aftercare_failed: false,
             merge: Some(MergeOutcome::Merged),
         });
         assert_eq!(outcome, Outcome::Cancelled);
@@ -211,29 +217,6 @@ mod tests {
         assert_eq!(classify_exit(Some(2)), ExitClass::Failure(2));
         assert_eq!(classify_exit(None), ExitClass::KilledBySignal);
     }
-
-    #[test]
-    fn test_and_merge_gates_follow_the_evidence() {
-        assert!(wants_tests(ExitClass::Success, false));
-        assert!(!wants_tests(ExitClass::Failure(1), false));
-        assert!(!wants_tests(ExitClass::KilledBySignal, false));
-        assert!(!wants_tests(ExitClass::Success, true));
-
-        assert!(wants_merge(
-            ExitClass::Success,
-            Some(StageOutcome::Passed),
-            false
-        ));
-        assert!(wants_merge(ExitClass::Success, None, false));
-        assert!(!wants_merge(
-            ExitClass::Success,
-            Some(StageOutcome::Failed),
-            false
-        ));
-        assert!(!wants_merge(ExitClass::Failure(1), None, false));
-        assert!(!wants_merge(ExitClass::Success, None, true));
-    }
-
     #[test]
     fn vendor_rejections_follow_code_owned_policy() {
         for class in [
