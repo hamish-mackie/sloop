@@ -29,6 +29,12 @@ fn configure_fake_agent_with_hours(
     blocking: bool,
     running_hours: Option<(u16, u16)>,
 ) {
+    fs::create_dir_all(world.root().join(".agents/sloop/flows")).unwrap();
+    fs::write(
+        world.root().join(".agents/sloop/flows/default.yaml"),
+        "stages:\n  - { name: build, kind: build }\n  - { name: merge, kind: merge }\n",
+    )
+    .unwrap();
     let script = world.root().join("fake-agent.sh");
     let release = world.root().join("release");
     let wait_loop = if blocking {

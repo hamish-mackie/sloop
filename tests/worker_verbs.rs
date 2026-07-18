@@ -83,6 +83,12 @@ fn worker_verbs_reject_missing_worker_context() {
 /// recording each reply in the worktree. `blocking` agents wait for `release`
 /// in the repository root so a test can inspect the live worker socket.
 fn configure_worker_agent(world: &World, blocking: bool) {
+    fs::create_dir_all(world.root().join(".agents/sloop/flows")).unwrap();
+    fs::write(
+        world.root().join(".agents/sloop/flows/default.yaml"),
+        "stages:\n  - { name: build, kind: build }\n  - { name: merge, kind: merge }\n",
+    )
+    .unwrap();
     let script = world.root().join("worker-agent.sh");
     let release = world.root().join("release");
     let wait_loop = if blocking {
@@ -266,6 +272,12 @@ fn a_running_agent_reads_its_brief_and_records_a_note() {
 #[test]
 fn project_show_groups_notes_and_git_commits_without_writing_source_files() {
     let world = World::configured();
+    fs::create_dir_all(world.root().join(".agents/sloop/flows")).unwrap();
+    fs::write(
+        world.root().join(".agents/sloop/flows/default.yaml"),
+        "stages:\n  - { name: build, kind: build }\n  - { name: merge, kind: merge }\n",
+    )
+    .unwrap();
     let script = world.root().join("activity-agent.sh");
     fs::write(
         &script,

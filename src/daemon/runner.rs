@@ -212,7 +212,7 @@ pub(super) fn spawn_output_reader(
     pipe: impl Read + Send + 'static,
     log: RunLogWriter,
     source: OutputSource,
-    stage: Option<&'static str>,
+    stage: Option<String>,
     stream: OutputStream,
 ) -> std::thread::JoinHandle<bool> {
     std::thread::spawn(move || {
@@ -222,7 +222,10 @@ pub(super) fn spawn_output_reader(
             match pipe.read(&mut buffer) {
                 Ok(0) => return true,
                 Ok(read) => {
-                    if log.append(source, stage, stream, &buffer[..read]).is_err() {
+                    if log
+                        .append(source, stage.as_deref(), stream, &buffer[..read])
+                        .is_err()
+                    {
                         return false;
                     }
                 }

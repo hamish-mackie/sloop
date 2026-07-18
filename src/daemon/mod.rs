@@ -21,14 +21,13 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::clock::{Clock, FileClock, SystemClock, format_timestamp, next_local_minute_ms};
 use crate::config::{AgentConfig, Config, ConfigError, Project, RunningHours, parse_local_time};
-use crate::flow::Flow;
+use crate::flow::{
+    Flow, Stage, StageEvidence, StageKind, Step, Verdict, VerdictSource, next_step, resolve_verdict,
+};
 use crate::frontmatter::{Frontmatter, FrontmatterError};
 use crate::ids::{IdError, next_id};
 use crate::logging::{LogLevel, OperationalLog};
-use crate::outcome::{
-    MergeOutcome, RunEvidence, StageOutcome, classify_exit, derive_outcome, wants_merge,
-    wants_tests,
-};
+use crate::outcome::{ExitClass, MergeOutcome, RunEvidence, classify_exit, derive_outcome};
 use crate::protocol::{
     Capability, ErrorBody, ErrorCode, Request, RequestEnvelope, RequestId, ResponseEnvelope,
 };
@@ -746,9 +745,9 @@ struct DispatcherState {
     shutdown_flag: Arc<AtomicBool>,
 }
 
-/// One executed test stage as observed by the supervisor.
+/// One executed flow stage as observed by the supervisor.
 struct StageResult {
-    outcome: StageOutcome,
+    verdict: Verdict,
     exit_code: Option<i32>,
     started_at_ms: i64,
     finished_at_ms: i64,
@@ -766,7 +765,8 @@ enum RunEvent {
         /// Commits made after the run branch was created. This is activity
         /// metadata only; it does not determine the run's outcome.
         commits: Vec<String>,
-        tests: Option<StageResult>,
+        commit_observation_complete: bool,
+        aftercare_failed: bool,
         merge: Option<MergeOutcome>,
         vendor_error: Option<VendorErrorMatch>,
         cooldown_until_ms: Option<i64>,
@@ -895,7 +895,8 @@ fn try_settle_run_exit(
         exit_code,
         capture_complete,
         commits,
-        tests,
+        commit_observation_complete,
+        aftercare_failed,
         merge,
         vendor_error,
         cooldown_until_ms,
@@ -908,7 +909,8 @@ fn try_settle_run_exit(
         cancelled,
         exit: classify_exit(*exit_code),
         vendor_error: vendor_error.as_ref().map(|error| error.class),
-        tests: tests.as_ref().map(|stage| stage.outcome),
+        commit_count: commit_observation_complete.then_some(commits.len()),
+        aftercare_failed: *aftercare_failed,
         merge: *merge,
     };
     let outcome = if *recovery == Some(RecoveryClassification::Orphaned)
@@ -927,7 +929,8 @@ fn try_settle_run_exit(
         },
         EvidenceRecord {
             kind: "commits_observed",
-            data_json: json!({"oids": commits}).to_string(),
+            data_json: json!({"complete": commit_observation_complete, "oids": commits})
+                .to_string(),
         },
     ];
     if let Some(classification) = recovery {
@@ -938,16 +941,6 @@ fn try_settle_run_exit(
                     RecoveryClassification::Aftercare => "aftercare",
                     RecoveryClassification::Orphaned => "orphaned",
                 }
-            })
-            .to_string(),
-        });
-    }
-    if let Some(stage) = &tests {
-        records.push(EvidenceRecord {
-            kind: "test_result",
-            data_json: json!({
-                "passed": stage.outcome == StageOutcome::Passed,
-                "exit_code": stage.exit_code,
             })
             .to_string(),
         });
@@ -970,17 +963,6 @@ fn try_settle_run_exit(
             data_json: vendor_error.evidence_json(*cooldown_until_ms),
         });
     }
-    let stage_row = tests.as_ref().map(|stage| StageRecord {
-        stage: "test",
-        state: match stage.outcome {
-            StageOutcome::Passed => "passed",
-            StageOutcome::Failed => "failed",
-        },
-        started_at_ms: stage.started_at_ms,
-        finished_at_ms: stage.finished_at_ms,
-        exit_code: stage.exit_code,
-    });
-
     let ticket_id = state
         .store
         .run(run_id)?
@@ -1003,7 +985,6 @@ fn try_settle_run_exit(
         *exit_code,
         outcome,
         &records,
-        stage_row.as_ref(),
         cooldown.as_ref(),
         state.clock.now_ms(),
     )?;
@@ -1070,7 +1051,7 @@ fn recover_inflight_runs(
             );
         } else {
             if run.state == "aftercare" {
-                spawn_aftercare_recovery(state, events.clone(), run, log.clone());
+                spawn_aftercare_recovery(state, events.clone(), run, log.clone())?;
             } else {
                 spawn_dead_run_recovery(state, events.clone(), run, log.clone());
             }
@@ -1204,7 +1185,8 @@ fn recovered_exit_event(
         exit_code,
         capture_complete: false,
         commits,
-        tests: None,
+        commit_observation_complete: true,
+        aftercare_failed: false,
         merge: None,
         vendor_error,
         cooldown_until_ms,
@@ -1217,10 +1199,12 @@ fn spawn_aftercare_recovery(
     events: mpsc::Sender<RunEvent>,
     run: RecoverableRun,
     log: OperationalLog,
-) {
+) -> Result<(), DaemonError> {
     let root = state.root.clone();
     let state_dir = state.state_dir.clone();
     let test_cmd = state.aftercare_test_cmd.clone();
+    let flow = bound_flow(&state.store, &state.flows, &run.ticket_id)
+        .map_err(DaemonError::InvalidResponse)?;
     let clock = state.clock.clone();
     let db_path = state.state_dir.join("sloop.db");
     let shutdown = state.shutdown_flag.clone();
@@ -1232,6 +1216,7 @@ fn spawn_aftercare_recovery(
                     resume_aftercare(
                         &root,
                         &state_dir,
+                        &flow,
                         test_cmd.as_deref(),
                         clock.as_ref(),
                         &store,
@@ -1256,12 +1241,14 @@ fn spawn_aftercare_recovery(
             }
         }
     });
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn resume_aftercare(
     root: &Path,
     state_dir: &Path,
+    flow: &Flow,
     test_cmd: Option<&[String]>,
     clock: &dyn Clock,
     store: &Store,
@@ -1290,30 +1277,12 @@ fn resume_aftercare(
         .ok_or_else(|| "the aftercare checkpoint has no valid commit evidence".to_owned())?;
     let (commits, commit_observation_complete) = commit_observation;
     let exit_code = run.exit_code.and_then(|code| i32::try_from(code).ok());
-    let exit = classify_exit(exit_code);
     let vendor_error = value("vendor_error_classified")
         .and_then(|data| serde_json::from_value::<VendorErrorMatch>(data).ok());
     let cooldown_until_ms =
         value("vendor_error_classified").and_then(|data| data["cooldown_until_ms"].as_i64());
     let output_log = RunLogWriter::open(&run_output_path(state_dir, &run.id))
         .map_err(|error| format!("cannot open run output: {error}"))?;
-
-    let mut tests = value("test_result").map(|data| StageResult {
-        outcome: if data["passed"].as_bool() == Some(true) {
-            StageOutcome::Passed
-        } else {
-            StageOutcome::Failed
-        },
-        exit_code: data["exit_code"]
-            .as_i64()
-            .and_then(|code| i32::try_from(code).ok()),
-        started_at_ms: data["started_at_ms"]
-            .as_i64()
-            .unwrap_or_else(|| clock.now_ms()),
-        finished_at_ms: data["finished_at_ms"]
-            .as_i64()
-            .unwrap_or_else(|| clock.now_ms()),
-    });
     if aftercare_cancelled(store, &run.id, log) {
         return Ok(RunEvent::Exited {
             run_id: run.id.clone(),
@@ -1321,78 +1290,38 @@ fn resume_aftercare(
             exit_code,
             capture_complete: !rows.iter().any(|(kind, _)| kind == "capture_incomplete"),
             commits,
-            tests,
+            commit_observation_complete,
+            aftercare_failed: false,
             merge: None,
             vendor_error,
             cooldown_until_ms,
             recovery: Some(RecoveryClassification::Aftercare),
         });
     }
-    if tests.is_none()
-        && wants_tests(exit, vendor_error.is_some())
-        && let Some(cmd) = test_cmd
-    {
-        stop_interrupted_process(&rows, "test_process")?;
-        let worktree = run
-            .worktree_path
-            .as_deref()
-            .ok_or_else(|| "the aftercare checkpoint has no worktree".to_owned())?;
-        let stage = run_test_stage(
-            Path::new(worktree),
-            cmd,
-            &output_log,
-            clock,
-            Some(store),
-            &run.id,
-            log,
-        );
-        store
-            .record_aftercare_evidence(
-                &run.id,
-                "test_result",
-                &test_result_json(&stage),
-                clock.now_ms(),
-            )
-            .map_err(|error| error.to_string())?;
-        tests = Some(stage);
-    }
-
-    let mut merge = value("merge_result").map(|data| {
-        if data["merged"].as_bool() == Some(true) {
-            MergeOutcome::Merged
-        } else {
-            MergeOutcome::Diverged
-        }
-    });
-    if !aftercare_cancelled(store, &run.id, log)
-        && merge.is_none()
-        && wants_merge(
-            exit,
-            tests.as_ref().map(|stage| stage.outcome),
-            vendor_error.is_some(),
-        )
-        && let Some(branch) = run.branch.as_deref()
-    {
-        stop_interrupted_process(&rows, "merge_process")?;
-        let outcome = attempt_merge(
-            root,
-            branch,
-            commit_observation_complete && commits.is_empty(),
-            Some(store),
-            &run.id,
-            clock,
-            log,
-        );
-        store
-            .record_aftercare_evidence(
-                &run.id,
-                "merge_result",
-                &merge_result_json(outcome),
-                clock.now_ms(),
-            )
-            .map_err(|error| error.to_string())?;
-        merge = Some(outcome);
-    }
+    let worktree = run
+        .worktree_path
+        .as_deref()
+        .ok_or_else(|| "the aftercare checkpoint has no worktree".to_owned())?;
+    let branch = run
+        .branch
+        .as_deref()
+        .ok_or_else(|| "the aftercare checkpoint has no branch".to_owned())?;
+    let result = drive_flow(
+        root,
+        Path::new(worktree),
+        branch,
+        flow,
+        test_cmd,
+        exit_code,
+        vendor_error.is_some(),
+        &commits,
+        commit_observation_complete,
+        &output_log,
+        clock,
+        store,
+        &run.id,
+        log,
+    )?;
 
     Ok(RunEvent::Exited {
         run_id: run.id.clone(),
@@ -1400,56 +1329,566 @@ fn resume_aftercare(
         exit_code,
         capture_complete: !rows.iter().any(|(kind, _)| kind == "capture_incomplete"),
         commits,
-        tests,
-        merge,
+        commit_observation_complete,
+        aftercare_failed: result.aftercare_failed,
+        merge: result.merge,
         vendor_error,
         cooldown_until_ms,
         recovery: Some(RecoveryClassification::Aftercare),
     })
 }
 
-fn stop_interrupted_process(rows: &[(String, String)], kind: &str) -> Result<(), String> {
-    let Some((pid, start_time, group)) = aftercare_process_identity(rows, kind)? else {
-        return Ok(());
-    };
-    if !process_identity_matches(pid, Some(start_time)) {
-        return Ok(());
-    }
-    unsafe {
-        libc::kill(-(group as libc::pid_t), libc::SIGKILL);
-    }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while process_identity_matches(pid, Some(start_time)) {
-        if Instant::now() >= deadline {
-            return Err("the interrupted test process did not exit".into());
+struct FlowRunResult {
+    aftercare_failed: bool,
+    merge: Option<MergeOutcome>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive_flow(
+    root: &Path,
+    worktree: &Path,
+    branch: &str,
+    bound_flow: &Flow,
+    test_cmd: Option<&[String]>,
+    exit_code: Option<i32>,
+    vendor_rejected: bool,
+    commits: &[String],
+    commit_observation_complete: bool,
+    output_log: &RunLogWriter,
+    clock: &dyn Clock,
+    store: &Store,
+    run_id: &str,
+    log: &OperationalLog,
+) -> Result<FlowRunResult, String> {
+    let flow = flow_with_implicit_test(bound_flow, test_cmd)?;
+    let rows = store
+        .aftercare_stages(run_id)
+        .map_err(|error| error.to_string())?;
+    let mut evidence = rows
+        .iter()
+        .map(|row| StageEvidence {
+            stage: row.stage.clone(),
+            verdict: if row.state == "passed" {
+                Verdict::Pass
+            } else {
+                Verdict::Fail
+            },
+            source: VerdictSource::ExitCode,
+            reason: None,
+        })
+        .collect::<Vec<_>>();
+    let mut merge = flow.stages.iter().find_map(|stage| {
+        if stage.kind != StageKind::Merge {
+            return None;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        evidence
+            .iter()
+            .find(|row| row.stage == stage.name)
+            .map(|row| {
+                if row.verdict == Verdict::Pass {
+                    MergeOutcome::Merged
+                } else {
+                    MergeOutcome::Diverged
+                }
+            })
+    });
+    let interrupted = store
+        .run_evidence(run_id)
+        .map_err(|error| error.to_string())?;
+
+    loop {
+        if aftercare_cancelled(store, run_id, log) {
+            return Ok(FlowRunResult {
+                aftercare_failed: false,
+                merge,
+            });
+        }
+        let stage = match next_step(&flow, &evidence) {
+            Step::Run(stage) => stage,
+            Step::Halted { failed_stage } => {
+                let build = flow
+                    .stages
+                    .first()
+                    .is_some_and(|stage| stage.name == failed_stage);
+                return Ok(FlowRunResult {
+                    aftercare_failed: !build,
+                    merge,
+                });
+            }
+            Step::Complete => {
+                return Ok(FlowRunResult {
+                    aftercare_failed: false,
+                    merge,
+                });
+            }
+        };
+        let stage_index = flow
+            .stages
+            .iter()
+            .position(|candidate| candidate.name == stage.name)
+            .expect("next_step returned a stage from this flow");
+        let interrupted_process = stop_interrupted_process(&interrupted, &stage.name)?;
+        if let Some((identity, PersistedProcessStop::LeaderMissing)) = &interrupted_process {
+            log.emit_with_fields(
+                LogLevel::Info,
+                "sloop::recovery",
+                "stale_aftercare_group_not_signalled",
+                json!({
+                    "run_id": run_id,
+                    "stage": stage.name,
+                    "process_group_id": identity.group,
+                }),
+            );
+        }
+        let merge_recovery = if let Some((identity, _)) = &interrupted_process
+            && stage.kind == StageKind::Merge
+        {
+            match inspect_interrupted_merge(root, branch, identity) {
+                Ok(recovery) => Some(recovery),
+                Err(error) => {
+                    log.emit_with_fields(
+                        LogLevel::Error,
+                        "sloop::recovery",
+                        "merge_recovery_inspection_failed",
+                        json!({"run_id": run_id, "error": error}),
+                    );
+                    Some(MergeRecovery::UnsafePartial)
+                }
+            }
+        } else {
+            None
+        };
+        if interrupted_process.is_some() {
+            store
+                .clear_aftercare_process(run_id)
+                .map_err(|error| error.to_string())?;
+        }
+        let result = match &stage.kind {
+            StageKind::Build => {
+                let now = clock.now_ms();
+                StageResult {
+                    verdict: if !vendor_rejected && classify_exit(exit_code) == ExitClass::Success {
+                        Verdict::Pass
+                    } else {
+                        Verdict::Fail
+                    },
+                    exit_code,
+                    started_at_ms: now,
+                    finished_at_ms: now,
+                }
+            }
+            StageKind::Exec { cmd } => run_exec_stage(
+                worktree,
+                &stage.name,
+                cmd,
+                output_log,
+                clock,
+                store,
+                run_id,
+                log,
+            ),
+            StageKind::Merge if merge_recovery == Some(MergeRecovery::AlreadyCompleted) => {
+                let now = clock.now_ms();
+                merge = Some(MergeOutcome::Merged);
+                StageResult {
+                    verdict: Verdict::Pass,
+                    exit_code: Some(0),
+                    started_at_ms: now,
+                    finished_at_ms: now,
+                }
+            }
+            StageKind::Merge if merge_recovery == Some(MergeRecovery::UnsafePartial) => {
+                let now = clock.now_ms();
+                merge = Some(MergeOutcome::Diverged);
+                StageResult {
+                    verdict: Verdict::Fail,
+                    exit_code: Some(1),
+                    started_at_ms: now,
+                    finished_at_ms: now,
+                }
+            }
+            StageKind::Merge => {
+                let started_at_ms = clock.now_ms();
+                let outcome = attempt_merge(
+                    root,
+                    branch,
+                    commit_observation_complete && commits.is_empty(),
+                    &stage.name,
+                    store,
+                    run_id,
+                    clock,
+                    log,
+                );
+                merge = Some(outcome);
+                StageResult {
+                    verdict: if outcome == MergeOutcome::Merged {
+                        Verdict::Pass
+                    } else {
+                        Verdict::Fail
+                    },
+                    exit_code: Some(if outcome == MergeOutcome::Merged {
+                        0
+                    } else {
+                        1
+                    }),
+                    started_at_ms,
+                    finished_at_ms: clock.now_ms(),
+                }
+            }
+        };
+        let (verdict, source, reason) = resolve_verdict(&stage.kind, result.verdict, None);
+        if let Err(error) = store.record_aftercare_stage(
+            run_id,
+            &StageRecord {
+                stage_index,
+                stage: stage.name.clone(),
+                state: if verdict == Verdict::Pass {
+                    "passed".into()
+                } else {
+                    "failed".into()
+                },
+                started_at_ms: result.started_at_ms,
+                finished_at_ms: result.finished_at_ms,
+                exit_code: result.exit_code,
+                output_ref: format!("runs/{run_id}/output.ndjson"),
+            },
+        ) {
+            log.emit_with_fields(
+                LogLevel::Error,
+                "sloop::supervisor",
+                "aftercare_stage_persist_failed",
+                json!({"run_id": run_id, "stage": stage.name, "error": error.to_string()}),
+            );
+            return Ok(FlowRunResult {
+                aftercare_failed: true,
+                merge,
+            });
+        }
+        if let Err(error) = store.clear_aftercare_process(run_id) {
+            log.emit_with_fields(
+                LogLevel::Error,
+                "sloop::supervisor",
+                "aftercare_process_clear_failed",
+                json!({"run_id": run_id, "stage": stage.name, "error": error.to_string()}),
+            );
+            return Ok(FlowRunResult {
+                aftercare_failed: true,
+                merge,
+            });
+        }
+        evidence.push(StageEvidence {
+            stage: stage.name.clone(),
+            verdict,
+            source,
+            reason,
+        });
+        wait_for_test_hook(&format!("after-aftercare-stage-{}", stage.name));
     }
-    Ok(())
+}
+
+fn flow_with_implicit_test(flow: &Flow, test_cmd: Option<&[String]>) -> Result<Flow, String> {
+    let mut flow = flow.clone();
+    if let Some(cmd) = test_cmd {
+        if flow.stages.iter().any(|stage| stage.name == "test") {
+            return Err("aftercare.test_cmd conflicts with flow stage `test`".into());
+        }
+        flow.stages.insert(
+            1,
+            Stage {
+                name: "test".into(),
+                kind: StageKind::Exec { cmd: cmd.to_vec() },
+            },
+        );
+    }
+    Ok(flow)
+}
+
+#[derive(Debug, Clone)]
+struct AftercareProcessIdentity {
+    pid: u32,
+    start_time: i64,
+    group: i64,
+    merge: Option<MergeProcessCheckpoint>,
+}
+
+#[derive(Debug, Clone)]
+struct MergeProcessCheckpoint {
+    target_head: String,
+    branch_tip: String,
+    completed_target: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistedProcessState {
+    OriginalLeader,
+    ReusedLeader,
+    LeaderMissing,
+    UnverifiableLeader,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistedProcessStop {
+    StoppedOriginal,
+    LeaderMissing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeRecovery {
+    Retry,
+    AlreadyCompleted,
+    UnsafePartial,
+}
+
+fn stop_interrupted_process(
+    rows: &[(String, String)],
+    stage: &str,
+) -> Result<Option<(AftercareProcessIdentity, PersistedProcessStop)>, String> {
+    let Some(identity) = aftercare_process_identity(rows, Some(stage))? else {
+        return Ok(None);
+    };
+    if identity.group <= 0 {
+        return Err("the interrupted aftercare stage has an invalid process group".into());
+    }
+    let stopped = stop_persisted_process_group(&identity)?;
+    Ok(Some((identity, stopped)))
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_alive(group: i64) -> bool {
+    let Ok(processes) = fs::read_dir("/proc") else {
+        return unsafe { libc::kill(-(group as libc::pid_t), 0) == 0 };
+    };
+    processes.filter_map(Result::ok).any(|process| {
+        let Ok(pid) = process.file_name().to_string_lossy().parse::<u32>() else {
+            return false;
+        };
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some(after_command) = stat.rfind(')').map(|index| &stat[index + 1..]) else {
+            return false;
+        };
+        let mut fields = after_command.split_whitespace();
+        let state = fields.next();
+        let _parent = fields.next();
+        let process_group = fields.next().and_then(|value| value.parse::<i64>().ok());
+        state != Some("Z") && process_group == Some(group)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_group_alive(group: i64) -> bool {
+    unsafe { libc::kill(-(group as libc::pid_t), 0) == 0 }
+}
+
+fn inspect_interrupted_merge(
+    root: &Path,
+    branch: &str,
+    identity: &AftercareProcessIdentity,
+) -> Result<MergeRecovery, String> {
+    let checkpoint = identity
+        .merge
+        .as_ref()
+        .ok_or_else(|| "the interrupted merge has no baseline checkpoint".to_owned())?;
+    if shared_checkout_has_git_operation(root)? || git_index_lock_path(root)?.exists() {
+        return Ok(MergeRecovery::UnsafePartial);
+    }
+    if !git_stdout(root, &["ls-files", "--unmerged"])?.is_empty() {
+        return Ok(MergeRecovery::UnsafePartial);
+    }
+    let branch_tip = git_stdout(root, &["rev-parse", branch])?;
+    if branch_tip != checkpoint.branch_tip {
+        return Ok(MergeRecovery::UnsafePartial);
+    }
+    let target_head = git_stdout(root, &["rev-parse", "HEAD"])?;
+    if checkpoint.completed_target.is_some() {
+        return if git_is_ancestor(root, &checkpoint.branch_tip, &target_head)? {
+            Ok(MergeRecovery::AlreadyCompleted)
+        } else {
+            Ok(MergeRecovery::UnsafePartial)
+        };
+    }
+    if target_head == checkpoint.target_head {
+        return if git_index_matches_head(root)? {
+            Ok(MergeRecovery::Retry)
+        } else {
+            Ok(MergeRecovery::UnsafePartial)
+        };
+    }
+    if git_is_ancestor(root, &checkpoint.branch_tip, &target_head)? {
+        return Ok(MergeRecovery::AlreadyCompleted);
+    }
+    Ok(MergeRecovery::UnsafePartial)
 }
 
 fn aftercare_process_identity(
     rows: &[(String, String)],
-    kind: &str,
-) -> Result<Option<(u32, i64, i64)>, String> {
+    stage: Option<&str>,
+) -> Result<Option<AftercareProcessIdentity>, String> {
     let Some(data) = rows
         .iter()
-        .find(|(candidate, _)| candidate == kind)
+        .find(|(candidate, _)| candidate == "aftercare_process")
         .and_then(|(_, data)| serde_json::from_str::<serde_json::Value>(data).ok())
     else {
         return Ok(None);
     };
+    if stage.is_some_and(|stage| data["stage"].as_str() != Some(stage)) {
+        return Ok(None);
+    }
     let pid = data["pid"]
         .as_u64()
         .and_then(|pid| u32::try_from(pid).ok())
-        .ok_or_else(|| "the interrupted test has no valid pid".to_owned())?;
+        .ok_or_else(|| "the interrupted aftercare stage has no valid pid".to_owned())?;
     let start_time = data["pid_start_time"]
         .as_i64()
-        .ok_or_else(|| "the interrupted test has no valid start time".to_owned())?;
+        .ok_or_else(|| "the interrupted aftercare stage has no valid start time".to_owned())?;
     let group = data["process_group_id"]
         .as_i64()
-        .ok_or_else(|| "the interrupted test has no valid process group".to_owned())?;
-    Ok(Some((pid, start_time, group)))
+        .ok_or_else(|| "the interrupted aftercare stage has no valid process group".to_owned())?;
+    let merge = data
+        .get("merge")
+        .map(|merge| -> Result<_, String> {
+            Ok(MergeProcessCheckpoint {
+                target_head: merge["target_head"]
+                    .as_str()
+                    .ok_or_else(|| "the interrupted merge has no target HEAD".to_owned())?
+                    .to_owned(),
+                branch_tip: merge["branch_tip"]
+                    .as_str()
+                    .ok_or_else(|| "the interrupted merge has no branch tip".to_owned())?
+                    .to_owned(),
+                completed_target: merge["completed_target"].as_str().map(str::to_owned),
+            })
+        })
+        .transpose()?;
+    Ok(Some(AftercareProcessIdentity {
+        pid,
+        start_time,
+        group,
+        merge,
+    }))
+}
+
+fn persisted_process_state(identity: &AftercareProcessIdentity) -> PersistedProcessState {
+    let observed_start_time = process_start_time(identity.pid);
+    classify_persisted_process(
+        identity.start_time,
+        observed_start_time,
+        observed_start_time.is_some() || process_exists(identity.pid),
+    )
+}
+
+fn classify_persisted_process(
+    expected_start_time: i64,
+    observed_start_time: Option<i64>,
+    leader_exists: bool,
+) -> PersistedProcessState {
+    match observed_start_time {
+        Some(actual) if actual == expected_start_time => PersistedProcessState::OriginalLeader,
+        Some(_) => PersistedProcessState::ReusedLeader,
+        None if leader_exists => PersistedProcessState::UnverifiableLeader,
+        None => PersistedProcessState::LeaderMissing,
+    }
+}
+
+fn stop_persisted_process_group(
+    identity: &AftercareProcessIdentity,
+) -> Result<PersistedProcessStop, String> {
+    if identity.group <= 0
+        || identity.group != i64::from(identity.pid)
+        || libc::pid_t::try_from(identity.group).is_err()
+    {
+        return Err("the persisted aftercare process group is not its recorded leader".into());
+    }
+    match persisted_process_state(identity) {
+        PersistedProcessState::ReusedLeader => {
+            return Err("the aftercare process group ID was reused; refusing to signal it".into());
+        }
+        PersistedProcessState::UnverifiableLeader => {
+            return Err("cannot verify the persisted aftercare process leader".into());
+        }
+        // The group may still exist, but without the recorded leader its
+        // identity is unverifiable and signaling it is unsafe.
+        PersistedProcessState::LeaderMissing => return Ok(PersistedProcessStop::LeaderMissing),
+        PersistedProcessState::OriginalLeader => {}
+    }
+    unsafe {
+        libc::kill(-(identity.group as libc::pid_t), libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_group_alive(identity.group) {
+        if Instant::now() >= deadline {
+            return Err("the interrupted aftercare process group did not exit".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(PersistedProcessStop::StoppedOriginal)
+}
+
+fn process_exists(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn git_is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
+    let status = Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(root)
+        .status()
+        .map_err(|error| error.to_string())?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git merge-base --is-ancestor {ancestor} {descendant} failed: {status}"
+        )),
+    }
+}
+
+fn git_index_matches_head(root: &Path) -> Result<bool, String> {
+    let status = Command::new("git")
+        .args(["diff", "--cached", "--quiet", "--no-ext-diff", "HEAD", "--"])
+        .current_dir(root)
+        .status()
+        .map_err(|error| error.to_string())?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!("git diff --cached --quiet failed: {status}")),
+    }
+}
+
+fn git_index_lock_path(root: &Path) -> Result<PathBuf, String> {
+    git_path(root, "index.lock")
+}
+
+fn git_path(root: &Path, name: &str) -> Result<PathBuf, String> {
+    let path = git_stdout(root, &["rev-parse", "--git-path", name])?;
+    let path = PathBuf::from(path);
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    })
+}
+
+fn shared_checkout_has_git_operation(root: &Path) -> Result<bool, String> {
+    for state in [
+        "MERGE_HEAD",
+        "AUTO_MERGE",
+        "MERGE_MODE",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "REBASE_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "sequencer",
+    ] {
+        if git_path(root, state)?.exists() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn recoverable_process_matches(run: &RecoverableRun) -> bool {
@@ -1617,6 +2056,27 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
                 continue;
             }
         };
+        let flow = match bound_flow(&state.store, &state.flows, &ticket_id) {
+            Ok(flow) => flow,
+            Err(error) => {
+                if let Err(abort_error) = state.store.abort_claim(&run_id, &ticket_id, now_ms) {
+                    mark_storage_full(state, &abort_error);
+                    log.emit_with_fields(
+                        LogLevel::Error,
+                        "sloop::dispatcher",
+                        "claim_abort_failed",
+                        json!({"run_id": run_id, "ticket_id": ticket_id, "error": abort_error.to_string()}),
+                    );
+                }
+                log.emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::dispatcher",
+                    "bound_flow_resolution_failed",
+                    json!({"run_id": run_id, "ticket_id": ticket_id, "error": error}),
+                );
+                continue;
+            }
+        };
         match launch_agent(state, &run_id, &ticket_id, claimed.attempt) {
             Ok(launched) => {
                 state.active.insert(run_id.clone());
@@ -1715,21 +2175,24 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
                             None
                         }
                     };
-                    let Some((commits, tests, merge)) = gather_exit_evidence(
-                        &exited_run,
-                        &root,
-                        &worktree,
-                        &branch,
-                        test_cmd.as_deref(),
-                        clock.as_ref(),
-                        &output_log,
-                        exit_code,
-                        capture_complete,
-                        vendor_error.as_ref(),
-                        cooldown_until_ms,
-                        checkpoint_store.as_mut(),
-                        &supervisor_log,
-                    ) else {
+                    let Some((commits, commit_observation_complete, aftercare_failed, merge)) =
+                        gather_exit_evidence(
+                            &exited_run,
+                            &root,
+                            &worktree,
+                            &branch,
+                            &flow,
+                            test_cmd.as_deref(),
+                            clock.as_ref(),
+                            &output_log,
+                            exit_code,
+                            capture_complete,
+                            vendor_error.as_ref(),
+                            cooldown_until_ms,
+                            checkpoint_store.as_mut(),
+                            &supervisor_log,
+                        )
+                    else {
                         return;
                     };
                     let _ = events.blocking_send(RunEvent::Exited {
@@ -1738,7 +2201,8 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
                         exit_code,
                         capture_complete,
                         commits,
-                        tests,
+                        commit_observation_complete,
+                        aftercare_failed,
                         merge,
                         vendor_error,
                         cooldown_until_ms,
@@ -1858,15 +2322,33 @@ fn eligible_ticket(store: &Store, activation: &QueuedActivation, now_ms: i64) ->
     }
 }
 
+fn bound_flow(
+    store: &Store,
+    flows: &BTreeMap<String, Flow>,
+    ticket_id: &str,
+) -> Result<Flow, String> {
+    let ticket = store
+        .ticket(ticket_id)
+        .map_err(|error| format!("cannot read ticket `{ticket_id}`: {error}"))?
+        .ok_or_else(|| format!("ticket `{ticket_id}` no longer exists"))?;
+    let flow_name = ticket
+        .flow
+        .ok_or_else(|| format!("ticket `{ticket_id}` has no bound flow"))?;
+    flows
+        .get(&flow_name)
+        .cloned()
+        .ok_or_else(|| format!("ticket `{ticket_id}` names unknown bound flow `{flow_name}`"))
+}
+
 /// Gathers post-exit evidence in the supervisor thread, keeping slow Git and
-/// test work out of the dispatcher: run-branch activity for display, the
-/// configured test stage after a successful exit, and the policy merge.
+/// flow execution out of the dispatcher.
 #[allow(clippy::too_many_arguments)]
 fn gather_exit_evidence(
     run_id: &str,
     root: &Path,
     worktree: &Path,
     branch: &str,
+    flow: &Flow,
     test_cmd: Option<&[String]>,
     clock: &dyn Clock,
     output_log: &RunLogWriter,
@@ -1876,8 +2358,7 @@ fn gather_exit_evidence(
     cooldown_until_ms: Option<i64>,
     mut checkpoint_store: Option<&mut Store>,
     operational_log: &OperationalLog,
-) -> Option<(Vec<String>, Option<StageResult>, Option<MergeOutcome>)> {
-    let exit = classify_exit(exit_code);
+) -> Option<(Vec<String>, bool, bool, Option<MergeOutcome>)> {
     let commit_observation = try_commits_on_branch(root, branch);
     let commit_observation_complete = commit_observation.is_ok();
     let commits = commit_observation.unwrap_or_default();
@@ -1925,82 +2406,41 @@ fn gather_exit_evidence(
             .as_deref()
             .is_some_and(|store| aftercare_cancelled(store, run_id, operational_log))
     {
-        return Some((commits, None, None));
+        return Some((commits, commit_observation_complete, false, None));
     }
-
-    let tests = match test_cmd {
-        Some(cmd) if wants_tests(exit, vendor_error.is_some()) => {
-            let stage = run_test_stage(
-                worktree,
-                cmd,
-                output_log,
-                clock,
-                checkpoint_store.as_deref(),
-                run_id,
-                operational_log,
-            );
-            let test_checkpointed = if let Some(store) = checkpoint_store.as_deref()
-                && let Err(error) = store.record_aftercare_evidence(
-                    run_id,
-                    "test_result",
-                    &test_result_json(&stage),
-                    clock.now_ms(),
-                ) {
-                operational_log.emit_with_fields(
-                    LogLevel::Error,
-                    "sloop::supervisor",
-                    "aftercare_checkpoint_failed",
-                    json!({"run_id": run_id, "stage": "test", "error": error.to_string()}),
-                );
-                false
-            } else {
-                true
-            };
-            if !test_checkpointed {
-                return Some((commits, Some(stage), None));
-            }
-            Some(stage)
-        }
-        _ => None,
-    };
-
-    let merge = if !checkpoint_store
-        .as_deref()
-        .is_some_and(|store| aftercare_cancelled(store, run_id, operational_log))
-        && wants_merge(
-            exit,
-            tests.as_ref().map(|stage| stage.outcome),
-            vendor_error.is_some(),
-        ) {
-        let outcome = attempt_merge(
-            root,
-            branch,
-            commit_observation_complete && commits.is_empty(),
-            checkpoint_store.as_deref(),
-            run_id,
-            clock,
-            operational_log,
-        );
-        if let Some(store) = checkpoint_store.as_deref()
-            && let Err(error) = store.record_aftercare_evidence(
-                run_id,
-                "merge_result",
-                &merge_result_json(outcome),
-                clock.now_ms(),
-            )
-        {
+    let store = checkpoint_store.as_deref()?;
+    match drive_flow(
+        root,
+        worktree,
+        branch,
+        flow,
+        test_cmd,
+        exit_code,
+        vendor_error.is_some(),
+        &commits,
+        commit_observation_complete,
+        output_log,
+        clock,
+        store,
+        run_id,
+        operational_log,
+    ) {
+        Ok(result) => Some((
+            commits,
+            commit_observation_complete,
+            result.aftercare_failed,
+            result.merge,
+        )),
+        Err(error) => {
             operational_log.emit_with_fields(
                 LogLevel::Error,
                 "sloop::supervisor",
-                "aftercare_checkpoint_failed",
-                json!({"run_id": run_id, "stage": "merge", "error": error.to_string()}),
+                "aftercare_failed",
+                json!({"run_id": run_id, "error": error}),
             );
+            Some((commits, commit_observation_complete, true, None))
         }
-        Some(outcome)
-    } else {
-        None
-    };
-    Some((commits, tests, merge))
+    }
 }
 
 fn aftercare_cancelled(store: &Store, run_id: &str, log: &OperationalLog) -> bool {
@@ -2016,20 +2456,6 @@ fn aftercare_cancelled(store: &Store, run_id: &str, log: &OperationalLog) -> boo
             true
         }
     }
-}
-
-fn test_result_json(stage: &StageResult) -> String {
-    json!({
-        "passed": stage.outcome == StageOutcome::Passed,
-        "exit_code": stage.exit_code,
-        "started_at_ms": stage.started_at_ms,
-        "finished_at_ms": stage.finished_at_ms,
-    })
-    .to_string()
-}
-
-fn merge_result_json(outcome: MergeOutcome) -> String {
-    json!({"merged": outcome == MergeOutcome::Merged}).to_string()
 }
 
 /// Commits made since the run branch was created. The branch's own reflog is
@@ -2066,29 +2492,36 @@ fn git_stdout(root: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Runs the configured test command in the run's worktree, capturing its
-/// output as `aftercare` evidence in the same ordered run log.
-fn run_test_stage(
+/// Runs one exec stage in the run's worktree, capturing its output as
+/// `aftercare` evidence in the same ordered run log.
+#[allow(clippy::too_many_arguments)]
+fn run_exec_stage(
     worktree: &Path,
+    stage: &str,
     cmd: &[String],
     output_log: &RunLogWriter,
     clock: &dyn Clock,
-    checkpoint_store: Option<&Store>,
+    store: &Store,
     run_id: &str,
     operational_log: &OperationalLog,
 ) -> StageResult {
     let started_at_ms = clock.now_ms();
     let failed = |finished_at_ms| StageResult {
-        outcome: StageOutcome::Failed,
+        verdict: Verdict::Fail,
         exit_code: None,
         started_at_ms,
         finished_at_ms,
     };
+    if aftercare_cancelled(store, run_id, operational_log) {
+        return failed(clock.now_ms());
+    }
 
     let mut command = Command::new(&cmd[0]);
     command
         .args(&cmd[1..])
         .current_dir(worktree)
+        .env_remove("SLOOP_SOCKET")
+        .env_remove("SLOOP_TOKEN")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2109,36 +2542,38 @@ fn run_test_stage(
             child.stdout.take().expect("stdout was piped"),
             output_log.clone(),
             OutputSource::Aftercare,
-            Some("test"),
+            Some(stage.to_owned()),
             OutputStream::Stdout,
         ),
         spawn_output_reader(
             child.stderr.take().expect("stderr was piped"),
             output_log.clone(),
             OutputSource::Aftercare,
-            Some("test"),
+            Some(stage.to_owned()),
             OutputStream::Stderr,
         ),
     ];
-    wait_for_test_hook("before-test-process-checkpoint");
-    if let Some(store) = checkpoint_store
-        && let Err(error) = store.record_aftercare_evidence(
-            run_id,
-            "test_process",
-            &json!({
-                "pid": pid,
-                "pid_start_time": pid_start_time,
-                "process_group_id": pid,
-            })
-            .to_string(),
-            clock.now_ms(),
-        )
-    {
+    if stage == "test" {
+        wait_for_test_hook("before-test-process-checkpoint");
+    }
+    wait_for_test_hook(&format!("before-aftercare-process-checkpoint-{stage}"));
+    if let Err(error) = store.record_aftercare_evidence(
+        run_id,
+        "aftercare_process",
+        &json!({
+            "stage": stage,
+            "pid": pid,
+            "pid_start_time": pid_start_time,
+            "process_group_id": pid,
+        })
+        .to_string(),
+        clock.now_ms(),
+    ) {
         operational_log.emit_with_fields(
             LogLevel::Error,
             "sloop::supervisor",
             "aftercare_process_checkpoint_failed",
-            json!({"run_id": run_id, "stage": "test", "error": error.to_string()}),
+            json!({"run_id": run_id, "stage": stage, "error": error.to_string()}),
         );
         if process_identity_matches(pid, Some(pid_start_time)) {
             unsafe {
@@ -2151,7 +2586,8 @@ fn run_test_stage(
         }
         return failed(clock.now_ms());
     }
-    if checkpoint_store.is_some_and(|store| aftercare_cancelled(store, run_id, operational_log)) {
+    wait_for_test_hook(&format!("after-aftercare-process-checkpoint-{stage}"));
+    if aftercare_cancelled(store, run_id, operational_log) {
         if process_identity_matches(pid, Some(pid_start_time)) {
             unsafe {
                 libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
@@ -2165,17 +2601,29 @@ fn run_test_stage(
     }
 
     let status = child.wait();
+    if kill_straggler_process_group(pid) {
+        operational_log.emit_with_fields(
+            LogLevel::Info,
+            "sloop::supervisor",
+            "aftercare_stragglers_killed",
+            json!({"run_id": run_id, "stage": stage, "process_group_id": pid}),
+        );
+    }
+    let mut capture_complete = true;
     for reader in readers {
-        let _ = reader.join();
+        capture_complete &= reader.join().unwrap_or(false);
+    }
+    if !capture_complete {
+        return failed(clock.now_ms());
     }
     let Ok(status) = status else {
         return failed(clock.now_ms());
     };
     StageResult {
-        outcome: if status.success() {
-            StageOutcome::Passed
+        verdict: if status.success() {
+            Verdict::Pass
         } else {
-            StageOutcome::Failed
+            Verdict::Fail
         },
         exit_code: status.code(),
         started_at_ms,
@@ -2184,15 +2632,15 @@ fn run_test_stage(
 }
 
 /// Attempts the policy merge into the default branch: fast-forward when
-/// possible, otherwise a merge commit. Only a textual conflict needs a
-/// human; the merge is aborted so the checkout stays clean and the run
-/// branch survives as evidence.
+/// possible, otherwise a merge commit. Failed merges leave the exact checkout
+/// state for human review; Sloop never guesses which post-merge edits it owns.
 #[allow(clippy::too_many_arguments)]
 fn attempt_merge(
     root: &Path,
     branch: &str,
     branch_unchanged: bool,
-    checkpoint_store: Option<&Store>,
+    stage: &str,
+    checkpoint_store: &Store,
     run_id: &str,
     clock: &dyn Clock,
     operational_log: &OperationalLog,
@@ -2203,12 +2651,26 @@ fn attempt_merge(
     let Ok(_guard) = MERGE_LOCK.lock() else {
         return MergeOutcome::Diverged;
     };
+    let Ok(true) = merge_checkout_ready(root) else {
+        return MergeOutcome::Diverged;
+    };
+    let Ok(target_head) = git_stdout(root, &["rev-parse", "HEAD"]) else {
+        return MergeOutcome::Diverged;
+    };
+    let Ok(branch_tip) = git_stdout(root, &["rev-parse", branch]) else {
+        return MergeOutcome::Diverged;
+    };
     let message = format!("Merge run branch '{branch}'");
     // The merge commit is sloop's own action, not the operator's or the
     // agent's, so it carries sloop's identity; a fast-forward creates no
     // commit and ignores these.
-    let mut command = Command::new("git");
+    let mut command = Command::new("sh");
     command
+        .args([
+            "-c",
+            "IFS= read -r _ || exit 125; exec git \"$@\"",
+            "sloop-merge",
+        ])
         .args([
             "-c",
             "user.name=sloop",
@@ -2218,10 +2680,10 @@ fn attempt_merge(
             "--quiet",
             "-m",
             &message,
-            branch,
+            &branch_tip,
         ])
         .current_dir(root)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0);
@@ -2229,6 +2691,7 @@ fn attempt_merge(
         return MergeOutcome::Diverged;
     };
     let pid = child.id();
+    let mut gate = child.stdin.take().expect("merge gate stdin was piped");
     let Some(pid_start_time) = process_start_time(pid) else {
         unsafe {
             libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
@@ -2236,46 +2699,115 @@ fn attempt_merge(
         let _ = child.wait();
         return MergeOutcome::Diverged;
     };
-    if let Some(store) = checkpoint_store {
-        let checkpoint = json!({
-            "pid": pid,
-            "pid_start_time": pid_start_time,
-            "process_group_id": pid,
-        })
-        .to_string();
-        if let Err(error) =
-            store.record_aftercare_evidence(run_id, "merge_process", &checkpoint, clock.now_ms())
-        {
-            operational_log.emit_with_fields(
-                LogLevel::Error,
-                "sloop::supervisor",
-                "aftercare_process_checkpoint_failed",
-                json!({"run_id": run_id, "stage": "merge", "error": error.to_string()}),
-            );
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-            }
-            let _ = child.wait();
-            return MergeOutcome::Diverged;
+    let checkpoint = MergeProcessCheckpoint {
+        target_head,
+        branch_tip,
+        completed_target: None,
+    };
+    if let Err(error) = record_merge_process_checkpoint(
+        checkpoint_store,
+        run_id,
+        stage,
+        pid,
+        pid_start_time,
+        &checkpoint,
+        clock.now_ms(),
+    ) {
+        operational_log.emit_with_fields(
+            LogLevel::Error,
+            "sloop::supervisor",
+            "aftercare_process_checkpoint_failed",
+            json!({"run_id": run_id, "stage": stage, "error": error.to_string()}),
+        );
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
         }
-        if aftercare_cancelled(store, run_id, operational_log) {
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-            }
-            let _ = child.wait();
-            return MergeOutcome::Diverged;
-        }
+        let _ = child.wait();
+        return MergeOutcome::Diverged;
     }
+    wait_for_test_hook(&format!("after-aftercare-process-checkpoint-{stage}"));
+    if aftercare_cancelled(checkpoint_store, run_id, operational_log) {
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+        let _ = child.wait();
+        return MergeOutcome::Diverged;
+    }
+    if gate.write_all(b"run\n").is_err() {
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+        let _ = child.wait();
+        return MergeOutcome::Diverged;
+    }
+    drop(gate);
     match child.wait() {
-        Ok(status) if status.success() => MergeOutcome::Merged,
+        Ok(status) if status.success() => {
+            if let Ok(completed_target) = git_stdout(root, &["rev-parse", "HEAD"]) {
+                let completed = MergeProcessCheckpoint {
+                    completed_target: Some(completed_target),
+                    ..checkpoint
+                };
+                if let Err(error) = record_merge_process_checkpoint(
+                    checkpoint_store,
+                    run_id,
+                    stage,
+                    pid,
+                    pid_start_time,
+                    &completed,
+                    clock.now_ms(),
+                ) {
+                    operational_log.emit_with_fields(
+                        LogLevel::Error,
+                        "sloop::supervisor",
+                        "merge_completion_checkpoint_failed",
+                        json!({"run_id": run_id, "stage": stage, "error": error.to_string()}),
+                    );
+                }
+            }
+            wait_for_test_hook("after-successful-merge-process-exit");
+            MergeOutcome::Merged
+        }
         _ => {
-            let _ = Command::new("git")
-                .args(["merge", "--abort"])
-                .current_dir(root)
-                .output();
+            wait_for_test_hook("after-failed-merge-process-exit");
             MergeOutcome::Diverged
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_merge_process_checkpoint(
+    store: &Store,
+    run_id: &str,
+    stage: &str,
+    pid: u32,
+    pid_start_time: i64,
+    checkpoint: &MergeProcessCheckpoint,
+    now_ms: i64,
+) -> Result<(), StoreError> {
+    store.record_aftercare_evidence(
+        run_id,
+        "aftercare_process",
+        &json!({
+            "stage": stage,
+            "pid": pid,
+            "pid_start_time": pid_start_time,
+            "process_group_id": pid,
+            "merge": {
+                "target_head": checkpoint.target_head,
+                "branch_tip": checkpoint.branch_tip,
+                "completed_target": checkpoint.completed_target,
+            },
+        })
+        .to_string(),
+        now_ms,
+    )
+}
+
+fn merge_checkout_ready(root: &Path) -> Result<bool, String> {
+    Ok(!shared_checkout_has_git_operation(root)?
+        && !git_index_lock_path(root)?.exists()
+        && git_index_matches_head(root)?)
 }
 
 fn classify_run_output(
@@ -3285,15 +3817,30 @@ fn handle_cancel(
 
     if run.state == "aftercare" {
         let rows = lookup(state, |store| store.run_evidence(&run.id))?;
-        for kind in ["merge_process", "test_process"] {
-            if let Some((pid, start_time, group)) =
-                aftercare_process_identity(&rows, kind).map_err(|error| internal(&error))?
-                && process_identity_matches(pid, Some(start_time))
-            {
-                unsafe {
-                    libc::kill(-(group as libc::pid_t), libc::SIGKILL);
+        if let Some(identity) =
+            aftercare_process_identity(&rows, None).map_err(|error| internal(&error))?
+        {
+            if identity.group <= 0 {
+                return Err(internal(
+                    "the active aftercare stage has an invalid process group",
+                ));
+            }
+            match stop_persisted_process_group(&identity) {
+                Ok(PersistedProcessStop::LeaderMissing) => state.log.emit_with_fields(
+                    LogLevel::Info,
+                    "sloop::supervisor",
+                    "stale_aftercare_group_not_signalled",
+                    json!({"run_id": run.id, "process_group_id": identity.group}),
+                ),
+                Ok(PersistedProcessStop::StoppedOriginal) => {}
+                Err(error) => {
+                    state.log.emit_with_fields(
+                        LogLevel::Error,
+                        "sloop::supervisor",
+                        "aftercare_cancel_signal_refused",
+                        json!({"run_id": run.id, "error": error}),
+                    );
                 }
-                break;
             }
         }
     } else {
@@ -3570,8 +4117,8 @@ mod tests {
 
     use super::runner::compose_worker_prompt;
     use super::{
-        WORKER_BOOTSTRAP_PROMPT, index_projects, process_start_time, rearm_every_at,
-        recoverable_process_matches,
+        PersistedProcessState, WORKER_BOOTSTRAP_PROMPT, classify_persisted_process, index_projects,
+        process_start_time, rearm_every_at, recoverable_process_matches,
     };
     use crate::config::expand_agent_cmd;
     use crate::store::{RecoverableRun, Store};
@@ -3608,6 +4155,26 @@ mod tests {
         assert!(!recoverable_process_matches(&recoverable_current_process(
             None
         )));
+    }
+
+    #[test]
+    fn persisted_process_identity_requires_the_recorded_leader_to_signal() {
+        assert_eq!(
+            classify_persisted_process(10, Some(10), true),
+            PersistedProcessState::OriginalLeader
+        );
+        assert_eq!(
+            classify_persisted_process(10, Some(11), true),
+            PersistedProcessState::ReusedLeader
+        );
+        assert_eq!(
+            classify_persisted_process(10, None, false),
+            PersistedProcessState::LeaderMissing
+        );
+        assert_eq!(
+            classify_persisted_process(10, None, true),
+            PersistedProcessState::UnverifiableLeader
+        );
     }
 
     #[test]

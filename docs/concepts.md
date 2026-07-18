@@ -27,9 +27,8 @@ Sloop's socket API.
    environment.
 5. **Run.** Output is captured continuously to the run log; the agent can
    read its assignment with `sloop brief` at any time.
-6. **Aftercare.** After the agent exits, Sloop gathers evidence and decides
-   the outcome: run the configured test command, and merge the work if it
-   passes.
+6. **Aftercare.** After the agent exits, Sloop gathers evidence, executes the
+   ticket's bound flow stages in order, and merges the work if they pass.
 
 One async dispatcher task owns every spawn decision. Socket handlers and
 run supervisors send it requests; they never spawn anything themselves.
@@ -41,9 +40,12 @@ gate-then-claim atomic.
 Sloop never trusts what the agent says in its output or notes. It derives the
 outcome from the process exit and aftercare evidence:
 
-- **Exit 0, tests pass** → the run branch merges.
+- **Exit 0, flow stages pass** → the run branch merges.
 - **Exit 0, no commits** → the ticket completes as a successful no-op.
-- **Exit 0, tests or merge fail** → the branch is kept for human review.
+- **Exit 0, aftercare fails with commits** → the branch is kept for human review.
+- **Exit 0, aftercare fails with known no commits** → the ticket fails.
+- **Exit 0, aftercare fails while commit evidence is incomplete** → the branch
+  is conservatively kept for human review.
 - **Nonzero exit** → the ticket fails, regardless of commit count.
 - **The vendor rejects authentication or configuration** → the ticket fails
   with a safe diagnostic.
@@ -58,9 +60,9 @@ the matched class, vendor, rule ID, and catalog-authored diagnostic as evidence.
 Raw output remains in the run log rather than being copied into diagnostics.
 
 Commit OIDs are recorded for the project activity view, using the run branch's
-creation point as their baseline. They are metadata, not an outcome gate, so a
-rebase or squash of the default branch cannot turn unrelated history into
-apparent successful work.
+creation point as their baseline. They never gate a successful run or no-op.
+When aftercare fails, known committed work is retained for review; incomplete
+commit evidence is treated conservatively the same way.
 
 A worker's `sloop note "done, merged, ship it"` stores a note and moves
 nothing.

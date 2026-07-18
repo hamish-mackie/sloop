@@ -119,6 +119,13 @@ impl World {
         agent: FakeAgent,
         max_parallel_tasks: usize,
     ) {
+        let flow_directory = self.root().join(".agents/sloop/flows");
+        fs::create_dir_all(&flow_directory).expect("create flow directory");
+        fs::write(
+            flow_directory.join("default.yaml"),
+            "stages:\n  - { name: build, kind: build }\n  - { name: merge, kind: merge }\n",
+        )
+        .expect("write default test flow");
         let script = self.root().join("fake-agent.sh");
         let mut body = String::from("#!/bin/sh\nset -eu\n");
 

@@ -111,15 +111,17 @@ stages:
 The filename is the flow name. Select one with `flow: <name>` in the ticket or
 with `sloop post my-ticket.md --flow <name>`.
 
-Flow definitions are validated and bound to tickets, but stage execution is
-still being wired up: today every run performs build, then the configured
-`aftercare.test_cmd` (if any), then merge. `exec` stages such as the
-scaffolded review step do not run yet. To gate merges on a command, set:
+Sloop executes the bound flow in order after the build agent exits. `exec`
+stages run their argv in the run worktree and a failed stage stops the flow
+before merge. To add a test gate to every flow, set:
 
 ```yaml
 aftercare:
   test_cmd: ["cargo", "test"]
 ```
+
+This compatibility command runs as an implicit `test` stage immediately after
+`build`, before the flow's own `exec` stages.
 
 ## Logs
 

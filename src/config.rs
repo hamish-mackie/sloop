@@ -227,14 +227,20 @@ impl Config {
             .unwrap_or_else(|| DEFAULT_PROJECT_PREFIX.into());
         validate_id_prefix("ids.project_prefix", &project_prefix, &project.config_path)?;
 
-        let default_agent_cmd = agent
-            .as_ref()
-            .map(|agent| agent.targets[&agent.default_target].as_slice());
-        let flows = load_flows(
-            &project.root,
-            default_agent_cmd,
-            aftercare_test_cmd.as_deref(),
-        )?;
+        let flows = load_flows(&project.root)?;
+        if aftercare_test_cmd.is_some()
+            && let Some(flow) = flows
+                .values()
+                .find(|flow| flow.stages.iter().any(|stage| stage.name == "test"))
+        {
+            return Err(ConfigError::Invalid {
+                path: project.config_path.clone(),
+                message: format!(
+                    "aftercare.test_cmd conflicts with stage `test` in flow `{}`",
+                    flow.name
+                ),
+            });
+        }
 
         let delete_missing_after_ms = repository
             .delete_missing_after
@@ -265,15 +271,8 @@ impl Config {
     }
 }
 
-fn load_flows(
-    root: &Path,
-    default_agent_cmd: Option<&[String]>,
-    test_cmd: Option<&[String]>,
-) -> Result<BTreeMap<String, Flow>, ConfigError> {
-    let mut flows = BTreeMap::from([(
-        DEFAULT_FLOW_NAME.into(),
-        crate::flow::built_in_default(default_agent_cmd, test_cmd),
-    )]);
+fn load_flows(root: &Path) -> Result<BTreeMap<String, Flow>, ConfigError> {
+    let mut flows = BTreeMap::from([(DEFAULT_FLOW_NAME.into(), crate::flow::built_in_default())]);
     let directory = root.join(".agents/sloop/flows");
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
@@ -656,7 +655,6 @@ mod tests {
 
     use super::{Config, ConfigError, Project, RunningHours};
     use crate::clock::Clock;
-    use crate::flow::StageKind;
 
     struct SpringForwardClock;
 
@@ -1110,12 +1108,12 @@ mod tests {
     }
 
     #[test]
-    fn built_in_default_flow_uses_the_default_agent_target() {
+    fn built_in_default_flow_does_not_reuse_agent_placeholders() {
         let root = tempdir().unwrap();
         fs::create_dir_all(root.path().join(".agents/sloop")).unwrap();
         fs::write(
             root.path().join(".agents/sloop/config.yaml"),
-            "version: 1\nagent:\n  default_target: reviewer\n  targets:\n    reviewer:\n      cmd: [review-agent, --batch, '{prompt}']\n",
+            "version: 1\nagent:\n  default_target: reviewer\n  targets:\n    reviewer:\n      cmd: [review-agent, --model, '{model}', --effort, '{effort}', '{prompt}']\n",
         )
         .unwrap();
 
@@ -1128,17 +1126,12 @@ mod tests {
                 .iter()
                 .map(|stage| stage.name.as_str())
                 .collect::<Vec<_>>(),
-            ["build", "review", "merge"]
+            ["build", "merge"]
         );
-        let StageKind::Exec { cmd } = &config.flows["default"].stages[1].kind else {
-            panic!("review stage must be exec");
-        };
-        assert_eq!(&cmd[..2], ["review-agent", "--batch"]);
-        assert!(cmd.last().unwrap().contains("Review the completed work"));
     }
 
     #[test]
-    fn aftercare_test_command_is_added_to_the_built_in_default_flow() {
+    fn aftercare_test_command_is_not_duplicated_in_the_built_in_default_flow() {
         let root = tempdir().unwrap();
         fs::create_dir_all(root.path().join(".agents/sloop")).unwrap();
         fs::write(
@@ -1155,13 +1148,7 @@ mod tests {
                 .iter()
                 .map(|stage| stage.name.as_str())
                 .collect::<Vec<_>>(),
-            ["build", "review", "test", "merge"]
-        );
-        assert_eq!(
-            flow.stages[2].kind,
-            StageKind::Exec {
-                cmd: vec!["cargo".into(), "test".into()]
-            }
+            ["build", "merge"]
         );
     }
 
