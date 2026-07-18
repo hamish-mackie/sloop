@@ -14,9 +14,11 @@ use crate::protocol::{PostActivation, PostArgs};
 use crate::store::{ActivationKind, NewActivation, Store, StoreError, TicketState};
 
 /// Registers a ticket file: validates and stamps frontmatter, indexes the
-/// ticket, and for `auto` creates one queued activation. Reposting a
-/// stamped file is idempotent. The dispatcher is the only caller, so plain
-/// reads before writes here cannot race another writer.
+/// ticket, and for `auto` and `at` creates one queued activation. Reposting
+/// a stamped file is idempotent; reposting with a different `--at` time
+/// reschedules the queued activation. The dispatcher is the only caller and
+/// computes `at_eligible_ms` from its injected clock, so plain reads before
+/// writes here cannot race another writer.
 #[allow(clippy::too_many_arguments)]
 pub fn handle(
     root: &Path,
@@ -24,14 +26,12 @@ pub fn handle(
     store: &Store,
     args: &PostArgs,
     now_ms: i64,
+    at_eligible_ms: Option<i64>,
     ticket_prefix: &str,
     agent: Option<&AgentConfig>,
     flows: &BTreeMap<String, Flow>,
     default_flow: &str,
 ) -> Result<Value, PostError> {
-    if matches!(args.activation, PostActivation::At { .. }) {
-        return Err(PostError::TimedActivationUnimplemented);
-    }
     let initial_state = match args.activation {
         PostActivation::Hold => TicketState::Held,
         _ => TicketState::Ready,
@@ -199,8 +199,20 @@ pub fn handle(
 
     let activation = match &args.activation {
         PostActivation::Manual | PostActivation::Hold => Value::Null,
-        PostActivation::Auto => queue_activation(store, &ticket.id, ActivationKind::Auto, now_ms)?,
-        PostActivation::At { .. } => return Err(PostError::TimedActivationUnimplemented),
+        PostActivation::Auto => {
+            queue_activation(store, &ticket.id, ActivationKind::Auto, None, now_ms)?
+        }
+        PostActivation::At { .. } => {
+            let eligible_at_ms =
+                at_eligible_ms.expect("the dispatcher computes eligibility for at activations");
+            queue_activation(
+                store,
+                &ticket.id,
+                ActivationKind::At,
+                Some(eligible_at_ms),
+                now_ms,
+            )?
+        }
     };
 
     Ok(json!({
@@ -257,15 +269,22 @@ pub(crate) fn parse_ticket_frontmatter(
 }
 
 /// Reuses an existing queued activation of the same kind so reposting cannot
-/// enqueue duplicate work.
+/// enqueue duplicate work. A timed repost moves the queued activation to the
+/// newly requested instant instead of keeping the stale one.
 fn queue_activation(
     store: &Store,
     ticket_id: &str,
     kind: ActivationKind,
+    eligible_at_ms: Option<i64>,
     now_ms: i64,
 ) -> Result<Value, PostError> {
     let id = match store.queued_ticket_activation(ticket_id, kind)? {
-        Some(id) => id,
+        Some(id) => {
+            if let Some(eligible_at_ms) = eligible_at_ms {
+                store.reschedule_activation(&id, eligible_at_ms, now_ms)?;
+            }
+            id
+        }
         None => {
             let id = format!("A{}", store.next_activation_ordinal()?);
             store.insert_activation(
@@ -274,7 +293,7 @@ fn queue_activation(
                     kind,
                     ticket_id: Some(ticket_id),
                     project_id: None,
-                    eligible_at_ms: None,
+                    eligible_at_ms,
                     interval_ms: None,
                 },
                 now_ms,
@@ -282,12 +301,16 @@ fn queue_activation(
             id
         }
     };
-    Ok(json!({
+    let mut activation = json!({
         "id": id,
         "kind": kind.as_str(),
         "state": "queued",
         "ticket": ticket_id,
-    }))
+    });
+    if let Some(eligible_at_ms) = eligible_at_ms {
+        activation["eligible_at_ms"] = json!(eligible_at_ms);
+    }
+    Ok(activation)
 }
 
 fn allocate_ticket_id(store: &Store, prefix: &str) -> Result<String, PostError> {
@@ -430,7 +453,6 @@ pub enum PostError {
         id: String,
         file: String,
     },
-    TimedActivationUnimplemented,
     Io {
         path: String,
         source: io::Error,
@@ -517,11 +539,6 @@ impl fmt::Display for PostError {
                 formatter,
                 "ticket ID `{id}` is already registered by `{file}`"
             ),
-            Self::TimedActivationUnimplemented => write!(
-                formatter,
-                "post --at is not implemented yet; post with --auto and \
-                 configure scheduler.running_hours to defer work"
-            ),
             Self::Io { path, source } => write!(formatter, "{path}: {source}"),
             Self::Store(error) => error.fmt(formatter),
             Self::IdAllocation(error) => error.fmt(formatter),
@@ -575,10 +592,32 @@ mod tests {
             store,
             args,
             now_ms,
+            None,
             ticket_prefix,
             agent,
             flows,
             default_flow,
+        )
+    }
+
+    fn handle_at(
+        root: &std::path::Path,
+        store: &Store,
+        args: &PostArgs,
+        now_ms: i64,
+        at_eligible_ms: i64,
+    ) -> Result<serde_json::Value, PostError> {
+        handle_with_directory(
+            root,
+            std::path::Path::new(".agents/sloop/tickets"),
+            store,
+            args,
+            now_ms,
+            Some(at_eligible_ms),
+            "TICK",
+            None,
+            &flows(),
+            "default",
         )
     }
 
@@ -672,6 +711,35 @@ mod tests {
         .unwrap();
         assert_eq!(first["ticket"]["id"], second["ticket"]["id"]);
         assert_eq!(first["activation"]["id"], second["activation"]["id"]);
+    }
+
+    #[test]
+    fn posting_at_queues_a_timed_activation_and_reposting_reschedules_it() {
+        let (root, store) = world();
+        std::fs::write(
+            root.path().join(".agents/sloop/tickets/timed.md"),
+            ticket("", "# Timed\n"),
+        )
+        .unwrap();
+        let args = post(
+            ".agents/sloop/tickets/timed.md",
+            PostActivation::At {
+                time: "03:00".into(),
+            },
+        );
+
+        let first = handle_at(root.path(), &store, &args, 2_000, 10_000).unwrap();
+        assert_eq!(first["ticket"]["state"], "ready");
+        assert_eq!(first["activation"]["kind"], "at");
+        assert_eq!(first["activation"]["eligible_at_ms"], 10_000);
+
+        let second = handle_at(root.path(), &store, &args, 3_000, 20_000).unwrap();
+        assert_eq!(second["activation"]["id"], first["activation"]["id"]);
+        assert_eq!(second["activation"]["eligible_at_ms"], 20_000);
+
+        let queued = store.queued_activations().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].eligible_at_ms, Some(20_000));
     }
 
     #[test]

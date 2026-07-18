@@ -704,6 +704,78 @@ fn every_waits_for_the_window_rearms_and_dispatches_again() {
     );
 }
 
+fn local_time_after(world: &World, minutes: u16) -> String {
+    let target = (SystemClock.local_minute(world.now_ms()) + minutes) % (24 * 60);
+    format!("{:02}:{:02}", target / 60, target % 60)
+}
+
+#[test]
+fn at_dispatches_only_once_its_scheduled_time_passes() {
+    let world = World::configured();
+    configure_fake_agent(&world, 1, false);
+    world.commit_all("initial");
+    world.start_daemon();
+    let ticket = world.write_ticket("timed.md", "# Timed\n");
+    let at = local_time_after(&world, 2);
+
+    let output = world.sloop(&[
+        "post",
+        ticket.to_str().expect("UTF-8 ticket path"),
+        "--at",
+        &at,
+    ]);
+    assert!(
+        output.status.success(),
+        "post --at failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        World::json_stdout(&output)["data"]["activation"]["kind"],
+        "at"
+    );
+    assert!(
+        status(&world)["next_wake"].is_string(),
+        "the dispatcher schedules a deadline instead of polling"
+    );
+
+    world.tick(Duration::from_secs(60));
+    assert!(!worktree_marker(&world, "R1").exists());
+
+    world.tick(Duration::from_secs(2 * 60));
+    wait_until("the timed activation dispatches once due", || {
+        worktree_marker(&world, "R1").is_file()
+    });
+}
+
+#[test]
+fn at_outside_running_hours_waits_for_the_window() {
+    let world = World::configured();
+    let current = SystemClock.local_minute(world.now_ms());
+    let start = (current + 5) % (24 * 60);
+    let end = (start + 5) % (24 * 60);
+    configure_fake_agent_with_hours(&world, 1, false, Some((start, end)));
+    world.commit_all("initial");
+    world.start_daemon();
+    let ticket = post_manual(&world, "timed.md", "# Timed\n");
+    let at = local_time_after(&world, 2);
+
+    let output = world.sloop(&["run", &ticket, "--at", &at]);
+    assert!(
+        output.status.success(),
+        "run --at failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    world.tick(Duration::from_secs(3 * 60));
+    assert_eq!(status(&world)["gate"]["running_hours"]["open"], false);
+    assert!(!worktree_marker(&world, "R1").exists());
+
+    world.tick(Duration::from_secs(3 * 60));
+    wait_until("the due timed run starts at the opening boundary", || {
+        worktree_marker(&world, "R1").is_file()
+    });
+}
+
 #[test]
 fn closing_time_does_not_cancel_active_work_or_start_the_next_run() {
     let world = World::configured();

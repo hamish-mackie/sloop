@@ -2,6 +2,7 @@ mod support;
 
 use std::fs;
 
+use sloop::clock::{Clock, SystemClock};
 use support::World;
 
 #[test]
@@ -325,27 +326,48 @@ fn post_defaults_to_auto_and_creates_one_queued_activation() {
 }
 
 #[test]
-fn post_at_is_rejected_loudly_without_registering_the_ticket() {
+fn post_at_queues_a_timed_activation_and_reposting_reschedules_it() {
     let world = World::configured();
     world.start_daemon();
     let ticket = world.write_ticket("cooldown.md", "# Persist cooldowns\n");
-    let output = world.sloop(&[
-        "post",
-        ticket.to_str().expect("UTF-8 ticket path"),
-        "--at",
-        "03:00",
-    ]);
+    let path = ticket.to_str().expect("UTF-8 ticket path");
 
-    assert!(!output.status.success());
-    let response: serde_json::Value =
-        serde_json::from_slice(&output.stderr).expect("error output is JSON");
-    assert_eq!(response["ok"], false);
-    assert_eq!(response["error"]["code"], "invalid_arguments");
+    let output = world.sloop(&["post", path, "--at", "03:00"]);
+    assert!(
+        output.status.success(),
+        "post --at failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let first = World::json_stdout(&output);
+    assert_eq!(first["data"]["ticket"]["state"], "ready");
+    assert_eq!(first["data"]["activation"]["kind"], "at");
+    assert_eq!(first["data"]["activation"]["state"], "queued");
+    let first_eligible = first["data"]["activation"]["eligible_at_ms"]
+        .as_i64()
+        .expect("timed activation carries its eligibility instant");
+    assert!(first_eligible > world.now_ms());
+    assert_eq!(
+        SystemClock.local_minute(first_eligible),
+        3 * 60,
+        "eligibility lands on the next local 03:00"
+    );
 
-    let list = world.sloop(&["list"]);
-    assert!(list.status.success());
-    let tickets = World::json_stdout(&list);
-    assert_eq!(tickets["data"]["tickets"], serde_json::json!([]));
+    let repost = world.sloop(&["post", path, "--at", "04:00"]);
+    assert!(repost.status.success());
+    let second = World::json_stdout(&repost);
+    assert_eq!(
+        second["data"]["activation"]["id"], first["data"]["activation"]["id"],
+        "reposting reuses the queued activation"
+    );
+    assert_eq!(
+        SystemClock.local_minute(
+            second["data"]["activation"]["eligible_at_ms"]
+                .as_i64()
+                .expect("rescheduled activation carries its eligibility instant")
+        ),
+        4 * 60,
+        "reposting moves the activation to the new local time"
+    );
 }
 
 #[test]

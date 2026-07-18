@@ -36,11 +36,12 @@ the file. The activation modes are mutually exclusive:
 - `--auto` (default) — queue one run for the next available opportunity.
 - `--manual` — register the ticket as ready without queuing a run.
 - `--hold` — register the ticket as held; `sloop ready` releases it.
-- `--at TIME` — accepted, but time-based dispatch is not implemented yet;
-  the queued run will not start on its own.
+- `--at HH:MM` — queue one run for the next occurrence of that local time;
+  it still waits for running hours, capacity, cooldown, and budget gates.
 
 Reposting an edited file updates the ticket in place without queuing a
-duplicate run.
+duplicate run; reposting with a different `--at` time reschedules the
+queued run.
 
 ### sloop run [TICKET] [--project P] [--only T1,T2] [--at TIME | --every INTERVAL | --overnight]
 
