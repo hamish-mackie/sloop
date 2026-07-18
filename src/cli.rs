@@ -412,10 +412,12 @@ fn run_command(
 ) -> ExitCode {
     match command {
         Command::Init => run_init(mode, stdout, stderr),
-        Command::Daemon(args) if args.foreground => match crate::daemon::serve_current_project() {
-            Ok(()) | Err(crate::daemon::DaemonError::AlreadyRunning) => ExitCode::SUCCESS,
-            Err(_) => ExitCode::FAILURE,
-        },
+        Command::Daemon(args) if args.foreground => {
+            match crate::daemon::serve_current_repository() {
+                Ok(()) | Err(crate::daemon::DaemonError::AlreadyRunning) => ExitCode::SUCCESS,
+                Err(_) => ExitCode::FAILURE,
+            }
+        }
         Command::Daemon(_) => run_daemon_request(
             Request::Daemon(EmptyArgs::default()),
             true,

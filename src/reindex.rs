@@ -8,11 +8,12 @@ use std::process::Command;
 use serde_json::{Value, json};
 
 use crate::config::{AgentConfig, expand_agent_cmd};
+use crate::domain::ticket::TicketState;
 use crate::flow::Flow;
 use crate::frontmatter::{self, Frontmatter};
 use crate::ids::next_id;
-use crate::post::{find_cycle, parse_ticket_frontmatter};
-use crate::store::{ReindexTicket, Store, TicketState};
+use crate::post::parse_ticket_frontmatter;
+use crate::store::{ReindexTicket, Store};
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -143,7 +144,7 @@ pub fn run(
         }
         dependencies.insert(ticket.id.clone(), ticket.blocked_by.clone());
     }
-    if let Some(chain) = find_cycle(&dependencies) {
+    if let Some(chain) = crate::domain::graph::find_cycle(&dependencies) {
         return Err(ReindexError(format!(
             "field `blocked_by` creates a dependency cycle: {}",
             chain.join(" -> ")

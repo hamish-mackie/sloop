@@ -9,7 +9,7 @@ mod worker_api;
 
 pub use server::{
     ClientResponse, DaemonError, LockIdentity, read_lock_identity, request, request_running,
-    serve_current_project,
+    serve_current_repository,
 };
 
 pub(crate) const WORKER_BOOTSTRAP_PROMPT: &str =

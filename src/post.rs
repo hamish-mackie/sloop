@@ -7,11 +7,12 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::config::{AgentConfig, expand_agent_cmd};
+use crate::domain::ticket::TicketState;
 use crate::flow::Flow;
 use crate::frontmatter::{self, FrontmatterError};
 use crate::ids::{IdError, next_id};
 use crate::protocol::{PostActivation, PostArgs};
-use crate::store::{ActivationKind, NewActivation, Store, StoreError, TicketState};
+use crate::store::{ActivationKind, NewActivation, Store, StoreError};
 
 /// Registers a ticket file: validates and stamps frontmatter, indexes the
 /// ticket, and for `auto` and `at` creates one queued activation. Reposting
@@ -145,7 +146,7 @@ pub fn handle(
     }
     let mut dependencies = store.ticket_dependencies()?;
     dependencies.insert(ticket_id.clone(), stamped.blocked_by.clone());
-    if let Some(chain) = find_cycle(&dependencies) {
+    if let Some(chain) = crate::domain::graph::find_cycle(&dependencies) {
         return Err(PostError::DependencyCycle(chain));
     }
 
@@ -316,53 +317,6 @@ fn queue_activation(
 fn allocate_ticket_id(store: &Store, prefix: &str) -> Result<String, PostError> {
     let ids = store.ticket_ids()?;
     next_id(prefix, ids.iter().map(String::as_str)).map_err(PostError::IdAllocation)
-}
-
-pub(crate) fn find_cycle(graph: &BTreeMap<String, Vec<String>>) -> Option<Vec<String>> {
-    fn visit(
-        node: &str,
-        graph: &BTreeMap<String, Vec<String>>,
-        states: &mut BTreeMap<String, u8>,
-        stack: &mut Vec<String>,
-    ) -> Option<Vec<String>> {
-        states.insert(node.to_owned(), 1);
-        stack.push(node.to_owned());
-        let mut neighbors = graph.get(node).cloned().unwrap_or_default();
-        neighbors.sort();
-        neighbors.dedup();
-        for neighbor in neighbors {
-            match states.get(&neighbor).copied().unwrap_or_default() {
-                0 => {
-                    if let Some(cycle) = visit(&neighbor, graph, states, stack) {
-                        return Some(cycle);
-                    }
-                }
-                1 => {
-                    let start = stack
-                        .iter()
-                        .position(|entry| entry == &neighbor)
-                        .expect("visiting node is on the DFS stack");
-                    let mut cycle = stack[start..].to_vec();
-                    cycle.push(neighbor);
-                    return Some(cycle);
-                }
-                _ => {}
-            }
-        }
-        stack.pop();
-        states.insert(node.to_owned(), 2);
-        None
-    }
-
-    let mut states = BTreeMap::new();
-    for node in graph.keys() {
-        if states.get(node).copied().unwrap_or_default() == 0 {
-            if let Some(cycle) = visit(node, graph, &mut states, &mut Vec::new()) {
-                return Some(cycle);
-            }
-        }
-    }
-    None
 }
 
 /// Resolves the request path against the repository root and requires the

@@ -16,7 +16,7 @@ pub const DEFAULT_PROJECT_DIR: &str = ".agents/sloop/projects";
 pub const DEFAULT_TICKET_DIR: &str = ".agents/sloop/tickets";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Project {
+pub struct Repository {
     pub root: PathBuf,
     pub config_path: PathBuf,
     pub state_dir: PathBuf,
@@ -27,7 +27,7 @@ pub struct Project {
     pub db_path: PathBuf,
 }
 
-impl Project {
+impl Repository {
     pub fn discover(start: &Path) -> Result<Self, ConfigError> {
         let start = start.canonicalize().map_err(|source| ConfigError::Io {
             path: start.to_path_buf(),
@@ -51,7 +51,7 @@ impl Project {
             }
         }
 
-        Err(ConfigError::ProjectNotFound(start))
+        Err(ConfigError::RepositoryNotFound(start))
     }
 }
 
@@ -122,36 +122,36 @@ impl RunningHours {
 }
 
 impl Config {
-    pub fn load(project: &Project) -> Result<Self, ConfigError> {
+    pub fn load(repository: &Repository) -> Result<Self, ConfigError> {
         let user_path = user_config_path().filter(|path| path.is_file());
         let user = user_path
             .as_ref()
             .map(|path| read_config(path))
             .transpose()?;
-        let repository = read_config(&project.config_path)?;
+        let config = read_config(&repository.config_path)?;
 
         let worktree_dir = validate_worktree_dir(
-            repository
+            config
                 .worktree_dir
                 .as_deref()
                 .unwrap_or_else(|| Path::new(DEFAULT_WORKTREE_DIR)),
-            &project.config_path,
+            &repository.config_path,
         )?;
         let project_dir = validate_repository_dir(
             "project_dir",
-            repository
+            config
                 .project_dir
                 .as_deref()
                 .unwrap_or_else(|| Path::new(DEFAULT_PROJECT_DIR)),
-            &project.config_path,
+            &repository.config_path,
         )?;
         let ticket_dir = validate_repository_dir(
             "ticket_dir",
-            repository
+            config
                 .ticket_dir
                 .as_deref()
                 .unwrap_or_else(|| Path::new(DEFAULT_TICKET_DIR)),
-            &project.config_path,
+            &repository.config_path,
         )?;
 
         if user.as_ref().is_some_and(|config| {
@@ -171,7 +171,7 @@ impl Config {
             .as_ref()
             .and_then(|config| config.defaults.as_ref())
             .and_then(|defaults| defaults.scheduler.as_ref());
-        let repository_scheduler = repository.scheduler.as_ref();
+        let repository_scheduler = config.scheduler.as_ref();
 
         let max_parallel_tasks = repository_scheduler
             .and_then(|scheduler| scheduler.max_parallel_tasks)
@@ -179,7 +179,7 @@ impl Config {
             .unwrap_or(1);
         if max_parallel_tasks == 0 {
             return Err(ConfigError::Invalid {
-                path: project.config_path.clone(),
+                path: repository.config_path.clone(),
                 message: "scheduler.max_parallel_tasks must be greater than zero".into(),
             });
         }
@@ -187,16 +187,16 @@ impl Config {
         let running_hours = repository_scheduler
             .and_then(|scheduler| scheduler.running_hours.clone())
             .or_else(|| defaults.and_then(|scheduler| scheduler.running_hours.clone()))
-            .map(|hours| validate_running_hours(hours, &project.config_path))
+            .map(|hours| validate_running_hours(hours, &repository.config_path))
             .transpose()?;
 
-        let agent = repository
+        let agent = config
             .agent
             .as_ref()
-            .map(|agent| validate_agent(agent, &project.config_path))
+            .map(|agent| validate_agent(agent, &repository.config_path))
             .transpose()?;
 
-        let aftercare_test_cmd = repository
+        let aftercare_test_cmd = config
             .aftercare
             .as_ref()
             .or_else(|| {
@@ -209,32 +209,36 @@ impl Config {
             && cmd.is_empty()
         {
             return Err(ConfigError::Invalid {
-                path: project.config_path.clone(),
+                path: repository.config_path.clone(),
                 message: "aftercare.test_cmd must name a command".into(),
             });
         }
 
-        let ticket_prefix = repository
+        let ticket_prefix = config
             .ids
             .as_ref()
             .and_then(|ids| ids.ticket_prefix.clone())
             .unwrap_or_else(|| DEFAULT_TICKET_PREFIX.into());
-        validate_id_prefix("ids.ticket_prefix", &ticket_prefix, &project.config_path)?;
-        let project_prefix = repository
+        validate_id_prefix("ids.ticket_prefix", &ticket_prefix, &repository.config_path)?;
+        let project_prefix = config
             .ids
             .as_ref()
             .and_then(|ids| ids.project_prefix.clone())
             .unwrap_or_else(|| DEFAULT_PROJECT_PREFIX.into());
-        validate_id_prefix("ids.project_prefix", &project_prefix, &project.config_path)?;
+        validate_id_prefix(
+            "ids.project_prefix",
+            &project_prefix,
+            &repository.config_path,
+        )?;
 
-        let flows = load_flows(&project.root)?;
+        let flows = load_flows(&repository.root)?;
         if aftercare_test_cmd.is_some()
             && let Some(flow) = flows
                 .values()
                 .find(|flow| flow.stages.iter().any(|stage| stage.name == "test"))
         {
             return Err(ConfigError::Invalid {
-                path: project.config_path.clone(),
+                path: repository.config_path.clone(),
                 message: format!(
                     "aftercare.test_cmd conflicts with stage `test` in flow `{}`",
                     flow.name
@@ -242,12 +246,12 @@ impl Config {
             });
         }
 
-        let delete_missing_after_ms = repository
+        let delete_missing_after_ms = config
             .delete_missing_after
             .as_deref()
             .map(|value| {
                 parse_duration_ms(value).map_err(|message| ConfigError::Invalid {
-                    path: project.config_path.clone(),
+                    path: repository.config_path.clone(),
                     message: format!("delete_missing_after: {message}"),
                 })
             })
@@ -606,7 +610,7 @@ struct RawRunningHours {
 
 #[derive(Debug)]
 pub enum ConfigError {
-    ProjectNotFound(PathBuf),
+    RepositoryNotFound(PathBuf),
     Paths(crate::paths::PathError),
     Io {
         path: PathBuf,
@@ -625,7 +629,7 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ProjectNotFound(start) => write!(
+            Self::RepositoryNotFound(start) => write!(
                 formatter,
                 "no .agents/sloop/config.yaml found from {}",
                 start.display()
@@ -653,7 +657,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{Config, ConfigError, Project, RunningHours};
+    use super::{Config, ConfigError, Repository, RunningHours};
     use crate::clock::Clock;
 
     struct SpringForwardClock;
@@ -673,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn discovers_the_nearest_project_from_a_nested_directory() {
+    fn discovers_the_nearest_repository_from_a_nested_directory() {
         let root = tempdir().unwrap();
         fs::create_dir_all(root.path().join(".agents/sloop")).unwrap();
         fs::write(
@@ -684,8 +688,8 @@ mod tests {
         let nested = root.path().join("src/deep");
         fs::create_dir_all(&nested).unwrap();
 
-        let project = Project::discover(&nested).unwrap();
-        assert_eq!(project.root, root.path().canonicalize().unwrap());
+        let repository = Repository::discover(&nested).unwrap();
+        assert_eq!(repository.root, root.path().canonicalize().unwrap());
     }
 
     #[test]
@@ -705,8 +709,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
-        let config = Config::load(&project).unwrap();
+        let repository = Repository::discover(root.path()).unwrap();
+        let config = Config::load(&repository).unwrap();
         assert_eq!(config.max_parallel_tasks, 3);
         assert_eq!(config.running_hours.unwrap().start, "22:00");
     }
@@ -721,9 +725,9 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
+        let repository = Repository::discover(root.path()).unwrap();
         assert_eq!(
-            Config::load(&project).unwrap().worktree_dir,
+            Config::load(&repository).unwrap().worktree_dir,
             PathBuf::from(".worktrees")
         );
     }
@@ -738,8 +742,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
-        let config = Config::load(&project).unwrap();
+        let repository = Repository::discover(root.path()).unwrap();
+        let config = Config::load(&repository).unwrap();
         assert_eq!(config.project_dir, PathBuf::from(".agents/sloop/projects"));
         assert_eq!(config.ticket_dir, PathBuf::from(".agents/sloop/tickets"));
     }
@@ -754,8 +758,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
-        let config = Config::load(&project).unwrap();
+        let repository = Repository::discover(root.path()).unwrap();
+        let config = Config::load(&repository).unwrap();
         assert_eq!(config.project_dir, PathBuf::from("planning/projects"));
         assert_eq!(config.ticket_dir, PathBuf::from("planning/tickets"));
     }
@@ -770,8 +774,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
-        let error = Config::load(&project).unwrap_err().to_string();
+        let repository = Repository::discover(root.path()).unwrap();
+        let error = Config::load(&repository).unwrap_err().to_string();
         assert!(error.contains("project_dir"), "{error}");
         assert!(error.contains("repository-relative"), "{error}");
 
@@ -780,7 +784,7 @@ mod tests {
             "version: 1\nproject_dir: planning/projects\nticket_dir: ../tickets\n",
         )
         .unwrap();
-        let error = Config::load(&project).unwrap_err().to_string();
+        let error = Config::load(&repository).unwrap_err().to_string();
         assert!(error.contains("ticket_dir"), "{error}");
         assert!(error.contains("repository root"), "{error}");
     }
@@ -795,9 +799,9 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
+        let repository = Repository::discover(root.path()).unwrap();
         assert_eq!(
-            Config::load(&project).unwrap().worktree_dir,
+            Config::load(&repository).unwrap().worktree_dir,
             PathBuf::from("build/agent-worktrees")
         );
     }
@@ -812,8 +816,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
-        let error = Config::load(&project).unwrap_err().to_string();
+        let repository = Repository::discover(root.path()).unwrap();
+        let error = Config::load(&repository).unwrap_err().to_string();
         assert!(error.contains("worktree_dir"), "{error}");
         assert!(error.contains("repository-relative"), "{error}");
     }
@@ -828,8 +832,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
-        let error = Config::load(&project).unwrap_err().to_string();
+        let repository = Repository::discover(root.path()).unwrap();
+        let error = Config::load(&repository).unwrap_err().to_string();
         assert!(error.contains("worktree_dir"), "{error}");
         assert!(error.contains("repository root"), "{error}");
     }
@@ -853,8 +857,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
-        let agent = Config::load(&project).unwrap().agent.unwrap();
+        let repository = Repository::discover(root.path()).unwrap();
+        let agent = Config::load(&repository).unwrap().agent.unwrap();
         assert_eq!(agent.default_target, "claude");
         assert_eq!(agent.targets.len(), 2);
         assert_eq!(agent.targets["codex"][0], "codex");
@@ -870,8 +874,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
-        let error = Config::load(&project).unwrap_err().to_string();
+        let repository = Repository::discover(root.path()).unwrap();
+        let error = Config::load(&repository).unwrap_err().to_string();
         assert!(error.contains("agent.default_target `missing`"), "{error}");
         assert!(error.contains("agent.targets"), "{error}");
     }
@@ -886,8 +890,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
-        let error = Config::load(&project).unwrap_err().to_string();
+        let repository = Repository::discover(root.path()).unwrap();
+        let error = Config::load(&repository).unwrap_err().to_string();
         assert!(error.contains("agent.targets.fake.cmd"), "{error}");
         assert!(error.contains("must name a command"), "{error}");
     }
@@ -903,8 +907,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
-        let error = Config::load(&project).unwrap_err().to_string();
+        let repository = Repository::discover(root.path()).unwrap();
+        let error = Config::load(&repository).unwrap_err().to_string();
         assert!(
             error.contains("agent.targets.missing_prompt.cmd"),
             "{error}"
@@ -917,7 +921,7 @@ mod tests {
             "version: 1\nagent:\n  default_target: duplicate_prompt\n  targets:\n    duplicate_prompt:\n      cmd: [agent, '{prompt}', 'again={prompt}']\n",
         )
         .unwrap();
-        let error = Config::load(&project).unwrap_err().to_string();
+        let error = Config::load(&repository).unwrap_err().to_string();
         assert!(
             error.contains("agent.targets.duplicate_prompt.cmd"),
             "{error}"
@@ -936,8 +940,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
-        let error = Config::load(&project).unwrap_err().to_string();
+        let repository = Repository::discover(root.path()).unwrap();
+        let error = Config::load(&repository).unwrap_err().to_string();
         assert!(error.contains("agent.cmd has been removed"), "{error}");
         assert!(error.contains("agent.default_target"), "{error}");
         assert!(error.contains("agent.targets"), "{error}");
@@ -952,8 +956,8 @@ mod tests {
             "version: 1\n",
         )
         .unwrap();
-        let project = Project::discover(root.path()).unwrap();
-        let defaults = Config::load(&project).unwrap();
+        let repository = Repository::discover(root.path()).unwrap();
+        let defaults = Config::load(&repository).unwrap();
         assert_eq!(defaults.ticket_prefix, "TICK");
         assert_eq!(defaults.project_prefix, "PROJ");
 
@@ -962,7 +966,7 @@ mod tests {
             "version: 1\nids:\n  ticket_prefix: WORK\n  project_prefix: TEAM\n",
         )
         .unwrap();
-        let configured = Config::load(&project).unwrap();
+        let configured = Config::load(&repository).unwrap();
         assert_eq!(configured.ticket_prefix, "WORK");
         assert_eq!(configured.project_prefix, "TEAM");
     }
@@ -977,8 +981,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
-        let error = Config::load(&project).unwrap_err().to_string();
+        let repository = Repository::discover(root.path()).unwrap();
+        let error = Config::load(&repository).unwrap_err().to_string();
         assert!(error.contains("ids.ticket_prefix"), "{error}");
         assert!(error.contains("non-empty"), "{error}");
     }
@@ -993,8 +997,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
-        let hours = Config::load(&project).unwrap().running_hours.unwrap();
+        let repository = Repository::discover(root.path()).unwrap();
+        let hours = Config::load(&repository).unwrap().running_hours.unwrap();
         assert!(!hours.is_open(8 * 60 + 59));
         assert!(hours.is_open(9 * 60));
         assert!(hours.is_open(16 * 60 + 59));
@@ -1011,8 +1015,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
-        let hours = Config::load(&project).unwrap().running_hours.unwrap();
+        let repository = Repository::discover(root.path()).unwrap();
+        let hours = Config::load(&repository).unwrap().running_hours.unwrap();
         assert!(hours.is_open(23 * 60));
         assert!(hours.is_open(5 * 60 + 59));
         assert!(!hours.is_open(6 * 60));
@@ -1029,9 +1033,9 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
+        let repository = Repository::discover(root.path()).unwrap();
         assert!(matches!(
-            Config::load(&project),
+            Config::load(&repository),
             Err(ConfigError::Invalid { .. })
         ));
     }
@@ -1061,9 +1065,9 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
+        let repository = Repository::discover(root.path()).unwrap();
         assert!(matches!(
-            Config::load(&project),
+            Config::load(&repository),
             Err(ConfigError::UnsupportedVersion { version: 2, .. })
         ));
     }
@@ -1088,19 +1092,19 @@ mod tests {
         let config_path = root.path().join(".agents/sloop/config.yaml");
 
         fs::write(&config_path, "version: 1\n").unwrap();
-        let project = Project::discover(root.path()).unwrap();
-        let config = Config::load(&project).unwrap();
+        let repository = Repository::discover(root.path()).unwrap();
+        let config = Config::load(&repository).unwrap();
         assert_eq!(
             config.delete_missing_after_ms,
             super::DEFAULT_DELETE_MISSING_AFTER_MS
         );
 
         fs::write(&config_path, "version: 1\ndelete_missing_after: 7d\n").unwrap();
-        let config = Config::load(&project).unwrap();
+        let config = Config::load(&repository).unwrap();
         assert_eq!(config.delete_missing_after_ms, 7 * 24 * 60 * 60 * 1000);
 
         fs::write(&config_path, "version: 1\ndelete_missing_after: soon\n").unwrap();
-        let error = Config::load(&project).unwrap_err();
+        let error = Config::load(&repository).unwrap_err();
         assert!(
             error.to_string().contains("delete_missing_after"),
             "{error}"
@@ -1117,8 +1121,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
-        let config = Config::load(&project).unwrap();
+        let repository = Repository::discover(root.path()).unwrap();
+        let config = Config::load(&repository).unwrap();
         assert_eq!(config.default_flow, "default");
         assert_eq!(
             config.flows["default"]
@@ -1140,8 +1144,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
-        let config = Config::load(&project).unwrap();
+        let repository = Repository::discover(root.path()).unwrap();
+        let config = Config::load(&repository).unwrap();
         let flow = &config.flows["default"];
         assert_eq!(
             flow.stages
@@ -1167,8 +1171,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
-        let config = Config::load(&project).unwrap();
+        let repository = Repository::discover(root.path()).unwrap();
+        let config = Config::load(&repository).unwrap();
         assert_eq!(
             config.flows["default"]
                 .stages
@@ -1194,8 +1198,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = Project::discover(root.path()).unwrap();
-        let error = Config::load(&project).unwrap_err().to_string();
+        let repository = Repository::discover(root.path()).unwrap();
+        let error = Config::load(&repository).unwrap_err().to_string();
         assert!(error.contains("broken.yaml"), "{error}");
         assert!(error.contains("non-empty `cmd`"), "{error}");
     }

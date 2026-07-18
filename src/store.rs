@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+use crate::domain::ticket::TicketState;
+
 pub const SCHEMA_VERSION: u32 = 8;
 
 const CONNECTION_PRAGMAS: &str = "
@@ -179,29 +181,6 @@ SELECT 'run', COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) + 1 FROM runs;
 INSERT OR IGNORE INTO id_counters (kind, next_ordinal)
 SELECT 'note', COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) + 1 FROM notes;
 ";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TicketState {
-    Ready,
-    Held,
-    Claimed,
-    Merged,
-    Failed,
-    NeedsReview,
-}
-
-impl TicketState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ready => "ready",
-            Self::Held => "held",
-            Self::Claimed => "claimed",
-            Self::Merged => "merged",
-            Self::Failed => "failed",
-            Self::NeedsReview => "needs_review",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
@@ -1525,14 +1504,7 @@ impl Store {
         }
         transaction.execute("DELETE FROM leases WHERE run_id = ?1", params![run_id])?;
 
-        let ticket_state = match outcome {
-            Outcome::Merged => TicketState::Merged,
-            Outcome::Failed => TicketState::Failed,
-            Outcome::NeedsReview => TicketState::NeedsReview,
-            Outcome::Cancelled => TicketState::Ready,
-            Outcome::RateLimited => TicketState::Ready,
-            Outcome::Orphaned => TicketState::Ready,
-        };
+        let ticket_state = TicketState::after_outcome(outcome);
         transaction.execute(
             "UPDATE tickets SET state = ?2, updated_at_ms = ?3
              WHERE id = ?1 AND state = 'claimed'",
@@ -2500,9 +2472,8 @@ impl std::error::Error for StoreError {}
 mod tests {
     use tempfile::tempdir;
 
-    use super::{
-        ActivationKind, ClaimRequest, ExitClaim, NewActivation, Store, StoreError, TicketState,
-    };
+    use super::{ActivationKind, ClaimRequest, ExitClaim, NewActivation, Store, StoreError};
+    use crate::domain::ticket::TicketState;
     use crate::outcome::Outcome;
 
     fn open_seeded(path: &std::path::Path) -> Store {
