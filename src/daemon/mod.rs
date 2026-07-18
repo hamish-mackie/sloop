@@ -2460,12 +2460,36 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
             "started": false
         }),
         Request::Post(args) => {
+            let now_ms = state.clock.now_ms();
+            let at_eligible_ms = match &args.activation {
+                crate::protocol::PostActivation::At { time } => {
+                    let Some(minute) = parse_local_time(time) else {
+                        return ResponseEnvelope::failure(
+                            Some(id),
+                            invalid_arguments(&format!(
+                                "time `{time}` must use a valid HH:MM value"
+                            )),
+                        );
+                    };
+                    let Some(eligible_at_ms) =
+                        next_local_minute_ms(state.clock.as_ref(), now_ms, minute)
+                    else {
+                        return ResponseEnvelope::failure(
+                            Some(id),
+                            invalid_arguments("the requested local time is out of range"),
+                        );
+                    };
+                    Some(eligible_at_ms)
+                }
+                _ => None,
+            };
             match crate::post::handle(
                 &state.root,
                 &state.ticket_dir,
                 &state.store,
                 &args,
-                state.clock.now_ms(),
+                now_ms,
+                at_eligible_ms,
                 &state.ticket_prefix,
                 state.agent.as_ref(),
                 &state.flows,
@@ -3165,8 +3189,7 @@ fn post_error_body(error: &crate::post::PostError) -> ErrorBody {
         | PostError::InvalidBlockedBy { .. }
         | PostError::EmptyBody { .. }
         | PostError::UnknownTarget(_)
-        | PostError::MissingTargetValue { .. }
-        | PostError::TimedActivationUnimplemented => ErrorCode::InvalidArguments,
+        | PostError::MissingTargetValue { .. } => ErrorCode::InvalidArguments,
         PostError::ProjectConflict { .. }
         | PostError::FlowConflict { .. }
         | PostError::TicketIdTaken { .. }

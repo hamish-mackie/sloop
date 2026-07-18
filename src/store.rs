@@ -1889,6 +1889,24 @@ impl Store {
         Ok(id)
     }
 
+    /// Moves a still-queued timed activation to a new eligibility instant,
+    /// so reposting a ticket with a different `--at` time reschedules the
+    /// existing activation instead of queueing a duplicate.
+    pub fn reschedule_activation(
+        &self,
+        id: &str,
+        eligible_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE activations
+             SET eligible_at_ms = ?2, updated_at_ms = ?3
+             WHERE id = ?1 AND state = 'queued'",
+            params![id, eligible_at_ms, now_ms],
+        )?;
+        Ok(())
+    }
+
     /// Reserves the next activation ordinal without reusing IDs removed by
     /// reindex.
     pub fn next_activation_ordinal(&self) -> Result<i64, StoreError> {
