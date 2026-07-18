@@ -184,7 +184,6 @@ SELECT 'note', COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) + 1 FROM notes;
 pub enum TicketState {
     Ready,
     Held,
-    Blocked,
     Claimed,
     Merged,
     Failed,
@@ -196,7 +195,6 @@ impl TicketState {
         match self {
             Self::Ready => "ready",
             Self::Held => "held",
-            Self::Blocked => "blocked",
             Self::Claimed => "claimed",
             Self::Merged => "merged",
             Self::Failed => "failed",
@@ -1377,6 +1375,19 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    pub fn unmerged_blockers(&self, ticket_id: &str) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT b.blocker_id FROM ticket_blockers b
+             JOIN tickets bt ON bt.id = b.blocker_id
+             WHERE b.ticket_id = ?1 AND bt.state != 'merged'
+             ORDER BY b.position, b.blocker_id",
+        )?;
+        statement
+            .query_map(params![ticket_id], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     /// Returns the next run ordinal. A successful claim advances the durable
     /// high-water counter so IDs and output paths cannot be reused.
     pub fn next_run_ordinal(&self) -> Result<i64, StoreError> {
@@ -1973,7 +1984,16 @@ impl Store {
         if changed != 1 {
             let state: Option<String> = transaction
                 .query_row(
-                    "SELECT CASE WHEN missing_at_ms IS NOT NULL THEN 'missing' ELSE state END
+                    "SELECT CASE
+                              WHEN missing_at_ms IS NOT NULL THEN 'missing'
+                              WHEN state = 'ready' AND EXISTS (
+                                  SELECT 1 FROM ticket_blockers b
+                                  JOIN tickets bt ON bt.id = b.blocker_id
+                                  WHERE b.ticket_id = tickets.id
+                                    AND bt.state != 'merged'
+                              ) THEN 'blocked'
+                              ELSE state
+                            END
                      FROM tickets WHERE id = ?1",
                     params![claim.ticket_id],
                     |row| row.get(0),
@@ -2113,9 +2133,19 @@ impl Store {
     }
 
     pub fn ticket_counts(&self) -> Result<TicketCounts, StoreError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT state, COUNT(*) FROM tickets GROUP BY state")?;
+        let mut statement = self.connection.prepare(
+            "SELECT CASE
+                      WHEN t.state = 'ready' AND EXISTS (
+                          SELECT 1 FROM ticket_blockers b
+                          JOIN tickets bt ON bt.id = b.blocker_id
+                          WHERE b.ticket_id = t.id AND bt.state != 'merged'
+                      ) THEN 'blocked'
+                      ELSE t.state
+                    END AS display_state,
+                    COUNT(*)
+             FROM tickets t
+             GROUP BY display_state",
+        )?;
         let mut rows = statement.query([])?;
         let mut counts = TicketCounts::default();
         while let Some(row) = rows.next()? {
@@ -2382,6 +2412,82 @@ mod tests {
             store.select_ready_ticket(&activation).unwrap().as_deref(),
             Some("T1")
         );
+    }
+
+    #[test]
+    fn blockers_gate_selection_claims_and_derived_counts_until_merged() {
+        let directory = tempdir().unwrap();
+        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        store
+            .insert_local_ticket(
+                "T2",
+                "default",
+                ".agents/sloop/tickets/t2.md",
+                "Ticket two",
+                &["T1".into()],
+                "sloop/T2",
+                Some("claude"),
+                None,
+                None,
+                "default",
+                TicketState::Ready,
+                1_500,
+            )
+            .unwrap();
+        let activation = super::QueuedActivation {
+            id: "A1".into(),
+            kind: "immediate".into(),
+            ticket_id: None,
+            project_id: None,
+            eligible_at_ms: None,
+            interval_ms: None,
+        };
+
+        assert_eq!(store.unmerged_blockers("T2").unwrap(), ["T1"]);
+        assert_eq!(
+            store.select_ready_ticket(&activation).unwrap().as_deref(),
+            Some("T1")
+        );
+        assert_eq!(store.ticket_counts().unwrap().blocked, 1);
+
+        store
+            .connection
+            .execute("UPDATE tickets SET state = 'failed' WHERE id = 'T1'", [])
+            .unwrap();
+        assert_eq!(store.select_ready_ticket(&activation).unwrap(), None);
+        match store
+            .claim_ticket(
+                &ClaimRequest {
+                    ticket_id: "T2",
+                    run_id: "R2",
+                    activation_id: "A1",
+                    owner_id: "daemon-1",
+                    lease_ms: 60_000,
+                    next_activation_eligible_at_ms: None,
+                },
+                2_000,
+            )
+            .unwrap_err()
+        {
+            StoreError::TicketNotReady { state, .. } => {
+                assert_eq!(state.as_deref(), Some("blocked"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(store.ticket("T2").unwrap().unwrap().attempts, 0);
+
+        store
+            .connection
+            .execute("UPDATE tickets SET state = 'merged' WHERE id = 'T1'", [])
+            .unwrap();
+        assert!(store.unmerged_blockers("T2").unwrap().is_empty());
+        assert_eq!(
+            store.select_ready_ticket(&activation).unwrap().as_deref(),
+            Some("T2")
+        );
+        let counts = store.ticket_counts().unwrap();
+        assert_eq!(counts.ready, 1);
+        assert_eq!(counts.blocked, 0);
     }
 
     #[test]

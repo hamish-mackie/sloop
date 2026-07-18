@@ -82,6 +82,28 @@ fn post_manual(world: &World, name: &str, body: &str) -> String {
         .to_owned()
 }
 
+fn post_manual_blocked(world: &World, name: &str, blockers: &[&str]) -> String {
+    let ticket = Path::new(".agents/sloop/tickets").join(name);
+    fs::write(
+        world.root().join(&ticket),
+        format!(
+            "---\nname: blocked dependent\nblocked_by: [{}]\n---\n# Blocked dependent\n",
+            blockers.join(", ")
+        ),
+    )
+    .unwrap();
+    let output = world.sloop(&["post", ticket.to_str().unwrap(), "--manual"]);
+    assert!(
+        output.status.success(),
+        "post failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    World::json_stdout(&output)["data"]["ticket"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
 fn worktree_marker(world: &World, run: &str) -> std::path::PathBuf {
     world
         .root()
@@ -384,6 +406,96 @@ fn list_explains_paused_failed_held_and_claimed_tickets() {
     )));
     assert!(human.contains(&format!("{held} held (default) held — held by operator")));
     assert!(human.contains(&format!("{claimed} claimed (default) claimed")));
+}
+
+#[test]
+fn blocked_dependencies_are_reported_and_release_after_every_blocker_merges() {
+    let world = World::configured();
+    configure_fake_agent(&world, 1, false);
+    world.commit_all("initial");
+    world.start_daemon();
+
+    let first = post_manual(&world, "first-blocker.md", "# First blocker\n");
+    let second = post_manual(&world, "second-blocker.md", "# Second blocker\n");
+    let dependent = post_manual_blocked(&world, "dependent.md", &[first.as_str(), second.as_str()]);
+    assert!(world.sloop(&["hold", &first]).status.success());
+    assert!(world.sloop(&["hold", &second]).status.success());
+
+    // An unscoped activation has no dispatchable ticket while both blockers
+    // are held, and a named activation cannot bypass the dependency gate.
+    assert!(world.sloop(&["run"]).status.success());
+    assert!(world.sloop(&["run", &dependent]).status.success());
+    let snapshot = status(&world);
+    assert_eq!(snapshot["gate"]["active_agents"], 0);
+    assert_eq!(snapshot["tickets"]["held"], 2);
+    assert_eq!(snapshot["tickets"]["ready"], 0);
+    assert_eq!(snapshot["tickets"]["blocked"], 1);
+    assert_eq!(snapshot["queued_activations"].as_array().unwrap().len(), 2);
+
+    let listed = World::json_stdout(&world.sloop(&["list"]));
+    let row = listed["data"]["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ticket| ticket["id"] == dependent)
+        .unwrap();
+    assert_eq!(row["state"], "blocked");
+    assert_eq!(
+        row["reason"],
+        format!("blocked by unmerged {first}, {second}")
+    );
+
+    // The old unscoped activation takes the first released blocker.
+    assert!(world.sloop(&["ready", &first]).status.success());
+    wait_until("the first blocker merges", || {
+        status(&world)["tickets"]["merged"] == 1
+    });
+    let listed = World::json_stdout(&world.sloop(&["list"]));
+    let row = listed["data"]["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ticket| ticket["id"] == dependent)
+        .unwrap();
+    assert_eq!(row["reason"], format!("blocked by unmerged {second}"));
+
+    assert!(world.sloop(&["ready", &second]).status.success());
+    assert!(world.sloop(&["run", &second]).status.success());
+    wait_until("the dependent runs after its last blocker merges", || {
+        worktree_marker(&world, "R3").is_file()
+    });
+    assert_eq!(
+        fs::read_to_string(worktree_marker(&world, "R3"))
+            .unwrap()
+            .trim(),
+        dependent
+    );
+    wait_until("all dependency-chain tickets merge", || {
+        status(&world)["tickets"]["merged"] == 3
+    });
+}
+
+#[test]
+fn a_failed_blocker_keeps_its_dependent_blocked() {
+    let world = World::configured();
+    configure_failing_fake_agent(&world, 1, false);
+    world.commit_all("initial");
+    world.start_daemon();
+
+    let blocker = post_manual(&world, "failing-blocker.md", "# Failing blocker\n");
+    let dependent = post_manual_blocked(&world, "failed-dependent.md", &[blocker.as_str()]);
+    assert!(world.sloop(&["run", &blocker]).status.success());
+    wait_until("the blocker fails", || {
+        status(&world)["tickets"]["failed"] == 1
+    });
+
+    assert!(world.sloop(&["run", &dependent]).status.success());
+    let snapshot = status(&world);
+    assert_eq!(snapshot["gate"]["active_agents"], 0);
+    assert_eq!(snapshot["tickets"]["failed"], 1);
+    assert_eq!(snapshot["tickets"]["blocked"], 1);
+    assert_eq!(snapshot["queued_activations"].as_array().unwrap().len(), 1);
+    assert!(!worktree_marker(&world, "R2").exists());
 }
 
 #[test]
