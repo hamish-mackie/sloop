@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use tokio::sync::mpsc;
 
+use crate::coordination::{Claim, Coordination};
 use crate::flow::Flow;
 use crate::frontmatter::Frontmatter;
 use crate::ids::next_id;
 use crate::logging::{LogLevel, OperationalLog};
-use crate::store::{ClaimRequest, QueuedActivation, Store, StoreError};
+use crate::store::{ClaimRequest, QueuedActivation, Store};
 
 use super::aftercare::gather_exit_evidence;
 use super::dispatcher::{
@@ -301,10 +302,10 @@ pub(super) fn reconcile(
             );
             continue;
         }
-        let claimed = match state.store.claim_ticket(&claim, now_ms) {
-            Ok(claimed) => claimed,
+        let claimed = match Coordination::new(&mut state.store).claim(&claim, now_ms) {
+            Ok(Claim::Granted(claimed)) => claimed,
             // Not ready right now; the activation stays queued for later.
-            Err(StoreError::TicketNotReady { .. }) => continue,
+            Ok(Claim::Denied(_)) => continue,
             Err(error) => {
                 mark_storage_full(state, &error);
                 log.emit_with_fields(
@@ -327,7 +328,9 @@ pub(super) fn reconcile(
         let flow = match bound_flow(&state.store, &state.flows, &ticket_id) {
             Ok(flow) => flow,
             Err(error) => {
-                if let Err(abort_error) = state.store.abort_claim(&run_id, &ticket_id, now_ms) {
+                if let Err(abort_error) =
+                    Coordination::new(&mut state.store).abandon(&run_id, &ticket_id, now_ms)
+                {
                     mark_storage_full(state, &abort_error);
                     log.emit_with_fields(
                         LogLevel::Error,
@@ -489,11 +492,11 @@ pub(super) fn reconcile(
                 if let Some(store_error) = error.store_error() {
                     mark_storage_full(state, store_error);
                 }
-                if let Err(abort_error) =
-                    state
-                        .store
-                        .abort_claim(&run_id, &ticket_id, state.clock.now_ms())
-                {
+                if let Err(abort_error) = Coordination::new(&mut state.store).abandon(
+                    &run_id,
+                    &ticket_id,
+                    state.clock.now_ms(),
+                ) {
                     mark_storage_full(state, &abort_error);
                     log.emit_with_fields(
                         LogLevel::Error,
