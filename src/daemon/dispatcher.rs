@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::clock::{Clock, format_timestamp, next_local_minute_ms};
 use crate::config::{AgentConfig, RunningHours, parse_local_time};
+use crate::coordination::Coordination;
 use crate::flow::Flow;
 use crate::logging::{LogLevel, OperationalLog};
 use crate::outcome::{MergeOutcome, RunEvidence, classify_exit, derive_outcome};
@@ -337,7 +338,7 @@ fn try_settle_run_exit(
             until_ms,
             reason: &error.diagnostic,
         });
-    state.store.finish_run(
+    Coordination::new(&mut state.store).settle(
         run_id,
         &ticket_id,
         *exit_code,

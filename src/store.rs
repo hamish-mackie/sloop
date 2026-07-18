@@ -1454,7 +1454,7 @@ impl Store {
     /// freed, and the ticket moves to its terminal state or back to `ready`
     /// when cancellation or recovery releases it.
     #[allow(clippy::too_many_arguments)]
-    pub fn finish_run(
+    pub(crate) fn finish_run(
         &mut self,
         run_id: &str,
         ticket_id: &str,
@@ -1861,7 +1861,7 @@ impl Store {
     /// Rolls back a claim whose launch failed before a process existed: the
     /// lease is released, the run is closed, and the ticket returns to
     /// `ready`. The consumed attempt is kept as evidence of the try.
-    pub fn abort_claim(
+    pub(crate) fn abort_claim(
         &mut self,
         run_id: &str,
         ticket_id: &str,
@@ -2071,7 +2071,7 @@ impl Store {
     /// Claims a ready ticket for one run in a single transaction. The
     /// conditional update plus the primary key on `leases.ticket_id` are the
     /// durable guards against a double claim.
-    pub fn claim_ticket(
+    pub(crate) fn claim_ticket(
         &mut self,
         claim: &ClaimRequest<'_>,
         now_ms: i64,
@@ -2191,7 +2191,7 @@ impl Store {
     /// expiry. Renewal is strict: an expired lease cannot be renewed, so once
     /// recovery treats expiry as "run is lost" a revived run can never
     /// resurrect a lease that recovery may be reclaiming.
-    pub fn renew_lease(
+    pub(crate) fn renew_lease(
         &mut self,
         ticket_id: &str,
         run_id: &str,
