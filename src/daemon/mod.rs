@@ -489,6 +489,7 @@ async fn serve(
         reconciliation_blocked: false,
         active: HashSet::new(),
         supervised: HashSet::new(),
+        suspected_dead: HashSet::new(),
         recovering: HashSet::new(),
         cancelling: HashSet::new(),
         worker_tokens: HashMap::new(),
@@ -729,6 +730,10 @@ struct DispatcherState {
     active: HashSet<String>,
     /// Run IDs whose normal or re-adopted supervisor still owns execution.
     supervised: HashSet<String>,
+    /// Supervised run IDs observed dead once. A second consecutive observation
+    /// starts recovery, leaving the normal supervisor one interval to finish
+    /// draining output and claim the durable exit handoff.
+    suspected_dead: HashSet<String>,
     /// Run IDs with a recovery task in flight. The entry remains until final
     /// settlement so a normal supervisor racing recovery cannot duplicate it.
     recovering: HashSet<String>,
@@ -877,6 +882,7 @@ fn settle_pending_exits(state: &mut DispatcherState, log: &OperationalLog) {
                 state.cancelling.remove(&run_id);
                 state.active.remove(&run_id);
                 state.supervised.remove(&run_id);
+                state.suspected_dead.remove(&run_id);
                 state.recovering.remove(&run_id);
                 close_worker_socket(state, &run_id);
                 log.emit_with_fields(
@@ -1025,9 +1031,9 @@ fn close_worker_socket(state: &mut DispatcherState, run_id: &str) {
     let _ = fs::remove_file(socket_path);
 }
 
-/// Classifies every durable lease before normal dispatch. Matching processes
-/// consume capacity and are monitored by identity; dead or reused PIDs are
-/// settled from the work preserved in their branches.
+/// Classifies every durable lease before normal dispatch. Processes that are
+/// live or cannot be disproved consume capacity and are monitored by identity;
+/// dead or reused PIDs are settled from the work preserved in their branches.
 fn recover_inflight_runs(
     state: &mut DispatcherState,
     events: &mpsc::Sender<RunEvent>,
@@ -1038,43 +1044,46 @@ fn recover_inflight_runs(
         // Every durable lease consumes capacity until adoption or settlement
         // succeeds; a transient database error must never permit double-spawn.
         state.active.insert(run.id.clone());
-        if recoverable_process_matches(&run) {
-            state.supervised.insert(run.id.clone());
-            let cancellation_requested = state
-                .store
-                .cancellation_requested(&run.id)
-                .map_err(DaemonError::Store)?;
-            if cancellation_requested {
-                state.cancelling.insert(run.id.clone());
-                if recoverable_process_matches(&run)
-                    && let Some(group) = run.process_group_id
-                {
-                    unsafe {
-                        libc::kill(-(group as libc::pid_t), libc::SIGKILL);
+        match recoverable_process_identity(&run) {
+            ProcessIdentity::Matches | ProcessIdentity::Unverifiable => {
+                state.supervised.insert(run.id.clone());
+                let cancellation_requested = state
+                    .store
+                    .cancellation_requested(&run.id)
+                    .map_err(DaemonError::Store)?;
+                if cancellation_requested {
+                    state.cancelling.insert(run.id.clone());
+                    if recoverable_process_matches(&run)
+                        && let Some(group) = run.process_group_id
+                    {
+                        unsafe {
+                            libc::kill(-(group as libc::pid_t), libc::SIGKILL);
+                        }
                     }
                 }
-            }
-            if let Err(error) = restore_worker_socket(state, &run) {
+                if let Err(error) = restore_worker_socket(state, &run) {
+                    log.emit_with_fields(
+                        LogLevel::Error,
+                        "sloop::recovery",
+                        "worker_socket_restore_failed",
+                        json!({"run_id": run.id, "error": error}),
+                    );
+                }
+                monitor_recovered_run(state, events.clone(), run.clone());
                 log.emit_with_fields(
-                    LogLevel::Error,
+                    LogLevel::Info,
                     "sloop::recovery",
-                    "worker_socket_restore_failed",
-                    json!({"run_id": run.id, "error": error}),
+                    "run_readopted",
+                    json!({"run_id": run.id, "ticket_id": run.ticket_id}),
                 );
             }
-            monitor_recovered_run(state, events.clone(), run.clone());
-            log.emit_with_fields(
-                LogLevel::Info,
-                "sloop::recovery",
-                "run_readopted",
-                json!({"run_id": run.id, "ticket_id": run.ticket_id}),
-            );
-        } else {
-            state.recovering.insert(run.id.clone());
-            if run.state == "aftercare" {
-                spawn_aftercare_recovery(state, events.clone(), run, log.clone())?;
-            } else {
-                spawn_dead_run_recovery(state, events.clone(), run, log.clone());
+            ProcessIdentity::GoneOrReused => {
+                state.recovering.insert(run.id.clone());
+                if run.state == "aftercare" {
+                    spawn_aftercare_recovery(state, events.clone(), run, log.clone())?;
+                } else {
+                    spawn_dead_run_recovery(state, events.clone(), run, log.clone());
+                }
             }
         }
     }
@@ -1290,8 +1299,12 @@ fn reconcile_run_liveness(
             continue;
         }
         match recoverable_process_identity(&run) {
-            ProcessIdentity::Matches => continue,
+            ProcessIdentity::Matches => {
+                state.suspected_dead.remove(&run.id);
+                continue;
+            }
             ProcessIdentity::Unverifiable => {
+                state.suspected_dead.remove(&run.id);
                 log.emit_with_fields(
                     LogLevel::Info,
                     "sloop::recovery",
@@ -1301,6 +1314,16 @@ fn reconcile_run_liveness(
                 continue;
             }
             ProcessIdentity::GoneOrReused => {}
+        }
+
+        if state.supervised.contains(&run.id) && state.suspected_dead.insert(run.id.clone()) {
+            log.emit_with_fields(
+                LogLevel::Info,
+                "sloop::recovery",
+                "supervised_run_exit_observed",
+                json!({"run_id": run.id}),
+            );
+            continue;
         }
 
         state.recovering.insert(run.id.clone());
@@ -1320,6 +1343,7 @@ fn reconcile_run_liveness(
             spawn_dead_run_recovery(state, events.clone(), run, log.clone());
         }
     }
+    wait_for_test_hook("after-run-liveness-reconciliation");
 }
 
 fn recovered_exit_event(
@@ -2159,6 +2183,18 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
             return;
         }
     };
+
+    // A durable lease missing from memory must consume capacity before the
+    // dispatcher can use an apparently free slot. The periodic pass remains
+    // responsible for idle reconciliation; this extra scan only runs when a
+    // queued activation could otherwise spawn now.
+    if !activations.is_empty() && state.active.len() < state.max_agents {
+        wait_for_test_hook("before-spawn-capacity-reconciliation");
+        reconcile_run_liveness(state, events, log);
+        if state.reconciliation_blocked {
+            return;
+        }
+    }
 
     for activation in activations {
         if state.active.len() >= state.max_agents {
@@ -3435,6 +3471,7 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
                     );
                 }
             };
+            let active_agents = runs.len();
             let queued: Vec<_> = match state.store.queued_activations() {
                 Ok(activations) => activations
                     .into_iter()
@@ -3456,7 +3493,7 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
             };
             let now_ms = state.clock.now_ms();
             let mut gate = json!({
-                "active_agents": state.active.len(),
+                "active_agents": active_agents,
                 "max_agents": state.max_agents,
                 "capacity_reconciled": !state.reconciliation_blocked,
                 "storage": {
@@ -3582,12 +3619,13 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
 
 fn handle_list(state: &DispatcherState) -> Result<serde_json::Value, ErrorBody> {
     let now_ms = state.clock.now_ms();
+    let at_capacity = lookup(state, Store::active_runs)?.len() >= state.max_agents;
     let gates = crate::eligibility::Gates {
         paused: state.paused,
         storage_writable: !state.storage_full.get() && !state.reconciliation_blocked,
         agent_configured: state.agent.is_some(),
         hours_open: running_hours_open(state, now_ms),
-        at_capacity: state.active.len() >= state.max_agents,
+        at_capacity,
         has_queued_activation: !lookup(state, Store::queued_activations)?.is_empty(),
     };
     let mut rows = Vec::new();

@@ -1945,10 +1945,12 @@ impl Store {
         let run = self
             .connection
             .query_row(
-                "SELECT id FROM runs
-                 WHERE ticket_id = ?1 AND state IN ('claimed', 'running', 'aftercare')
-                   AND exited_at_ms IS NULL
-                 ORDER BY created_at_ms DESC, id DESC LIMIT 1",
+                "SELECT r.id FROM runs r
+                 JOIN leases l ON l.run_id = r.id
+                 WHERE r.ticket_id = ?1
+                   AND r.state IN ('claimed', 'running', 'aftercare')
+                   AND r.exited_at_ms IS NULL
+                 ORDER BY r.created_at_ms DESC, r.id DESC LIMIT 1",
                 params![ticket_id],
                 |row| row.get(0),
             )
@@ -1956,12 +1958,14 @@ impl Store {
         Ok(run)
     }
 
-    /// Runs that have started and not yet exited, oldest first.
+    /// Leased nonterminal runs that consume capacity, oldest first.
     pub fn active_runs(&self) -> Result<Vec<ActiveRun>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT r.id, r.ticket_id, t.project_id, r.state FROM runs r
+             JOIN leases l ON l.run_id = r.id
              JOIN tickets t ON t.id = r.ticket_id
-             WHERE r.exited_at_ms IS NULL AND r.state IN ('running', 'aftercare')
+             WHERE r.exited_at_ms IS NULL
+               AND r.state IN ('claimed', 'running', 'aftercare')
              ORDER BY r.created_at_ms, r.id",
         )?;
         let runs = statement

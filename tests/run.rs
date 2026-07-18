@@ -1038,6 +1038,47 @@ fn restart_readopts_a_matching_live_process_until_it_exits() {
 }
 
 #[test]
+fn restart_does_not_orphan_a_live_process_with_unverifiable_identity() {
+    let world = World::configured();
+    world.configure_fake_agent(FakeAgent::new().block_until_released("unverifiable-recovery"));
+    let ticket = world.write_ticket("unverifiable-recovery.md", "# Recovery\nwork\n");
+    world.commit_all("seed");
+    let daemon_pid = world.start_daemon()["data"]["pid"]
+        .as_u64()
+        .expect("daemon pid") as u32;
+    let posted = world.sloop(&["post", ticket.to_str().unwrap(), "--auto"]);
+    assert!(posted.status.success());
+    wait_until("the agent reaches its blocking point", || {
+        world.fake_agent_reached("unverifiable-recovery")
+    });
+    let agent_pid = world.run_process_id("R1");
+    rusqlite::Connection::open(world.db_path())
+        .expect("open state database")
+        .execute("UPDATE runs SET pid_start_time = NULL WHERE id = 'R1'", [])
+        .expect("make process identity unverifiable");
+
+    world.kill_daemon(daemon_pid);
+    world.start_daemon();
+
+    let deadline = Instant::now() + Duration::from_millis(2_200);
+    while Instant::now() < deadline {
+        assert!(process_alive(agent_pid));
+        let snapshot = status(&world);
+        assert_eq!(snapshot["gate"]["active_agents"], 1);
+        assert_eq!(snapshot["runs"][0]["state"], "running");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    world.release("unverifiable-recovery");
+    wait_until("the recovered run is settled", || {
+        let snapshot = status(&world);
+        snapshot["gate"]["active_agents"] == 0
+            && snapshot["runs"].as_array().is_some_and(Vec::is_empty)
+            && snapshot["tickets"]["ready"] == 1
+    });
+}
+
+#[test]
 fn restart_orphans_a_dead_process_without_using_commits_as_a_verdict() {
     let world = World::configured();
     world.configure_fake_agent(
@@ -1158,6 +1199,137 @@ fn periodic_reconciliation_treats_a_mismatched_start_time_as_pid_reuse() {
         "reconciliation must not signal a process whose identity mismatches"
     );
     world.kill_process_group(agent_pid);
+}
+
+#[test]
+fn durable_capacity_is_repaired_before_another_agent_can_spawn() {
+    let world = World::configured();
+    world.configure_fake_agent(FakeAgent::new().block_until_released("unexpected-spawn"));
+    let leased_path = world.write_ticket("leased.md", "# Durable lease\nwork\n");
+    let candidate_path = world.write_ticket("candidate.md", "# Candidate\nwork\n");
+    world.commit_all("seed");
+    let daemon_pid = world.start_daemon()["data"]["pid"]
+        .as_u64()
+        .expect("daemon pid") as u32;
+    let leased = world.sloop(&["post", leased_path.to_str().unwrap(), "--manual"]);
+    let candidate = world.sloop(&["post", candidate_path.to_str().unwrap(), "--manual"]);
+    assert!(leased.status.success());
+    assert!(candidate.status.success());
+    let leased_id = World::json_stdout(&leased)["data"]["ticket"]["id"]
+        .as_str()
+        .expect("leased ticket id")
+        .to_owned();
+    let candidate_id = World::json_stdout(&candidate)["data"]["ticket"]["id"]
+        .as_str()
+        .expect("candidate ticket id")
+        .to_owned();
+
+    assert!(world.sloop(&["pause"]).status.success());
+    assert!(world.sloop(&["run", &candidate_id]).status.success());
+
+    let mut connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
+    let transaction = connection.transaction().expect("begin capacity fixture");
+    transaction
+        .execute(
+            "UPDATE tickets SET state = 'claimed', attempts = attempts + 1 WHERE id = ?1",
+            [&leased_id],
+        )
+        .expect("claim durable ticket");
+    transaction
+        .execute(
+            "INSERT INTO activations
+                 (id, kind, state, ticket_id, created_at_ms, updated_at_ms)
+             VALUES ('A-capacity', 'auto', 'completed', ?1, 1, 1)",
+            [&leased_id],
+        )
+        .expect("insert durable activation");
+    transaction
+        .execute(
+            "INSERT INTO runs
+                 (id, activation_id, ticket_id, state, attempt, pid, created_at_ms, updated_at_ms)
+             VALUES ('R-capacity', 'A-capacity', ?1, 'running', 1, ?2, 1, 1)",
+            rusqlite::params![leased_id, i64::from(daemon_pid)],
+        )
+        .expect("insert durable run");
+    transaction
+        .execute(
+            "INSERT INTO leases
+                 (ticket_id, run_id, owner_id, acquired_at_ms, renewed_at_ms, expires_at_ms)
+             VALUES (?1, 'R-capacity', 'lost-dispatcher-state', 1, 1, 9999999999999)",
+            [&leased_id],
+        )
+        .expect("insert durable lease");
+    transaction.commit().expect("commit capacity fixture");
+
+    world.arm_test_hook("before-spawn-capacity-reconciliation");
+    let resume = world.spawn_sloop(&["resume"]);
+    wait_until("the spawn path checks durable capacity", || {
+        world.test_hook_reached("before-spawn-capacity-reconciliation")
+    });
+    let candidate_runs: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM runs WHERE ticket_id = ?1",
+            [&candidate_id],
+            |row| row.get(0),
+        )
+        .expect("count candidate runs");
+    assert_eq!(candidate_runs, 0);
+
+    world.release_test_hook("before-spawn-capacity-reconciliation");
+    let resumed = resume.wait_with_output().expect("wait for resume");
+    assert!(resumed.status.success());
+    wait_until("durable capacity becomes authoritative", || {
+        let snapshot = status(&world);
+        snapshot["gate"]["active_agents"] == 1
+            && snapshot["runs"]
+                .as_array()
+                .is_some_and(|runs| runs.len() == 1 && runs[0]["id"] == "R-capacity")
+    });
+    assert!(!world.fake_agent_reached("unexpected-spawn"));
+}
+
+#[test]
+fn periodic_reconciliation_does_not_duplicate_supervisor_aftercare() {
+    let world = World::configured();
+    world.configure_fake_agent(FakeAgent::new());
+    let ticket = world.write_ticket("single-aftercare.md", "# Single aftercare\nwork\n");
+    world.commit_all("seed");
+    world.arm_test_hook("after-agent-exit-checkpoint");
+    world.start_daemon();
+    let posted = world.sloop(&["post", ticket.to_str().unwrap(), "--auto"]);
+    assert!(posted.status.success());
+    wait_until("the supervisor owns the exit handoff", || {
+        world.test_hook_reached("after-agent-exit-checkpoint")
+    });
+
+    world.arm_test_hook("after-run-liveness-reconciliation");
+    wait_until_slow("reconciliation observes supervisor-owned aftercare", || {
+        world.test_hook_reached("after-run-liveness-reconciliation")
+    });
+    world.release_test_hook("after-run-liveness-reconciliation");
+    world.release_test_hook("after-agent-exit-checkpoint");
+    wait_until("the run settles once", || {
+        status(&world)["tickets"]["merged"] == 1
+    });
+
+    let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
+    let stage_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM aftercare_stages WHERE run_id = 'R1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count aftercare stages");
+    assert_eq!(stage_count, 2);
+    let exit_evidence_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM run_evidence
+             WHERE run_id = 'R1' AND kind = 'exit_classified'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count exit evidence");
+    assert_eq!(exit_evidence_count, 1);
 }
 
 fn assert_periodic_dead_agent_is_orphaned(world: &World, ticket_name: &str, marker: &str) {
