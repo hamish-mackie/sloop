@@ -2,7 +2,7 @@ mod support;
 
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sloop::clock::{Clock, SystemClock};
 use support::{FakeAgent, World, process_alive, wait_until, wait_until_slow};
@@ -1065,6 +1065,125 @@ fn restart_orphans_a_dead_process_without_using_commits_as_a_verdict() {
         let snapshot = status(&world);
         snapshot["gate"]["active_agents"] == 0 && snapshot["tickets"]["ready"] == 1
     });
+    let waited = world.sloop(&["wait", "R1", "--timeout", "5"]);
+    assert!(!waited.status.success());
+    assert_eq!(
+        World::json_stdout_or_stderr(&waited)["data"]["state"],
+        "orphaned"
+    );
+}
+
+#[test]
+fn periodic_reconciliation_orphans_a_dead_agent_without_restarting_the_daemon() {
+    let world = World::configured();
+    world.configure_fake_agent(FakeAgent::new().block_until_released("periodic-recovery"));
+    assert_periodic_dead_agent_is_orphaned(&world, "periodic-recovery.md", "periodic-recovery");
+}
+
+#[test]
+fn periodic_reconciliation_does_not_use_commits_as_a_dead_run_verdict() {
+    let world = World::configured();
+    world.configure_fake_agent(
+        FakeAgent::new()
+            .commit("work before death")
+            .block_until_released("periodic-commit-recovery"),
+    );
+    assert_periodic_dead_agent_is_orphaned(
+        &world,
+        "periodic-commit-recovery.md",
+        "periodic-commit-recovery",
+    );
+}
+
+#[test]
+fn periodic_reconciliation_leaves_a_healthy_live_agent_untouched() {
+    let world = World::configured();
+    world.configure_fake_agent(FakeAgent::new().block_until_released("healthy-periodic"));
+    let ticket = world.write_ticket("healthy-periodic.md", "# Keep live agent\nwork\n");
+    world.commit_all("seed");
+    world.start_daemon();
+    let posted = world.sloop(&["post", ticket.to_str().unwrap(), "--auto"]);
+    assert!(posted.status.success());
+    wait_until("the healthy agent reaches its blocking point", || {
+        world.fake_agent_reached("healthy-periodic")
+    });
+    let agent_pid = world.run_process_id("R1");
+
+    // Observe continuously across two liveness intervals rather than sleeping
+    // and checking only the final state.
+    let deadline = Instant::now() + Duration::from_millis(4_200);
+    while Instant::now() < deadline {
+        assert!(process_alive(agent_pid));
+        let snapshot = status(&world);
+        assert_eq!(snapshot["gate"]["active_agents"], 1);
+        assert_eq!(snapshot["runs"][0]["state"], "running");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    world.release("healthy-periodic");
+    wait_until("the healthy agent settles normally", || {
+        status(&world)["tickets"]["merged"] == 1
+    });
+}
+
+#[test]
+fn periodic_reconciliation_treats_a_mismatched_start_time_as_pid_reuse() {
+    let world = World::configured();
+    world.configure_fake_agent(FakeAgent::new().block_until_released("pid-reuse"));
+    let ticket = world.write_ticket("pid-reuse.md", "# Detect PID reuse\nwork\n");
+    world.commit_all("seed");
+    world.start_daemon();
+    let posted = world.sloop(&["post", ticket.to_str().unwrap(), "--auto"]);
+    assert!(posted.status.success());
+    wait_until("the agent reaches its blocking point", || {
+        world.fake_agent_reached("pid-reuse")
+    });
+    let agent_pid = world.run_process_id("R1");
+    let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
+    connection
+        .execute(
+            "UPDATE runs SET pid_start_time = pid_start_time + 1 WHERE id = 'R1'",
+            [],
+        )
+        .expect("fabricate reused PID identity");
+
+    wait_until_slow("the mismatched PID identity is recovered", || {
+        let snapshot = status(&world);
+        snapshot["gate"]["active_agents"] == 0
+            && snapshot["tickets"]["ready"] == 1
+            && snapshot["runs"].as_array().is_some_and(Vec::is_empty)
+    });
+    assert!(
+        process_alive(agent_pid),
+        "reconciliation must not signal a process whose identity mismatches"
+    );
+    world.kill_process_group(agent_pid);
+}
+
+fn assert_periodic_dead_agent_is_orphaned(world: &World, ticket_name: &str, marker: &str) {
+    let ticket = world.write_ticket(ticket_name, "# Recover dead agent\nwork\n");
+    world.commit_all("seed");
+    world.arm_test_hook("before-agent-exit-checkpoint");
+    world.start_daemon();
+    let posted = world.sloop(&["post", ticket.to_str().unwrap(), "--auto"]);
+    assert!(posted.status.success());
+    wait_until("the agent reaches its blocking point", || {
+        world.fake_agent_reached(marker)
+    });
+
+    let agent_pid = world.run_process_id("R1");
+    world.kill_process_group(agent_pid);
+    wait_until("the supervisor reaches the exit handoff", || {
+        world.test_hook_reached("before-agent-exit-checkpoint")
+    });
+    wait_until_slow("periodic recovery settles the dead run", || {
+        let snapshot = status(world);
+        snapshot["gate"]["active_agents"] == 0
+            && snapshot["tickets"]["ready"] == 1
+            && snapshot["runs"].as_array().is_some_and(Vec::is_empty)
+    });
+
+    world.release_test_hook("before-agent-exit-checkpoint");
     let waited = world.sloop(&["wait", "R1", "--timeout", "5"]);
     assert!(!waited.status.success());
     assert_eq!(
