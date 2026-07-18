@@ -304,18 +304,69 @@ fn a_conflicting_merge_parks_the_ticket_and_leaves_the_checkout_clean() {
 }
 
 #[test]
-fn exit_zero_without_commits_fails_the_ticket() {
+fn exit_zero_without_commits_runs_tests_and_completes_the_ticket() {
     let world = World::configured();
     configure(&world, "exit 0\n", Some("echo tested > tested.txt"));
     world.commit_all("initial");
     world.start_daemon();
     post_and_run(&world, "empty.md");
 
+    wait_until("the ticket reaches merged", || {
+        tickets(&world)["merged"] == 1
+    });
+    assert!(world.root().join(".worktrees/R1/tested.txt").exists());
+}
+
+#[test]
+fn rewriting_the_default_branch_does_not_invent_run_commits() {
+    let world = World::configured();
+    configure(
+        &world,
+        concat!(
+            "root=\"$(dirname \"$0\")\"\n",
+            "echo rewritten > \"$root/rewritten.txt\"\n",
+            "git -C \"$root\" add rewritten.txt\n",
+            "git -C \"$root\" -c user.name=op -c user.email=op@example.invalid commit --quiet --amend --no-edit\n",
+            "exit 0\n",
+        ),
+        None,
+    );
+    world.commit_all("initial");
+    world.start_daemon();
+    let ticket = post_and_run(&world, "rewrite.md");
+
+    wait_until("the no-op ticket reaches merged", || {
+        tickets(&world)["merged"] == 1
+    });
+    assert!(default_branch_has(&world, "rewritten.txt"));
+
+    let shown = world.sloop(&["show", "default"]);
+    assert!(shown.status.success());
+    let response = World::json_stdout(&shown);
+    let activity = response["data"]["value"]["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == ticket)
+        .expect("ticket activity");
+    assert_eq!(activity["commits"], serde_json::json!([]));
+}
+
+#[test]
+fn a_nonzero_exit_fails_even_when_the_agent_committed() {
+    let world = World::configured();
+    configure(
+        &world,
+        &COMMITTING_AGENT.replace("exit 0", "exit 1"),
+        Some("echo should-not-run > tested.txt"),
+    );
+    world.commit_all("initial");
+    world.start_daemon();
+    post_and_run(&world, "failed.md");
+
     wait_until("the ticket reaches failed", || {
         tickets(&world)["failed"] == 1
     });
-    // Tests qualify committed work for merging; a run without commits never
-    // reaches the test stage.
     assert!(!world.root().join(".worktrees/R1/tested.txt").exists());
 }
 
@@ -422,7 +473,7 @@ fn a_finished_run_cannot_be_cancelled() {
     world.start_daemon();
     post_and_run(&world, "done.md");
 
-    wait_until("the run finishes", || tickets(&world)["failed"] == 1);
+    wait_until("the run finishes", || tickets(&world)["merged"] == 1);
 
     let output = world.sloop(&["cancel", "R1"]);
     let response = json_stderr(&output);

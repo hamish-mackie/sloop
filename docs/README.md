@@ -1,8 +1,8 @@
 # Sloop Documentation
 
 Sloop is a job scheduler for coding agents. It runs each ticket in its own
-Git worktree, judges the result from commits and tests, and merges work
-that passes.
+Git worktree, judges the result from process exit and tests, and merges work
+that passes. Git commit counts never determine the verdict.
 
 Start here:
 

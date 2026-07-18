@@ -98,11 +98,10 @@ sloop logs <run-id>   # a run's captured output
 sloop wait <run-id>   # block until the run finishes; exit 0 only on merge
 ```
 
-When the agent exits, Sloop does not take its word for it. It checks the
-evidence: commits in the worktree, the exit code, and your configured test
-command, if any. Work that passes is merged into your branch. Work that
-fails or produces no commits is not — a run is never "done" just because
-the agent said so.
+When the agent exits, Sloop checks the process exit status and your configured
+test command, if any. A successful exit that passes aftercare is merged into
+your branch. An unchanged run branch is a successful no-op; Sloop does not use
+commit counts to decide whether the ticket is complete.
 
 ## Everyday controls
 

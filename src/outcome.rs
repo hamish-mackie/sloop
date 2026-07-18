@@ -48,10 +48,8 @@ pub struct RunEvidence {
     /// An operator recorded cancellation intent before the exit was handled.
     pub cancelled: bool,
     pub exit: ExitClass,
-    /// Commits on the run branch that are not on the default branch.
-    pub commit_count: u64,
-    /// `None` when no test stage ran: either the exit and commit evidence
-    /// never justified testing, or no test command is configured.
+    /// `None` when no test stage ran: either the exit did not justify testing,
+    /// or no test command is configured.
     pub tests: Option<StageOutcome>,
     /// `None` when a merge was never attempted.
     pub merge: Option<MergeOutcome>,
@@ -66,8 +64,8 @@ pub enum Outcome {
     Failed,
     NeedsReview,
     Cancelled,
-    /// Recovery found neither a live process nor committed work. The
-    /// worktree stays available for inspection and the ticket is released.
+    /// Recovery found no live process before the agent exit was checkpointed.
+    /// The worktree stays available for inspection and the ticket is released.
     Orphaned,
 }
 
@@ -83,17 +81,16 @@ impl Outcome {
     }
 }
 
-/// Whether exit and commit evidence justify running the test stage. Tests
-/// exist to qualify committed work for merging, so anything else skips them.
-pub fn wants_tests(exit: ExitClass, commit_count: u64) -> bool {
-    exit == ExitClass::Success && commit_count > 0
+/// Whether the process exit justifies running the test stage.
+pub fn wants_tests(exit: ExitClass) -> bool {
+    exit == ExitClass::Success
 }
 
 /// Whether the evidence so far justifies attempting a merge. A test stage
 /// that ran and failed blocks the merge; an unconfigured test stage does
 /// not, because the operator chose auto-merge policy without one.
-pub fn wants_merge(exit: ExitClass, commit_count: u64, tests: Option<StageOutcome>) -> bool {
-    wants_tests(exit, commit_count) && tests != Some(StageOutcome::Failed)
+pub fn wants_merge(exit: ExitClass, tests: Option<StageOutcome>) -> bool {
+    wants_tests(exit) && tests != Some(StageOutcome::Failed)
 }
 
 /// Maps complete evidence to the run's terminal outcome.
@@ -101,20 +98,16 @@ pub fn wants_merge(exit: ExitClass, commit_count: u64, tests: Option<StageOutcom
 /// Constraints fixed by the design documents:
 /// - Cancellation always wins: the outcome is `Cancelled` regardless of
 ///   other evidence, so racing exit and cancel events stay idempotent.
-/// - Exit zero with no commits is NOT successful work.
 /// - A run may only be `Merged` when the merge itself succeeded
 ///   (`Some(MergeOutcome::Merged)`).
-/// - A nonzero or killed exit that left commits must preserve the evidence
-///   for a human rather than merging or silently discarding it.
 ///
 /// Policy decisions taken here:
-/// - Committed work whose tests failed is `NeedsReview`, not `Failed`:
-///   commits are evidence a human may want to salvage, and discarding them
-///   silently would violate the preserve-the-work constraint above.
+/// - A successful exit whose tests or merge failed is `NeedsReview`; its run
+///   branch is retained for inspection.
+/// - A nonzero or killed exit is `Failed`; Git history does not upgrade or
+///   downgrade the verdict.
 /// - A merge attempt that conflicted is `NeedsReview`: the work passed
 ///   tests, only integration needs a human.
-/// - `Failed` is reserved for runs that produced no commits at all; there
-///   is nothing to review.
 pub fn derive_outcome(evidence: &RunEvidence) -> Outcome {
     if evidence.cancelled {
         return Outcome::Cancelled;
@@ -122,7 +115,7 @@ pub fn derive_outcome(evidence: &RunEvidence) -> Outcome {
     if evidence.merge == Some(MergeOutcome::Merged) {
         return Outcome::Merged;
     }
-    if evidence.commit_count == 0 {
+    if evidence.exit != ExitClass::Success {
         return Outcome::Failed;
     }
     Outcome::NeedsReview
@@ -136,23 +129,20 @@ mod tests {
         RunEvidence {
             cancelled: false,
             exit: ExitClass::Success,
-            commit_count: 0,
             tests: None,
             merge: None,
         }
     }
 
     #[test]
-    fn exit_zero_without_commits_is_not_successful_work() {
+    fn a_successful_exit_without_a_merge_needs_review() {
         let outcome = derive_outcome(&evidence());
-        assert_ne!(outcome, Outcome::Merged);
-        assert_ne!(outcome, Outcome::Cancelled);
+        assert_eq!(outcome, Outcome::NeedsReview);
     }
 
     #[test]
     fn a_successful_merge_is_the_only_path_to_merged() {
         let merged = derive_outcome(&RunEvidence {
-            commit_count: 2,
             tests: Some(StageOutcome::Passed),
             merge: Some(MergeOutcome::Merged),
             ..evidence()
@@ -160,7 +150,6 @@ mod tests {
         assert_eq!(merged, Outcome::Merged);
 
         let diverged = derive_outcome(&RunEvidence {
-            commit_count: 2,
             tests: Some(StageOutcome::Passed),
             merge: Some(MergeOutcome::Diverged),
             ..evidence()
@@ -171,7 +160,6 @@ mod tests {
     #[test]
     fn failed_tests_never_reach_merged() {
         let outcome = derive_outcome(&RunEvidence {
-            commit_count: 1,
             tests: Some(StageOutcome::Failed),
             ..evidence()
         });
@@ -180,13 +168,12 @@ mod tests {
     }
 
     #[test]
-    fn a_crashed_agent_with_commits_preserves_the_work_for_a_human() {
+    fn a_crashed_agent_fails_regardless_of_git_history() {
         let outcome = derive_outcome(&RunEvidence {
             exit: ExitClass::Failure(1),
-            commit_count: 3,
             ..evidence()
         });
-        assert_eq!(outcome, Outcome::NeedsReview);
+        assert_eq!(outcome, Outcome::Failed);
     }
 
     #[test]
@@ -194,7 +181,6 @@ mod tests {
         let outcome = derive_outcome(&RunEvidence {
             cancelled: true,
             exit: ExitClass::KilledBySignal,
-            commit_count: 5,
             tests: Some(StageOutcome::Passed),
             merge: Some(MergeOutcome::Merged),
         });
@@ -210,22 +196,13 @@ mod tests {
 
     #[test]
     fn test_and_merge_gates_follow_the_evidence() {
-        assert!(wants_tests(ExitClass::Success, 1));
-        assert!(!wants_tests(ExitClass::Success, 0));
-        assert!(!wants_tests(ExitClass::Failure(1), 4));
-        assert!(!wants_tests(ExitClass::KilledBySignal, 4));
+        assert!(wants_tests(ExitClass::Success));
+        assert!(!wants_tests(ExitClass::Failure(1)));
+        assert!(!wants_tests(ExitClass::KilledBySignal));
 
-        assert!(wants_merge(
-            ExitClass::Success,
-            1,
-            Some(StageOutcome::Passed)
-        ));
-        assert!(wants_merge(ExitClass::Success, 1, None));
-        assert!(!wants_merge(
-            ExitClass::Success,
-            1,
-            Some(StageOutcome::Failed)
-        ));
-        assert!(!wants_merge(ExitClass::Failure(1), 1, None));
+        assert!(wants_merge(ExitClass::Success, Some(StageOutcome::Passed)));
+        assert!(wants_merge(ExitClass::Success, None));
+        assert!(!wants_merge(ExitClass::Success, Some(StageOutcome::Failed)));
+        assert!(!wants_merge(ExitClass::Failure(1), None));
     }
 }

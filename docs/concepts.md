@@ -36,18 +36,20 @@ run supervisors send it requests; they never spawn anything themselves.
 That single ownership — not politeness between callers — is what makes
 gate-then-claim atomic.
 
-## Outcomes are derived, never declared
+## Outcomes come from process and aftercare evidence
 
-The signature failure of unattended agents is exiting `0` having done
-nothing. So Sloop never trusts an exit code, and never trusts what the
-agent says. It derives the outcome from evidence:
+Sloop never trusts what the agent says in its output or notes. It derives the
+outcome from the process exit and aftercare evidence:
 
-- **Exit 0, commits exist, tests pass** → the work merges.
-- **Exit 0, no commits** → not done. The ticket fails; nothing merges.
-- **Commits exist, tests fail** → the work is kept on its branch and the
-  ticket is left for human review.
-- **The agent crashed but committed first** → the commits are preserved for
-  review; a supervisor dying never throws work away.
+- **Exit 0, tests pass** → the run branch merges.
+- **Exit 0, no commits** → the ticket completes as a successful no-op.
+- **Exit 0, tests or merge fail** → the branch is kept for human review.
+- **Nonzero exit** → the ticket fails, regardless of commit count.
+
+Commit OIDs are recorded for the project activity view, using the run branch's
+creation point as their baseline. They are metadata, not an outcome gate, so a
+rebase or squash of the default branch cannot turn unrelated history into
+apparent successful work.
 
 A worker's `sloop note "done, merged, ship it"` stores a note and moves
 nothing.
@@ -83,10 +85,9 @@ live agent. At startup, every in-flight run is classified:
 
 - Process still alive (PID and start time match) → re-adopt and keep
   supervising it. Its ticket is not double-spawned.
-- Process dead, commits in the worktree → send the work to aftercare; it is
-  not lost because the supervisor died.
-- Process dead, worktree bare → release the ticket and keep the worktree
-  for autopsy.
+- Process dead before its exit was checkpointed → release the ticket and keep
+  its branch and worktree for autopsy. Commit count does not change this
+  classification.
 - Daemon died mid-aftercare → aftercare stages are individually evidenced,
   so the interrupted stage is re-run idempotently.
 
@@ -98,7 +99,7 @@ finished runs reserved, blocks new dispatch, and reports the storage gate in
 `sloop status` and `sloop list`. It periodically attempts a small committed
 write; after space becomes available, pending outcomes settle and dispatch
 resumes automatically. If the pre-aftercare checkpoint could not be written,
-Sloop skips side-effecting aftercare and preserves committed work for review.
+Sloop skips side-effecting aftercare and preserves the run branch for review.
 
 ## Files versus runtime state
 

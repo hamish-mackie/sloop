@@ -51,8 +51,8 @@ ids:
 
 - `test_cmd` — an argv run inside the worktree after the agent exits and
   before its work can merge. A failing command keeps the work out of your
-  branch and leaves the ticket for review. Omit it to merge on commits
-  alone.
+  branch and leaves the ticket for review. Omit it to merge after a successful
+  agent exit without another qualification step.
 
 ### agent
 

@@ -369,18 +369,10 @@ fn branch_state(root: &Path, branch: &str) -> Result<Option<TicketState>, Reinde
             "cannot compare Git branch `{branch}` with HEAD"
         )));
     }
-    let unmerged_count = git_output(
-        root,
-        &["rev-list", "--count", &format!("HEAD..{branch}")],
-        branch,
-    )?
-    .parse::<u64>()
-    .map_err(|_| {
-        ReindexError(format!(
-            "Git returned an invalid commit count for `{branch}`"
-        ))
-    })?;
-    let has_work = created_at.is_some_and(|created_at| created_at != tip) || unmerged_count > 0;
+    // The branch's creation tip is stable even if the default branch is later
+    // rebased or squashed. Comparing against HEAD would turn untouched run
+    // branches into apparent work after any such rewrite.
+    let has_work = created_at.is_some_and(|created_at| created_at != tip);
     if !has_work {
         return Ok(None);
     }

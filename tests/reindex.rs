@@ -147,6 +147,60 @@ fn create_unmerged_worktree(world: &World, branch: &str, directory: &str) {
 }
 
 #[test]
+fn reindex_does_not_treat_an_untouched_branch_as_work_after_a_rewrite() {
+    let world = World::configured();
+    write_ticket(
+        &world,
+        "rewrite.md",
+        "id: T1\nproject: default\nname: Rewrite\nblocked_by: []\nworktree: sloop/T1\n",
+        "# Keep an untouched branch ready",
+    );
+    world.commit_all("initial ticket");
+
+    let branch = Command::new("git")
+        .args(["branch", "sloop/T1"])
+        .current_dir(world.root())
+        .status()
+        .expect("create ticket branch");
+    assert!(branch.success());
+    fs::write(world.root().join("rewritten.txt"), "rewritten\n").expect("write rewrite marker");
+    let add = Command::new("git")
+        .args(["add", "rewritten.txt"])
+        .current_dir(world.root())
+        .status()
+        .expect("stage rewrite marker");
+    assert!(add.success());
+    let amend = Command::new("git")
+        .args([
+            "-c",
+            "user.name=sloop-test",
+            "-c",
+            "user.email=sloop-test@example.invalid",
+            "commit",
+            "--quiet",
+            "--amend",
+            "--no-edit",
+        ])
+        .current_dir(world.root())
+        .status()
+        .expect("rewrite default branch");
+    assert!(amend.success());
+
+    let output = world.sloop(&["reindex"]);
+    assert!(output.status.success());
+    assert_eq!(
+        World::json_stdout(&output)["data"]["tickets_state_changed"],
+        0
+    );
+    let shown = world.sloop(&["show", "T1"]);
+    assert!(shown.status.success());
+    assert_eq!(
+        World::json_stdout(&shown)["data"]["value"]["state"],
+        "ready"
+    );
+}
+
+#[test]
 fn reindex_rebuilds_files_and_git_but_not_deleted_runtime_history() {
     let world = World::configured();
     world.configure_fake_agent(
