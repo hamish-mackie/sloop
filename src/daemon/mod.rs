@@ -486,7 +486,10 @@ async fn serve(
         daemon_log: project.daemon_log.clone(),
         store,
         storage_full: Cell::new(false),
+        reconciliation_blocked: false,
         active: HashSet::new(),
+        supervised: HashSet::new(),
+        recovering: HashSet::new(),
         cancelling: HashSet::new(),
         worker_tokens: HashMap::new(),
         worker_listeners: HashMap::new(),
@@ -719,8 +722,16 @@ struct DispatcherState {
     /// `SQLITE_FULL` is a dispatcher gate. The daemon retains active and
     /// pending run evidence in memory until a committed probe succeeds.
     storage_full: Cell<bool>,
-    /// Run IDs with a live supervised process; its size is the capacity gate.
+    /// A failed durable liveness scan closes the spawn gate until a later scan
+    /// succeeds, so incomplete capacity information cannot over-dispatch.
+    reconciliation_blocked: bool,
+    /// Run IDs with a durable nonterminal lease; its size is the capacity gate.
     active: HashSet<String>,
+    /// Run IDs whose normal or re-adopted supervisor still owns execution.
+    supervised: HashSet<String>,
+    /// Run IDs with a recovery task in flight. The entry remains until final
+    /// settlement so a normal supervisor racing recovery cannot duplicate it.
+    recovering: HashSet<String>,
     /// Run IDs whose cancellation was requested but whose exit has not been
     /// resolved yet; mirrors the durable `cancel_requested` evidence.
     cancelling: HashSet<String>,
@@ -787,6 +798,11 @@ async fn run_dispatcher(
     events_tx: mpsc::Sender<RunEvent>,
     log: OperationalLog,
 ) {
+    let mut liveness_tick = tokio::time::interval(Duration::from_secs(2));
+    liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Tokio intervals fire immediately once; consume that tick because startup
+    // recovery already classified every durable lease.
+    liveness_tick.tick().await;
     reconcile(&mut state, &events_tx, &log);
     loop {
         let deadline = next_dispatch_deadline(&state);
@@ -816,12 +832,13 @@ async fn run_dispatcher(
             }
             // Wall-clock is deliberate: this is a liveness probe, not
             // decision logic, so the manual test clock must not gate it.
-            () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+            _ = liveness_tick.tick() => {
                 if !state.root.join(".git").exists() {
                     log.emit(LogLevel::Error, "sloop::dispatcher", "project_root_missing");
                     let _ = state.shutdown.send(()).await;
                     break;
                 }
+                reconcile_run_liveness(&mut state, &events_tx, &log);
             }
         }
         reconcile(&mut state, &events_tx, &log);
@@ -859,6 +876,8 @@ fn settle_pending_exits(state: &mut DispatcherState, log: &OperationalLog) {
             Ok(outcome) => {
                 state.cancelling.remove(&run_id);
                 state.active.remove(&run_id);
+                state.supervised.remove(&run_id);
+                state.recovering.remove(&run_id);
                 close_worker_socket(state, &run_id);
                 log.emit_with_fields(
                     LogLevel::Info,
@@ -1020,6 +1039,7 @@ fn recover_inflight_runs(
         // succeeds; a transient database error must never permit double-spawn.
         state.active.insert(run.id.clone());
         if recoverable_process_matches(&run) {
+            state.supervised.insert(run.id.clone());
             let cancellation_requested = state
                 .store
                 .cancellation_requested(&run.id)
@@ -1050,6 +1070,7 @@ fn recover_inflight_runs(
                 json!({"run_id": run.id, "ticket_id": run.ticket_id}),
             );
         } else {
+            state.recovering.insert(run.id.clone());
             if run.state == "aftercare" {
                 spawn_aftercare_recovery(state, events.clone(), run, log.clone())?;
             } else {
@@ -1099,21 +1120,32 @@ fn monitor_recovered_run(
     let state_dir = state.state_dir.clone();
     let classifier = state.classifier.clone();
     let clock = state.clock.clone();
+    let db_path = state.state_dir.join("sloop.db");
     let log = state.log.clone();
     let shutdown = state.shutdown_flag.clone();
     tokio::task::spawn_blocking(move || {
-        while recoverable_process_matches(&run) {
+        loop {
             if shutdown.load(Ordering::Acquire) {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            match recoverable_process_identity(&run) {
+                ProcessIdentity::Matches | ProcessIdentity::Unverifiable => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                ProcessIdentity::GoneOrReused => break,
+            }
         }
         while !shutdown.load(Ordering::Acquire) {
             match recovered_exit_event(&root, &state_dir, &classifier, clock.now_ms(), &run) {
-                Ok(event) => {
-                    let _ = events.blocking_send(event);
-                    break;
-                }
+                Ok(event) => match claim_recovered_exit(&db_path, clock.as_ref(), &event, &log) {
+                    Ok(claimed) => {
+                        if claimed {
+                            let _ = events.blocking_send(event);
+                        }
+                        break;
+                    }
+                    Err(()) => std::thread::sleep(Duration::from_secs(1)),
+                },
                 Err(error) => {
                     log.emit_with_fields(
                         LogLevel::Error,
@@ -1138,13 +1170,26 @@ fn spawn_dead_run_recovery(
     let state_dir = state.state_dir.clone();
     let classifier = state.classifier.clone();
     let clock = state.clock.clone();
+    let db_path = state.state_dir.join("sloop.db");
     let shutdown = state.shutdown_flag.clone();
     tokio::task::spawn_blocking(move || {
         while !shutdown.load(Ordering::Acquire) {
             match recovered_exit_event(&root, &state_dir, &classifier, clock.now_ms(), &run) {
                 Ok(event) => {
-                    let _ = events.blocking_send(event);
-                    break;
+                    let claim = if run.state == "running" {
+                        claim_recovered_exit(&db_path, clock.as_ref(), &event, &log)
+                    } else {
+                        Ok(true)
+                    };
+                    match claim {
+                        Ok(claimed) => {
+                            if claimed {
+                                let _ = events.blocking_send(event);
+                            }
+                            break;
+                        }
+                        Err(()) => std::thread::sleep(Duration::from_secs(1)),
+                    }
                 }
                 Err(error) => {
                     log.emit_with_fields(
@@ -1158,6 +1203,123 @@ fn spawn_dead_run_recovery(
             }
         }
     });
+}
+
+/// Claims the same durable exit handoff used by the normal supervisor. A
+/// racing loser emits no settlement event and leaves aftercare to the winner.
+fn claim_recovered_exit(
+    db_path: &Path,
+    clock: &dyn Clock,
+    event: &RunEvent,
+    log: &OperationalLog,
+) -> Result<bool, ()> {
+    let RunEvent::Exited {
+        run_id,
+        exit_code,
+        capture_complete,
+        commits,
+        commit_observation_complete,
+        vendor_error,
+        cooldown_until_ms,
+        ..
+    } = event;
+    let now_ms = clock.now_ms();
+    let result = Store::open(db_path, now_ms).and_then(|mut store| {
+        store.record_agent_exit(
+            run_id,
+            *exit_code,
+            *capture_complete,
+            &json!({"complete": commit_observation_complete, "oids": commits}).to_string(),
+            vendor_error.as_ref(),
+            *cooldown_until_ms,
+            now_ms,
+        )
+    });
+    match result {
+        Ok(ExitClaim::Claimed) => Ok(true),
+        Ok(ExitClaim::AlreadyClaimed { state }) => {
+            log.emit_with_fields(
+                LogLevel::Info,
+                "sloop::recovery",
+                "exit_checkpoint_already_claimed",
+                json!({"run_id": run_id, "state": state}),
+            );
+            Ok(false)
+        }
+        Err(error) => {
+            log.emit_with_fields(
+                LogLevel::Error,
+                "sloop::recovery",
+                "agent_exit_checkpoint_failed",
+                json!({"run_id": run_id, "error": error.to_string()}),
+            );
+            Err(())
+        }
+    }
+}
+
+/// Repairs in-memory capacity from durable leases and recovers runs whose
+/// recorded process identity is provably gone or reused.
+fn reconcile_run_liveness(
+    state: &mut DispatcherState,
+    events: &mpsc::Sender<RunEvent>,
+    log: &OperationalLog,
+) {
+    let runs = match state.store.recoverable_runs() {
+        Ok(runs) => {
+            state.reconciliation_blocked = false;
+            runs
+        }
+        Err(error) => {
+            state.reconciliation_blocked = true;
+            log.emit_with_fields(
+                LogLevel::Error,
+                "sloop::recovery",
+                "run_reconciliation_failed",
+                json!({"error": error.to_string()}),
+            );
+            return;
+        }
+    };
+    for run in runs {
+        state.active.insert(run.id.clone());
+        if state.recovering.contains(&run.id) {
+            continue;
+        }
+        if run.state == "aftercare" && state.supervised.contains(&run.id) {
+            continue;
+        }
+        match recoverable_process_identity(&run) {
+            ProcessIdentity::Matches => continue,
+            ProcessIdentity::Unverifiable => {
+                log.emit_with_fields(
+                    LogLevel::Info,
+                    "sloop::recovery",
+                    "run_identity_unverifiable",
+                    json!({"run_id": run.id}),
+                );
+                continue;
+            }
+            ProcessIdentity::GoneOrReused => {}
+        }
+
+        state.recovering.insert(run.id.clone());
+        if run.state == "aftercare" {
+            if let Err(error) =
+                spawn_aftercare_recovery(state, events.clone(), run.clone(), log.clone())
+            {
+                state.recovering.remove(&run.id);
+                log.emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::recovery",
+                    "aftercare_recovery_start_failed",
+                    json!({"run_id": run.id, "error": error.to_string()}),
+                );
+            }
+        } else {
+            spawn_dead_run_recovery(state, events.clone(), run, log.clone());
+        }
+    }
 }
 
 fn recovered_exit_event(
@@ -1892,13 +2054,30 @@ fn shared_checkout_has_git_operation(root: &Path) -> Result<bool, String> {
 }
 
 fn recoverable_process_matches(run: &RecoverableRun) -> bool {
+    recoverable_process_identity(run) == ProcessIdentity::Matches
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessIdentity {
+    Matches,
+    GoneOrReused,
+    Unverifiable,
+}
+
+fn recoverable_process_identity(run: &RecoverableRun) -> ProcessIdentity {
     if run.state != "running" {
-        return false;
+        return ProcessIdentity::GoneOrReused;
     }
     let Some(pid) = run.pid.and_then(|pid| u32::try_from(pid).ok()) else {
-        return false;
+        return ProcessIdentity::GoneOrReused;
     };
-    process_identity_matches(pid, run.pid_start_time)
+    match (run.pid_start_time, process_start_time(pid)) {
+        (Some(expected), Some(actual)) if expected == actual => ProcessIdentity::Matches,
+        (Some(_), Some(_)) => ProcessIdentity::GoneOrReused,
+        (_, None) if process_exists(pid) => ProcessIdentity::Unverifiable,
+        (_, None) => ProcessIdentity::GoneOrReused,
+        (None, Some(_)) => ProcessIdentity::Unverifiable,
+    }
 }
 
 fn process_identity_matches(pid: u32, expected_start_time: Option<i64>) -> bool {
@@ -1961,6 +2140,7 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
     }
     settle_pending_exits(state, log);
     if state.storage_full.get()
+        || state.reconciliation_blocked
         || state.paused
         || state.agent.is_none()
         || !running_hours_open(state, now_ms)
@@ -2111,6 +2291,7 @@ fn reconcile(state: &mut DispatcherState, events: &mpsc::Sender<RunEvent>, log: 
                     state.log.clone(),
                 ));
                 state.worker_listeners.insert(run_id.clone(), accept_loop);
+                state.supervised.insert(run_id.clone());
                 let pid = child.id();
                 tokio::task::spawn_blocking(move || {
                     let exit_code = match child.wait() {
@@ -2362,6 +2543,7 @@ fn gather_exit_evidence(
     let commit_observation = try_commits_on_branch(root, branch);
     let commit_observation_complete = commit_observation.is_ok();
     let commits = commit_observation.unwrap_or_default();
+    wait_for_test_hook("before-agent-exit-checkpoint");
     let checkpointed = if let Some(store) = checkpoint_store.as_deref_mut() {
         match store.record_agent_exit(
             run_id,
@@ -3276,6 +3458,7 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
             let mut gate = json!({
                 "active_agents": state.active.len(),
                 "max_agents": state.max_agents,
+                "capacity_reconciled": !state.reconciliation_blocked,
                 "storage": {
                     "writable": !state.storage_full.get(),
                     "reason": state.storage_full.get().then_some("database_full"),
@@ -3401,7 +3584,7 @@ fn handle_list(state: &DispatcherState) -> Result<serde_json::Value, ErrorBody> 
     let now_ms = state.clock.now_ms();
     let gates = crate::eligibility::Gates {
         paused: state.paused,
-        storage_writable: !state.storage_full.get(),
+        storage_writable: !state.storage_full.get() && !state.reconciliation_blocked,
         agent_configured: state.agent.is_some(),
         hours_open: running_hours_open(state, now_ms),
         at_capacity: state.active.len() >= state.max_agents,
@@ -4117,8 +4300,9 @@ mod tests {
 
     use super::runner::compose_worker_prompt;
     use super::{
-        PersistedProcessState, WORKER_BOOTSTRAP_PROMPT, classify_persisted_process, index_projects,
-        process_start_time, rearm_every_at, recoverable_process_matches,
+        PersistedProcessState, ProcessIdentity, WORKER_BOOTSTRAP_PROMPT,
+        classify_persisted_process, index_projects, process_start_time, rearm_every_at,
+        recoverable_process_identity, recoverable_process_matches,
     };
     use crate::config::expand_agent_cmd;
     use crate::store::{RecoverableRun, Store};
@@ -4155,6 +4339,10 @@ mod tests {
         assert!(!recoverable_process_matches(&recoverable_current_process(
             None
         )));
+        assert_eq!(
+            recoverable_process_identity(&recoverable_current_process(None)),
+            ProcessIdentity::Unverifiable
+        );
     }
 
     #[test]
