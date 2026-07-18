@@ -261,6 +261,14 @@ impl World {
             .expect("run sloop")
     }
 
+    pub fn spawn_sloop(&self, args: &[&str]) -> std::process::Child {
+        self.sloop_command(&Self::with_json(args))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sloop")
+    }
+
     pub fn sloop_in(&self, directory: &Path, args: &[&str]) -> Output {
         self.sloop_command_in(directory, &Self::with_json(args))
             .output()
