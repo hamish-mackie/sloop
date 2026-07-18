@@ -1,24 +1,28 @@
 use std::io::Write;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde_json::json;
 
 use crate::clock::Clock;
-use crate::flow::{Flow, Verdict};
+use crate::flow::{
+    Flow, Stage, StageEvidence, StageKind, Step, Verdict, VerdictSource, next_step, resolve_verdict,
+};
 use crate::logging::{LogLevel, OperationalLog};
-use crate::outcome::MergeOutcome;
+use crate::outcome::{ExitClass, MergeOutcome, classify_exit};
 use crate::run_log::{OutputSource, OutputStream, RunLogWriter};
-use crate::store::{ExitClaim, Store};
+use crate::store::{ExitClaim, StageRecord, Store, StoreError};
 use crate::vendor_error::VendorErrorMatch;
 
-use super::runner::{process_start_time, spawn_output_reader};
-use super::{
-    MERGE_LOCK, MergeProcessCheckpoint, drive_flow, git_stdout, kill_straggler_process_group,
-    merge_checkout_ready, process_identity_matches, record_merge_process_checkpoint,
-    wait_for_test_hook,
+use super::dispatcher::wait_for_test_hook;
+use super::recovery::{
+    MergeProcessCheckpoint, PersistedProcessStop, inspect_interrupted_merge,
+    kill_straggler_process_group, process_identity_matches, stop_interrupted_process,
 };
+use super::runner::{process_start_time, spawn_output_reader};
+
+static MERGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// One executed flow stage as observed by the supervisor.
 pub(super) struct StageResult {
@@ -444,4 +448,391 @@ pub(super) fn attempt_merge(
             MergeOutcome::Diverged
         }
     }
+}
+
+pub(super) struct FlowRunResult {
+    pub(super) aftercare_failed: bool,
+    pub(super) merge: Option<MergeOutcome>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn drive_flow(
+    root: &Path,
+    worktree: &Path,
+    branch: &str,
+    bound_flow: &Flow,
+    test_cmd: Option<&[String]>,
+    exit_code: Option<i32>,
+    vendor_rejected: bool,
+    commits: &[String],
+    commit_observation_complete: bool,
+    output_log: &RunLogWriter,
+    clock: &dyn Clock,
+    store: &Store,
+    run_id: &str,
+    log: &OperationalLog,
+) -> Result<FlowRunResult, String> {
+    let flow = flow_with_implicit_test(bound_flow, test_cmd)?;
+    let rows = store
+        .aftercare_stages(run_id)
+        .map_err(|error| error.to_string())?;
+    let mut evidence = rows
+        .iter()
+        .map(|row| StageEvidence {
+            stage: row.stage.clone(),
+            verdict: if row.state == "passed" {
+                Verdict::Pass
+            } else {
+                Verdict::Fail
+            },
+            source: VerdictSource::ExitCode,
+            reason: None,
+        })
+        .collect::<Vec<_>>();
+    let mut merge = flow.stages.iter().find_map(|stage| {
+        if stage.kind != StageKind::Merge {
+            return None;
+        }
+        evidence
+            .iter()
+            .find(|row| row.stage == stage.name)
+            .map(|row| {
+                if row.verdict == Verdict::Pass {
+                    MergeOutcome::Merged
+                } else {
+                    MergeOutcome::Diverged
+                }
+            })
+    });
+    let interrupted = store
+        .run_evidence(run_id)
+        .map_err(|error| error.to_string())?;
+
+    loop {
+        if aftercare_cancelled(store, run_id, log) {
+            return Ok(FlowRunResult {
+                aftercare_failed: false,
+                merge,
+            });
+        }
+        let stage = match next_step(&flow, &evidence) {
+            Step::Run(stage) => stage,
+            Step::Halted { failed_stage } => {
+                let build = flow
+                    .stages
+                    .first()
+                    .is_some_and(|stage| stage.name == failed_stage);
+                return Ok(FlowRunResult {
+                    aftercare_failed: !build,
+                    merge,
+                });
+            }
+            Step::Complete => {
+                return Ok(FlowRunResult {
+                    aftercare_failed: false,
+                    merge,
+                });
+            }
+        };
+        let stage_index = flow
+            .stages
+            .iter()
+            .position(|candidate| candidate.name == stage.name)
+            .expect("next_step returned a stage from this flow");
+        let interrupted_process = stop_interrupted_process(&interrupted, &stage.name)?;
+        if let Some((identity, PersistedProcessStop::LeaderMissing)) = &interrupted_process {
+            log.emit_with_fields(
+                LogLevel::Info,
+                "sloop::recovery",
+                "stale_aftercare_group_not_signalled",
+                json!({
+                    "run_id": run_id,
+                    "stage": stage.name,
+                    "process_group_id": identity.group,
+                }),
+            );
+        }
+        let merge_recovery = if let Some((identity, _)) = &interrupted_process
+            && stage.kind == StageKind::Merge
+        {
+            match inspect_interrupted_merge(root, branch, identity) {
+                Ok(recovery) => Some(recovery),
+                Err(error) => {
+                    log.emit_with_fields(
+                        LogLevel::Error,
+                        "sloop::recovery",
+                        "merge_recovery_inspection_failed",
+                        json!({"run_id": run_id, "error": error}),
+                    );
+                    Some(super::recovery::MergeRecovery::UnsafePartial)
+                }
+            }
+        } else {
+            None
+        };
+        if interrupted_process.is_some() {
+            store
+                .clear_aftercare_process(run_id)
+                .map_err(|error| error.to_string())?;
+        }
+        let result = match &stage.kind {
+            StageKind::Build => {
+                let now = clock.now_ms();
+                StageResult {
+                    verdict: if !vendor_rejected && classify_exit(exit_code) == ExitClass::Success {
+                        Verdict::Pass
+                    } else {
+                        Verdict::Fail
+                    },
+                    exit_code,
+                    started_at_ms: now,
+                    finished_at_ms: now,
+                }
+            }
+            StageKind::Exec { cmd } => run_exec_stage(
+                worktree,
+                &stage.name,
+                cmd,
+                output_log,
+                clock,
+                store,
+                run_id,
+                log,
+            ),
+            StageKind::Merge
+                if merge_recovery == Some(super::recovery::MergeRecovery::AlreadyCompleted) =>
+            {
+                let now = clock.now_ms();
+                merge = Some(MergeOutcome::Merged);
+                StageResult {
+                    verdict: Verdict::Pass,
+                    exit_code: Some(0),
+                    started_at_ms: now,
+                    finished_at_ms: now,
+                }
+            }
+            StageKind::Merge
+                if merge_recovery == Some(super::recovery::MergeRecovery::UnsafePartial) =>
+            {
+                let now = clock.now_ms();
+                merge = Some(MergeOutcome::Diverged);
+                StageResult {
+                    verdict: Verdict::Fail,
+                    exit_code: Some(1),
+                    started_at_ms: now,
+                    finished_at_ms: now,
+                }
+            }
+            StageKind::Merge => {
+                let started_at_ms = clock.now_ms();
+                let outcome = attempt_merge(
+                    root,
+                    branch,
+                    commit_observation_complete && commits.is_empty(),
+                    &stage.name,
+                    store,
+                    run_id,
+                    clock,
+                    log,
+                );
+                merge = Some(outcome);
+                StageResult {
+                    verdict: if outcome == MergeOutcome::Merged {
+                        Verdict::Pass
+                    } else {
+                        Verdict::Fail
+                    },
+                    exit_code: Some(if outcome == MergeOutcome::Merged {
+                        0
+                    } else {
+                        1
+                    }),
+                    started_at_ms,
+                    finished_at_ms: clock.now_ms(),
+                }
+            }
+        };
+        let (verdict, source, reason) = resolve_verdict(&stage.kind, result.verdict, None);
+        if let Err(error) = store.record_aftercare_stage(
+            run_id,
+            &StageRecord {
+                stage_index,
+                stage: stage.name.clone(),
+                state: if verdict == Verdict::Pass {
+                    "passed".into()
+                } else {
+                    "failed".into()
+                },
+                started_at_ms: result.started_at_ms,
+                finished_at_ms: result.finished_at_ms,
+                exit_code: result.exit_code,
+                output_ref: format!("runs/{run_id}/output.ndjson"),
+            },
+        ) {
+            log.emit_with_fields(
+                LogLevel::Error,
+                "sloop::supervisor",
+                "aftercare_stage_persist_failed",
+                json!({"run_id": run_id, "stage": stage.name, "error": error.to_string()}),
+            );
+            return Ok(FlowRunResult {
+                aftercare_failed: true,
+                merge,
+            });
+        }
+        if let Err(error) = store.clear_aftercare_process(run_id) {
+            log.emit_with_fields(
+                LogLevel::Error,
+                "sloop::supervisor",
+                "aftercare_process_clear_failed",
+                json!({"run_id": run_id, "stage": stage.name, "error": error.to_string()}),
+            );
+            return Ok(FlowRunResult {
+                aftercare_failed: true,
+                merge,
+            });
+        }
+        evidence.push(StageEvidence {
+            stage: stage.name.clone(),
+            verdict,
+            source,
+            reason,
+        });
+        wait_for_test_hook(&format!("after-aftercare-stage-{}", stage.name));
+    }
+}
+
+fn flow_with_implicit_test(flow: &Flow, test_cmd: Option<&[String]>) -> Result<Flow, String> {
+    let mut flow = flow.clone();
+    if let Some(cmd) = test_cmd {
+        if flow.stages.iter().any(|stage| stage.name == "test") {
+            return Err("aftercare.test_cmd conflicts with flow stage `test`".into());
+        }
+        flow.stages.insert(
+            1,
+            Stage {
+                name: "test".into(),
+                kind: StageKind::Exec { cmd: cmd.to_vec() },
+            },
+        );
+    }
+    Ok(flow)
+}
+
+pub(super) fn git_stdout(root: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .map_err(|error| error.to_string())?;
+    match output {
+        output if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        }
+        output => Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_merge_process_checkpoint(
+    store: &Store,
+    run_id: &str,
+    stage: &str,
+    pid: u32,
+    pid_start_time: i64,
+    checkpoint: &MergeProcessCheckpoint,
+    now_ms: i64,
+) -> Result<(), StoreError> {
+    store.record_aftercare_evidence(
+        run_id,
+        "aftercare_process",
+        &json!({
+            "stage": stage,
+            "pid": pid,
+            "pid_start_time": pid_start_time,
+            "process_group_id": pid,
+            "merge": {
+                "target_head": checkpoint.target_head,
+                "branch_tip": checkpoint.branch_tip,
+                "completed_target": checkpoint.completed_target,
+            },
+        })
+        .to_string(),
+        now_ms,
+    )
+}
+
+fn merge_checkout_ready(root: &Path) -> Result<bool, String> {
+    Ok(!shared_checkout_has_git_operation(root)?
+        && !git_index_lock_path(root)?.exists()
+        && git_index_matches_head(root)?)
+}
+
+pub(super) fn git_is_ancestor(
+    root: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool, String> {
+    let status = Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(root)
+        .status()
+        .map_err(|error| error.to_string())?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git merge-base --is-ancestor {ancestor} {descendant} failed: {status}"
+        )),
+    }
+}
+
+pub(super) fn git_index_matches_head(root: &Path) -> Result<bool, String> {
+    let status = Command::new("git")
+        .args(["diff", "--cached", "--quiet", "--no-ext-diff", "HEAD", "--"])
+        .current_dir(root)
+        .status()
+        .map_err(|error| error.to_string())?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!("git diff --cached --quiet failed: {status}")),
+    }
+}
+
+pub(super) fn git_index_lock_path(root: &Path) -> Result<PathBuf, String> {
+    git_path(root, "index.lock")
+}
+
+fn git_path(root: &Path, name: &str) -> Result<PathBuf, String> {
+    let path = git_stdout(root, &["rev-parse", "--git-path", name])?;
+    let path = PathBuf::from(path);
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    })
+}
+
+pub(super) fn shared_checkout_has_git_operation(root: &Path) -> Result<bool, String> {
+    for state in [
+        "MERGE_HEAD",
+        "AUTO_MERGE",
+        "MERGE_MODE",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "REBASE_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "sequencer",
+    ] {
+        if git_path(root, state)?.exists() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

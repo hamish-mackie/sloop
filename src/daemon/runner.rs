@@ -9,7 +9,8 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_TOKEN;
 use tokio::net::UnixListener;
 
-use super::{DispatcherState, WORKER_BOOTSTRAP_PROMPT};
+use super::WORKER_BOOTSTRAP_PROMPT;
+use super::dispatcher::DispatcherState;
 use crate::config::expand_agent_cmd;
 use crate::run_log::{OutputSource, OutputStream, RunLogWriter};
 use crate::store::StoreError;
@@ -296,5 +297,74 @@ pub(super) fn process_start_time(pid: u32) -> Option<i64> {
             hash = hash.wrapping_mul(0x100000001b3);
         }
         Some(hash as i64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::compose_worker_prompt;
+    use crate::config::expand_agent_cmd;
+    use crate::daemon::WORKER_BOOTSTRAP_PROMPT;
+
+    #[test]
+    fn agent_command_expands_ticket_model_and_effort() {
+        let template = vec![
+            "agent".to_owned(),
+            "--model={model}".to_owned(),
+            "--effort".to_owned(),
+            "{effort}".to_owned(),
+            "prompt={prompt}".to_owned(),
+        ];
+
+        assert_eq!(
+            expand_agent_cmd(&template, Some("sonnet"), Some("medium"), "assignment").unwrap(),
+            [
+                "agent",
+                "--model=sonnet",
+                "--effort",
+                "medium",
+                "prompt=assignment"
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_command_rejects_a_missing_ticket_field() {
+        let template = vec!["agent".to_owned(), "{model}".to_owned()];
+
+        assert_eq!(
+            expand_agent_cmd(&template, None, Some("medium"), "assignment"),
+            Err("does not specify `model`".to_owned())
+        );
+    }
+
+    #[test]
+    fn worker_prompt_uses_the_builtin_when_instructions_are_absent() {
+        let root = tempdir().unwrap();
+
+        assert_eq!(
+            compose_worker_prompt(root.path()).unwrap(),
+            WORKER_BOOTSTRAP_PROMPT
+        );
+    }
+
+    #[test]
+    fn worker_prompt_appends_repository_instructions() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".agents/sloop")).unwrap();
+        fs::write(
+            root.path().join(".agents/sloop/instructions.md"),
+            "Use repository conventions.\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            compose_worker_prompt(root.path()).unwrap(),
+            format!("{WORKER_BOOTSTRAP_PROMPT}\n\nUse repository conventions.\n")
+        );
     }
 }
