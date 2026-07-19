@@ -98,7 +98,14 @@ pub enum TicketSourceConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentConfig {
     pub default_target: String,
-    pub targets: BTreeMap<String, Vec<String>>,
+    pub targets: BTreeMap<String, AgentTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTarget {
+    pub cmd: Vec<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -482,7 +489,24 @@ fn validate_agent(agent: &RawAgent, path: &Path) -> Result<AgentConfig, ConfigEr
                 ),
             });
         }
-        commands.insert(name.clone(), target.cmd.clone());
+        for (key, value) in [("model", &target.model), ("effort", &target.effort)] {
+            if let Some(value) = value
+                && value.trim().is_empty()
+            {
+                return Err(ConfigError::Invalid {
+                    path: path.to_path_buf(),
+                    message: format!("agent.targets.{name}.{key} must not be empty"),
+                });
+            }
+        }
+        commands.insert(
+            name.clone(),
+            AgentTarget {
+                cmd: target.cmd.clone(),
+                model: target.model.clone(),
+                effort: target.effort.clone(),
+            },
+        );
     }
     Ok(AgentConfig {
         default_target: default_target.clone(),
@@ -491,12 +515,15 @@ fn validate_agent(agent: &RawAgent, path: &Path) -> Result<AgentConfig, ConfigEr
 }
 
 pub(crate) fn expand_agent_cmd(
-    template: &[String],
+    target: &AgentTarget,
     model: Option<&str>,
     effort: Option<&str>,
     prompt: &str,
 ) -> Result<Vec<String>, String> {
-    template
+    let model = model.or(target.model.as_deref());
+    let effort = effort.or(target.effort.as_deref());
+    target
+        .cmd
         .iter()
         .map(|argument| {
             let argument = match (argument.contains("{model}"), model) {
@@ -700,6 +727,8 @@ struct RawAgent {
 #[derive(Debug, Deserialize)]
 struct RawAgentTarget {
     cmd: Vec<String>,
+    model: Option<String>,
+    effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1059,7 +1088,55 @@ mod tests {
         let agent = Config::load(&repository).unwrap().agent.unwrap();
         assert_eq!(agent.default_target, "claude");
         assert_eq!(agent.targets.len(), 2);
-        assert_eq!(agent.targets["codex"][0], "codex");
+        assert_eq!(agent.targets["codex"].cmd[0], "codex");
+    }
+
+    #[test]
+    fn agent_targets_load_default_model_and_effort() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".agents/sloop")).unwrap();
+        fs::write(
+            root.path().join(".agents/sloop/config.yaml"),
+            concat!(
+                "version: 1\n",
+                "agent:\n",
+                "  default_target: claude\n",
+                "  targets:\n",
+                "    claude:\n",
+                "      model: opus\n",
+                "      effort: high\n",
+                "      cmd: [claude, --model, '{model}', --effort, '{effort}', '{prompt}']\n",
+            ),
+        )
+        .unwrap();
+
+        let repository = Repository::discover(root.path()).unwrap();
+        let agent = Config::load(&repository).unwrap().agent.unwrap();
+        assert_eq!(agent.targets["claude"].model.as_deref(), Some("opus"));
+        assert_eq!(agent.targets["claude"].effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn agent_target_rejects_a_blank_default_model() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".agents/sloop")).unwrap();
+        fs::write(
+            root.path().join(".agents/sloop/config.yaml"),
+            concat!(
+                "version: 1\n",
+                "agent:\n",
+                "  default_target: claude\n",
+                "  targets:\n",
+                "    claude:\n",
+                "      model: ' '\n",
+                "      cmd: [claude, --model, '{model}', '{prompt}']\n",
+            ),
+        )
+        .unwrap();
+
+        let repository = Repository::discover(root.path()).unwrap();
+        let error = Config::load(&repository).unwrap_err().to_string();
+        assert!(error.contains("agent.targets.claude.model"), "{error}");
     }
 
     #[test]

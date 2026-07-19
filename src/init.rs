@@ -174,7 +174,9 @@ mod tests {
         let config = std::fs::read_to_string(root.path().join(".agents/sloop/config.yaml"))
             .expect("read default config");
         assert_eq!(config, DEFAULT_CONFIG);
-        assert!(config.contains("default_target: opencode"));
+        assert!(config.contains("default_target: claude"));
+        assert!(config.contains("model: opus"));
+        assert!(config.contains("effort: high"));
         assert!(config.contains("worktree_retention: 7d"));
         assert!(config.contains("- claude"));
         assert!(config.contains("- opencode"));

@@ -3,9 +3,11 @@ worktree_dir: .worktrees
 worktree_retention: 7d
 
 agent:
-  default_target: opencode
+  default_target: claude
   targets:
     claude:
+      model: opus
+      effort: high
       cmd:
         - claude
         - --print
@@ -14,16 +16,9 @@ agent:
         - --effort
         - "{effort}"
         - "{prompt}"
-    opencode:
-      cmd:
-        - opencode
-        - run
-        - --model
-        - "{model}"
-        - --variant
-        - "{effort}"
-        - "{prompt}"
     codex:
+      model: gpt-5.6-sol
+      effort: high
       cmd:
         - codex
         - exec
@@ -34,4 +29,15 @@ agent:
         - --sandbox
         - workspace-write
         - --ephemeral
+        - "{prompt}"
+    # OpenCode model names are provider-qualified (for example
+    # anthropic/claude-opus-4-8), so pick yours here or per ticket.
+    opencode:
+      cmd:
+        - opencode
+        - run
+        - --model
+        - "{model}"
+        - --variant
+        - "{effort}"
         - "{prompt}"

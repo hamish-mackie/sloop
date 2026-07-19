@@ -531,7 +531,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{PostError, handle as handle_with_directory};
-    use crate::config::AgentConfig;
+    use crate::config::{AgentConfig, AgentTarget};
     use crate::flow::{Flow, Stage, StageKind, VerdictPolicy};
     use crate::protocol::{PostActivation, PostArgs};
     use crate::store::Store;
@@ -643,15 +643,26 @@ mod tests {
         AgentConfig {
             default_target: "claude".into(),
             targets: BTreeMap::from([
-                ("claude".into(), vec!["claude".into(), "{prompt}".into()]),
+                (
+                    "claude".into(),
+                    AgentTarget {
+                        cmd: vec!["claude".into(), "{prompt}".into()],
+                        model: None,
+                        effort: None,
+                    },
+                ),
                 (
                     "codex".into(),
-                    vec![
-                        "codex".into(),
-                        "{model}".into(),
-                        "{effort}".into(),
-                        "{prompt}".into(),
-                    ],
+                    AgentTarget {
+                        cmd: vec![
+                            "codex".into(),
+                            "{model}".into(),
+                            "{effort}".into(),
+                            "{prompt}".into(),
+                        ],
+                        model: None,
+                        effort: None,
+                    },
                 ),
             ]),
         }
