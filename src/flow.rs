@@ -6,25 +6,25 @@
 
 use std::collections::HashSet;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_FLOW_NAME: &str = "default";
 pub const REVIEW_PROMPT_PATH: &str = ".agents/sloop/prompts/review.md";
 pub const REVIEW_PROMPT_INSTRUCTION: &str = "Review the completed work for correctness and regressions. Run relevant tests, then report a pass or fail verdict with a concise reason.";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Flow {
     pub name: String,
     pub stages: Vec<Stage>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stage {
     pub name: String,
     pub kind: StageKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StageKind {
     Build,
     Merge,

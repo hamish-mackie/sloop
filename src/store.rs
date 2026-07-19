@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::domain::ticket::TicketState;
 
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 const CONNECTION_PRAGMAS: &str = "
 PRAGMA foreign_keys = ON;
@@ -96,6 +96,8 @@ CREATE TABLE runs (
     started_at_ms         INTEGER,
     exited_at_ms          INTEGER,
     exit_code             INTEGER,
+    flow_json             TEXT,
+    ticket_json           TEXT,
     created_at_ms         INTEGER NOT NULL,
     updated_at_ms         INTEGER NOT NULL
 );
@@ -182,6 +184,11 @@ INSERT OR IGNORE INTO id_counters (kind, next_ordinal)
 SELECT 'note', COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) + 1 FROM notes;
 ";
 
+const RUN_SNAPSHOT_COLUMNS: &str = "
+ALTER TABLE runs ADD COLUMN flow_json TEXT;
+ALTER TABLE runs ADD COLUMN ticket_json TEXT;
+";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
     Claimed,
@@ -253,6 +260,8 @@ pub struct ClaimRequest<'a> {
     pub owner_id: &'a str,
     pub lease_ms: i64,
     pub next_activation_eligible_at_ms: Option<i64>,
+    pub flow_json: &'a str,
+    pub ticket_json: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,6 +345,8 @@ pub struct RunRecord {
     pub process_group_id: Option<i64>,
     pub exit_code: Option<i64>,
     pub exited_at_ms: Option<i64>,
+    pub flow_json: Option<String>,
+    pub ticket_json: Option<String>,
 }
 
 /// One lease that must be classified when a daemon starts. Process identity
@@ -355,6 +366,7 @@ pub(crate) struct RecoverableRun {
     pub(crate) worker_socket_path: Option<String>,
     pub(crate) exit_code: Option<i64>,
     pub(crate) lease_expires_at_ms: i64,
+    pub(crate) flow_json: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -528,6 +540,7 @@ impl Store {
                          PRIMARY KEY (ticket_id, blocker_id)
                      );",
                 )?;
+                transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
@@ -551,6 +564,7 @@ impl Store {
                          PRIMARY KEY (ticket_id, blocker_id)
                      );",
                 )?;
+                transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
@@ -573,6 +587,7 @@ impl Store {
                          PRIMARY KEY (ticket_id, blocker_id)
                      );",
                 )?;
+                transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
@@ -587,6 +602,7 @@ impl Store {
                      ALTER TABLE tickets ADD COLUMN missing_at_ms INTEGER;
                      ALTER TABLE runs ADD COLUMN worker_socket_path TEXT;",
                 )?;
+                transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
@@ -600,6 +616,7 @@ impl Store {
                     "ALTER TABLE tickets ADD COLUMN missing_at_ms INTEGER;
                          ALTER TABLE runs ADD COLUMN worker_socket_path TEXT;",
                 )?;
+                transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
@@ -611,6 +628,7 @@ impl Store {
                     .transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction
                     .execute_batch("ALTER TABLE runs ADD COLUMN worker_socket_path TEXT;")?;
+                transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
@@ -620,7 +638,17 @@ impl Store {
                 let transaction = self
                     .connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.commit()?;
+                Ok(())
+            }
+            8 => {
+                let transaction = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -1891,7 +1919,8 @@ impl Store {
             .connection
             .query_row(
                 "SELECT id, ticket_id, state, branch, worktree_path, pid,
-                        pid_start_time, process_group_id, exit_code, exited_at_ms
+                        pid_start_time, process_group_id, exit_code, exited_at_ms,
+                        flow_json, ticket_json
                  FROM runs WHERE id = ?1",
                 params![id],
                 |row| {
@@ -1906,6 +1935,8 @@ impl Store {
                         process_group_id: row.get(7)?,
                         exit_code: row.get(8)?,
                         exited_at_ms: row.get(9)?,
+                        flow_json: row.get(10)?,
+                        ticket_json: row.get(11)?,
                     })
                 },
             )
@@ -1959,7 +1990,7 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT r.id, r.ticket_id, t.target, r.state, r.branch, r.worktree_path,
                     r.pid, r.pid_start_time, r.process_group_id, r.worker_token,
-                    r.worker_socket_path, r.exit_code, l.expires_at_ms
+                    r.worker_socket_path, r.exit_code, l.expires_at_ms, r.flow_json
              FROM runs r
              JOIN leases l ON l.run_id = r.id
              JOIN tickets t ON t.id = r.ticket_id
@@ -1983,6 +2014,7 @@ impl Store {
                     worker_socket_path: row.get(10)?,
                     exit_code: row.get(11)?,
                     lease_expires_at_ms: row.get(12)?,
+                    flow_json: row.get(13)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -2141,14 +2173,17 @@ impl Store {
 
         transaction.execute(
             "INSERT INTO runs
-                 (id, activation_id, ticket_id, state, attempt, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                 (id, activation_id, ticket_id, state, attempt, flow_json, ticket_json,
+                  created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
             params![
                 claim.run_id,
                 claim.activation_id,
                 claim.ticket_id,
                 RunState::Claimed.as_str(),
                 attempt,
+                claim.flow_json,
+                claim.ticket_json,
                 now_ms,
             ],
         )?;
@@ -2473,7 +2508,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{ActivationKind, ClaimRequest, ExitClaim, NewActivation, Store, StoreError};
-    use crate::domain::ticket::TicketState;
+    use crate::domain::ticket::{TicketSnapshot, TicketState};
+    use crate::flow::{Flow, Stage, StageKind};
     use crate::outcome::Outcome;
 
     fn open_seeded(path: &std::path::Path) -> Store {
@@ -2560,7 +2596,63 @@ mod tests {
             owner_id: "daemon-1",
             lease_ms: 60_000,
             next_activation_eligible_at_ms: None,
+            flow_json: "{}",
+            ticket_json: "{}",
         }
+    }
+
+    #[test]
+    fn claims_persist_flow_and_ticket_snapshots() {
+        let directory = tempdir().unwrap();
+        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        let flow = Flow {
+            name: "default".into(),
+            stages: vec![
+                Stage {
+                    name: "build".into(),
+                    kind: StageKind::Build,
+                },
+                Stage {
+                    name: "check".into(),
+                    kind: StageKind::Exec {
+                        cmd: vec!["cargo".into(), "test".into()],
+                    },
+                },
+            ],
+        };
+        let ticket = TicketSnapshot {
+            id: "T1".into(),
+            name: "Ticket one".into(),
+            blocked_by: vec![],
+            worktree: Some("sloop/T1".into()),
+            target: Some("claude".into()),
+            model: Some("sonnet".into()),
+            effort: Some("medium".into()),
+            body: "# Original body\n".into(),
+        };
+        let flow_json = serde_json::to_string(&flow).unwrap();
+        let ticket_json = serde_json::to_string(&ticket).unwrap();
+
+        store
+            .claim_ticket(
+                &ClaimRequest {
+                    flow_json: &flow_json,
+                    ticket_json: &ticket_json,
+                    ..claim_t1("R1")
+                },
+                2_000,
+            )
+            .unwrap();
+
+        let run = store.run("R1").unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Flow>(run.flow_json.as_deref().unwrap()).unwrap(),
+            flow
+        );
+        assert_eq!(
+            serde_json::from_str::<TicketSnapshot>(run.ticket_json.as_deref().unwrap()).unwrap(),
+            ticket
+        );
     }
 
     #[test]
@@ -2655,6 +2747,8 @@ mod tests {
                     owner_id: "daemon-1",
                     lease_ms: 60_000,
                     next_activation_eligible_at_ms: None,
+                    flow_json: "{}",
+                    ticket_json: "{}",
                 },
                 2_000,
             )
@@ -3348,7 +3442,9 @@ mod tests {
                  ALTER TABLE tickets DROP COLUMN worktree;
                  ALTER TABLE tickets DROP COLUMN flow;
                  ALTER TABLE tickets DROP COLUMN missing_at_ms;
-                 ALTER TABLE runs DROP COLUMN worker_socket_path;",
+                 ALTER TABLE runs DROP COLUMN worker_socket_path;
+                 ALTER TABLE runs DROP COLUMN flow_json;
+                 ALTER TABLE runs DROP COLUMN ticket_json;",
             )
             .unwrap();
         connection.pragma_update(None, "user_version", 3).unwrap();
@@ -3394,6 +3490,30 @@ mod tests {
             Store::open(&path, 3_000),
             Err(StoreError::UnsupportedSchemaVersion(99))
         ));
+    }
+
+    #[test]
+    fn version_eight_migrates_existing_runs_with_null_snapshots() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("sloop.db");
+        let mut store = open_seeded(&path);
+        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        drop(store);
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE runs DROP COLUMN flow_json;
+                 ALTER TABLE runs DROP COLUMN ticket_json;",
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 8).unwrap();
+        drop(connection);
+
+        let store = Store::open(&path, 3_000).unwrap();
+        let run = store.run("R1").unwrap().unwrap();
+        assert_eq!(run.flow_json, None);
+        assert_eq!(run.ticket_json, None);
     }
 
     #[test]

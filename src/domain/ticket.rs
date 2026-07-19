@@ -1,4 +1,18 @@
+use serde::{Deserialize, Serialize};
+
 use crate::outcome::Outcome;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketSnapshot {
+    pub id: String,
+    pub name: String,
+    pub blocked_by: Vec<String>,
+    pub worktree: Option<String>,
+    pub target: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub body: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketState {

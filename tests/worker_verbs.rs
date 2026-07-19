@@ -104,12 +104,12 @@ fn configure_worker_agent(world: &World, blocking: bool) {
         format!(
             "#!/bin/sh\n\
              SLOOP=\"{sloop}\"\n\
+             {wait_loop}\
              \"$SLOOP\" --json brief > brief.json 2> brief.err\n\
              \"$SLOOP\" --json show \"$SLOOP_TICKET_ID\" > show.json 2> show.err\n\
              \"$SLOOP\" --json show T999 > foreign-show.out 2> foreign-show.json\n\
              echo $? > foreign-show.exit\n\
              \"$SLOOP\" --json note work in progress > note.json 2> note.err\n\
-             {wait_loop}\
              exit 0\n",
             sloop = env!("CARGO_BIN_EXE_sloop"),
         ),
@@ -267,6 +267,36 @@ fn a_running_agent_reads_its_brief_and_records_a_note() {
     let store = sloop::store::Store::open(&world.db_path(), 0).expect("open runtime store");
     let notes = store.notes_for_run("R1").expect("read notes");
     assert_eq!(notes, vec!["work in progress".to_owned()]);
+}
+
+#[test]
+fn a_worker_brief_uses_the_ticket_body_captured_at_claim() {
+    let world = World::configured();
+    configure_worker_agent(&world, true);
+    world.commit_all("initial");
+    world.start_daemon();
+    let ticket = post_manual(
+        &world,
+        "admission.md",
+        "# Admission body\n\nOriginal instructions.\n",
+    );
+
+    assert!(world.sloop(&["run", &ticket]).status.success());
+    wait_until("the claimed run starts", || {
+        world.worker_socket("R1").exists()
+    });
+    fs::write(
+        world.root().join(".agents/sloop/tickets/admission.md"),
+        "# Changed after claim\n",
+    )
+    .expect("edit source ticket after claim");
+    fs::write(world.root().join("release"), "go\n").expect("release the agent");
+    wait_until("the run settles", || run_settled(&world));
+
+    let brief = worktree_json(&world, "R1", "brief.json");
+    let body = brief["data"]["ticket"]["body"].as_str().expect("body");
+    assert!(body.contains("Original instructions"), "brief body: {body}");
+    assert!(!body.contains("Changed after claim"), "brief body: {body}");
 }
 
 #[test]

@@ -318,16 +318,16 @@ fn unknown_bound_flow_never_falls_back_to_default() {
         .unwrap();
 
     assert!(world.sloop(&["run", &ticket]).status.success());
-    wait_until("the invalid flow claim is safely aborted", || {
-        tickets(&world)["ready"] == 1
+    wait_until("the invalid flow is rejected before claim", || {
+        fs::read_to_string(world.daemon_log())
+            .is_ok_and(|log| log.contains("bound_flow_resolution_failed"))
     });
     assert!(!world.root().join(".worktrees/R1").exists());
-    let state: String = connection
-        .query_row("SELECT state FROM runs WHERE id = 'R1'", [], |row| {
-            row.get(0)
-        })
+    let runs: i64 = connection
+        .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(state, "aborted");
+    assert_eq!(runs, 0);
+    assert_eq!(tickets(&world)["ready"], 1);
 }
 
 #[test]
@@ -443,23 +443,33 @@ fn restart_between_exec_stages_skips_the_completed_stage() {
     configure(&world, COMMITTING_AGENT, None);
     world.arm_test_hook(HOOK);
     let invocations = world.root().join("flow-invocations");
-    write_flow(
-        &world,
-        &format!(
+    fs::write(
+        world.root().join(".agents/sloop/flows/resume.yaml"),
+        format!(
             "stages:\n  - {{ name: build, kind: build }}\n  - {{ name: first, kind: exec, cmd: [\"sh\", \"-c\", \"printf 1 >> {}\"] }}\n  - {{ name: second, kind: exec, cmd: [\"sh\", \"-c\", \"printf 2 >> {}\"] }}\n  - {{ name: merge, kind: merge }}\n",
             invocations.display(),
             invocations.display(),
         ),
-    );
+    )
+    .expect("write named recovery flow");
     world.commit_all("initial");
     let daemon_pid = world.start_daemon()["data"]["pid"].as_u64().unwrap() as u32;
-    post_and_run(&world, "resume-flow.md");
+    let ticket_path = world.write_ticket("resume-flow.md", "---\nflow: resume\n---\n# Work\n");
+    let output = world.sloop(&["post", ticket_path.to_str().unwrap(), "--manual"]);
+    assert!(output.status.success());
+    let ticket = World::json_stdout(&output)["data"]["ticket"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(world.sloop(&["run", &ticket]).status.success());
     wait_until("the first stage is durably complete", || {
         world.test_hook_reached(HOOK)
             && fs::read_to_string(&invocations).is_ok_and(|value| value == "1")
     });
 
     world.kill_daemon(daemon_pid);
+    fs::remove_file(world.root().join(".agents/sloop/flows/resume.yaml"))
+        .expect("remove admitted flow before restart");
     world.start_daemon();
     wait_until("recovery completes the remaining flow", || {
         tickets(&world)["merged"] == 1

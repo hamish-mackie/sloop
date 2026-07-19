@@ -260,8 +260,16 @@ pub(super) fn spawn_aftercare_recovery(
     let root = state.root.clone();
     let state_dir = state.state_dir.clone();
     let test_cmd = state.aftercare_test_cmd.clone();
-    let flow = bound_flow(&state.store, &state.flows, &run.ticket_id)
-        .map_err(DaemonError::InvalidResponse)?;
+    let flow = match run.flow_json.as_deref() {
+        Some(snapshot) => serde_json::from_str::<Flow>(snapshot).map_err(|error| {
+            DaemonError::InvalidResponse(format!(
+                "run `{}` has an invalid flow snapshot: {error}",
+                run.id
+            ))
+        })?,
+        None => bound_flow(&state.store, &state.flows, &run.ticket_id)
+            .map_err(DaemonError::InvalidResponse)?,
+    };
     let clock = state.clock.clone();
     let db_path = state.state_dir.join("sloop.db");
     let shutdown = state.shutdown_flag.clone();
@@ -842,6 +850,7 @@ mod tests {
             worker_socket_path: None,
             exit_code: None,
             lease_expires_at_ms: 1,
+            flow_json: None,
         }
     }
 
