@@ -99,6 +99,7 @@ pub enum Request {
     Brief(EmptyArgs),
     Show(ShowArgs),
     Note(NoteArgs),
+    Verdict(VerdictArgs),
 }
 
 impl Request {
@@ -123,12 +124,13 @@ impl Request {
             Self::Brief(_) => "brief",
             Self::Show(_) => "show",
             Self::Note(_) => "note",
+            Self::Verdict(_) => "verdict",
         }
     }
 
     pub fn capability(&self) -> Capability {
         match self {
-            Self::Brief(_) | Self::Note(_) => Capability::Worker,
+            Self::Brief(_) | Self::Note(_) | Self::Verdict(_) => Capability::Worker,
             Self::Show(_) => Capability::Both,
             _ => Capability::Operator,
         }
@@ -156,6 +158,7 @@ impl Request {
                 | "brief"
                 | "show"
                 | "note"
+                | "verdict"
         )
     }
 }
@@ -241,6 +244,21 @@ pub struct ShowArgs {
 #[serde(deny_unknown_fields)]
 pub struct NoteArgs {
     pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerdictArgs {
+    pub verdict: VerdictValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerdictValue {
+    Pass,
+    Fail,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

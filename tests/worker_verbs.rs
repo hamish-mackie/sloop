@@ -67,6 +67,29 @@ fn note_preserves_the_complete_note_text() {
 }
 
 #[test]
+fn verdict_sends_the_selected_verdict_and_reason() {
+    let world = World::configured();
+    let reply = json!({
+        "id": "req-1",
+        "ok": true,
+        "data": {"verdict": {"run": "R1", "stage": "review", "verdict": "fail", "reason": "changes requested"}}
+    });
+    let (output, request) = world.worker_exchange(
+        &["verdict", "fail", "--reason", "changes requested"],
+        reply.clone(),
+    );
+
+    assert!(output.status.success());
+    assert_eq!(World::json_stdout(&output), reply);
+    assert_eq!(request["verb"], "verdict");
+    assert_eq!(
+        request["args"],
+        json!({"verdict": "fail", "reason": "changes requested"})
+    );
+    assert_eq!(request["token"], "test-worker-token");
+}
+
+#[test]
 fn worker_verbs_reject_missing_worker_context() {
     let world = World::configured();
     let output = world.sloop(&["brief"]);
@@ -110,6 +133,7 @@ fn configure_worker_agent(world: &World, blocking: bool) {
              \"$SLOOP\" --json show T999 > foreign-show.out 2> foreign-show.json\n\
              echo $? > foreign-show.exit\n\
              \"$SLOOP\" --json note work in progress > note.json 2> note.err\n\
+             git -c user.name=sloop-test-agent -c user.email=sloop-test-agent@example.invalid commit --quiet --allow-empty -m worker\n\
              exit 0\n",
             sloop = env!("CARGO_BIN_EXE_sloop"),
         ),
@@ -267,6 +291,61 @@ fn a_running_agent_reads_its_brief_and_records_a_note() {
     let store = sloop::store::Store::open(&world.db_path(), 0).expect("open runtime store");
     let notes = store.notes_for_run("R1").expect("read notes");
     assert_eq!(notes, vec!["work in progress".to_owned()]);
+}
+
+#[test]
+fn reported_stage_records_the_first_verdict_and_rejects_the_second() {
+    let world = World::configured();
+    configure_worker_agent(&world, false);
+    let reviewer = world.root().join("reviewer.sh");
+    fs::write(
+        &reviewer,
+        format!(
+            "#!/bin/sh\n\
+             SLOOP={}\n\
+             \"$SLOOP\" --json verdict fail --reason 'changes requested' > verdict.json 2> verdict.err\n\
+             \"$SLOOP\" --json verdict pass > duplicate.out 2> duplicate.json\n\
+             echo $? > duplicate.exit\n\
+             exit 0\n",
+            serde_json::to_string(env!("CARGO_BIN_EXE_sloop")).expect("quote sloop path"),
+        ),
+    )
+    .expect("write reviewer");
+    fs::write(
+        world.root().join(".agents/sloop/flows/default.yaml"),
+        format!(
+            "stages:\n  - {{ name: build, kind: agent }}\n  - name: review\n    kind: exec\n    cmd: [\"sh\", {}]\n    verdict: reported\n  - {{ name: merge, kind: merge }}\n",
+            serde_json::to_string(&reviewer.to_string_lossy()).expect("quote reviewer path"),
+        ),
+    )
+    .expect("write reported flow");
+    world.commit_all("initial");
+    world.start_daemon();
+    let ticket = post_manual(&world, "reported.md", "# Reported review\n");
+
+    assert!(world.sloop(&["run", &ticket]).status.success());
+    wait_until("the reported failure settles", || run_settled(&world));
+
+    let first = worktree_json(&world, "R1", "verdict.json");
+    assert_eq!(first["ok"], true, "first verdict failed: {first}");
+    assert_eq!(first["data"]["verdict"]["stage"], "review");
+    assert_eq!(first["data"]["verdict"]["verdict"], "fail");
+    assert_eq!(first["data"]["verdict"]["reason"], "changes requested");
+
+    let duplicate = worktree_json(&world, "R1", "duplicate.json");
+    assert_eq!(duplicate["ok"], false);
+    assert_eq!(duplicate["error"]["code"], "conflict");
+    assert_eq!(
+        fs::read_to_string(world.root().join(".worktrees/R1/duplicate.exit"))
+            .expect("read duplicate exit")
+            .trim(),
+        "1"
+    );
+    let persisted = world
+        .run_evidence("R1", "stage_verdict")
+        .expect("reported verdict evidence");
+    assert_eq!(persisted["verdict"], "fail");
+    assert_eq!(persisted["reason"], "changes requested");
 }
 
 #[test]

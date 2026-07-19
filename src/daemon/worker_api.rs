@@ -3,15 +3,17 @@ use std::fs;
 use serde_json::json;
 
 use crate::domain::ticket::TicketSnapshot;
-use crate::protocol::{ErrorBody, Request, RequestId, ResponseEnvelope};
+use crate::flow::{Flow, VerdictPolicy};
+use crate::protocol::{ErrorBody, Request, RequestId, ResponseEnvelope, VerdictArgs, VerdictValue};
 use crate::vendor_error::VendorErrorMatch;
 
 use super::commands::lookup;
-use super::dispatcher::{DispatcherState, internal, mark_storage_full, unauthorized};
+use super::dispatcher::{DispatcherState, conflict, internal, mark_storage_full, unauthorized};
 
 /// Serves a worker verb after proving the caller holds the run's token.
-/// Everything an agent can reach flows through here: `brief` and `show` are
-/// scoped reads, `note` is the only write and moves nothing.
+/// Everything an agent can reach flows through here: reads and writes are
+/// scoped to the authenticated run, and only a configured reported-verdict
+/// stage can affect flow evidence.
 pub(super) fn dispatch_worker(
     state: &mut DispatcherState,
     id: RequestId,
@@ -36,6 +38,7 @@ pub(super) fn dispatch_worker(
         Request::Brief(_) => handle_brief(state, run_id),
         Request::Show(args) => handle_show(state, run_id, &args.reference),
         Request::Note(args) => handle_note(state, run_id, &args.text),
+        Request::Verdict(args) => handle_verdict(state, run_id, &args),
         // The connection handler already rejected operator verbs.
         _ => Err(unauthorized(
             "operator verbs are not available on a worker socket",
@@ -182,4 +185,76 @@ fn handle_note(
             internal(&format!("cannot record note: {error}"))
         })?;
     Ok(json!({"note": {"id": note_id, "run": run_id, "text": text}}))
+}
+
+fn handle_verdict(
+    state: &DispatcherState,
+    run_id: &str,
+    args: &VerdictArgs,
+) -> Result<serde_json::Value, ErrorBody> {
+    let run = lookup(state, |store| store.run(run_id))?
+        .ok_or_else(|| internal("the run for this token no longer exists"))?;
+    let snapshot = run
+        .flow_json
+        .as_deref()
+        .ok_or_else(|| internal("the run has no flow snapshot"))?;
+    let flow: Flow = serde_json::from_str(snapshot)
+        .map_err(|error| internal(&format!("the run's flow snapshot is invalid: {error}")))?;
+    let stage_name = match run.state.as_str() {
+        "running" => flow
+            .stages
+            .first()
+            .map(|stage| stage.name.clone())
+            .ok_or_else(|| internal("the run's flow has no first stage"))?,
+        "aftercare" => {
+            let rows = lookup(state, |store| store.run_evidence(run_id))?;
+            rows.iter()
+                .find(|(kind, _)| kind == "aftercare_process")
+                .and_then(|(_, data)| serde_json::from_str::<serde_json::Value>(data).ok())
+                .and_then(|data| data["stage"].as_str().map(str::to_owned))
+                .ok_or_else(|| conflict("the run has no stage process currently executing"))?
+        }
+        _ => return Err(conflict("the run has no stage currently executing")),
+    };
+    let stage = flow
+        .stages
+        .iter()
+        .find(|stage| stage.name == stage_name)
+        .ok_or_else(|| internal("the executing stage is not in the run's flow snapshot"))?;
+    if stage.verdict != VerdictPolicy::Reported {
+        return Err(unauthorized(&format!(
+            "stage `{stage_name}` does not use the reported verdict policy"
+        )));
+    }
+
+    let verdict = match args.verdict {
+        VerdictValue::Pass => "pass",
+        VerdictValue::Fail => "fail",
+    };
+    let inserted = state
+        .store
+        .record_stage_verdict(
+            run_id,
+            &stage_name,
+            verdict,
+            args.reason.as_deref(),
+            state.clock.now_ms(),
+        )
+        .map_err(|error| {
+            mark_storage_full(state, &error);
+            internal(&format!("cannot record stage verdict: {error}"))
+        })?;
+    if !inserted {
+        return Err(conflict(&format!(
+            "stage `{stage_name}` already has a reported verdict"
+        )));
+    }
+    Ok(json!({
+        "verdict": {
+            "run": run_id,
+            "stage": stage_name,
+            "verdict": verdict,
+            "reason": args.reason,
+        }
+    }))
 }

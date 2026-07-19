@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub const DEFAULT_FLOW_NAME: &str = "default";
 pub const REVIEW_PROMPT_PATH: &str = ".agents/sloop/prompts/review.md";
@@ -18,17 +18,54 @@ pub struct Flow {
     pub stages: Vec<Stage>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Stage {
     pub name: String,
     pub kind: StageKind,
+    pub verdict: VerdictPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StageKind {
-    Build,
+    #[serde(alias = "Build")]
+    Agent,
     Merge,
-    Exec { cmd: Vec<String> },
+    Exec {
+        cmd: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VerdictPolicy {
+    Exit,
+    Commits,
+    Check { cmd: Vec<String> },
+    Reported,
+}
+
+impl<'de> Deserialize<'de> for Stage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SnapshotStage {
+            name: String,
+            kind: StageKind,
+            verdict: Option<VerdictPolicy>,
+        }
+
+        let stage = SnapshotStage::deserialize(deserializer)?;
+        let verdict = stage.verdict.unwrap_or(match &stage.kind {
+            StageKind::Agent => VerdictPolicy::Commits,
+            StageKind::Exec { .. } | StageKind::Merge => VerdictPolicy::Exit,
+        });
+        Ok(Self {
+            name: stage.name,
+            kind: stage.kind,
+            verdict,
+        })
+    }
 }
 
 pub(crate) fn parse(name: &str, contents: &str) -> Result<Flow, String> {
@@ -45,11 +82,11 @@ pub(crate) fn parse(name: &str, contents: &str) -> Result<Flow, String> {
             return Err(format!("duplicate stage name `{}`", raw.name));
         }
         let kind = match raw.kind.as_str() {
-            "build" => {
+            "agent" | "build" => {
                 if raw.cmd.is_some() {
-                    return Err(format!("build stage `{}` must not define `cmd`", raw.name));
+                    return Err(format!("agent stage `{}` must not define `cmd`", raw.name));
                 }
-                StageKind::Build
+                StageKind::Agent
             }
             "merge" => {
                 if raw.cmd.is_some() {
@@ -69,9 +106,40 @@ pub(crate) fn parse(name: &str, contents: &str) -> Result<Flow, String> {
             }
             kind => return Err(format!("stage `{}` has unknown kind `{kind}`", raw.name)),
         };
+        let verdict = match (&kind, raw.verdict) {
+            (StageKind::Merge, Some(_)) => {
+                return Err(format!(
+                    "merge stage `{}` must not define `verdict`",
+                    raw.name
+                ));
+            }
+            (StageKind::Merge | StageKind::Exec { .. }, None) => VerdictPolicy::Exit,
+            (StageKind::Agent, None) => VerdictPolicy::Commits,
+            (_, Some(RawVerdict::Name(name))) => match name.as_str() {
+                "exit" => VerdictPolicy::Exit,
+                "commits" => VerdictPolicy::Commits,
+                "reported" => VerdictPolicy::Reported,
+                _ => {
+                    return Err(format!(
+                        "stage `{}` has unknown verdict policy `{name}`",
+                        raw.name
+                    ));
+                }
+            },
+            (_, Some(RawVerdict::Check { check })) => {
+                if check.is_empty() {
+                    return Err(format!(
+                        "stage `{}` check verdict must define a non-empty command",
+                        raw.name
+                    ));
+                }
+                VerdictPolicy::Check { cmd: check }
+            }
+        };
         stages.push(Stage {
             name: raw.name,
             kind,
+            verdict,
         });
     }
 
@@ -86,11 +154,13 @@ pub(crate) fn built_in_default() -> Flow {
     let stages = vec![
         Stage {
             name: "build".into(),
-            kind: StageKind::Build,
+            kind: StageKind::Agent,
+            verdict: VerdictPolicy::Commits,
         },
         Stage {
             name: "merge".into(),
             kind: StageKind::Merge,
+            verdict: VerdictPolicy::Exit,
         },
     ];
     Flow {
@@ -100,17 +170,21 @@ pub(crate) fn built_in_default() -> Flow {
 }
 
 fn validate_order(stages: &[Stage]) -> Result<(), String> {
-    let build_count = stages
-        .iter()
-        .filter(|stage| stage.kind == StageKind::Build)
-        .count();
-    if build_count != 1 {
-        return Err(format!(
-            "flow must contain exactly one build stage; found {build_count}"
-        ));
+    if !stages
+        .first()
+        .is_some_and(|stage| stage.kind == StageKind::Agent)
+    {
+        return Err("the first stage must be an agent stage".into());
     }
-    if stages.first().map(|stage| &stage.kind) != Some(&StageKind::Build) {
-        return Err("build stage must be first".into());
+    let agent_count = stages
+        .iter()
+        .filter(|stage| stage.kind == StageKind::Agent)
+        .count();
+    if agent_count > 1 {
+        return Err(
+            "only the first stage may be an agent stage; additional agent stages require runner support"
+                .into(),
+        );
     }
 
     let merge_count = stages
@@ -165,26 +239,25 @@ pub struct StageEvidence {
     pub reason: Option<String>,
 }
 
-/// Resolves a stage's verdict, source, and reason from its exit-code
-/// reading and an optional reported verdict.
-///
-/// Policy: a reported verdict is authoritative and overrides the exit code,
-/// because agentic stages (e.g. review) exit 0 regardless of their
-/// judgment — the CLI ran; that says nothing about the verdict. `build` is
-/// the one exception: its evidence rule (exit 0 and commits > 0) is fixed
-/// and not negotiable by the worker, so a reported verdict is ignored
-/// entirely when the stage kind is `Build`.
+/// Resolves a stage's verdict, source, and reason from the evidence selected
+/// by its policy. Reports are authoritative only for `Reported`; other
+/// policies ignore them.
 pub fn resolve_verdict(
-    kind: &StageKind,
+    policy: &VerdictPolicy,
     exit: Verdict,
     reported: Option<Reported>,
 ) -> (Verdict, VerdictSource, Option<String>) {
-    if *kind != StageKind::Build {
-        if let Some(reported) = reported {
-            return (reported.verdict, VerdictSource::Reported, reported.reason);
-        }
+    if *policy != VerdictPolicy::Reported {
+        return (exit, VerdictSource::ExitCode, None);
     }
-    (exit, VerdictSource::ExitCode, None)
+    match reported {
+        Some(reported) => (reported.verdict, VerdictSource::Reported, reported.reason),
+        None => (
+            Verdict::Fail,
+            VerdictSource::Reported,
+            Some("no verdict reported".into()),
+        ),
+    }
 }
 
 /// What the walk does next, given a flow and its evidence so far.
@@ -234,13 +307,21 @@ struct RawStage {
     name: String,
     kind: String,
     cmd: Option<Vec<String>>,
+    verdict: Option<RawVerdict>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawVerdict {
+    Name(String),
+    Check { check: Vec<String> },
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Flow, Reported, Stage, StageEvidence, StageKind, Step, Verdict, VerdictSource, next_step,
-        parse, resolve_verdict,
+        Flow, Reported, Stage, StageEvidence, StageKind, Step, Verdict, VerdictPolicy,
+        VerdictSource, next_step, parse, resolve_verdict,
     };
 
     fn error(yaml: &str) -> String {
@@ -251,7 +332,7 @@ mod tests {
     fn valid_multi_stage_flow_parses_in_order() {
         let flow = parse(
             "release",
-            "stages:\n  - name: build\n    kind: build\n  - name: test\n    kind: exec\n    cmd: [cargo, test]\n  - name: merge\n    kind: merge\n",
+            "stages:\n  - name: build\n    kind: agent\n  - name: test\n    kind: exec\n    cmd: [cargo, test]\n    verdict: { check: [cargo, clippy] }\n  - name: merge\n    kind: merge\n",
         )
         .unwrap();
 
@@ -262,21 +343,71 @@ mod tests {
                 stages: vec![
                     Stage {
                         name: "build".into(),
-                        kind: StageKind::Build,
+                        kind: StageKind::Agent,
+                        verdict: VerdictPolicy::Commits,
                     },
                     Stage {
                         name: "test".into(),
                         kind: StageKind::Exec {
                             cmd: vec!["cargo".into(), "test".into()],
                         },
+                        verdict: VerdictPolicy::Check {
+                            cmd: vec!["cargo".into(), "clippy".into()],
+                        },
                     },
                     Stage {
                         name: "merge".into(),
                         kind: StageKind::Merge,
+                        verdict: VerdictPolicy::Exit,
                     },
                 ],
             }
         );
+    }
+
+    #[test]
+    fn build_is_a_deprecated_alias_for_agent() {
+        let flow = parse("example", "- { name: build, kind: build }\n").unwrap();
+        assert_eq!(flow.stages[0].kind, StageKind::Agent);
+        assert_eq!(flow.stages[0].verdict, VerdictPolicy::Commits);
+    }
+
+    #[test]
+    fn old_build_snapshots_deserialize_with_the_agent_default() {
+        let flow: Flow = serde_json::from_str(
+            r#"{"name":"example","stages":[{"name":"build","kind":"Build"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(flow.stages[0].kind, StageKind::Agent);
+        assert_eq!(flow.stages[0].verdict, VerdictPolicy::Commits);
+    }
+
+    #[test]
+    fn verdict_policies_and_defaults_parse() {
+        let flow = parse(
+            "example",
+            "- { name: build, kind: agent, verdict: exit }\n- { name: test, kind: exec, cmd: ['true'], verdict: commits }\n- { name: review, kind: exec, cmd: ['true'], verdict: reported }\n",
+        )
+        .unwrap();
+        assert_eq!(flow.stages[0].verdict, VerdictPolicy::Exit);
+        assert_eq!(flow.stages[1].verdict, VerdictPolicy::Commits);
+        assert_eq!(flow.stages[2].verdict, VerdictPolicy::Reported);
+
+        let defaults = parse(
+            "example",
+            "- { name: build, kind: agent }\n- { name: test, kind: exec, cmd: ['true'] }\n",
+        )
+        .unwrap();
+        assert_eq!(defaults.stages[0].verdict, VerdictPolicy::Commits);
+        assert_eq!(defaults.stages[1].verdict, VerdictPolicy::Exit);
+    }
+
+    #[test]
+    fn merge_stages_reject_verdict_policies() {
+        let error = error(
+            "- { name: build, kind: agent }\n- { name: merge, kind: merge, verdict: exit }\n",
+        );
+        assert!(error.contains("must not define `verdict`"), "{error}");
     }
 
     #[test]
@@ -292,19 +423,15 @@ mod tests {
     }
 
     #[test]
-    fn exactly_one_build_stage_is_required() {
+    fn exactly_one_first_agent_stage_is_required() {
         let missing = error("- { name: check, kind: exec, cmd: ['true'] }\n");
-        assert!(missing.contains("exactly one build stage"), "{missing}");
+        assert!(
+            missing.contains("first stage must be an agent"),
+            "{missing}"
+        );
 
-        let duplicate = error("- { name: build, kind: build }\n- { name: rebuild, kind: build }\n");
-        assert!(duplicate.contains("exactly one build stage"), "{duplicate}");
-    }
-
-    #[test]
-    fn build_stage_must_be_first() {
-        let error =
-            error("- { name: check, kind: exec, cmd: ['true'] }\n- { name: build, kind: build }\n");
-        assert!(error.contains("build stage must be first"), "{error}");
+        let duplicate = error("- { name: build, kind: agent }\n- { name: rebuild, kind: agent }\n");
+        assert!(duplicate.contains("require runner support"), "{duplicate}");
     }
 
     #[test]
@@ -340,17 +467,20 @@ mod tests {
             stages: vec![
                 Stage {
                     name: "build".into(),
-                    kind: StageKind::Build,
+                    kind: StageKind::Agent,
+                    verdict: VerdictPolicy::Commits,
                 },
                 Stage {
                     name: "review".into(),
                     kind: StageKind::Exec {
                         cmd: vec!["true".into()],
                     },
+                    verdict: VerdictPolicy::Exit,
                 },
                 Stage {
                     name: "merge".into(),
                     kind: StageKind::Merge,
+                    verdict: VerdictPolicy::Exit,
                 },
             ],
         }
@@ -429,13 +559,9 @@ mod tests {
     }
 
     #[test]
-    fn reported_verdicts_override_exit_code_for_ordinary_stages() {
-        let exec = StageKind::Exec {
-            cmd: vec!["true".into()],
-        };
-
+    fn only_reported_policy_consults_reported_verdicts() {
         assert_eq!(
-            resolve_verdict(&exec, Verdict::Pass, None),
+            resolve_verdict(&VerdictPolicy::Exit, Verdict::Pass, None),
             (Verdict::Pass, VerdictSource::ExitCode, None)
         );
 
@@ -444,7 +570,7 @@ mod tests {
             reason: Some("changes requested".into()),
         };
         assert_eq!(
-            resolve_verdict(&exec, Verdict::Pass, Some(reported)),
+            resolve_verdict(&VerdictPolicy::Reported, Verdict::Pass, Some(reported)),
             (
                 Verdict::Fail,
                 VerdictSource::Reported,
@@ -454,15 +580,27 @@ mod tests {
     }
 
     #[test]
-    fn build_stage_ignores_reported_verdicts() {
+    fn non_reported_policies_ignore_reports() {
         let reported = Reported {
             verdict: Verdict::Pass,
             reason: Some("looks fine to me".into()),
         };
 
         assert_eq!(
-            resolve_verdict(&StageKind::Build, Verdict::Fail, Some(reported)),
+            resolve_verdict(&VerdictPolicy::Commits, Verdict::Fail, Some(reported)),
             (Verdict::Fail, VerdictSource::ExitCode, None)
+        );
+    }
+
+    #[test]
+    fn missing_report_is_a_failed_reported_verdict() {
+        assert_eq!(
+            resolve_verdict(&VerdictPolicy::Reported, Verdict::Pass, None),
+            (
+                Verdict::Fail,
+                VerdictSource::Reported,
+                Some("no verdict reported".into())
+            )
         );
     }
 }

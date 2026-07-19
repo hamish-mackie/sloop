@@ -103,6 +103,18 @@ fn aftercare_stages(world: &World, run_id: &str) -> Vec<(i64, String, String, St
         .expect("read aftercare stages")
 }
 
+fn aftercare_stage_evidence(world: &World, run_id: &str, stage: &str) -> serde_json::Value {
+    let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
+    let evidence: String = connection
+        .query_row(
+            "SELECT evidence_json FROM aftercare_stages WHERE run_id = ?1 AND stage = ?2",
+            [run_id, stage],
+            |row| row.get(0),
+        )
+        .expect("read aftercare stage evidence");
+    serde_json::from_str(&evidence).expect("stage evidence is JSON")
+}
+
 fn default_branch_has(world: &World, file: &str) -> bool {
     // The default branch is what the root checkout points at; a completed
     // fast-forward merge makes the agent's file visible there.
@@ -300,6 +312,65 @@ fn failed_exec_halts_before_merge_and_preserves_commits_for_review() {
             ("reject".into(), "failed".into())
         ]
     );
+}
+
+#[test]
+fn check_verdict_uses_the_check_commands_exit() {
+    let passing = World::configured();
+    configure(&passing, COMMITTING_AGENT, None);
+    write_flow(
+        &passing,
+        "stages:\n  - { name: build, kind: agent }\n  - { name: verify, kind: exec, cmd: ['true'], verdict: { check: ['true'] } }\n  - { name: merge, kind: merge }\n",
+    );
+    passing.commit_all("initial");
+    passing.start_daemon();
+    post_and_run(&passing, "check-pass.md");
+    wait_until("the passing check merges", || {
+        tickets(&passing)["merged"] == 1
+    });
+
+    let failing = World::configured();
+    configure(&failing, COMMITTING_AGENT, None);
+    write_flow(
+        &failing,
+        "stages:\n  - { name: build, kind: agent }\n  - { name: verify, kind: exec, cmd: ['true'], verdict: { check: ['false'] } }\n  - { name: merge, kind: merge }\n",
+    );
+    failing.commit_all("initial");
+    failing.start_daemon();
+    post_and_run(&failing, "check-fail.md");
+    wait_until("the failing check needs review", || {
+        tickets(&failing)["needs_review"] == 1
+    });
+    assert_eq!(
+        aftercare_stages(&failing, "R1")
+            .into_iter()
+            .map(|(_, name, state, _)| (name, state))
+            .collect::<Vec<_>>(),
+        [
+            ("build".into(), "passed".into()),
+            ("verify".into(), "failed".into())
+        ]
+    );
+}
+
+#[test]
+fn reported_stage_without_a_report_fails_with_a_reason() {
+    let world = World::configured();
+    configure(&world, COMMITTING_AGENT, None);
+    write_flow(
+        &world,
+        "stages:\n  - { name: build, kind: agent }\n  - { name: review, kind: exec, cmd: ['true'], verdict: reported }\n  - { name: merge, kind: merge }\n",
+    );
+    world.commit_all("initial");
+    world.start_daemon();
+    post_and_run(&world, "missing-report.md");
+
+    wait_until("the unreported stage needs review", || {
+        tickets(&world)["needs_review"] == 1
+    });
+    let evidence = aftercare_stage_evidence(&world, "R1", "review");
+    assert_eq!(evidence["verdict_source"], "reported");
+    assert_eq!(evidence["reason"], "no verdict reported");
 }
 
 #[test]
@@ -1389,17 +1460,17 @@ fn a_conflicting_merge_parks_the_ticket_and_preserves_the_conflict() {
 }
 
 #[test]
-fn exit_zero_without_commits_runs_tests_and_completes_the_ticket() {
+fn exit_zero_without_commits_needs_review_before_tests() {
     let world = World::configured();
     configure(&world, "exit 0\n", Some("echo tested > tested.txt"));
     world.commit_all("initial");
     world.start_daemon();
     post_and_run(&world, "empty.md");
 
-    wait_until("the ticket reaches merged", || {
-        tickets(&world)["merged"] == 1
+    wait_until("the ticket reaches needs review", || {
+        tickets(&world)["needs_review"] == 1
     });
-    assert!(world.root().join(".worktrees/R1/tested.txt").exists());
+    assert!(!world.root().join(".worktrees/R1/tested.txt").exists());
 }
 
 #[test]
@@ -1420,8 +1491,8 @@ fn rewriting_the_default_branch_does_not_invent_run_commits() {
     world.start_daemon();
     let ticket = post_and_run(&world, "rewrite.md");
 
-    wait_until("the no-op ticket reaches merged", || {
-        tickets(&world)["merged"] == 1
+    wait_until("the no-op ticket reaches needs review", || {
+        tickets(&world)["needs_review"] == 1
     });
     assert!(default_branch_has(&world, "rewritten.txt"));
 
@@ -1558,7 +1629,7 @@ fn a_finished_run_cannot_be_cancelled() {
     world.start_daemon();
     post_and_run(&world, "done.md");
 
-    wait_until("the run finishes", || tickets(&world)["merged"] == 1);
+    wait_until("the run finishes", || tickets(&world)["needs_review"] == 1);
 
     let output = world.sloop(&["cancel", "R1"]);
     let response = json_stderr(&output);
