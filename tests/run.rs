@@ -2,6 +2,7 @@ mod support;
 
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use sloop::clock::{Clock, SystemClock};
@@ -1330,6 +1331,280 @@ fn periodic_reconciliation_does_not_duplicate_supervisor_aftercare() {
         )
         .expect("count exit evidence");
     assert_eq!(exit_evidence_count, 1);
+}
+
+/// A committing agent plus a flow whose exec stage always fails: the run halts
+/// at `needs_review` with the agent's commit preserved on its run branch, ready
+/// for an operator to merge by hand.
+fn configure_review_agent(world: &World) {
+    fs::create_dir_all(world.root().join(".agents/sloop/flows")).unwrap();
+    fs::write(
+        world.root().join(".agents/sloop/flows/default.yaml"),
+        "stages:\n  - { name: build, kind: agent, verdict: exit }\n  - { name: reject, kind: exec, cmd: ['false'] }\n  - { name: merge, kind: merge }\n",
+    )
+    .unwrap();
+    let script = world.root().join("fake-agent.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\necho \"$SLOOP_TICKET_ID\" > agent-ran.txt\necho work > work.txt\ngit add work.txt\ngit -c user.name=agent -c user.email=agent@example.invalid commit --quiet -m 'agent work'\nexit 0\n",
+    )
+    .expect("write committing agent script");
+    fs::write(
+        world.root().join(".agents/sloop/config.yaml"),
+        format!(
+            "version: 1\nscheduler:\n  max_parallel_tasks: 1\nagent:\n  default_target: fake\n  targets:\n    fake:\n      cmd: [\"sh\", \"{}\", \"{{prompt}}\"]\n",
+            script.display()
+        ),
+    )
+    .expect("write agent config");
+}
+
+fn git_root(world: &World, args: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .args(args)
+        .current_dir(world.root())
+        .output()
+        .expect("run git in root")
+}
+
+/// Advances the default branch with an unrelated commit, so a later hand-merge
+/// of a diverged run branch produces a merge commit (a strict ancestor) rather
+/// than a fast-forward — the shape the operator gets once other runs have
+/// already moved the default branch.
+fn advance_default_branch(world: &World, marker: &str) {
+    fs::write(world.root().join(marker), b"advance\n").unwrap();
+    assert!(git_root(world, &["add", marker]).status.success());
+    assert!(
+        git_root(
+            world,
+            &[
+                "-c",
+                "user.name=operator",
+                "-c",
+                "user.email=operator@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "advance default branch",
+            ],
+        )
+        .status
+        .success()
+    );
+}
+
+fn external_merge_count(world: &World) -> i64 {
+    let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM run_evidence WHERE kind = 'external_merge_observed'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count external merge evidence")
+}
+
+#[test]
+fn a_hand_merged_review_branch_settles_to_merged_and_releases_its_dependent() {
+    let world = World::configured();
+    configure_review_agent(&world);
+    world.commit_all("initial");
+    world.start_daemon();
+
+    let blocker = post_manual(&world, "review-blocker.md", "# Review blocker\n");
+    let dependent = post_manual_blocked(&world, "review-dependent.md", &[blocker.as_str()]);
+    assert!(world.sloop(&["run", &blocker]).status.success());
+    wait_until("the blocker halts at needs_review", || {
+        status(&world)["tickets"]["needs_review"] == 1
+    });
+    let snapshot = status(&world);
+    assert_eq!(snapshot["tickets"]["blocked"], 1);
+    assert_eq!(snapshot["tickets"]["ready"], 0);
+
+    // An operator reviews and merges the preserved run branch by hand.
+    advance_default_branch(&world, "unrelated.txt");
+    let branch = format!("sloop/{blocker}-a1-R1");
+    let merged = git_root(
+        &world,
+        &[
+            "-c",
+            "user.name=operator",
+            "-c",
+            "user.email=operator@example.invalid",
+            "merge",
+            "--no-ff",
+            "-m",
+            "operator merges the run branch",
+            &branch,
+        ],
+    );
+    assert!(
+        merged.status.success(),
+        "hand merge failed: {}",
+        String::from_utf8_lossy(&merged.stderr)
+    );
+
+    // The running daemon notices within one reconciliation interval; polling
+    // `status` drives those passes without a reindex or a restart.
+    wait_until_slow("the daemon reconciles the external merge", || {
+        status(&world)["tickets"]["merged"] == 1
+    });
+    let snapshot = status(&world);
+    assert_eq!(snapshot["tickets"]["needs_review"], 0);
+    assert_eq!(
+        snapshot["tickets"]["blocked"], 0,
+        "the dependent releases once its blocker merges"
+    );
+    assert_eq!(snapshot["tickets"]["ready"], 1);
+
+    let listed = World::json_stdout(&world.sloop(&["list"]));
+    let row = listed["data"]["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ticket| ticket["id"] == dependent)
+        .unwrap();
+    assert_ne!(row["state"], "blocked");
+    assert_eq!(external_merge_count(&world), 1);
+}
+
+#[test]
+fn a_squash_merged_review_branch_stays_in_needs_review() {
+    let world = World::configured();
+    configure_review_agent(&world);
+    world.commit_all("initial");
+    world.start_daemon();
+
+    let blocker = post_manual(&world, "squash-blocker.md", "# Squash blocker\n");
+    assert!(world.sloop(&["run", &blocker]).status.success());
+    wait_until("the blocker halts at needs_review", || {
+        status(&world)["tickets"]["needs_review"] == 1
+    });
+
+    // A squash-merge rewrites the commits, so the run branch tip is not an
+    // ancestor of the default branch and ancestry cannot prove integration.
+    let branch = format!("sloop/{blocker}-a1-R1");
+    assert!(
+        git_root(&world, &["merge", "--squash", &branch])
+            .status
+            .success()
+    );
+    assert!(
+        git_root(
+            &world,
+            &[
+                "-c",
+                "user.name=operator",
+                "-c",
+                "user.email=operator@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "squash the run branch",
+            ],
+        )
+        .status
+        .success()
+    );
+
+    // Drive several reconciliation passes; the ticket must stay for review.
+    for _ in 0..4 {
+        let snapshot = status(&world);
+        assert_eq!(snapshot["tickets"]["needs_review"], 1);
+        assert_eq!(snapshot["tickets"]["merged"], 0);
+    }
+    assert_eq!(external_merge_count(&world), 0);
+}
+
+#[test]
+fn a_deleted_review_branch_leaves_the_ticket_and_daemon_untouched() {
+    let world = World::configured();
+    configure_review_agent(&world);
+    world.commit_all("initial");
+    world.start_daemon();
+
+    let blocker = post_manual(&world, "deleted-blocker.md", "# Deleted blocker\n");
+    assert!(world.sloop(&["run", &blocker]).status.success());
+    wait_until("the blocker halts at needs_review", || {
+        status(&world)["tickets"]["needs_review"] == 1
+    });
+
+    // The operator discards the run branch entirely. Its worktree must be
+    // released first, since Git refuses to delete a checked-out branch.
+    let worktree = world.root().join(".worktrees/R1");
+    assert!(
+        git_root(
+            &world,
+            &["worktree", "remove", "--force", &worktree.to_string_lossy()],
+        )
+        .status
+        .success()
+    );
+    let branch = format!("sloop/{blocker}-a1-R1");
+    assert!(
+        git_root(&world, &["branch", "-D", &branch])
+            .status
+            .success()
+    );
+
+    // An unresolvable ref is not evidence: the ticket stays and the daemon
+    // keeps answering.
+    for _ in 0..4 {
+        let snapshot = status(&world);
+        assert_eq!(snapshot["tickets"]["needs_review"], 1);
+        assert_eq!(snapshot["tickets"]["merged"], 0);
+    }
+    assert_eq!(external_merge_count(&world), 0);
+}
+
+#[test]
+fn external_merge_reconciliation_survives_a_restart_without_duplicating_evidence() {
+    let world = World::configured();
+    configure_review_agent(&world);
+    world.commit_all("initial");
+    world.start_daemon();
+
+    let blocker = post_manual(&world, "restart-blocker.md", "# Restart blocker\n");
+    assert!(world.sloop(&["run", &blocker]).status.success());
+    wait_until("the blocker halts at needs_review", || {
+        status(&world)["tickets"]["needs_review"] == 1
+    });
+
+    advance_default_branch(&world, "unrelated.txt");
+    let branch = format!("sloop/{blocker}-a1-R1");
+    assert!(
+        git_root(
+            &world,
+            &[
+                "-c",
+                "user.name=operator",
+                "-c",
+                "user.email=operator@example.invalid",
+                "merge",
+                "--no-ff",
+                "-m",
+                "operator merges the run branch",
+                &branch,
+            ],
+        )
+        .status
+        .success()
+    );
+    wait_until_slow("the daemon reconciles the external merge", || {
+        status(&world)["tickets"]["merged"] == 1
+    });
+    assert_eq!(external_merge_count(&world), 1);
+
+    // A restart re-derives the same fact from Git, but the settled ticket is no
+    // longer in review, so the evidence row is neither duplicated nor lost.
+    assert!(world.sloop(&["stop"]).status.success());
+    world.start_daemon();
+    for _ in 0..4 {
+        let snapshot = status(&world);
+        assert_eq!(snapshot["tickets"]["merged"], 1);
+        assert_eq!(snapshot["tickets"]["needs_review"], 0);
+    }
+    assert_eq!(external_merge_count(&world), 1);
 }
 
 fn assert_periodic_dead_agent_is_orphaned(world: &World, ticket_name: &str, marker: &str) {

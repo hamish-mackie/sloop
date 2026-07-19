@@ -166,6 +166,14 @@ If SQLite was deleted, tickets without Git evidence return as ready; holds,
 notes, attempts, and other runtime-only history cannot be recovered. The daemon
 must be idle before reindexing.
 
+A `needs_review` ticket whose preserved run branch an operator merges into the
+default branch by hand no longer needs a reindex: the running daemon settles it
+to `merged` on its next reconciliation pass (typically within one interval),
+releasing any `blocked_by` dependents. This works only when the branch tip is a
+strict ancestor of the default branch tip. Squash- and rebase-merges rewrite the
+commits, so ancestry cannot prove them, and those still require `sloop reindex`
+with the daemon idle.
+
 ## Worker commands
 
 These are a worker process's entire vocabulary. They require the `SLOOP_SOCKET`

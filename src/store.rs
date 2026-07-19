@@ -401,6 +401,15 @@ pub struct RunRecord {
     pub ticket_json: Option<String>,
 }
 
+/// A `needs_review` ticket paired with the preserved run branch whose tip the
+/// daemon can test for external integration against the default branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NeedsReviewBranch {
+    pub(crate) ticket_id: String,
+    pub(crate) run_id: String,
+    pub(crate) branch: String,
+}
+
 /// One lease that must be classified when a daemon starts. Process identity
 /// and worker credentials are returned only to the daemon recovery path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2224,6 +2233,87 @@ impl Store {
             )
             .optional()?;
         Ok(run)
+    }
+
+    /// Every `needs_review` ticket paired with the branch of the run that
+    /// produced it, so the daemon can freshly test each branch tip for external
+    /// integration. Only the newest `needs_review` run with a branch is
+    /// returned per ticket; the tip itself is never cached here.
+    pub(crate) fn needs_review_branches(&self) -> Result<Vec<NeedsReviewBranch>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT t.id, r.id, r.branch
+             FROM tickets t
+             JOIN runs r ON r.id = (
+                 SELECT r2.id FROM runs r2
+                 WHERE r2.ticket_id = t.id
+                   AND r2.state = 'needs_review'
+                   AND r2.branch IS NOT NULL
+                 ORDER BY r2.created_at_ms DESC, r2.id DESC
+                 LIMIT 1
+             )
+             WHERE t.state = 'needs_review'",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(NeedsReviewBranch {
+                    ticket_id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    branch: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Settles a `needs_review` ticket whose run branch an operator merged by
+    /// hand: the ticket becomes `merged`, releasing its `blocked_by` dependents
+    /// exactly as a flow merge would, and the observation is recorded as
+    /// evidence. The ticket-state gate makes a repeated pass a no-op and the
+    /// `dedupe_key` UNIQUE gate keeps the evidence row unique across restarts.
+    /// Returns whether this call performed the transition.
+    pub(crate) fn settle_external_merge(
+        &mut self,
+        run_id: &str,
+        ticket_id: &str,
+        branch: &str,
+        branch_tip: &str,
+        observed_default_tip: &str,
+        now_ms: i64,
+    ) -> Result<bool, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE tickets SET state = 'merged', held_reason = NULL, updated_at_ms = ?2
+             WHERE id = ?1 AND state = 'needs_review'",
+            params![ticket_id, now_ms],
+        )?;
+        if changed == 0 {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let data_json = serde_json::json!({
+            "branch": branch,
+            "branch_tip": branch_tip,
+            "observed_default_tip": observed_default_tip,
+        })
+        .to_string();
+        transaction.execute(
+            "INSERT OR IGNORE INTO run_evidence
+                 (run_id, kind, observed_at_ms, dedupe_key, data_json)
+             VALUES (?1, 'external_merge_observed', ?2, 'external_merge:' || ?1, ?3)",
+            params![run_id, now_ms, data_json],
+        )?;
+        record_event(
+            &transaction,
+            now_ms,
+            "external_merge_reconciled",
+            Some(run_id),
+            Some(ticket_id),
+            &data_json,
+        )?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     pub fn active_run_for_ticket(&self, ticket_id: &str) -> Result<Option<String>, StoreError> {
