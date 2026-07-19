@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
 
-use clap::error::ErrorKind;
+use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{ArgGroup, Args, ColorChoice, CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde_json::json;
 
@@ -398,9 +398,64 @@ where
                         json!({"kind": "version", "version": env!("CARGO_PKG_VERSION")}),
                     ),
                 ),
-                _ => write_cli_error(mode, stderr, error.to_string().trim_end().to_owned()),
+                _ => write_cli_error(
+                    mode,
+                    stderr,
+                    augment_unknown_subcommand(&error, error.to_string().trim_end().to_owned()),
+                ),
             }
         }
+    }
+}
+
+/// Synonyms an agent is likely to type that clap's edit-distance matcher does
+/// not catch, each mapped to the real verb it should have used. This is the one
+/// place to add an alias; keep it small and keep every entry pointed at a verb
+/// that exists. Suggestions are text only — nothing here executes.
+fn subcommand_synonym(attempted: &str) -> Option<&'static str> {
+    match attempted {
+        "tickets" | "ls" | "queue" => Some("list"),
+        "ps" => Some("status"),
+        "start" => Some("run"),
+        "kill" | "abort" => Some("cancel"),
+        _ => None,
+    }
+}
+
+/// Adds a remedy to clap's "unrecognized subcommand" error. clap already
+/// appends a `tip:` line when the typo is a near-miss of a real verb, and that
+/// text rides through the JSON envelope unchanged, so we leave those alone and
+/// only fill the gap: when similarity matching finds nothing but our synonym
+/// table does, point the caller at the verb they meant.
+fn augment_unknown_subcommand(error: &clap::Error, rendered: String) -> String {
+    if error.kind() != ErrorKind::InvalidSubcommand
+        || error.get(ContextKind::SuggestedSubcommand).is_some()
+    {
+        return rendered;
+    }
+    let Some(attempted) = invalid_subcommand(error) else {
+        return rendered;
+    };
+    let Some(verb) = subcommand_synonym(&attempted) else {
+        return rendered;
+    };
+    let tip = format!(
+        "\n\n  tip: `{attempted}` is not a verb; did you mean `{verb}`? run `sloop {verb}`"
+    );
+    match rendered.find("\n\nUsage:") {
+        Some(index) => {
+            let mut augmented = rendered;
+            augmented.insert_str(index, &tip);
+            augmented
+        }
+        None => rendered + &tip,
+    }
+}
+
+fn invalid_subcommand(error: &clap::Error) -> Option<String> {
+    match error.get(ContextKind::InvalidSubcommand) {
+        Some(ContextValue::String(value)) => Some(value.clone()),
+        _ => None,
     }
 }
 
@@ -812,10 +867,68 @@ fn write_response(
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
-    use super::Cli;
+    use super::{Cli, subcommand_synonym};
     use crate::protocol::{Capability, Request};
+
+    /// Drives the full CLI entry point and returns the error envelope written
+    /// to stderr, exactly as an agent using `--json` would receive it.
+    fn error_envelope(args: &[&str]) -> Value {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut argv = vec!["sloop", "--json"];
+        argv.extend_from_slice(args);
+        super::run(argv, &mut stdout, &mut stderr);
+        serde_json::from_slice(&stderr).expect("stderr carries a JSON envelope")
+    }
+
+    #[test]
+    fn unknown_subcommand_suggests_the_tickets_synonym() {
+        let envelope = error_envelope(&["tickets"]);
+
+        assert_eq!(envelope["error"]["code"], "invalid_arguments");
+        let message = envelope["error"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            message.contains("did you mean `list`") && message.contains("sloop list"),
+            "synonym remedy missing from: {message}"
+        );
+    }
+
+    #[test]
+    fn unknown_subcommand_suggests_a_near_miss_spelling() {
+        // clap's own similarity matcher supplies this tip; the envelope must
+        // carry it through unchanged.
+        let envelope = error_envelope(&["statuss"]);
+
+        let message = envelope["error"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            message.contains("status"),
+            "near-miss suggestion missing from: {message}"
+        );
+    }
+
+    #[test]
+    fn synonym_table_only_points_at_real_verbs() {
+        use clap::CommandFactory;
+
+        let verbs: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|subcommand| subcommand.get_name().to_owned())
+            .collect();
+        for attempted in ["tickets", "ls", "queue", "ps", "start", "kill", "abort"] {
+            let verb = subcommand_synonym(attempted).expect("synonym maps to a verb");
+            assert!(
+                verbs.iter().any(|known| known == verb),
+                "synonym `{attempted}` points at unknown verb `{verb}`"
+            );
+        }
+        assert!(subcommand_synonym("definitely-not-a-verb").is_none());
+    }
 
     #[test]
     fn parses_every_documented_verb() {

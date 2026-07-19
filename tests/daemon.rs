@@ -399,3 +399,40 @@ fn status_renders_a_human_summary_without_the_json_flag() {
     assert!(text.contains("ready"), "ticket counts are shown: {text}");
     assert!(text.contains("agents"), "the gate is shown: {text}");
 }
+
+#[test]
+fn show_names_the_reference_kinds_it_accepts() {
+    let world = World::configured();
+
+    // R99 is a run-shaped id, but `show` only resolves tickets and projects.
+    let output = world.sloop(&["show", "R99"]);
+
+    assert!(!output.status.success());
+    let response = World::json_stdout_or_stderr(&output);
+    assert_eq!(response["error"]["code"], "not_found");
+    let message = response["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(
+        message.contains("ticket or project") && message.contains("sloop list"),
+        "remedy does not name the accepted references: {message}"
+    );
+}
+
+#[test]
+fn worker_verbs_on_the_operator_socket_point_at_an_alternative() {
+    let world = World::configured();
+    world.start_daemon();
+
+    let response =
+        world.operator_exchange(r#"{"v":1,"id":"req-1","verb":"brief","args":{},"token":null}"#);
+
+    assert_eq!(response["error"]["code"], "unauthorized");
+    let message = response["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(
+        message.contains("sloop list"),
+        "remedy does not name an operator alternative: {message}"
+    );
+}

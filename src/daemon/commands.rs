@@ -31,8 +31,12 @@ pub(super) fn handle_operator_show(
         let vendor_error = current_ticket_vendor_error(state, &ticket)?;
         return Ok(ticket_show(reference, &ticket, vendor_error.as_ref()));
     }
-    let project = lookup(state, |store| store.project(reference))?
-        .ok_or_else(|| not_found(&format!("reference `{reference}` is not indexed")))?;
+    let project = lookup(state, |store| store.project(reference))?.ok_or_else(|| {
+        not_found(&format!(
+            "reference `{reference}` is not indexed; `show` accepts a ticket or project id — \
+             run `sloop list` to see ticket names"
+        ))
+    })?;
     let tickets = lookup(state, |store| store.tickets_for_project(reference))?;
     let mut vendor_errors = HashMap::new();
     for ticket in &tickets {
@@ -211,7 +215,7 @@ pub(super) fn handle_run(
     if let Some(ticket_id) = &args.ticket {
         let Some(ticket) = lookup(state, |store| store.ticket(ticket_id))? else {
             return Err(not_found(&format!(
-                "ticket `{ticket_id}` is not registered"
+                "ticket `{ticket_id}` is not registered; run `sloop list` to see registered ticket ids"
             )));
         };
         if ticket.state == TicketState::Held.as_str() {
@@ -227,7 +231,9 @@ pub(super) fn handle_run(
     }
     for only in &args.only {
         let Some(ticket) = lookup(state, |store| store.ticket(only))? else {
-            return Err(not_found(&format!("ticket `{only}` is not registered")));
+            return Err(not_found(&format!(
+                "ticket `{only}` is not registered; run `sloop list` to see registered ticket ids"
+            )));
         };
         if let Some(project) = &args.project
             && &ticket.project_id != project
@@ -403,7 +409,7 @@ pub(super) fn handle_wait(
     args: &crate::protocol::RunReferenceArgs,
 ) -> Result<serde_json::Value, ErrorBody> {
     let Some(run) = lookup(state, |store| store.run(&args.run))? else {
-        return Err(not_found(&format!("run `{}` does not exist", args.run)));
+        return Err(run_not_found(&args.run));
     };
     let terminal = matches!(
         run.state.as_str(),
@@ -433,7 +439,7 @@ pub(super) fn handle_logs(
     args: &crate::protocol::RunReferenceArgs,
 ) -> Result<serde_json::Value, ErrorBody> {
     if lookup(state, |store| store.run(&args.run))?.is_none() {
-        return Err(not_found(&format!("run `{}` does not exist", args.run)));
+        return Err(run_not_found(&args.run));
     }
     let page = crate::run_log::read_page(
         &run_output_path(&state.state_dir, &args.run),
@@ -464,7 +470,7 @@ pub(super) fn handle_cancel(
     args: &crate::protocol::RunReferenceArgs,
 ) -> Result<serde_json::Value, ErrorBody> {
     let Some(run) = lookup(state, |store| store.run(&args.run))? else {
-        return Err(not_found(&format!("run `{}` does not exist", args.run)));
+        return Err(run_not_found(&args.run));
     };
     if !matches!(run.state.as_str(), "running" | "aftercare") || run.exited_at_ms.is_some() {
         return Err(conflict(&format!(
@@ -572,7 +578,7 @@ pub(super) fn handle_reindex(state: &mut DispatcherState) -> Result<serde_json::
     active.sort();
     if !active.is_empty() {
         return Err(conflict(&format!(
-            "{} active run(s): {}; reindex requires an idle daemon",
+            "{} active run(s): {}; reindex requires an idle daemon — wait for them to finish or cancel with `sloop cancel <run>`",
             active.len(),
             active.join(", "),
         )));
@@ -600,6 +606,15 @@ pub(super) fn handle_reindex(state: &mut DispatcherState) -> Result<serde_json::
         &state.default_flow,
     )
     .map_err(|error| internal(&format!("cannot reindex tickets: {error}")))
+}
+
+/// The `logs`, `wait`, and `cancel` verbs all address a run by id; agents that
+/// pass a ticket name instead land here. Naming the `R14` shape and pointing at
+/// `sloop list` turns the dead end into a next step.
+fn run_not_found(run: &str) -> ErrorBody {
+    not_found(&format!(
+        "run `{run}` does not exist; pass a run id like `R14` — run `sloop list` to see each ticket's runs"
+    ))
 }
 
 pub(super) fn lookup<T>(

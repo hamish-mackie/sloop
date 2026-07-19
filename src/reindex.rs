@@ -137,8 +137,9 @@ pub fn run(
         for blocker in &ticket.blocked_by {
             if !ticket_ids.contains(blocker.as_str()) {
                 return Err(ReindexError(format!(
-                    "ticket `{}` field `blocked_by` references unknown ticket `{blocker}`",
-                    ticket.id
+                    "ticket `{}` field `blocked_by` references unknown ticket `{blocker}`; \
+                     edit `{}` to drop or correct the reference",
+                    ticket.id, ticket.file_path
                 )));
             }
         }

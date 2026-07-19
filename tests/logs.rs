@@ -100,3 +100,21 @@ fn logs_for_an_unknown_run_is_not_found() {
     let error: serde_json::Value = serde_json::from_slice(&output.stderr).expect("stderr is JSON");
     assert_eq!(error["error"]["code"], "not_found");
 }
+
+#[test]
+fn logs_for_a_missing_run_names_the_run_id_shape() {
+    let world = World::configured();
+
+    let output = world.sloop(&["logs", "my-ticket"]);
+
+    assert!(!output.status.success());
+    let response = World::json_stdout_or_stderr(&output);
+    assert_eq!(response["error"]["code"], "not_found");
+    let message = response["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(
+        message.contains("`R14`") && message.contains("sloop list"),
+        "remedy does not name the run id shape: {message}"
+    );
+}
