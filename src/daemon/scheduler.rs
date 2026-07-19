@@ -7,11 +7,12 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::coordination::{Claim, Coordination};
+use crate::domain::ticket::TicketSnapshot;
 use crate::flow::Flow;
 use crate::frontmatter::Frontmatter;
 use crate::ids::next_id;
 use crate::logging::{LogLevel, OperationalLog};
-use crate::store::{ClaimRequest, QueuedActivation, Store};
+use crate::store::{ClaimRequest, QueuedActivation, Store, TicketRecord};
 
 use super::aftercare::gather_exit_evidence;
 use super::dispatcher::{
@@ -257,6 +258,58 @@ pub(super) fn reconcile(
             continue;
         };
 
+        let ticket = match state.store.ticket(&ticket_id) {
+            Ok(Some(ticket)) => ticket,
+            Ok(None) => {
+                log.emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::dispatcher",
+                    "bound_flow_resolution_failed",
+                    json!({"ticket_id": ticket_id, "error": format!("ticket `{ticket_id}` no longer exists")}),
+                );
+                continue;
+            }
+            Err(error) => {
+                log.emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::dispatcher",
+                    "bound_flow_resolution_failed",
+                    json!({"ticket_id": ticket_id, "error": format!("cannot read ticket `{ticket_id}`: {error}")}),
+                );
+                continue;
+            }
+        };
+        let flow = match bound_flow_for_ticket(&state.flows, &ticket) {
+            Ok(flow) => flow,
+            Err(error) => {
+                log.emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::dispatcher",
+                    "bound_flow_resolution_failed",
+                    json!({"ticket_id": ticket_id, "error": error}),
+                );
+                continue;
+            }
+        };
+        let body = ticket
+            .file_path
+            .as_ref()
+            .and_then(|file_path| fs::read_to_string(state.root.join(file_path)).ok())
+            .unwrap_or_default();
+        let ticket_snapshot = TicketSnapshot {
+            id: ticket.id.clone(),
+            name: ticket.name.clone(),
+            blocked_by: ticket.blocked_by.clone(),
+            worktree: ticket.worktree.clone(),
+            target: ticket.target.clone(),
+            model: ticket.model.clone(),
+            effort: ticket.effort.clone(),
+            body,
+        };
+        let flow_json = serde_json::to_string(&flow).expect("flow snapshots serialize to JSON");
+        let ticket_json =
+            serde_json::to_string(&ticket_snapshot).expect("ticket snapshots serialize to JSON");
+
         let now_ms = state.clock.now_ms();
         let run_ordinal = match state.store.next_run_ordinal() {
             Ok(ordinal) => ordinal,
@@ -282,6 +335,8 @@ pub(super) fn reconcile(
             activation_id: &activation.id,
             owner_id: &owner,
             lease_ms: DEFAULT_LEASE_MS,
+            flow_json: &flow_json,
+            ticket_json: &ticket_json,
             next_activation_eligible_at_ms: if activation.kind == "every" {
                 match (activation.eligible_at_ms, activation.interval_ms) {
                     (Some(eligible_at_ms), Some(interval_ms)) => {
@@ -322,29 +377,6 @@ pub(super) fn reconcile(
                 if error.is_disk_full() {
                     break;
                 }
-                continue;
-            }
-        };
-        let flow = match bound_flow(&state.store, &state.flows, &ticket_id) {
-            Ok(flow) => flow,
-            Err(error) => {
-                if let Err(abort_error) =
-                    Coordination::new(&mut state.store).abandon(&run_id, &ticket_id, now_ms)
-                {
-                    mark_storage_full(state, &abort_error);
-                    log.emit_with_fields(
-                        LogLevel::Error,
-                        "sloop::dispatcher",
-                        "claim_abort_failed",
-                        json!({"run_id": run_id, "ticket_id": ticket_id, "error": abort_error.to_string()}),
-                    );
-                }
-                log.emit_with_fields(
-                    LogLevel::Error,
-                    "sloop::dispatcher",
-                    "bound_flow_resolution_failed",
-                    json!({"run_id": run_id, "ticket_id": ticket_id, "error": error}),
-                );
                 continue;
             }
         };
@@ -603,13 +635,23 @@ pub(super) fn bound_flow(
         .ticket(ticket_id)
         .map_err(|error| format!("cannot read ticket `{ticket_id}`: {error}"))?
         .ok_or_else(|| format!("ticket `{ticket_id}` no longer exists"))?;
+    bound_flow_for_ticket(flows, &ticket)
+}
+
+fn bound_flow_for_ticket(
+    flows: &BTreeMap<String, Flow>,
+    ticket: &TicketRecord,
+) -> Result<Flow, String> {
     let flow_name = ticket
         .flow
-        .ok_or_else(|| format!("ticket `{ticket_id}` has no bound flow"))?;
-    flows
-        .get(&flow_name)
-        .cloned()
-        .ok_or_else(|| format!("ticket `{ticket_id}` names unknown bound flow `{flow_name}`"))
+        .as_ref()
+        .ok_or_else(|| format!("ticket `{}` has no bound flow", ticket.id))?;
+    flows.get(flow_name).cloned().ok_or_else(|| {
+        format!(
+            "ticket `{}` names unknown bound flow `{flow_name}`",
+            ticket.id
+        )
+    })
 }
 
 #[cfg(test)]

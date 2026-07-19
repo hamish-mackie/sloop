@@ -2,6 +2,7 @@ use std::fs;
 
 use serde_json::json;
 
+use crate::domain::ticket::TicketSnapshot;
 use crate::protocol::{ErrorBody, Request, RequestId, ResponseEnvelope};
 use crate::vendor_error::VendorErrorMatch;
 
@@ -52,13 +53,29 @@ pub(super) fn dispatch_worker(
 fn handle_brief(state: &DispatcherState, run_id: &str) -> Result<serde_json::Value, ErrorBody> {
     let run = lookup(state, |store| store.run(run_id))?
         .ok_or_else(|| internal("the run for this token no longer exists"))?;
-    let ticket = lookup(state, |store| store.ticket(&run.ticket_id))?
-        .ok_or_else(|| internal("the ticket for this run no longer exists"))?;
-    let body = ticket
-        .file_path
-        .as_ref()
-        .and_then(|file_path| fs::read_to_string(state.root.join(file_path)).ok())
-        .unwrap_or_default();
+    let ticket = match run.ticket_json.as_deref() {
+        Some(snapshot) => serde_json::from_str::<TicketSnapshot>(snapshot)
+            .map_err(|error| internal(&format!("the run's ticket snapshot is invalid: {error}")))?,
+        None => {
+            let ticket = lookup(state, |store| store.ticket(&run.ticket_id))?
+                .ok_or_else(|| internal("the ticket for this run no longer exists"))?;
+            let body = ticket
+                .file_path
+                .as_ref()
+                .and_then(|file_path| fs::read_to_string(state.root.join(file_path)).ok())
+                .unwrap_or_default();
+            TicketSnapshot {
+                id: ticket.id,
+                name: ticket.name,
+                blocked_by: ticket.blocked_by,
+                worktree: ticket.worktree,
+                target: ticket.target,
+                model: ticket.model,
+                effort: ticket.effort,
+                body,
+            }
+        }
+    };
 
     let mut definition_of_done = vec!["Commit your work to the run branch".to_owned()];
     if state.aftercare_test_cmd.is_some() {
@@ -72,7 +89,7 @@ fn handle_brief(state: &DispatcherState, run_id: &str) -> Result<serde_json::Val
             "name": ticket.name,
             "blocked_by": ticket.blocked_by,
             "worktree": ticket.worktree,
-            "body": body,
+            "body": ticket.body,
             "acceptance": [],
             "target": ticket.target,
             "model": ticket.model,

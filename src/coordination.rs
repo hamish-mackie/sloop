@@ -143,6 +143,8 @@ mod tests {
             owner_id: "daemon-1",
             lease_ms: 60_000,
             next_activation_eligible_at_ms: None,
+            flow_json: "{}",
+            ticket_json: "{}",
         };
         let mut coordination = Coordination::new(&mut store);
 
