@@ -58,7 +58,13 @@ pub struct ClientResponse {
 pub fn request(request: Request) -> Result<ClientResponse, DaemonError> {
     let cwd = std::env::current_dir().map_err(DaemonError::CurrentDirectory)?;
     let repository = Repository::discover(&cwd)?;
-    Config::load(&repository)?;
+    Config::validate_client_essentials(&repository)?;
+
+    // Posting binds and snapshots a live flow definition. All other requests
+    // can use the configuration snapshot held by an existing daemon.
+    if matches!(&request, Request::Post(_)) {
+        Config::load(&repository)?;
+    }
 
     if let Ok(response) = send_existing(&repository, request.clone()) {
         return Ok(ClientResponse {
@@ -67,6 +73,8 @@ pub fn request(request: Request) -> Result<ClientResponse, DaemonError> {
         });
     }
 
+    // Implicit startup has the same validation boundary as `sloop daemon`.
+    Config::load(&repository)?;
     spawn_daemon(&repository)?;
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
@@ -88,7 +96,7 @@ pub fn request(request: Request) -> Result<ClientResponse, DaemonError> {
 pub fn request_running(request: Request) -> Result<Option<ResponseEnvelope>, DaemonError> {
     let cwd = std::env::current_dir().map_err(DaemonError::CurrentDirectory)?;
     let repository = Repository::discover(&cwd)?;
-    Config::load(&repository)?;
+    Config::validate_client_essentials(&repository)?;
     match send_existing(&repository, request) {
         Ok(response) => Ok(Some(response)),
         Err(DaemonError::Connect(_)) => Ok(None),

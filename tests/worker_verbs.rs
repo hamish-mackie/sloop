@@ -370,6 +370,11 @@ fn a_worker_brief_uses_the_ticket_body_captured_at_claim() {
         world.worker_socket(&world.run_id(1)).exists()
     });
     fs::write(
+        world.root().join(".agents/sloop/flows/default.yaml"),
+        "- { name: build, kind: unknown }\n",
+    )
+    .expect("invalidate the flow after admission");
+    fs::write(
         world.root().join(".agents/sloop/tickets/admission.md"),
         "# Changed after claim\n",
     )
@@ -381,6 +386,12 @@ fn a_worker_brief_uses_the_ticket_body_captured_at_claim() {
     let body = brief["data"]["ticket"]["body"].as_str().expect("body");
     assert!(body.contains("Original instructions"), "brief body: {body}");
     assert!(!body.contains("Changed after claim"), "brief body: {body}");
+    assert_eq!(worktree_json(&world, 1, "show.json")["ok"], true);
+    assert_eq!(worktree_json(&world, 1, "note.json")["ok"], true);
+    assert_eq!(
+        World::json_stdout(&world.sloop(&["status"]))["data"]["tickets"]["merged"],
+        1
+    );
 }
 
 #[test]

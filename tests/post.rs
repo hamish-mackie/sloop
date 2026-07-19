@@ -609,3 +609,32 @@ fn unknown_flow_is_rejected_and_names_known_flows() {
             .contains("id:")
     );
 }
+
+#[test]
+fn invalid_flow_is_rejected_without_registering_the_ticket() {
+    let world = World::configured();
+    world.start_daemon();
+    fs::create_dir_all(world.root().join(".agents/sloop/flows")).unwrap();
+    fs::write(
+        world.root().join(".agents/sloop/flows/broken.yaml"),
+        "- { name: build, kind: unknown }\n",
+    )
+    .unwrap();
+    let ticket = world.write_ticket("unregistered.md", "# Must not register\n");
+
+    let output = world.sloop(&["post", ticket.to_str().unwrap(), "--manual"]);
+
+    assert!(!output.status.success());
+    let error = World::json_stdout_or_stderr(&output);
+    assert_eq!(error["error"]["code"], "invalid_arguments");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("broken.yaml"), "{message}");
+    assert!(message.contains("unknown kind `unknown`"), "{message}");
+    let status = World::json_stdout(&world.sloop(&["status"]));
+    assert_eq!(status["data"]["tickets"]["ready"], 0);
+    assert!(
+        !fs::read_to_string(world.root().join(ticket))
+            .unwrap()
+            .contains("id:")
+    );
+}

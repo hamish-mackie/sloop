@@ -19,6 +19,14 @@ The commands split into two sets, and the split is enforced by the daemon:
 run, or project, while a worker's `show` is scoped to its own ticket. The
 verb is read-only on either socket.
 
+A running daemon uses the configuration and flow definitions it validated at
+startup. Operational commands (`status`, `stop`, `pause`, `resume`, `cancel`,
+`logs`, `wait`, `list`, `hold`, and `ready`) and worker commands therefore keep
+working if a flow file on disk is later made invalid. Active runs continue from
+their admitted flow snapshots. Flow errors surface when `sloop post` reads and
+snapshots the current definitions and when daemon startup validates them; fix
+the named flow file before posting work or starting a new daemon.
+
 ## Operator commands
 
 ### sloop init
