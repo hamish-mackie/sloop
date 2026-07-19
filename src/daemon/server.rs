@@ -17,7 +17,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::clock::{Clock, FileClock, SystemClock};
-use crate::config::{Config, ConfigError, Repository};
+use crate::config::{Config, ConfigError, Repository, TicketSourceConfig};
 use crate::frontmatter::FrontmatterError;
 use crate::ids::IdError;
 use crate::logging::{LogLevel, OperationalLog};
@@ -25,6 +25,9 @@ use crate::protocol::{
     Capability, ErrorBody, ErrorCode, Request, RequestEnvelope, RequestId, ResponseEnvelope,
 };
 use crate::runner::local::{process_identity_matches, process_start_time};
+use crate::sources::TicketSource;
+use crate::sources::exec::ExecTicketSource;
+use crate::sources::markdown::MarkdownTicketSource;
 use crate::store::{Store, StoreError};
 use crate::vendor_error::{CatalogError, VendorErrorClassifier};
 
@@ -281,6 +284,15 @@ async fn serve(
     let (events_tx, events_rx) = mpsc::channel(DISPATCH_CHANNEL_CAPACITY);
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let ticket_source: Arc<dyn TicketSource> = match &config.ticket_source {
+        TicketSourceConfig::Markdown => Arc::new(MarkdownTicketSource::new(
+            &repository.root,
+            &config.ticket_dir,
+        )),
+        TicketSourceConfig::Exec(argv) => {
+            Arc::new(ExecTicketSource::new(&repository.root, argv.clone()))
+        }
+    };
     let mut state = DispatcherState {
         pid: std::process::id(),
         paused,
@@ -295,6 +307,7 @@ async fn serve(
         root: repository.root.clone(),
         project_dir: config.project_dir.clone(),
         ticket_dir: config.ticket_dir.clone(),
+        ticket_source,
         worktree_dir: repository.root.join(&config.worktree_dir),
         state_dir: repository.state_dir.clone(),
         runtime_dir: repository.runtime_dir.clone(),

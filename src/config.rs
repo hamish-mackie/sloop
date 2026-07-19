@@ -8,6 +8,8 @@ use serde::Deserialize;
 
 use crate::flow::{DEFAULT_FLOW_NAME, Flow};
 use crate::ids::{DEFAULT_PROJECT_PREFIX, DEFAULT_TICKET_PREFIX, valid_prefix};
+use crate::sources::FlowSource;
+use crate::sources::markdown::MarkdownFlowSource;
 
 pub const CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_DELETE_MISSING_AFTER_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -60,6 +62,7 @@ pub struct Config {
     pub worktree_dir: PathBuf,
     pub project_dir: PathBuf,
     pub ticket_dir: PathBuf,
+    pub ticket_source: TicketSourceConfig,
     pub max_parallel_tasks: usize,
     pub running_hours: Option<RunningHours>,
     /// Repository-scoped exec-shaped agent adapters. Absent means the
@@ -80,6 +83,12 @@ pub struct Config {
     /// How long a ticket row stays stamped missing after its committed file
     /// disappears before reconciliation deletes it.
     pub delete_missing_after_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TicketSourceConfig {
+    Markdown,
+    Exec(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,10 +171,38 @@ impl Config {
                     .is_some_and(|defaults| defaults.agent.is_some())
         }) {
             return Err(ConfigError::Invalid {
-                path: user_path.expect("loaded user config has a path"),
+                path: user_path.clone().expect("loaded user config has a path"),
                 message: "agent targets are repository-scoped; configure `agent.default_target` and `agent.targets` in .agents/sloop/config.yaml".into(),
             });
         }
+        if user.as_ref().is_some_and(|config| {
+            config.sources.is_some()
+                || config
+                    .defaults
+                    .as_ref()
+                    .is_some_and(|defaults| defaults.sources.is_some())
+        }) {
+            return Err(ConfigError::Invalid {
+                path: user_path.expect("loaded user config has a path"),
+                message: "sources are repository-scoped; configure `sources` in .agents/sloop/config.yaml".into(),
+            });
+        }
+
+        let ticket_source = match config
+            .sources
+            .as_ref()
+            .and_then(|sources| sources.tickets.as_ref())
+            .and_then(|tickets| tickets.exec.clone())
+        {
+            None => TicketSourceConfig::Markdown,
+            Some(argv) if argv.is_empty() => {
+                return Err(ConfigError::Invalid {
+                    path: repository.config_path.clone(),
+                    message: "sources.tickets.exec must name a command".into(),
+                });
+            }
+            Some(argv) => TicketSourceConfig::Exec(argv),
+        };
 
         let defaults = user
             .as_ref()
@@ -262,6 +299,7 @@ impl Config {
             worktree_dir,
             project_dir,
             ticket_dir,
+            ticket_source,
             max_parallel_tasks,
             running_hours,
             agent,
@@ -277,48 +315,11 @@ impl Config {
 
 fn load_flows(root: &Path) -> Result<BTreeMap<String, Flow>, ConfigError> {
     let mut flows = BTreeMap::from([(DEFAULT_FLOW_NAME.into(), crate::flow::built_in_default())]);
-    let directory = root.join(".agents/sloop/flows");
-    let entries = match fs::read_dir(&directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(flows),
-        Err(source) => {
-            return Err(ConfigError::Io {
-                path: directory,
-                source,
-            });
-        }
-    };
-
-    let mut paths = entries
-        .map(|entry| {
-            entry
-                .map(|entry| entry.path())
-                .map_err(|source| ConfigError::Io {
-                    path: directory.clone(),
-                    source,
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    paths.retain(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "yaml"));
-    paths.sort();
-
-    for path in paths {
-        let name = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .ok_or_else(|| ConfigError::Invalid {
-                path: path.clone(),
-                message: "flow filename must be valid UTF-8".into(),
-            })?;
-        let contents = fs::read_to_string(&path).map_err(|source| ConfigError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        let flow = crate::flow::parse(name, &contents).map_err(|message| ConfigError::Invalid {
-            path: path.clone(),
-            message,
-        })?;
-        flows.insert(name.into(), flow);
+    for flow in MarkdownFlowSource::new(root)
+        .pull()
+        .map_err(ConfigError::Source)?
+    {
+        flows.insert(flow.name.clone(), flow);
     }
     Ok(flows)
 }
@@ -533,6 +534,7 @@ struct RawConfig {
     defaults: Option<RawDefaults>,
     scheduler: Option<RawScheduler>,
     agent: Option<RawAgent>,
+    sources: Option<RawSources>,
     aftercare: Option<RawAftercare>,
     ids: Option<RawIds>,
     delete_missing_after: Option<String>,
@@ -576,7 +578,20 @@ struct RawIds {
 struct RawDefaults {
     scheduler: Option<RawScheduler>,
     agent: Option<RawAgent>,
+    sources: Option<RawSources>,
     aftercare: Option<RawAftercare>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSources {
+    tickets: Option<RawTicketSource>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTicketSource {
+    exec: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -612,6 +627,7 @@ struct RawRunningHours {
 pub enum ConfigError {
     RepositoryNotFound(PathBuf),
     Paths(crate::paths::PathError),
+    Source(crate::sources::SourceError),
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -635,6 +651,7 @@ impl fmt::Display for ConfigError {
                 start.display()
             ),
             Self::Paths(error) => write!(formatter, "cannot resolve Sloop runtime paths: {error}"),
+            Self::Source(error) => error.fmt(formatter),
             Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
             Self::Invalid { path, message } => write!(formatter, "{}: {message}", path.display()),
             Self::UnsupportedVersion { path, version } => write!(
@@ -657,7 +674,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{Config, ConfigError, Repository, RunningHours};
+    use super::{Config, ConfigError, Repository, RunningHours, TicketSourceConfig};
     use crate::clock::Clock;
 
     struct SpringForwardClock;
@@ -746,6 +763,56 @@ mod tests {
         let config = Config::load(&repository).unwrap();
         assert_eq!(config.project_dir, PathBuf::from(".agents/sloop/projects"));
         assert_eq!(config.ticket_dir, PathBuf::from(".agents/sloop/tickets"));
+    }
+
+    #[test]
+    fn ticket_source_defaults_to_markdown() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".agents/sloop")).unwrap();
+        fs::write(
+            root.path().join(".agents/sloop/config.yaml"),
+            "version: 1\n",
+        )
+        .unwrap();
+
+        let repository = Repository::discover(root.path()).unwrap();
+        assert_eq!(
+            Config::load(&repository).unwrap().ticket_source,
+            TicketSourceConfig::Markdown
+        );
+    }
+
+    #[test]
+    fn exec_ticket_source_loads_from_repository_configuration() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".agents/sloop")).unwrap();
+        fs::write(
+            root.path().join(".agents/sloop/config.yaml"),
+            "version: 1\nsources:\n  tickets:\n    exec: [ticket-source, --repo, .]\n",
+        )
+        .unwrap();
+
+        let repository = Repository::discover(root.path()).unwrap();
+        assert_eq!(
+            Config::load(&repository).unwrap().ticket_source,
+            TicketSourceConfig::Exec(vec!["ticket-source".into(), "--repo".into(), ".".into()])
+        );
+    }
+
+    #[test]
+    fn exec_ticket_source_command_must_be_nonempty() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".agents/sloop")).unwrap();
+        fs::write(
+            root.path().join(".agents/sloop/config.yaml"),
+            "version: 1\nsources:\n  tickets:\n    exec: []\n",
+        )
+        .unwrap();
+
+        let repository = Repository::discover(root.path()).unwrap();
+        let error = Config::load(&repository).unwrap_err().to_string();
+        assert!(error.contains("sources.tickets.exec"), "{error}");
+        assert!(error.contains("must name a command"), "{error}");
     }
 
     #[test]

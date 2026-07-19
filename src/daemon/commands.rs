@@ -168,6 +168,11 @@ pub(super) fn handle_list(state: &DispatcherState) -> Result<serde_json::Value, 
         let display_state =
             crate::eligibility::display_state(&ticket.state, ineligibility.as_ref());
         let mut reason = ineligibility.map(|reason| reason.describe());
+        if ticket.state == "held"
+            && let Some(held_reason) = ticket.held_reason
+        {
+            reason = Some(held_reason);
+        }
         if ticket.state == "failed"
             && let Some(error) = &vendor_error
         {
@@ -632,7 +637,7 @@ pub(super) fn handle_reindex(state: &mut DispatcherState) -> Result<serde_json::
     .map_err(|error| internal(&format!("cannot reindex projects: {error}")))?;
     crate::reindex::run(
         &state.root,
-        &state.ticket_dir,
+        state.ticket_source.as_ref(),
         &state.worktree_dir,
         &state.state_dir,
         &state.store,

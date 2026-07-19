@@ -258,7 +258,7 @@ fn repost_refreshes_name_blockers_and_worktree_without_changing_identity() {
     assert!(first.status.success());
     fs::write(
         world.root().join(&ticket),
-        "---\nid: T1\nproject: default\nname: New name\nblocked_by: [T0]\nworktree: new/branch\n---\nsubject body\n",
+        "---\nid: T1\nproject: default\nname: New name\nblocked_by: [T0]\nworktree: new/branch\n---\nupdated subject body\n",
     )
     .unwrap();
 
@@ -273,6 +273,13 @@ fn repost_refreshes_name_blockers_and_worktree_without_changing_identity() {
     );
     assert_eq!(response["data"]["ticket"]["worktree"], "new/branch");
     assert!(response["data"]["activation"].is_null());
+    let connection = rusqlite::Connection::open(world.db_path()).unwrap();
+    let body: String = connection
+        .query_row("SELECT body FROM tickets WHERE id = 'T1'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(body.trim(), "updated subject body");
 }
 
 #[test]
