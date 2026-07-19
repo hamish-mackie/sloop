@@ -135,6 +135,21 @@ impl RunningHours {
 }
 
 impl Config {
+    /// Validates only the repository configuration needed before contacting an
+    /// existing daemon. Runtime policy and authored definitions are owned by
+    /// the daemon snapshot and must not hold operational verbs hostage.
+    pub fn validate_client_essentials(repository: &Repository) -> Result<(), ConfigError> {
+        let config = read_client_config(&repository.config_path)?;
+        validate_worktree_dir(
+            config
+                .worktree_dir
+                .as_deref()
+                .unwrap_or_else(|| Path::new(DEFAULT_WORKTREE_DIR)),
+            &repository.config_path,
+        )?;
+        Ok(())
+    }
+
     pub fn load(repository: &Repository) -> Result<Self, ConfigError> {
         let user_path = user_config_path().filter(|path| path.is_file());
         let user = user_path
@@ -534,6 +549,25 @@ fn read_config(path: &Path) -> Result<RawConfig, ConfigError> {
     Ok(config)
 }
 
+fn read_client_config(path: &Path) -> Result<RawClientConfig, ConfigError> {
+    let contents = fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let config: RawClientConfig =
+        serde_yaml::from_str(&contents).map_err(|source| ConfigError::Invalid {
+            path: path.to_path_buf(),
+            message: source.to_string(),
+        })?;
+    if config.version != CONFIG_VERSION {
+        return Err(ConfigError::UnsupportedVersion {
+            path: path.to_path_buf(),
+            version: config.version,
+        });
+    }
+    Ok(config)
+}
+
 fn validate_running_hours(
     hours: RawRunningHours,
     path: &Path,
@@ -589,6 +623,12 @@ struct RawConfig {
     aftercare: Option<RawAftercare>,
     ids: Option<RawIds>,
     delete_missing_after: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawClientConfig {
+    version: u32,
+    worktree_dir: Option<PathBuf>,
 }
 
 /// Parses durations like `45s`, `30m`, `12h`, `30d`, or `2w` into
@@ -1036,6 +1076,21 @@ mod tests {
         let error = Config::load(&repository).unwrap_err().to_string();
         assert!(error.contains("agent.default_target `missing`"), "{error}");
         assert!(error.contains("agent.targets"), "{error}");
+    }
+
+    #[test]
+    fn client_essentials_ignore_daemon_only_configuration_validation() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".agents/sloop")).unwrap();
+        fs::write(
+            root.path().join(".agents/sloop/config.yaml"),
+            "version: 1\nagent:\n  default_target: missing\n  targets: not-a-map\n",
+        )
+        .unwrap();
+
+        let repository = Repository::discover(root.path()).unwrap();
+        Config::validate_client_essentials(&repository).unwrap();
+        assert!(Config::load(&repository).is_err());
     }
 
     #[test]

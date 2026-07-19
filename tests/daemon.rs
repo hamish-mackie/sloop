@@ -112,6 +112,70 @@ fn status_uses_the_real_socket_and_dispatcher() {
 }
 
 #[test]
+fn operational_verbs_survive_an_invalid_flow_and_stop_the_daemon() {
+    let world = World::configured();
+    world.configure_fake_agent(
+        FakeAgent::new()
+            .block_until_released("invalid-flow")
+            .commit("completed work")
+            .exit(0),
+    );
+    let ticket = world.write_ticket("active.md", "# Active work\n");
+    world.commit_all("initial");
+    let pid = world.start_daemon()["data"]["pid"].as_u64().unwrap() as u32;
+    assert!(
+        world
+            .sloop(&["post", ticket.to_str().unwrap(), "--auto"])
+            .status
+            .success()
+    );
+    wait_until("the agent reaches its blocking point", || {
+        world.fake_agent_reached("invalid-flow")
+    });
+    let run = world.run_id(1);
+    fs::write(
+        world.root().join(".agents/sloop/flows/default.yaml"),
+        "- { name: build, kind: unknown }\n",
+    )
+    .expect("invalidate the flow file");
+
+    for args in [
+        vec!["status"],
+        vec!["list"],
+        vec!["logs", run.as_str()],
+        vec!["pause"],
+        vec!["resume"],
+    ] {
+        let output = world.sloop(&args);
+        assert!(
+            output.status.success(),
+            "{args:?} failed after invalidating the flow: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    world.release("invalid-flow");
+    wait_until("the admitted flow completes from its snapshot", || {
+        status(&world)["tickets"]["merged"] == 1
+    });
+    let stopped = world.sloop(&["stop"]);
+    assert!(
+        stopped.status.success(),
+        "stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    wait_until("the daemon stops", || !process_alive(pid));
+
+    let restart = world.sloop(&["daemon"]);
+    assert!(!restart.status.success());
+    let error = World::json_stdout_or_stderr(&restart);
+    assert_eq!(error["error"]["code"], "invalid_arguments");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("default.yaml"), "{message}");
+    assert!(message.contains("unknown kind `unknown`"), "{message}");
+}
+
+#[test]
 fn idle_restart_self_execs_and_reacquires_the_socket_and_lock() {
     let world = World::configured();
     world.commit_all("initial");
