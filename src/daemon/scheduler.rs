@@ -20,7 +20,7 @@ use crate::runner::local::{
 use crate::runner::{AgentLaunch, RunnerError, StageExecution, StageOrder};
 use crate::store::{ClaimRequest, QueuedActivation, Store, TicketRecord};
 
-use super::aftercare::{StoreStageHooks, gather_exit_evidence};
+use super::aftercare::{StoreStageHooks, gather_exit_evidence, git_is_ancestor, git_stdout};
 use super::dispatcher::{
     DispatcherState, RunEvent, close_worker_socket, mark_storage_full, recover_storage,
     settle_pending_exits,
@@ -302,6 +302,10 @@ pub(super) fn reconcile(
         return;
     }
     settle_pending_exits(state, log);
+    // Settling externally merged review branches is independent of the dispatch
+    // gates below: it releases blocked dependents even while paused, at
+    // capacity, or outside running hours.
+    reconcile_external_merges(state, log);
     if state.storage_full.get()
         || state.reconciliation_blocked
         || state.paused
@@ -633,6 +637,88 @@ pub(super) fn reconcile(
                         "ticket_id": ticket_id,
                         "error": error.to_string(),
                     }),
+                );
+            }
+        }
+    }
+}
+
+/// Notices review branches an operator merged into the default branch by hand.
+/// A run branch whose tip is a strict ancestor of the default branch tip has
+/// been integrated, so its `needs_review` ticket settles to `merged` without a
+/// reindex. Refs are resolved freshly every pass; a missing branch or any git
+/// failure is a no-op for that ticket, since unprovable evidence is not
+/// evidence. Squash- and rebase-merges rewrite the commits and are invisible to
+/// ancestry, so they still require `sloop reindex`.
+fn reconcile_external_merges(state: &mut DispatcherState, log: &OperationalLog) {
+    let branches = match state.store.needs_review_branches() {
+        Ok(branches) => branches,
+        Err(error) => {
+            log.emit_with_fields(
+                LogLevel::Error,
+                "sloop::dispatcher",
+                "needs_review_scan_failed",
+                json!({"error": error.to_string()}),
+            );
+            return;
+        }
+    };
+    if branches.is_empty() {
+        return;
+    }
+    let default_tip = match git_stdout(&state.root, &["rev-parse", "HEAD"]) {
+        Ok(tip) => tip,
+        // Without the default branch tip nothing can be proven this pass.
+        Err(_) => return,
+    };
+    for branch in branches {
+        let Ok(branch_tip) = git_stdout(&state.root, &["rev-parse", &branch.branch]) else {
+            // A deleted branch ref or any git failure leaves the ticket alone.
+            continue;
+        };
+        // A tip equal to the default tip is not a strict ancestor: an untouched
+        // branch coinciding with the default branch proves no external merge.
+        if branch_tip == default_tip {
+            continue;
+        }
+        if !matches!(
+            git_is_ancestor(&state.root, &branch_tip, &default_tip),
+            Ok(true)
+        ) {
+            continue;
+        }
+        let now_ms = state.clock.now_ms();
+        match state.store.settle_external_merge(
+            &branch.run_id,
+            &branch.ticket_id,
+            &branch.branch,
+            &branch_tip,
+            &default_tip,
+            now_ms,
+        ) {
+            Ok(true) => {
+                log.emit_with_fields(
+                    LogLevel::Info,
+                    "sloop::dispatcher",
+                    "external_merge_reconciled",
+                    json!({
+                        "ticket_id": branch.ticket_id,
+                        "run_id": branch.run_id,
+                        "branch": branch.branch,
+                        "branch_tip": branch_tip,
+                        "observed_default_tip": default_tip,
+                    }),
+                );
+            }
+            // A concurrent settlement already moved the ticket out of review.
+            Ok(false) => {}
+            Err(error) => {
+                mark_storage_full(state, &error);
+                log.emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::dispatcher",
+                    "external_merge_settle_failed",
+                    json!({"ticket_id": branch.ticket_id, "run_id": branch.run_id, "error": error.to_string()}),
                 );
             }
         }

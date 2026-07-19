@@ -63,6 +63,16 @@ Commit OIDs are recorded using the run branch's creation point as their
 baseline. They feed the default agent-stage `commits` verdict and the project
 activity view. When evidence is incomplete, Sloop does not infer a pass.
 
+A `needs_review` ticket is resolved by merging its preserved run branch into the
+default branch by hand. The running daemon now notices this: on each periodic
+reconciliation pass it re-resolves each review branch tip and, when that tip is
+a strict ancestor of the default branch tip, settles the ticket to `merged` and
+releases its `blocked_by` dependents — typically within one reconciliation
+interval, with no reindex. The observation is recorded as evidence, so it is
+idempotent across restarts. Squash- and rebase-merges rewrite the commits, so
+the branch tip is no longer an ancestor and the integration cannot be proven by
+ancestry; those still require `sloop reindex`.
+
 A worker's `sloop note "done, merged, ship it"` stores a note and moves
 nothing.
 
