@@ -17,6 +17,7 @@ use crate::logging::{LogLevel, OperationalLog};
 use crate::outcome::{MergeOutcome, RunEvidence, classify_exit, derive_outcome};
 use crate::protocol::{ErrorBody, ErrorCode, Request, RequestId, ResponseEnvelope};
 use crate::runner::local::worker_socket_path;
+use crate::sources::TicketSource;
 use crate::store::{CooldownUpdate, EvidenceRecord, Store, StoreError};
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
 
@@ -62,6 +63,7 @@ pub(super) struct DispatcherState {
     pub(super) root: PathBuf,
     pub(super) project_dir: PathBuf,
     pub(super) ticket_dir: PathBuf,
+    pub(super) ticket_source: Arc<dyn TicketSource>,
     pub(super) worktree_dir: PathBuf,
     pub(super) state_dir: PathBuf,
     pub(super) runtime_dir: PathBuf,
@@ -212,7 +214,7 @@ pub(super) fn settle_pending_exits(state: &mut DispatcherState, log: &Operationa
             continue;
         };
         match try_settle_run_exit(state, &event) {
-            Ok(outcome) => {
+            Ok((ticket_id, outcome, applied)) => {
                 state.cancelling.remove(&run_id);
                 state.active.remove(&run_id);
                 state.supervised.remove(&run_id);
@@ -225,6 +227,20 @@ pub(super) fn settle_pending_exits(state: &mut DispatcherState, log: &Operationa
                     "run_exited",
                     json!({"run_id": run_id, "outcome": outcome.as_str()}),
                 );
+                if applied {
+                    let ticket_source = state.ticket_source.clone();
+                    let report_log = log.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(error) = ticket_source.report(&ticket_id, &outcome) {
+                            report_log.emit_with_fields(
+                                LogLevel::Warn,
+                                "sloop::dispatcher",
+                                "ticket_source_report_failed",
+                                json!({"ticket_id": ticket_id, "outcome": outcome.as_str(), "error": error.to_string()}),
+                            );
+                        }
+                    });
+                }
             }
             Err(error) => {
                 let disk_full = error.is_disk_full();
@@ -247,7 +263,7 @@ pub(super) fn settle_pending_exits(state: &mut DispatcherState, log: &Operationa
 fn try_settle_run_exit(
     state: &mut DispatcherState,
     event: &RunEvent,
-) -> Result<crate::outcome::Outcome, StoreError> {
+) -> Result<(String, crate::outcome::Outcome, bool), StoreError> {
     let RunEvent::Exited {
         run_id,
         target,
@@ -338,7 +354,7 @@ fn try_settle_run_exit(
             until_ms,
             reason: &error.diagnostic,
         });
-    Coordination::new(&mut state.store).settle(
+    let applied = Coordination::new(&mut state.store).settle(
         run_id,
         &ticket_id,
         *exit_code,
@@ -347,7 +363,7 @@ fn try_settle_run_exit(
         cooldown.as_ref(),
         state.clock.now_ms(),
     )?;
-    Ok(outcome)
+    Ok((ticket_id, outcome, applied))
 }
 
 /// Tears down a run's worker boundary: the token stops validating, the

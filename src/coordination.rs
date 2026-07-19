@@ -84,7 +84,7 @@ impl<'a> Coordination<'a> {
         evidence: &[EvidenceRecord],
         cooldown: Option<&CooldownUpdate<'_>>,
         now_ms: i64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         self.0.finish_run(
             run_id, ticket_id, exit_code, outcome, evidence, cooldown, now_ms,
         )
