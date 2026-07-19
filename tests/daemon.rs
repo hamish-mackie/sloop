@@ -404,8 +404,9 @@ fn status_renders_a_human_summary_without_the_json_flag() {
 fn show_names_the_reference_kinds_it_accepts() {
     let world = World::configured();
 
-    // R99 is a run-shaped id, but `show` only resolves tickets and projects.
-    let output = world.sloop(&["show", "R99"]);
+    // A reference matching no ticket, run, or project fails with a remedy that
+    // names every kind `show` resolves and points at `sloop list`.
+    let output = world.sloop(&["show", "nonexistent"]);
 
     assert!(!output.status.success());
     let response = World::json_stdout_or_stderr(&output);
@@ -414,7 +415,10 @@ fn show_names_the_reference_kinds_it_accepts() {
         .as_str()
         .expect("error message");
     assert!(
-        message.contains("ticket or project") && message.contains("sloop list"),
+        message.contains("ticket")
+            && message.contains("run")
+            && message.contains("project")
+            && message.contains("sloop list"),
         "remedy does not name the accepted references: {message}"
     );
 }

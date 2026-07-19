@@ -321,9 +321,90 @@ fn render_reindex(data: &Value) -> String {
 }
 
 fn render_show(data: &Value) -> String {
-    if data["kind"] != "project" {
-        return fallback(data);
+    match data["kind"].as_str() {
+        Some("ticket") => render_ticket_show(data),
+        Some("run") => render_run_show(data),
+        Some("project") => render_project_show(data),
+        _ => fallback(data),
     }
+}
+
+/// A scannable frontmatter summary followed by the ticket body. The worker's
+/// own `show` carries no `body`, so the same layout renders just the summary
+/// for it — no worker-specific branch and no behavior change.
+fn render_ticket_show(data: &Value) -> String {
+    let value = &data["value"];
+    let mut text = format!(
+        "{}  {}  ({})\n",
+        value["id"].as_str().unwrap_or("?"),
+        value["name"].as_str().unwrap_or("?"),
+        value["state"].as_str().unwrap_or("?"),
+    );
+    if let Some(project) = value["project"].as_str() {
+        let _ = writeln!(text, "project: {project}");
+    }
+    if let Some(worktree) = value["worktree"].as_str() {
+        let _ = writeln!(text, "worktree: {worktree}");
+    }
+    let blocked_by = string_items(&value["blocked_by"]).collect::<Vec<_>>();
+    if !blocked_by.is_empty() {
+        let _ = writeln!(text, "blocked_by: {}", blocked_by.join(", "));
+    }
+    for (label, key) in [
+        ("target", "target"),
+        ("model", "model"),
+        ("effort", "effort"),
+    ] {
+        if let Some(field) = value[key].as_str() {
+            let _ = writeln!(text, "{label}: {field}");
+        }
+    }
+    if let Some(reason) = value["reason"].as_str() {
+        let _ = writeln!(text, "reason: {reason}");
+    }
+    if let Some(body) = value["body"]
+        .as_str()
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+    {
+        let _ = write!(text, "\n{body}\n");
+    }
+    text
+}
+
+/// A run's identity and settled evidence, one fact per line.
+fn render_run_show(data: &Value) -> String {
+    let value = &data["value"];
+    let mut text = format!(
+        "{}  ({})\n",
+        value["id"].as_str().unwrap_or("?"),
+        value["state"].as_str().unwrap_or("?"),
+    );
+    let ticket = value["ticket"].as_str().unwrap_or("?");
+    match value["ticket_name"].as_str() {
+        Some(name) => {
+            let _ = writeln!(text, "ticket: {ticket}  {name}");
+        }
+        None => {
+            let _ = writeln!(text, "ticket: {ticket}");
+        }
+    }
+    if let Some(branch) = value["branch"].as_str() {
+        let _ = writeln!(text, "branch: {branch}");
+    }
+    if let Some(worktree) = value["worktree"].as_str() {
+        let _ = writeln!(text, "worktree: {worktree}");
+    }
+    if let Some(exit_code) = value["exit_code"].as_i64() {
+        let _ = writeln!(text, "exit: {exit_code}");
+    }
+    if let Some(reason) = value["reason"].as_str() {
+        let _ = writeln!(text, "reason: {reason}");
+    }
+    text
+}
+
+fn render_project_show(data: &Value) -> String {
     let project = &data["value"];
     let mut text = format!(
         "project {} ({})\n",
@@ -587,10 +668,89 @@ mod tests {
     }
 
     #[test]
-    fn ticket_show_keeps_the_existing_fallback_rendering() {
-        let data = json!({"ref": "T1", "kind": "ticket", "value": {"id": "T1"}});
-        let response = ResponseEnvelope::success(None, data.clone());
-        assert_eq!(render(Some("show"), &response), super::fallback(&data));
+    fn ticket_show_renders_a_summary_then_the_body() {
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "ref": "TICK-1",
+                "kind": "ticket",
+                "value": {
+                    "id": "TICK-1",
+                    "name": "cooldown",
+                    "state": "ready",
+                    "project": "default",
+                    "worktree": "sloop/TICK-1",
+                    "blocked_by": ["TICK-0"],
+                    "target": "claude",
+                    "model": "opus",
+                    "effort": "high",
+                    "body": "# Persist cooldowns\n\nSurvive restarts.",
+                }
+            }),
+        );
+
+        assert_eq!(
+            render(Some("show"), &response),
+            concat!(
+                "TICK-1  cooldown  (ready)\n",
+                "project: default\n",
+                "worktree: sloop/TICK-1\n",
+                "blocked_by: TICK-0\n",
+                "target: claude\n",
+                "model: opus\n",
+                "effort: high\n",
+                "\n",
+                "# Persist cooldowns\n\nSurvive restarts.\n",
+            )
+        );
+    }
+
+    #[test]
+    fn ticket_show_without_a_body_renders_only_the_summary() {
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "ref": "T1",
+                "kind": "ticket",
+                "value": {"id": "T1", "name": "work", "state": "ready", "blocked_by": []}
+            }),
+        );
+
+        assert_eq!(render(Some("show"), &response), "T1  work  (ready)\n");
+    }
+
+    #[test]
+    fn run_show_renders_the_run_evidence_summary() {
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "ref": "R14",
+                "kind": "run",
+                "value": {
+                    "id": "R14",
+                    "ticket": "TICK-1",
+                    "ticket_name": "cooldown",
+                    "state": "merged",
+                    "terminal": true,
+                    "branch": "sloop/R14-TICK-1",
+                    "worktree": "/repo/.worktrees/R14",
+                    "exit_code": 0,
+                    "reason": null,
+                    "classification": null,
+                }
+            }),
+        );
+
+        assert_eq!(
+            render(Some("show"), &response),
+            concat!(
+                "R14  (merged)\n",
+                "ticket: TICK-1  cooldown\n",
+                "branch: sloop/R14-TICK-1\n",
+                "worktree: /repo/.worktrees/R14\n",
+                "exit: 0\n",
+            )
+        );
     }
 
     #[test]
