@@ -428,6 +428,28 @@ impl World {
         u32::try_from(pid).expect("run pid fits u32")
     }
 
+    /// The run's lease expiry, or `None` once the lease row is gone —
+    /// settlement deletes it.
+    pub fn lease_expires_at_ms(&self, run_id: &str) -> Option<i64> {
+        let connection = rusqlite::Connection::open(self.db_path()).expect("open state database");
+        connection
+            .query_row(
+                "SELECT expires_at_ms FROM leases WHERE run_id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    pub fn run_state(&self, run_id: &str) -> String {
+        let connection = rusqlite::Connection::open(self.db_path()).expect("open state database");
+        connection
+            .query_row("SELECT state FROM runs WHERE id = ?1", [run_id], |row| {
+                row.get(0)
+            })
+            .expect("read run state")
+    }
+
     pub fn run_note_count(&self, run_id: &str) -> i64 {
         let connection = rusqlite::Connection::open(self.db_path()).expect("open state database");
         connection

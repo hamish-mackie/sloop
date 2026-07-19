@@ -123,8 +123,13 @@ CREATE INDEX runs_by_activation ON runs(activation_id, created_at_ms);
 -- `expires_at_ms` gates renewal only: an expired lease cannot be renewed, so a
 -- revived process cannot resurrect a claim recovery has decided is lost.
 -- Liveness of a run is determined by process identity (pid + pid start time +
--- process group id), never by lease expiry. An expired lease on a live,
--- supervised run is currently normal.
+-- process group id), never by lease expiry.
+--
+-- The daemon renews the lease of every run it supervises, so `expires_at_ms`
+-- stays in the future for as long as a run is alive and an expired row means
+-- nobody was there to renew it. Because renewal is strict, a daemon returning
+-- after longer than the TTL re-arms a readopted run's lapsed lease through
+-- `readopt_lease` rather than through renewal.
 --
 -- A lease is released by deleting its row: on settlement (`finish_run`) or on
 -- claim rollback (`abort_claim`). An expired-but-present row is evidence of an
@@ -241,17 +246,103 @@ ALTER TABLE runs ADD COLUMN cleanup_eligible_at_ms INTEGER;
 ALTER TABLE runs ADD COLUMN cleaned_at_ms INTEGER;
 ";
 
+/// Every value the `runs.state` column can hold. The ladder runs
+/// `claimed → running → aftercare` and then to one terminal state, either an
+/// outcome written by [`Store::finish_run`] or `aborted` from a rolled-back
+/// claim. Values are the exact strings already stored; there is no migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
     Claimed,
     Running,
+    Aftercare,
+    /// A claim rolled back before a process existed.
+    Aborted,
+    Merged,
+    Failed,
+    NeedsReview,
+    Cancelled,
+    RateLimited,
+    Orphaned,
 }
+
+/// The nonterminal run states, in ladder order. A run in one of these still
+/// owns its lease and is a candidate for recovery.
+pub(crate) const NONTERMINAL_RUN_STATES: [RunState; 3] =
+    [RunState::Claimed, RunState::Running, RunState::Aftercare];
 
 impl RunState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Claimed => "claimed",
             Self::Running => "running",
+            Self::Aftercare => "aftercare",
+            Self::Aborted => "aborted",
+            Self::Merged => "merged",
+            Self::Failed => "failed",
+            Self::NeedsReview => "needs_review",
+            Self::Cancelled => "cancelled",
+            Self::RateLimited => "rate_limited",
+            Self::Orphaned => "orphaned",
+        }
+    }
+
+    /// Reads a state written by an older or newer binary. An unrecognized
+    /// value is an error rather than a fallback: silently treating it as
+    /// nonterminal would let the daemon act on a run it cannot classify.
+    pub fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "claimed" => Ok(Self::Claimed),
+            "running" => Ok(Self::Running),
+            "aftercare" => Ok(Self::Aftercare),
+            "aborted" => Ok(Self::Aborted),
+            "merged" => Ok(Self::Merged),
+            "failed" => Ok(Self::Failed),
+            "needs_review" => Ok(Self::NeedsReview),
+            "cancelled" => Ok(Self::Cancelled),
+            "rate_limited" => Ok(Self::RateLimited),
+            "orphaned" => Ok(Self::Orphaned),
+            other => Err(StoreError::UnknownRunState {
+                state: other.into(),
+            }),
+        }
+    }
+
+    /// Whether the run has stopped: no lease, no supervision, no renewal.
+    pub fn is_terminal(self) -> bool {
+        !NONTERMINAL_RUN_STATES.contains(&self)
+    }
+}
+
+/// Reads `runs.state` as a typed value. An unrecognized string fails the row
+/// rather than defaulting, so a state this binary does not understand can
+/// never be mistaken for a live or a settled run.
+impl rusqlite::types::FromSql for RunState {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        let text = value.as_str()?;
+        Self::parse(text).map_err(|error| rusqlite::types::FromSqlError::Other(Box::new(error)))
+    }
+}
+
+/// Binds the nonterminal states as `?1, ?2, ?3` for the `IN` clauses that
+/// select live runs.
+fn nonterminal_state_params() -> [&'static str; 3] {
+    [
+        NONTERMINAL_RUN_STATES[0].as_str(),
+        NONTERMINAL_RUN_STATES[1].as_str(),
+        NONTERMINAL_RUN_STATES[2].as_str(),
+    ]
+}
+
+impl From<crate::outcome::Outcome> for RunState {
+    fn from(outcome: crate::outcome::Outcome) -> Self {
+        use crate::outcome::Outcome;
+        match outcome {
+            Outcome::Merged => Self::Merged,
+            Outcome::Failed => Self::Failed,
+            Outcome::NeedsReview => Self::NeedsReview,
+            Outcome::Cancelled => Self::Cancelled,
+            Outcome::RateLimited => Self::RateLimited,
+            Outcome::Orphaned => Self::Orphaned,
         }
     }
 }
@@ -488,7 +579,7 @@ pub(crate) struct RecoverableRun {
     pub(crate) id: String,
     pub(crate) ticket_id: String,
     pub(crate) target: String,
-    pub(crate) state: String,
+    pub(crate) state: RunState,
     pub(crate) branch: Option<String>,
     pub(crate) worktree_path: Option<String>,
     pub(crate) pid: Option<i64>,
@@ -1733,10 +1824,10 @@ impl Store {
         let transaction = self.connection.unchecked_transaction()?;
         let changed = transaction.execute(
             "UPDATE runs
-             SET state = 'running', branch = ?2, worktree_path = ?3, pid = ?4,
+             SET state = ?10, branch = ?2, worktree_path = ?3, pid = ?4,
                  pid_start_time = ?5, process_group_id = ?6, worker_token = ?7,
                  worker_socket_path = ?8, started_at_ms = ?9, updated_at_ms = ?9
-             WHERE id = ?1 AND state = 'claimed' AND exited_at_ms IS NULL",
+             WHERE id = ?1 AND state = ?11 AND exited_at_ms IS NULL",
             params![
                 run_id,
                 branch,
@@ -1747,6 +1838,8 @@ impl Store {
                 worker_token,
                 worker_socket_path,
                 now_ms,
+                RunState::Running.as_str(),
+                RunState::Claimed.as_str(),
             ],
         )?;
         if changed != 1 {
@@ -1760,7 +1853,7 @@ impl Store {
             return Err(StoreError::RunStateConflict {
                 run_id: run_id.into(),
                 state,
-                requested: "running".into(),
+                requested: RunState::Running.as_str().into(),
             });
         }
         let ticket_id: String = transaction.query_row(
@@ -1800,12 +1893,19 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run_state = RunState::from(outcome);
         let changed = transaction.execute(
             "UPDATE runs
              SET state = ?2, exited_at_ms = ?3, exit_code = ?4, updated_at_ms = ?3,
-                 cleanup_eligible_at_ms = CASE WHEN ?2 = 'merged' THEN ?3 ELSE NULL END
+                 cleanup_eligible_at_ms = CASE WHEN ?2 = ?5 THEN ?3 ELSE NULL END
              WHERE id = ?1 AND exited_at_ms IS NULL",
-            params![run_id, outcome.as_str(), now_ms, exit_code],
+            params![
+                run_id,
+                run_state.as_str(),
+                now_ms,
+                exit_code,
+                RunState::Merged.as_str(),
+            ],
         )?;
         if changed == 0 {
             let existing: Option<(String, Option<i64>)> = transaction
@@ -1824,7 +1924,7 @@ impl Store {
                     return Err(StoreError::RunStateConflict {
                         run_id: run_id.into(),
                         state: Some(state),
-                        requested: outcome.as_str().into(),
+                        requested: run_state.as_str().into(),
                     });
                 }
                 None => {
@@ -1978,9 +2078,15 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
             "UPDATE runs
-             SET state = 'aftercare', exit_code = ?2, updated_at_ms = ?3
-             WHERE id = ?1 AND state = 'running' AND exited_at_ms IS NULL",
-            params![run_id, exit_code, now_ms],
+             SET state = ?4, exit_code = ?2, updated_at_ms = ?3
+             WHERE id = ?1 AND state = ?5 AND exited_at_ms IS NULL",
+            params![
+                run_id,
+                exit_code,
+                now_ms,
+                RunState::Aftercare.as_str(),
+                RunState::Running.as_str(),
+            ],
         )?;
         if changed == 0 {
             let state: Option<String> = transaction
@@ -2257,9 +2363,9 @@ impl Store {
         transaction.execute("DELETE FROM leases WHERE run_id = ?1", params![run_id])?;
         transaction.execute(
             "UPDATE runs
-             SET state = 'aborted', exited_at_ms = ?2, updated_at_ms = ?2
+             SET state = ?3, exited_at_ms = ?2, updated_at_ms = ?2
              WHERE id = ?1 AND exited_at_ms IS NULL",
-            params![run_id, now_ms],
+            params![run_id, now_ms, RunState::Aborted.as_str()],
         )?;
         transaction.execute(
             "UPDATE tickets SET state = 'ready', held_reason = NULL, updated_at_ms = ?2
@@ -2557,10 +2663,15 @@ impl Store {
                 "SELECT r.id, r.attempt FROM runs r
                  JOIN leases l ON l.run_id = r.id
                  WHERE r.ticket_id = ?1
-                   AND r.state IN ('claimed', 'running', 'aftercare')
+                   AND r.state IN (?2, ?3, ?4)
                    AND r.exited_at_ms IS NULL
                  ORDER BY r.created_at_ms DESC, r.id DESC LIMIT 1",
-                params![ticket_id],
+                params![
+                    ticket_id,
+                    NONTERMINAL_RUN_STATES[0].as_str(),
+                    NONTERMINAL_RUN_STATES[1].as_str(),
+                    NONTERMINAL_RUN_STATES[2].as_str(),
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
@@ -2574,11 +2685,11 @@ impl Store {
              JOIN leases l ON l.run_id = r.id
              JOIN tickets t ON t.id = r.ticket_id
              WHERE r.exited_at_ms IS NULL
-               AND r.state IN ('claimed', 'running', 'aftercare')
+               AND r.state IN (?1, ?2, ?3)
              ORDER BY r.created_at_ms, r.id",
         )?;
         let runs = statement
-            .query_map([], |row| {
+            .query_map(nonterminal_state_params(), |row| {
                 Ok(ActiveRun {
                     id: row.get(0)?,
                     ticket_id: row.get(1)?,
@@ -2604,11 +2715,11 @@ impl Store {
              JOIN leases l ON l.run_id = r.id
              JOIN tickets t ON t.id = r.ticket_id
              WHERE r.exited_at_ms IS NULL
-               AND r.state IN ('claimed', 'running', 'aftercare')
+               AND r.state IN (?1, ?2, ?3)
              ORDER BY r.created_at_ms, r.id",
         )?;
         statement
-            .query_map([], |row| {
+            .query_map(nonterminal_state_params(), |row| {
                 Ok(RecoverableRun {
                     id: row.get(0)?,
                     ticket_id: row.get(1)?,
@@ -2818,10 +2929,44 @@ impl Store {
         })
     }
 
+    /// Re-arms the lease of a run this daemon has just adopted, returning the
+    /// new expiry. Unlike [`Store::renew_lease`] this accepts an already
+    /// expired lease: a daemon down longer than the TTL comes back to leases
+    /// that lapsed while nobody was renewing them, and ordinary renewal could
+    /// never lift them again. It is not a weaker renewal — the guard moves
+    /// from the clock to the run itself, so only a run that has not settled
+    /// can be re-armed, and a dead run's lease stays expired because recovery
+    /// settles it instead of adopting it.
+    pub(crate) fn readopt_lease(
+        &mut self,
+        ticket_id: &str,
+        run_id: &str,
+        lease_ms: i64,
+        now_ms: i64,
+    ) -> Result<i64, StoreError> {
+        let expires_at_ms = now_ms + lease_ms;
+        let changed = self.connection.execute(
+            "UPDATE leases
+             SET renewed_at_ms = ?3, expires_at_ms = ?4
+             WHERE ticket_id = ?1 AND run_id = ?2
+               AND EXISTS (SELECT 1 FROM runs
+                           WHERE id = ?2 AND exited_at_ms IS NULL)",
+            params![ticket_id, run_id, now_ms, expires_at_ms],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::LeaseNotHeld {
+                ticket_id: ticket_id.into(),
+                run_id: run_id.into(),
+            });
+        }
+        Ok(expires_at_ms)
+    }
+
     /// Renews the lease that `run_id` holds on `ticket_id`, returning the new
     /// expiry. Renewal is strict: an expired lease cannot be renewed, so once
     /// recovery treats expiry as "run is lost" a revived run can never
-    /// resurrect a lease that recovery may be reclaiming.
+    /// resurrect a lease that recovery may be reclaiming. Re-arming an expired
+    /// lease is a separate, adoption-only verb ([`Store::readopt_lease`]).
     pub(crate) fn renew_lease(
         &mut self,
         ticket_id: &str,
@@ -3124,6 +3269,9 @@ pub enum StoreError {
         state: Option<String>,
         requested: String,
     },
+    UnknownRunState {
+        state: String,
+    },
 }
 
 impl StoreError {
@@ -3191,6 +3339,9 @@ impl fmt::Display for StoreError {
                 ),
                 None => write!(formatter, "run `{run_id}` does not exist"),
             },
+            Self::UnknownRunState { state } => {
+                write!(formatter, "unrecognized run state `{state}`")
+            }
         }
     }
 }
@@ -3203,8 +3354,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ActivationKind, ClaimRequest, ExitClaim, NewActivation, ReindexTicket, SCHEMA_VERSION,
-        Store, StoreError,
+        ActivationKind, ClaimRequest, ExitClaim, NewActivation, ReindexTicket, RunState,
+        SCHEMA_VERSION, Store, StoreError,
     };
     use crate::domain::ticket::{TicketSnapshot, TicketState};
     use crate::flow::{Flow, Stage, StageKind, VerdictPolicy};
@@ -3739,7 +3890,10 @@ mod tests {
         let run = store.run("R1").unwrap().unwrap();
         assert_eq!(run.state, "aftercare");
         assert_eq!(run.exit_code, Some(0));
-        assert_eq!(store.recoverable_runs().unwrap()[0].state, "aftercare");
+        assert_eq!(
+            store.recoverable_runs().unwrap()[0].state,
+            RunState::Aftercare
+        );
         let evidence = store.run_evidence("R1").unwrap();
         assert_eq!(
             evidence
@@ -4151,6 +4305,87 @@ mod tests {
 
         // The lease expires at 62_000; renewal at or after that must fail.
         let error = store.renew_lease("T1", "R1", 60_000, 62_000).unwrap_err();
+        assert!(matches!(error, StoreError::LeaseNotHeld { .. }));
+    }
+
+    #[test]
+    fn every_run_state_round_trips_through_its_stored_string() {
+        let states = [
+            RunState::Claimed,
+            RunState::Running,
+            RunState::Aftercare,
+            RunState::Aborted,
+            RunState::Merged,
+            RunState::Failed,
+            RunState::NeedsReview,
+            RunState::Cancelled,
+            RunState::RateLimited,
+            RunState::Orphaned,
+        ];
+        for state in states {
+            assert_eq!(RunState::parse(state.as_str()).unwrap(), state);
+        }
+        // Every outcome `finish_run` can write is one of those variants.
+        for outcome in [
+            crate::outcome::Outcome::Merged,
+            crate::outcome::Outcome::Failed,
+            crate::outcome::Outcome::NeedsReview,
+            crate::outcome::Outcome::Cancelled,
+            crate::outcome::Outcome::RateLimited,
+            crate::outcome::Outcome::Orphaned,
+        ] {
+            assert_eq!(RunState::from(outcome).as_str(), outcome.as_str());
+            assert!(RunState::from(outcome).is_terminal());
+        }
+        for state in [RunState::Claimed, RunState::Running, RunState::Aftercare] {
+            assert!(!state.is_terminal());
+        }
+        assert!(RunState::Aborted.is_terminal());
+    }
+
+    #[test]
+    fn an_unknown_stored_run_state_is_an_error_not_a_fallback() {
+        let error = RunState::parse("half_running").unwrap_err();
+        assert!(matches!(error, StoreError::UnknownRunState { state } if state == "half_running"));
+    }
+
+    #[test]
+    fn a_readopted_lease_is_re_armed_even_after_it_expired() {
+        let directory = tempdir().unwrap();
+        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+
+        // The lease expired at 62_000, so ordinary renewal is refused...
+        assert!(store.renew_lease("T1", "R1", 60_000, 90_000).is_err());
+        // ...while adoption re-arms it, and renewal works again afterwards.
+        assert_eq!(
+            store.readopt_lease("T1", "R1", 60_000, 90_000).unwrap(),
+            150_000
+        );
+        assert_eq!(
+            store.renew_lease("T1", "R1", 60_000, 100_000).unwrap(),
+            160_000
+        );
+    }
+
+    #[test]
+    fn a_settled_run_cannot_be_readopted() {
+        let directory = tempdir().unwrap();
+        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        store
+            .finish_run(
+                "R1",
+                "T1",
+                Some(0),
+                crate::outcome::Outcome::Failed,
+                &[],
+                None,
+                3_000,
+            )
+            .unwrap();
+
+        let error = store.readopt_lease("T1", "R1", 60_000, 4_000).unwrap_err();
         assert!(matches!(error, StoreError::LeaseNotHeld { .. }));
     }
 

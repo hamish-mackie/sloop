@@ -128,11 +128,16 @@ live agent. At startup, every in-flight run is classified:
   so the interrupted stage is re-run idempotently.
 
 Recovery is driven entirely by that process identity, never by how old a
-lease is. A lease's expiry only decides whether it may be renewed, so a
-lease that has outlived its deadline while its run is alive and supervised
-is normal and harmless. The lease row is dropped when the ticket settles or
-its claim is rolled back, so a stale row left behind is evidence of an owner
-that died mid-work.
+lease is. Expiry is a report, not an authority: the daemon renews the lease
+of every run it supervises on each reconcile pass, so a live run's lease
+stays in the future for as long as the run lasts, and an expired lease
+means nobody was there to renew it. Renewal is strict — an expired lease
+cannot be renewed — so a daemon returning after longer than the lease TTL
+re-arms the lease of each run it readopts, having first confirmed that
+run's process is alive. A run whose process identity fails is settled, not
+readopted, so its lease is never lifted. The lease row is dropped when the
+ticket settles or its claim is rolled back, so a stale row left behind is
+evidence of an owner that died mid-work.
 
 A lock file guarantees at most one daemon per repository; a second
 `sloop daemon` connects to the first instead of racing it.
