@@ -428,6 +428,7 @@ pub(crate) struct RecoverableRun {
     pub(crate) exit_code: Option<i64>,
     pub(crate) lease_expires_at_ms: i64,
     pub(crate) flow_json: Option<String>,
+    pub(crate) ticket_json: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2362,7 +2363,8 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT r.id, r.ticket_id, t.target, r.state, r.branch, r.worktree_path,
                     r.pid, r.pid_start_time, r.process_group_id, r.worker_token,
-                    r.worker_socket_path, r.exit_code, l.expires_at_ms, r.flow_json
+                    r.worker_socket_path, r.exit_code, l.expires_at_ms, r.flow_json,
+                    r.ticket_json
              FROM runs r
              JOIN leases l ON l.run_id = r.id
              JOIN tickets t ON t.id = r.ticket_id
@@ -2387,6 +2389,7 @@ impl Store {
                     exit_code: row.get(11)?,
                     lease_expires_at_ms: row.get(12)?,
                     flow_json: row.get(13)?,
+                    ticket_json: row.get(14)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -2658,6 +2661,40 @@ impl Store {
             )
             .optional()
             .map_err(StoreError::from)
+    }
+
+    /// Number of runs currently holding a durable lease. Used as the capacity
+    /// gate for repair spawns, which run inside an already-leased run.
+    pub(crate) fn active_lease_count(&self) -> Result<usize, StoreError> {
+        let count: i64 = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM leases", [], |row| row.get(0))?;
+        Ok(count as usize)
+    }
+
+    /// Persists one repair attempt for a stage. The dedupe key is per
+    /// (run, stage, attempt), so recovery counts consumed attempts without
+    /// repeating or losing one, and the retry verdict can be filled in later
+    /// by upserting the same key.
+    pub(crate) fn record_repair_attempt(
+        &self,
+        run_id: &str,
+        stage: &str,
+        attempt: u32,
+        data_json: &str,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO run_evidence
+                 (run_id, kind, observed_at_ms, dedupe_key, data_json)
+             VALUES (?1, 'repair_attempt', ?2,
+                     'repair:' || ?1 || ':' || ?3 || ':' || ?4, ?5)
+             ON CONFLICT(dedupe_key) DO UPDATE SET
+                 observed_at_ms = excluded.observed_at_ms,
+                 data_json = excluded.data_json",
+            params![run_id, now_ms, stage, attempt as i64, data_json],
+        )?;
+        Ok(())
     }
 
     pub fn active_cooldowns(&self, now_ms: i64) -> Result<Vec<CooldownRecord>, StoreError> {
@@ -2994,6 +3031,7 @@ mod tests {
                     name: "build".into(),
                     kind: StageKind::Agent,
                     verdict: VerdictPolicy::Commits,
+                    on_fail: None,
                 },
                 Stage {
                     name: "check".into(),
@@ -3001,6 +3039,7 @@ mod tests {
                         cmd: vec!["cargo".into(), "test".into()],
                     },
                     verdict: VerdictPolicy::Exit,
+                    on_fail: None,
                 },
             ],
         };

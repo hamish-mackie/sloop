@@ -20,7 +20,9 @@ use crate::runner::local::{
 use crate::runner::{AgentLaunch, RunnerError, StageExecution, StageOrder};
 use crate::store::{ClaimRequest, QueuedActivation, Store, TicketRecord};
 
-use super::aftercare::{StoreStageHooks, gather_exit_evidence, git_is_ancestor, git_stdout};
+use super::aftercare::{
+    RepairContext, StoreStageHooks, gather_exit_evidence, git_is_ancestor, git_stdout,
+};
 use super::dispatcher::{
     DispatcherState, RunEvent, close_worker_socket, mark_storage_full, recover_storage,
     settle_pending_exits,
@@ -494,6 +496,14 @@ pub(super) fn reconcile(
                 let state_dir = state.state_dir.clone();
                 let db_path = state.state_dir.join("sloop.db");
                 let worker = launched.worker().clone();
+                let repair = state.agent.as_ref().map(|agent| {
+                    RepairContext::new(
+                        agent.clone(),
+                        &ticket_snapshot,
+                        state.running_hours.clone(),
+                        state.max_agents,
+                    )
+                });
                 state
                     .worker_tokens
                     .insert(run_id.clone(), worker.token.clone());
@@ -579,6 +589,7 @@ pub(super) fn reconcile(
                             vendor_error.as_ref(),
                             cooldown_until_ms,
                             checkpoint_store.as_mut(),
+                            repair.as_ref(),
                             &supervisor_log,
                         )
                     else {

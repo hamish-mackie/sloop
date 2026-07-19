@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -6,16 +7,18 @@ use std::process::{Command, Stdio};
 use serde_json::json;
 
 use crate::clock::Clock;
+use crate::config::{AgentConfig, RunningHours, expand_agent_cmd};
+use crate::domain::ticket::TicketSnapshot;
 use crate::flow::{
-    Flow, Reported, Stage, StageEvidence, StageKind, Step, Verdict, VerdictPolicy, VerdictSource,
-    next_step, resolve_verdict,
+    Flow, OnFail, Reported, Stage, StageEvidence, StageKind, Step, Verdict, VerdictPolicy,
+    VerdictSource, next_step, resolve_verdict,
 };
 use crate::logging::{LogLevel, OperationalLog};
 use crate::outcome::{ExitClass, MergeOutcome, classify_exit};
 use crate::runner::local::{process_start_time, run_exec_stage, wait_for_test_hook};
 use crate::runner::{
-    AgentProcessCheckpoint, ExecLaunch, ExecProcessCheckpoint, ExecutionEvidence, RunnerError,
-    StageExecution, StageHooks, StageOrder, WorkerCredentials,
+    AgentProcessCheckpoint, ExecLaunch, ExecProcessCheckpoint, ExecutionEvidence, ProcessIdentity,
+    RunnerError, StageExecution, StageHooks, StageOrder, WorkerCredentials,
 };
 use crate::store::{ExitClaim, StageRecord, Store, StoreError};
 use crate::vendor_error::VendorErrorMatch;
@@ -101,6 +104,7 @@ pub(super) fn gather_exit_evidence(
     vendor_error: Option<&VendorErrorMatch>,
     cooldown_until_ms: Option<i64>,
     mut checkpoint_store: Option<&mut Store>,
+    repair: Option<&RepairContext>,
     operational_log: &OperationalLog,
 ) -> Option<(Vec<String>, bool, bool, Option<MergeOutcome>)> {
     let commit_observation = try_commits_on_branch(root, branch);
@@ -169,6 +173,7 @@ pub(super) fn gather_exit_evidence(
         clock,
         store,
         run_id,
+        repair,
         operational_log,
     ) {
         Ok(result) => Some((
@@ -239,6 +244,7 @@ fn execute_stage_order(
         execution: StageExecution::Exec(ExecLaunch {
             argv: cmd.to_vec(),
             worker: worker.cloned(),
+            environment: Vec::new(),
         }),
         worktree: worktree.into(),
         branch: branch.into(),
@@ -441,6 +447,200 @@ pub(super) struct FlowRunResult {
     pub(super) merge: Option<MergeOutcome>,
 }
 
+/// Everything the detached aftercare thread needs to spawn a stage's repair
+/// agent and pass it through the same gates as a normal spawn. Built from
+/// dispatcher state before aftercare detaches; `None` disables repair, so a
+/// stage without a resolvable repair worker settles exactly as it does today.
+pub(super) struct RepairContext {
+    pub(super) agent: AgentConfig,
+    pub(super) ticket_id: String,
+    pub(super) ticket_target: Option<String>,
+    pub(super) ticket_model: Option<String>,
+    pub(super) ticket_effort: Option<String>,
+    pub(super) running_hours: Option<RunningHours>,
+    pub(super) max_parallel_tasks: usize,
+}
+
+impl RepairContext {
+    /// Builds a repair context from the run's snapshotted ticket and the
+    /// live spawn gates. The `on_fail` block itself rides in the flow
+    /// snapshot, so a repair's behavior is frozen at post time like the flow.
+    pub(super) fn new(
+        agent: AgentConfig,
+        ticket: &TicketSnapshot,
+        running_hours: Option<RunningHours>,
+        max_parallel_tasks: usize,
+    ) -> Self {
+        Self {
+            agent,
+            ticket_id: ticket.id.clone(),
+            ticket_target: ticket.target.clone(),
+            ticket_model: ticket.model.clone(),
+            ticket_effort: ticket.effort.clone(),
+            running_hours,
+            max_parallel_tasks,
+        }
+    }
+}
+
+/// Resolves the repair worker's target: the `on_fail` override, then the
+/// ticket's snapshotted target, then the configured default target.
+fn resolve_repair_target(ctx: &RepairContext, on_fail: &OnFail) -> String {
+    on_fail
+        .target
+        .clone()
+        .or_else(|| ctx.ticket_target.clone())
+        .unwrap_or_else(|| ctx.agent.default_target.clone())
+}
+
+/// Whether a repair spawn for `target` clears the same gates a normal spawn
+/// would: running hours, the per-target cooldown, and capacity. Budget
+/// reservations are not yet enforced for any spawn, so that gate is open. A
+/// store read error closes the gate rather than risk an ungated spawn.
+fn repair_gates_open(
+    ctx: &RepairContext,
+    store: &Store,
+    target: &str,
+    clock: &dyn Clock,
+    now_ms: i64,
+) -> bool {
+    let hours_open = ctx
+        .running_hours
+        .as_ref()
+        .is_none_or(|hours| hours.is_open(clock.local_minute(now_ms)));
+    if !hours_open {
+        return false;
+    }
+    match store.active_cooldown_for_target(target, now_ms) {
+        Ok(None) => {}
+        _ => return false,
+    }
+    // The repair runs inside an already-leased run, so that run's own lease is
+    // counted here; an over-subscribed store still closes the gate.
+    matches!(store.active_lease_count(), Ok(count) if count <= ctx.max_parallel_tasks)
+}
+
+/// Repair attempts already consumed for `stage`, recovered from durable
+/// evidence so a restart never repeats or loses one.
+fn repair_attempts_used(evidence: &[(String, String)], stage: &str) -> u32 {
+    evidence
+        .iter()
+        .filter(|(kind, _)| kind == "repair_attempt")
+        .filter_map(|(_, data)| serde_json::from_str::<serde_json::Value>(data).ok())
+        .filter(|value| value["stage"].as_str() == Some(stage))
+        .count() as u32
+}
+
+fn repair_attempt_json(
+    stage: &str,
+    attempt: u32,
+    target: &str,
+    identity: Option<ProcessIdentity>,
+    retry_verdict: Option<Verdict>,
+) -> String {
+    json!({
+        "stage": stage,
+        "attempt": attempt,
+        "target": target,
+        "pid": identity.map(|id| id.pid),
+        "pid_start_time": identity.and_then(|id| id.start_time),
+        "retry_verdict": retry_verdict.map(|verdict| match verdict {
+            Verdict::Pass => "pass",
+            Verdict::Fail => "fail",
+        }),
+    })
+    .to_string()
+}
+
+fn repair_agent_environment(
+    ctx: &RepairContext,
+    run_id: &str,
+) -> Result<Vec<(OsString, OsString)>, String> {
+    let executable = std::env::current_exe()
+        .map_err(|source| format!("cannot locate sloop executable: {source}"))?;
+    let executable_dir = executable
+        .parent()
+        .ok_or_else(|| "sloop executable has no parent directory".to_owned())?;
+    let mut path_entries = vec![executable_dir.to_path_buf()];
+    if let Some(path) = std::env::var_os("PATH") {
+        path_entries.extend(std::env::split_paths(&path));
+    }
+    let path = std::env::join_paths(path_entries)
+        .map_err(|source| format!("cannot construct agent PATH: {source}"))?;
+    Ok(vec![
+        (OsString::from("SLOOP_RUN_ID"), OsString::from(run_id)),
+        (
+            OsString::from("SLOOP_TICKET_ID"),
+            OsString::from(&ctx.ticket_id),
+        ),
+        (
+            OsString::from("SLOOP_BIN"),
+            executable.as_os_str().to_owned(),
+        ),
+        (OsString::from("PATH"), path),
+    ])
+}
+
+/// Spawns the stage's repair agent in the run worktree, captures its output to
+/// the run log, checkpoints its process for crash recovery, and waits for it to
+/// exit. The agent works in place; the caller re-runs the stage afterwards. The
+/// repair agent never reports a verdict — the retried stage is the only
+/// evidence. Returns the repair process identity for the attempt record.
+#[allow(clippy::too_many_arguments)]
+fn run_repair_agent(
+    ctx: &RepairContext,
+    on_fail: &OnFail,
+    target: &str,
+    worktree: &Path,
+    output_path: &Path,
+    store: &Store,
+    run_id: &str,
+    stage: &str,
+    attempt: u32,
+    clock: &dyn Clock,
+    log: &OperationalLog,
+) -> Result<ProcessIdentity, String> {
+    let template = ctx
+        .agent
+        .targets
+        .get(target)
+        .ok_or_else(|| format!("repair target `{target}` is not a configured agent target"))?;
+    let model = on_fail.model.as_deref().or(ctx.ticket_model.as_deref());
+    let effort = on_fail.effort.as_deref().or(ctx.ticket_effort.as_deref());
+    let argv = expand_agent_cmd(template, model, effort, &on_fail.agent)
+        .map_err(|message| format!("repair target `{target}` {message}"))?;
+    let environment = repair_agent_environment(ctx, run_id)?;
+    // A repair agent works in the run worktree only; it never touches the
+    // default-branch checkout. `branch` is unused because no worktree is
+    // created here — the run's worktree already exists.
+    let order = StageOrder {
+        run_id: run_id.into(),
+        stage: stage.into(),
+        execution: StageExecution::Exec(ExecLaunch {
+            argv,
+            worker: None,
+            environment,
+        }),
+        worktree: worktree.into(),
+        branch: String::new(),
+        output_path: output_path.into(),
+    };
+    log.emit_with_fields(
+        LogLevel::Info,
+        "sloop::supervisor",
+        "repair_agent_spawned",
+        json!({"run_id": run_id, "stage": stage, "attempt": attempt, "target": target}),
+    );
+    let hooks = StoreStageHooks::new(store, log);
+    let evidence = match run_exec_stage(&order, &hooks, clock) {
+        Ok(evidence) => evidence,
+        Err(failure) => failure.evidence,
+    };
+    evidence
+        .process
+        .ok_or_else(|| format!("repair agent for stage `{stage}` produced no process identity"))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn drive_flow(
     root: &Path,
@@ -457,6 +657,7 @@ pub(super) fn drive_flow(
     clock: &dyn Clock,
     store: &Store,
     run_id: &str,
+    repair: Option<&RepairContext>,
     log: &OperationalLog,
 ) -> Result<FlowRunResult, String> {
     let flow = flow_with_implicit_test(bound_flow, test_cmd)?;
@@ -543,8 +744,9 @@ pub(super) fn drive_flow(
                 }),
             );
         }
-        let merge_recovery = if let Some((identity, _)) = &interrupted_process
+        let mut merge_recovery = if let Some((identity, _)) = &interrupted_process
             && stage.kind == StageKind::Merge
+            && identity.merge.is_some()
         {
             match inspect_interrupted_merge(root, branch, identity) {
                 Ok(recovery) => Some(recovery),
@@ -566,97 +768,30 @@ pub(super) fn drive_flow(
                 .clear_aftercare_process(run_id)
                 .map_err(|error| error.to_string())?;
         }
-        let mut result = match &stage.kind {
-            StageKind::Agent => {
-                let now = clock.now_ms();
-                StageResult {
-                    verdict: if !vendor_rejected && classify_exit(exit_code) == ExitClass::Success {
-                        Verdict::Pass
-                    } else {
-                        Verdict::Fail
-                    },
-                    exit_code,
-                    started_at_ms: now,
-                    finished_at_ms: now,
+        // Each `on_fail` stage may run up to `attempts` repair-then-retry
+        // cycles. The repair agent never produces the verdict: after it exits
+        // the stage is re-run and its own verdict policy re-applied, and that
+        // re-run is the only evidence.
+        let mut repair_used = repair_attempts_used(&interrupted, &stage.name);
+        let mut pending_repair: Option<(u32, ProcessIdentity, String)> = None;
+        let (verdict, source, reason, result) = loop {
+            let mut result = match &stage.kind {
+                StageKind::Agent => {
+                    let now = clock.now_ms();
+                    StageResult {
+                        verdict: if !vendor_rejected
+                            && classify_exit(exit_code) == ExitClass::Success
+                        {
+                            Verdict::Pass
+                        } else {
+                            Verdict::Fail
+                        },
+                        exit_code,
+                        started_at_ms: now,
+                        finished_at_ms: now,
+                    }
                 }
-            }
-            StageKind::Exec { cmd } => execute_stage_order(
-                worktree,
-                branch,
-                &stage.name,
-                cmd,
-                output_path,
-                clock,
-                store,
-                run_id,
-                log,
-                (stage.verdict == VerdictPolicy::Reported).then_some(worker),
-            ),
-            StageKind::Merge
-                if merge_recovery == Some(super::recovery::MergeRecovery::AlreadyCompleted) =>
-            {
-                let now = clock.now_ms();
-                merge = Some(MergeOutcome::Merged);
-                StageResult {
-                    verdict: Verdict::Pass,
-                    exit_code: Some(0),
-                    started_at_ms: now,
-                    finished_at_ms: now,
-                }
-            }
-            StageKind::Merge
-                if merge_recovery == Some(super::recovery::MergeRecovery::UnsafePartial) =>
-            {
-                let now = clock.now_ms();
-                merge = Some(MergeOutcome::Diverged);
-                StageResult {
-                    verdict: Verdict::Fail,
-                    exit_code: Some(1),
-                    started_at_ms: now,
-                    finished_at_ms: now,
-                }
-            }
-            StageKind::Merge => {
-                let started_at_ms = clock.now_ms();
-                let outcome = attempt_merge(
-                    root,
-                    branch,
-                    commit_observation_complete && commits.is_empty(),
-                    &stage.name,
-                    store,
-                    run_id,
-                    clock,
-                    log,
-                );
-                merge = Some(outcome);
-                StageResult {
-                    verdict: if outcome == MergeOutcome::Merged {
-                        Verdict::Pass
-                    } else {
-                        Verdict::Fail
-                    },
-                    exit_code: Some(if outcome == MergeOutcome::Merged {
-                        0
-                    } else {
-                        1
-                    }),
-                    started_at_ms,
-                    finished_at_ms: clock.now_ms(),
-                }
-            }
-        };
-        match &stage.verdict {
-            VerdictPolicy::Exit | VerdictPolicy::Reported => {}
-            VerdictPolicy::Commits => {
-                if result.verdict != Verdict::Pass
-                    || !commit_observation_complete
-                    || commits.is_empty()
-                {
-                    result.verdict = Verdict::Fail;
-                }
-            }
-            VerdictPolicy::Check { cmd } if result.verdict == Verdict::Pass => {
-                result = execute_stage_order(
+                StageKind::Exec { cmd } => execute_stage_order(
                     worktree,
                     branch,
                     &stage.name,
@@ -666,17 +801,174 @@ pub(super) fn drive_flow(
                     store,
                     run_id,
                     log,
-                    None,
+                    (stage.verdict == VerdictPolicy::Reported).then_some(worker),
+                ),
+                StageKind::Merge
+                    if merge_recovery == Some(super::recovery::MergeRecovery::AlreadyCompleted) =>
+                {
+                    let now = clock.now_ms();
+                    merge = Some(MergeOutcome::Merged);
+                    StageResult {
+                        verdict: Verdict::Pass,
+                        exit_code: Some(0),
+                        started_at_ms: now,
+                        finished_at_ms: now,
+                    }
+                }
+                StageKind::Merge
+                    if merge_recovery == Some(super::recovery::MergeRecovery::UnsafePartial) =>
+                {
+                    let now = clock.now_ms();
+                    merge = Some(MergeOutcome::Diverged);
+                    StageResult {
+                        verdict: Verdict::Fail,
+                        exit_code: Some(1),
+                        started_at_ms: now,
+                        finished_at_ms: now,
+                    }
+                }
+                StageKind::Merge => {
+                    let started_at_ms = clock.now_ms();
+                    let outcome = attempt_merge(
+                        root,
+                        branch,
+                        commit_observation_complete && commits.is_empty(),
+                        &stage.name,
+                        store,
+                        run_id,
+                        clock,
+                        log,
+                    );
+                    merge = Some(outcome);
+                    StageResult {
+                        verdict: if outcome == MergeOutcome::Merged {
+                            Verdict::Pass
+                        } else {
+                            Verdict::Fail
+                        },
+                        exit_code: Some(if outcome == MergeOutcome::Merged {
+                            0
+                        } else {
+                            1
+                        }),
+                        started_at_ms,
+                        finished_at_ms: clock.now_ms(),
+                    }
+                }
+            };
+            match &stage.verdict {
+                VerdictPolicy::Exit | VerdictPolicy::Reported => {}
+                VerdictPolicy::Commits => {
+                    if result.verdict != Verdict::Pass
+                        || !commit_observation_complete
+                        || commits.is_empty()
+                    {
+                        result.verdict = Verdict::Fail;
+                    }
+                }
+                VerdictPolicy::Check { cmd } if result.verdict == Verdict::Pass => {
+                    result = execute_stage_order(
+                        worktree,
+                        branch,
+                        &stage.name,
+                        cmd,
+                        output_path,
+                        clock,
+                        store,
+                        run_id,
+                        log,
+                        None,
+                    );
+                }
+                VerdictPolicy::Check { .. } => {}
+            }
+            let reported = if stage.verdict == VerdictPolicy::Reported {
+                reported_verdict(store, run_id, &stage.name)?
+            } else {
+                None
+            };
+            let (verdict, source, reason) =
+                resolve_verdict(&stage.verdict, result.verdict, reported);
+            // Fill in the verdict of the re-run that followed the last repair.
+            if let Some((attempt, identity, target)) = pending_repair.take() {
+                let _ = store.record_repair_attempt(
+                    run_id,
+                    &stage.name,
+                    attempt,
+                    &repair_attempt_json(
+                        &stage.name,
+                        attempt,
+                        &target,
+                        Some(identity),
+                        Some(verdict),
+                    ),
+                    clock.now_ms(),
                 );
             }
-            VerdictPolicy::Check { .. } => {}
-        }
-        let reported = if stage.verdict == VerdictPolicy::Reported {
-            reported_verdict(store, run_id, &stage.name)?
-        } else {
-            None
+            if verdict == Verdict::Pass {
+                break (verdict, source, reason, result);
+            }
+            // The stage failed. If it has a repair worker, attempts remain, and
+            // every spawn gate is open, repair in place and re-run the stage.
+            if let (Some(on_fail), Some(ctx)) = (stage.on_fail.as_ref(), repair)
+                && repair_used < on_fail.attempts
+            {
+                let target = resolve_repair_target(ctx, on_fail);
+                if repair_gates_open(ctx, store, &target, clock, clock.now_ms()) {
+                    let attempt = repair_used + 1;
+                    // Record the attempt before spawning so a crash mid-repair
+                    // still counts it: recovery re-runs the stage, never the
+                    // repair, so the attempt is neither repeated nor lost.
+                    store
+                        .record_repair_attempt(
+                            run_id,
+                            &stage.name,
+                            attempt,
+                            &repair_attempt_json(&stage.name, attempt, &target, None, None),
+                            clock.now_ms(),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    match run_repair_agent(
+                        ctx,
+                        on_fail,
+                        &target,
+                        worktree,
+                        output_path,
+                        store,
+                        run_id,
+                        &stage.name,
+                        attempt,
+                        clock,
+                        log,
+                    ) {
+                        Ok(identity) => {
+                            repair_used = attempt;
+                            pending_repair = Some((attempt, identity, target));
+                            // A fresh retry: any interrupted-merge recovery from
+                            // a crash applied only to the first execution.
+                            merge_recovery = None;
+                            continue;
+                        }
+                        Err(error) => {
+                            log.emit_with_fields(
+                                LogLevel::Error,
+                                "sloop::supervisor",
+                                "repair_agent_failed",
+                                json!({"run_id": run_id, "stage": stage.name, "error": error}),
+                            );
+                        }
+                    }
+                } else {
+                    log.emit_with_fields(
+                        LogLevel::Info,
+                        "sloop::supervisor",
+                        "repair_gate_closed",
+                        json!({"run_id": run_id, "stage": stage.name, "target": target}),
+                    );
+                }
+            }
+            break (verdict, source, reason, result);
         };
-        let (verdict, source, reason) = resolve_verdict(&stage.verdict, result.verdict, reported);
         if let Err(error) = store.record_aftercare_stage(
             run_id,
             &StageRecord {
@@ -744,6 +1036,7 @@ fn flow_with_implicit_test(flow: &Flow, test_cmd: Option<&[String]>) -> Result<F
                 name: "test".into(),
                 kind: StageKind::Exec { cmd: cmd.to_vec() },
                 verdict: VerdictPolicy::Exit,
+                on_fail: None,
             },
         );
     }

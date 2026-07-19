@@ -247,6 +247,7 @@ pub fn run_exec_stage<H: StageHooks>(
     };
     command
         .current_dir(&order.worktree)
+        .envs(launch.environment.iter().cloned())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
@@ -613,6 +614,7 @@ mod tests {
             execution: StageExecution::Exec(ExecLaunch {
                 argv: vec!["sh".into(), "-c".into(), "printf runner-output".into()],
                 worker: None,
+                environment: Vec::new(),
             }),
             worktree: directory.path().into(),
             branch: "sloop/T1-a1-R1".into(),

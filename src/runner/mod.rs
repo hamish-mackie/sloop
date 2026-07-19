@@ -37,6 +37,9 @@ pub struct AgentLaunch {
 pub struct ExecLaunch {
     pub argv: Vec<String>,
     pub worker: Option<WorkerCredentials>,
+    /// Extra environment applied to the child. Empty for ordinary exec
+    /// stages; repair agents carry the agent environment here.
+    pub environment: Vec<(OsString, OsString)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

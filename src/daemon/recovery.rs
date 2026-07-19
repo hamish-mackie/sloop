@@ -21,8 +21,8 @@ use crate::store::{ExitClaim, RecoverableRun, Store};
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
 
 use super::aftercare::{
-    aftercare_cancelled, drive_flow, git_index_lock_path, git_index_matches_head, git_is_ancestor,
-    git_stdout, shared_checkout_has_git_operation, try_commits_on_branch,
+    RepairContext, aftercare_cancelled, drive_flow, git_index_lock_path, git_index_matches_head,
+    git_is_ancestor, git_stdout, shared_checkout_has_git_operation, try_commits_on_branch,
 };
 use super::dispatcher::{DispatcherState, RunEvent};
 use super::scheduler::{VENDOR_COOLDOWN_MS, bound_flow};
@@ -262,6 +262,22 @@ pub(super) fn recovered_exit_event(
     })
 }
 
+/// Rebuilds the repair context for a resumed run from its snapshotted ticket
+/// and the live spawn gates. Absent when no agent is configured or the ticket
+/// snapshot is missing, which simply disables repair on resume.
+fn repair_context(state: &DispatcherState, run: &RecoverableRun) -> Option<RepairContext> {
+    let agent = state.agent.as_ref()?;
+    let ticket = run.ticket_json.as_deref().and_then(|json| {
+        serde_json::from_str::<crate::domain::ticket::TicketSnapshot>(json).ok()
+    })?;
+    Some(RepairContext::new(
+        agent.clone(),
+        &ticket,
+        state.running_hours.clone(),
+        state.max_agents,
+    ))
+}
+
 pub(super) fn spawn_aftercare_recovery(
     state: &DispatcherState,
     events: mpsc::Sender<RunEvent>,
@@ -284,6 +300,7 @@ pub(super) fn spawn_aftercare_recovery(
     let clock = state.clock.clone();
     let db_path = state.state_dir.join("sloop.db");
     let shutdown = state.shutdown_flag.clone();
+    let repair = repair_context(state, &run);
     let worker = WorkerCredentials {
         socket: run
             .worker_socket_path
@@ -306,6 +323,7 @@ pub(super) fn spawn_aftercare_recovery(
                         clock.as_ref(),
                         &store,
                         &run,
+                        repair.as_ref(),
                         &log,
                     )
                 });
@@ -339,6 +357,7 @@ pub(super) fn resume_aftercare(
     clock: &dyn Clock,
     store: &Store,
     run: &RecoverableRun,
+    repair: Option<&RepairContext>,
     log: &OperationalLog,
 ) -> Result<RunEvent, String> {
     let rows = store
@@ -406,6 +425,7 @@ pub(super) fn resume_aftercare(
         clock,
         store,
         &run.id,
+        repair,
         log,
     )?;
 
@@ -852,6 +872,7 @@ mod tests {
             exit_code: None,
             lease_expires_at_ms: 1,
             flow_json: None,
+            ticket_json: None,
         }
     }
 
