@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -6,25 +7,109 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use tokio::sync::mpsc;
 
+use crate::config::expand_agent_cmd;
 use crate::coordination::{Claim, Coordination};
 use crate::domain::ticket::TicketSnapshot;
 use crate::flow::Flow;
 use crate::frontmatter::Frontmatter;
 use crate::ids::next_id;
 use crate::logging::{LogLevel, OperationalLog};
+use crate::runner::local::{
+    compose_worker_prompt, launch_agent, run_output_path, wait_for_test_hook, worker_socket_path,
+};
+use crate::runner::{AgentLaunch, RunnerError, StageExecution, StageOrder};
 use crate::store::{ClaimRequest, QueuedActivation, Store, TicketRecord};
 
-use super::aftercare::{WorkerCredentials, gather_exit_evidence};
+use super::aftercare::{StoreStageHooks, gather_exit_evidence};
 use super::dispatcher::{
     DispatcherState, RunEvent, close_worker_socket, mark_storage_full, recover_storage,
     settle_pending_exits,
 };
-use super::recovery::{classify_run_output, kill_straggler_process_group, reconcile_run_liveness};
-use super::runner::{LaunchedRun, launch_agent};
+use super::recovery::{classify_run_output, reconcile_run_liveness};
 use super::server::{DaemonError, serve_worker_socket};
 
 pub(super) const DEFAULT_LEASE_MS: i64 = 10 * 60 * 1000;
 pub(super) const VENDOR_COOLDOWN_MS: i64 = 5 * 60 * 1000;
+
+fn agent_stage_order(
+    state: &DispatcherState,
+    ticket: &TicketRecord,
+    flow: &Flow,
+    run_id: &str,
+    attempt: i64,
+) -> Result<(StageOrder, String), RunnerError<crate::store::StoreError>> {
+    let error = |message| RunnerError::Execution(message);
+    let agent = state
+        .agent
+        .as_ref()
+        .ok_or_else(|| error("no agent targets configured".into()))?;
+    let target = ticket.target.as_deref().ok_or_else(|| {
+        error(format!(
+            "ticket `{}` does not specify an agent target",
+            ticket.id
+        ))
+    })?;
+    let template = agent.targets.get(target).ok_or_else(|| {
+        error(format!(
+            "ticket `{}` names unknown agent target `{target}`",
+            ticket.id
+        ))
+    })?;
+    let prompt = compose_worker_prompt(&state.root).map_err(error)?;
+    let argv = expand_agent_cmd(
+        template,
+        ticket.model.as_deref(),
+        ticket.effort.as_deref(),
+        &prompt,
+    )
+    .map_err(|message| error(format!("ticket `{}` {message}", ticket.id)))?;
+    let executable = std::env::current_exe()
+        .map_err(|source| error(format!("cannot locate sloop executable: {source}")))?;
+    let executable_dir = executable
+        .parent()
+        .ok_or_else(|| error("sloop executable has no parent directory".into()))?;
+    let mut path_entries = vec![executable_dir.to_path_buf()];
+    if let Some(path) = std::env::var_os("PATH") {
+        path_entries.extend(std::env::split_paths(&path));
+    }
+    let path = std::env::join_paths(path_entries)
+        .map_err(|source| error(format!("cannot construct agent PATH: {source}")))?;
+    let branch = format!("sloop/{}-a{attempt}-{run_id}", ticket.id);
+    let worktree = state.worktree_dir.join(run_id);
+    let stage = flow
+        .stages
+        .iter()
+        .find(|stage| matches!(stage.kind, crate::flow::StageKind::Agent))
+        .map_or_else(|| "agent".into(), |stage| stage.name.clone());
+    let environment = vec![
+        (OsString::from("SLOOP_RUN_ID"), OsString::from(run_id)),
+        (
+            OsString::from("SLOOP_TICKET_ID"),
+            OsString::from(&ticket.id),
+        ),
+        (
+            OsString::from("SLOOP_BIN"),
+            executable.as_os_str().to_owned(),
+        ),
+        (OsString::from("PATH"), path),
+    ];
+    Ok((
+        StageOrder {
+            run_id: run_id.into(),
+            stage,
+            execution: StageExecution::Agent(AgentLaunch {
+                argv,
+                environment,
+                repository: state.root.clone(),
+                worker_socket_path: worker_socket_path(&state.runtime_dir, run_id),
+            }),
+            worktree,
+            branch,
+            output_path: run_output_path(&state.state_dir, run_id),
+        },
+        target.into(),
+    ))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OrphanDisposition {
@@ -243,7 +328,7 @@ pub(super) fn reconcile(
     // responsible for idle reconciliation; this extra scan only runs when a
     // queued activation could otherwise spawn now.
     if !activations.is_empty() && state.active.len() < state.max_agents {
-        super::dispatcher::wait_for_test_hook("before-spawn-capacity-reconciliation");
+        wait_for_test_hook("before-spawn-capacity-reconciliation");
         reconcile_run_liveness(state, events, log);
         if state.reconciliation_blocked {
             return;
@@ -380,8 +465,18 @@ pub(super) fn reconcile(
                 continue;
             }
         };
-        match launch_agent(state, &run_id, &ticket_id, claimed.attempt) {
-            Ok(launched) => {
+        let launch = agent_stage_order(state, &ticket, &flow, &run_id, claimed.attempt).and_then(
+            |(order, target)| {
+                let worktree = order.worktree.clone();
+                let branch = order.branch.clone();
+                let output_path = order.output_path.clone();
+                let hooks = StoreStageHooks::new(&state.store, log);
+                launch_agent(order, &hooks, state.clock.as_ref())
+                    .map(|launched| (launched, target, worktree, branch, output_path))
+            },
+        );
+        match launch {
+            Ok((mut launched, target, worktree, branch, output_path)) => {
                 state.active.insert(run_id.clone());
                 let events = events.clone();
                 let exited_run = run_id.clone();
@@ -392,50 +487,34 @@ pub(super) fn reconcile(
                 let supervisor_log = log.clone();
                 let state_dir = state.state_dir.clone();
                 let db_path = state.state_dir.join("sloop.db");
-                let LaunchedRun {
-                    mut child,
-                    readers,
-                    worktree,
-                    branch,
-                    output_log,
-                    target,
-                    worker_listener,
-                    worker_token,
-                    worker_socket_path,
-                } = launched;
-                let worker = WorkerCredentials {
-                    socket: worker_socket_path.clone(),
-                    token: worker_token.clone(),
-                };
-                state.worker_tokens.insert(run_id.clone(), worker_token);
+                let worker = launched.worker().clone();
+                state
+                    .worker_tokens
+                    .insert(run_id.clone(), worker.token.clone());
                 state
                     .worker_socket_paths
-                    .insert(run_id.clone(), worker_socket_path);
+                    .insert(run_id.clone(), worker.socket.clone());
                 let accept_loop = tokio::spawn(serve_worker_socket(
-                    worker_listener,
+                    launched.take_worker_listener(),
                     run_id.clone(),
                     state.requests_tx.clone(),
                     state.log.clone(),
                 ));
                 state.worker_listeners.insert(run_id.clone(), accept_loop);
                 state.supervised.insert(run_id.clone());
-                let pid = child.id();
+                let pid = launched.process().pid;
                 tokio::task::spawn_blocking(move || {
-                    let exit_code = match child.wait() {
-                        Ok(status) => status.code(),
-                        Err(error) => {
-                            supervisor_log.emit_with_fields(
-                                LogLevel::Error,
-                                "sloop::supervisor",
-                                "agent_wait_failed",
-                                json!({"run_id": exited_run, "error": error.to_string()}),
-                            );
-                            None
-                        }
-                    };
-                    // Stragglers inherit the pipes and would keep the
-                    // readers below from ever reaching EOF.
-                    if kill_straggler_process_group(pid) {
+                    let completion = launched.wait(clock.as_ref());
+                    let exit_code = completion.evidence.exit_code;
+                    if let Some(error) = completion.wait_error {
+                        supervisor_log.emit_with_fields(
+                            LogLevel::Error,
+                            "sloop::supervisor",
+                            "agent_wait_failed",
+                            json!({"run_id": exited_run, "error": error}),
+                        );
+                    }
+                    if completion.evidence.stragglers_killed {
                         supervisor_log.emit_with_fields(
                             LogLevel::Info,
                             "sloop::supervisor",
@@ -443,12 +522,7 @@ pub(super) fn reconcile(
                             json!({"run_id": exited_run, "process_group_id": pid}),
                         );
                     }
-                    // Capture must be complete on disk before the exit is
-                    // reported; the readers end when the pipes close.
-                    let mut capture_complete = true;
-                    for reader in readers {
-                        capture_complete &= reader.join().unwrap_or(false);
-                    }
+                    let mut capture_complete = completion.evidence.output_capture_complete;
                     let vendor_error = match classify_run_output(
                         &classifier,
                         &state_dir,
@@ -493,7 +567,7 @@ pub(super) fn reconcile(
                             &worker,
                             test_cmd.as_deref(),
                             clock.as_ref(),
-                            &output_log,
+                            &output_path,
                             exit_code,
                             capture_complete,
                             vendor_error.as_ref(),
@@ -526,7 +600,7 @@ pub(super) fn reconcile(
                 );
             }
             Err(error) => {
-                if let Some(store_error) = error.store_error() {
+                if let RunnerError::Hook(store_error) = &error {
                     mark_storage_full(state, store_error);
                 }
                 if let Err(abort_error) = Coordination::new(&mut state.store).abandon(

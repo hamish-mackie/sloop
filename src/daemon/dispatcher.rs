@@ -16,6 +16,7 @@ use crate::flow::Flow;
 use crate::logging::{LogLevel, OperationalLog};
 use crate::outcome::{MergeOutcome, RunEvidence, classify_exit, derive_outcome};
 use crate::protocol::{ErrorBody, ErrorCode, Request, RequestId, ResponseEnvelope};
+use crate::runner::local::worker_socket_path;
 use crate::store::{CooldownUpdate, EvidenceRecord, Store, StoreError};
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
 
@@ -24,7 +25,6 @@ use super::commands::{
     handle_ready, handle_reindex, handle_retry, handle_run, handle_stop, handle_wait,
 };
 use super::recovery::{RecoveryClassification, reconcile_run_liveness};
-use super::runner::worker_socket_path;
 use super::scheduler::{next_dispatch_deadline, reconcile};
 use super::worker_api::dispatch_worker;
 
@@ -719,25 +719,3 @@ pub(super) fn internal(message: &str) -> ErrorBody {
         details: json!({}),
     }
 }
-
-#[cfg(debug_assertions)]
-pub(super) fn wait_for_test_hook(name: &str) {
-    let Some(directory) = std::env::var_os("SLOOP_TEST_HOOK_DIR").map(PathBuf::from) else {
-        return;
-    };
-    let armed = directory.join(format!("{name}.armed"));
-    if !armed.is_file() {
-        return;
-    }
-    let reached = directory.join(format!("{name}.reached"));
-    let release = directory.join(format!("{name}.release"));
-    if fs::write(&reached, b"").is_err() {
-        return;
-    }
-    while !release.is_file() {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-#[cfg(not(debug_assertions))]
-pub(super) fn wait_for_test_hook(_name: &str) {}
