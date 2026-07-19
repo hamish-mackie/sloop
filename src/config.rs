@@ -13,6 +13,7 @@ use crate::sources::markdown::MarkdownFlowSource;
 
 pub const CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_DELETE_MISSING_AFTER_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+pub const DEFAULT_WORKTREE_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 pub const DEFAULT_WORKTREE_DIR: &str = ".worktrees";
 pub const DEFAULT_PROJECT_DIR: &str = ".agents/sloop/projects";
 pub const DEFAULT_TICKET_DIR: &str = ".agents/sloop/tickets";
@@ -60,6 +61,9 @@ impl Repository {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub worktree_dir: PathBuf,
+    /// How long settled run worktrees remain available. `None` disables
+    /// automatic removal.
+    pub worktree_retention_ms: Option<i64>,
     pub project_dir: PathBuf,
     pub ticket_dir: PathBuf,
     pub ticket_source: TicketSourceConfig,
@@ -295,9 +299,22 @@ impl Config {
             })
             .transpose()?
             .unwrap_or(DEFAULT_DELETE_MISSING_AFTER_MS);
+        let worktree_retention_ms = match config.worktree_retention.as_deref() {
+            Some("never") => None,
+            Some(value) => Some(parse_duration_ms(value).map_err(|message| {
+                ConfigError::Invalid {
+                    path: repository.config_path.clone(),
+                    message: format!(
+                        "worktree_retention: {message}; use a positive duration such as 7d, 24h, or 90m, or use `never`"
+                    ),
+                }
+            })?),
+            None => Some(DEFAULT_WORKTREE_RETENTION_MS),
+        };
 
         Ok(Self {
             worktree_dir,
+            worktree_retention_ms,
             project_dir,
             ticket_dir,
             ticket_source,
@@ -562,6 +579,7 @@ pub(crate) fn parse_local_time(value: &str) -> Option<u16> {
 struct RawConfig {
     version: u32,
     worktree_dir: Option<PathBuf>,
+    worktree_retention: Option<String>,
     project_dir: Option<PathBuf>,
     ticket_dir: Option<PathBuf>,
     defaults: Option<RawDefaults>,
@@ -780,6 +798,46 @@ mod tests {
             Config::load(&repository).unwrap().worktree_dir,
             PathBuf::from(".worktrees")
         );
+    }
+
+    #[test]
+    fn worktree_retention_defaults_to_seven_days_and_accepts_never() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".agents/sloop")).unwrap();
+        let path = root.path().join(".agents/sloop/config.yaml");
+        fs::write(&path, "version: 1\n").unwrap();
+        let repository = Repository::discover(root.path()).unwrap();
+        assert_eq!(
+            Config::load(&repository).unwrap().worktree_retention_ms,
+            Some(7 * 24 * 60 * 60 * 1000)
+        );
+
+        fs::write(&path, "version: 1\nworktree_retention: never\n").unwrap();
+        assert_eq!(
+            Config::load(&repository).unwrap().worktree_retention_ms,
+            None
+        );
+        fs::write(&path, "version: 1\nworktree_retention: 90m\n").unwrap();
+        assert_eq!(
+            Config::load(&repository).unwrap().worktree_retention_ms,
+            Some(90 * 60 * 1000)
+        );
+    }
+
+    #[test]
+    fn invalid_worktree_retention_names_the_key_and_remedy() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".agents/sloop")).unwrap();
+        fs::write(
+            root.path().join(".agents/sloop/config.yaml"),
+            "version: 1\nworktree_retention: tomorrow\n",
+        )
+        .unwrap();
+        let repository = Repository::discover(root.path()).unwrap();
+        let error = Config::load(&repository).unwrap_err().to_string();
+        assert!(error.contains("worktree_retention"), "{error}");
+        assert!(error.contains("use a positive duration"), "{error}");
+        assert!(error.contains("`never`"), "{error}");
     }
 
     #[test]

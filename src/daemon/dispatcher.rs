@@ -78,6 +78,7 @@ pub(super) struct DispatcherState {
     pub(super) ticket_dir: PathBuf,
     pub(super) ticket_source: Arc<dyn TicketSource>,
     pub(super) worktree_dir: PathBuf,
+    pub(super) worktree_retention_ms: Option<i64>,
     pub(super) state_dir: PathBuf,
     pub(super) runtime_dir: PathBuf,
     pub(super) socket: PathBuf,

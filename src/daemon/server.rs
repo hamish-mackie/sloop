@@ -357,6 +357,7 @@ async fn serve(
         ticket_dir: config.ticket_dir.clone(),
         ticket_source,
         worktree_dir: repository.root.join(&config.worktree_dir),
+        worktree_retention_ms: config.worktree_retention_ms,
         state_dir: repository.state_dir.clone(),
         runtime_dir: repository.runtime_dir.clone(),
         socket: repository.operator_socket.clone(),

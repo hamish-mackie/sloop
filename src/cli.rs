@@ -804,6 +804,7 @@ fn format_event(event: &serde_json::Value) -> String {
             format!("{time}  {run} finished: {outcome} ({ticket} -> {state})")
         }
         "run_aborted" => format!("{time}  {run} aborted before launch ({ticket} back to ready)"),
+        "run_worktree_cleaned" => format!("{time}  {run} worktree and branch removed"),
         "daemon_restart_requested" => {
             let active = data["active_runs"].as_u64().unwrap_or(0);
             let noun = if active == 1 { "run" } else { "runs" };
