@@ -80,6 +80,7 @@ impl OperationalLog {
 #[serde(rename_all = "snake_case")]
 pub enum LogLevel {
     Error,
+    Warn,
     Info,
 }
 

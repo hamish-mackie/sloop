@@ -21,6 +21,15 @@ impl Frontmatter {
     pub fn has_blocked_by(&self) -> bool {
         self.blocked_by_present
     }
+
+    pub(crate) fn sourced(name: String, blocked_by: Vec<String>) -> Self {
+        Self {
+            name,
+            blocked_by,
+            blocked_by_present: true,
+            ..Self::default()
+        }
+    }
 }
 
 /// Parses the leading `---` frontmatter block. A file without a block parses

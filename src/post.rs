@@ -182,6 +182,11 @@ pub fn handle(
             now_ms,
         )?;
     }
+    store.update_ticket_body(
+        &ticket_id,
+        frontmatter::body(&content).expect("validated frontmatter has a body"),
+        now_ms,
+    )?;
     let ticket = store
         .ticket(&ticket_id)?
         .expect("registered ticket still exists");

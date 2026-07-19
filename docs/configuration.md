@@ -33,6 +33,11 @@ agent:
     codex:
       cmd: ["codex", "exec", "--model", "{model}", "--config", 'model_reasoning_effort="{effort}"', "--sandbox", "workspace-write", "--ephemeral", "{prompt}"]
 
+# Optional: replace Markdown ticket pulls with an external source.
+sources:
+  tickets:
+    exec: ["./scripts/ticket-source.sh"]
+
 ids:
   ticket_prefix: TICK
   project_prefix: PROJ
@@ -69,6 +74,34 @@ environment.
 
 Agent targets are repository policy: they are only read from the
 repository's config, never from user-level defaults.
+
+### sources
+
+Tickets normally come from Markdown files under `ticket_dir`. Configuring
+`sources.tickets.exec` replaces that source for `sloop reindex`; sources are
+not merged. The command runs from the repository root and receives one JSON
+request on stdin:
+
+```json
+{"verb":"pull"}
+```
+
+For a pull, stdout must be a JSON array. Each object accepts `id`, `name`,
+`project`, `blocked_by`, `target`, `model`, `effort`, `flow`, and `body`;
+unknown fields are rejected. `name` and `body` are required, while omitted
+`blocked_by` defaults to an empty list and the other optional fields use the
+same defaults as Markdown frontmatter.
+
+After a run settles, Sloop invokes the same command with a best-effort
+notification:
+
+```json
+{"verb":"report","ticket":"TICK-7","outcome":"merged"}
+```
+
+A failed pull leaves the current index untouched. A failed report is logged
+as a warning and does not change the settled outcome. Source commands are
+repository policy and cannot be configured in user-level defaults.
 
 ### ids
 
