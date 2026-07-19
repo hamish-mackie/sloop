@@ -78,6 +78,12 @@ Patterns that fall out of the verbs:
   sequence them, `list` to observe why something is not running.
 - **Build a dashboard** — everything `status`, `list`, `show`, and `logs`
   return is structured JSON; render it however you like.
+- **Stream activity** — `events` returns one page of the append-only
+  activity feed (`run_claimed`, `run_started`, `run_finished`,
+  `run_aborted`) plus a `next_cursor`. Poll with `{"after": <cursor>}` to
+  follow live, or `{"tail": N}` to start near the newest event; the daemon
+  keeps no per-client state, so a websocket bridge or UI can fan the same
+  feed out however it likes. `sloop watch` is exactly this loop.
 
 A worker token can read its run-scoped brief and ticket, leave advisory notes,
 and report the verdict of a stage explicitly configured to accept one. It

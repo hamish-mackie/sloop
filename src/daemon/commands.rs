@@ -461,6 +461,45 @@ pub(super) fn handle_logs(
     }))
 }
 
+/// One page of the activity feed. Reads are cursor-based and stateless, so a
+/// watcher streams by polling with the cursor from the previous response and
+/// the daemon keeps no per-client state.
+pub(super) fn handle_events(
+    state: &DispatcherState,
+    args: &crate::protocol::EventsArgs,
+) -> Result<serde_json::Value, ErrorBody> {
+    const DEFAULT_LIMIT: u32 = 64;
+    const MAX_LIMIT: u32 = 256;
+    let limit = args.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
+    let latest = lookup(state, |store| store.latest_event_sequence())?;
+    let after = match (args.after, args.tail) {
+        (Some(after), _) => after,
+        (None, Some(tail)) => latest.saturating_sub(i64::from(tail)),
+        (None, None) => 0,
+    };
+    let events = lookup(state, |store| store.events_after(after, limit))?;
+    let next_cursor = events.last().map_or(after.max(0), |event| event.sequence);
+    let events = events
+        .iter()
+        .map(|event| {
+            json!({
+                "sequence": event.sequence,
+                "occurred_at_ms": event.occurred_at_ms,
+                "kind": event.kind,
+                "run": event.run_id,
+                "ticket": event.ticket_id,
+                "data": serde_json::from_str::<serde_json::Value>(&event.data_json)
+                    .unwrap_or_else(|_| json!({})),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "events": events,
+        "next_cursor": next_cursor,
+        "latest": latest,
+    }))
+}
+
 /// Records cancellation intent durably, then kills the run's whole process
 /// group. Termination is confirmed by the exit event, which reads the intent
 /// and settles the outcome as `Cancelled`; the worktree, branch, and captured
