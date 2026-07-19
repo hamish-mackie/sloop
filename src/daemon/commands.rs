@@ -221,6 +221,7 @@ pub(super) fn handle_list(state: &DispatcherState) -> Result<serde_json::Value, 
     let at_capacity = lookup(state, Store::active_runs)?.len() >= state.max_agents;
     let gates = crate::eligibility::Gates {
         paused: state.paused,
+        draining: state.draining,
         storage_writable: !state.storage_full.get() && !state.reconciliation_blocked,
         agent_configured: state.agent.is_some(),
         hours_open: running_hours_open(state, now_ms),

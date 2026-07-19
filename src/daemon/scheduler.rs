@@ -311,6 +311,7 @@ pub(super) fn reconcile(
     if state.storage_full.get()
         || state.reconciliation_blocked
         || state.paused
+        || state.draining
         || state.agent.is_none()
         || !running_hours_open(state, now_ms)
     {

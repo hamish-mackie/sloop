@@ -282,6 +282,25 @@ impl World {
             .expect("run sloop with alternate runtime")
     }
 
+    pub fn sloop_with_binary(&self, binary: &Path, args: &[&str]) -> Output {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match self
+                .sloop_command_with_binary(binary, self.root(), &Self::with_json(args))
+                .output()
+            {
+                Ok(output) => return output,
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ETXTBSY)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("run alternate sloop binary: {error}"),
+            }
+        }
+    }
+
     /// Runs sloop without `--json`: the human-readable default output.
     pub fn sloop_plain(&self, args: &[&str]) -> Output {
         self.sloop_command(args).output().expect("run sloop")
@@ -298,6 +317,23 @@ impl World {
 
     pub fn start_daemon(&self) -> Value {
         let output = self.sloop(&["daemon"]);
+        assert!(
+            output.status.success(),
+            "daemon failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response = Self::json_stdout(&output);
+        let pid = response["data"]["pid"].as_u64().expect("daemon pid") as u32;
+        let mut daemon_pids = self.daemon_pids.borrow_mut();
+        if !daemon_pids.contains(&pid) {
+            daemon_pids.push(pid);
+        }
+        drop(daemon_pids);
+        response
+    }
+
+    pub fn start_daemon_with_binary(&self, binary: &Path) -> Value {
+        let output = self.sloop_with_binary(binary, &["daemon"]);
         assert!(
             output.status.success(),
             "daemon failed: {}",
@@ -456,7 +492,14 @@ impl World {
     }
 
     pub fn json_stdout(output: &Output) -> Value {
-        serde_json::from_slice(&output.stdout).expect("stdout is JSON")
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "stdout is JSON: {error}; status={}; stdout={}; stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            )
+        })
     }
 
     /// Parses whichever stream carried the envelope; errors land on stderr.
@@ -507,7 +550,11 @@ impl World {
     }
 
     fn sloop_command_in(&self, directory: &Path, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sloop"));
+        self.sloop_command_with_binary(Path::new(env!("CARGO_BIN_EXE_sloop")), directory, args)
+    }
+
+    fn sloop_command_with_binary(&self, binary: &Path, directory: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(binary);
         command
             .args(args)
             .current_dir(directory)
