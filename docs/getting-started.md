@@ -82,8 +82,10 @@ than guessing:
 
 Everything else is optional. `target`, `model`, and `effort` select the
 agent; omitted values fall back to the repository configuration. Sloop
-stamps an `id` and a worktree branch (`sloop/<id>`) for you unless you set
-your own.
+stamps an `id` and a worktree branch derived from the filename
+(`add-request-logging.md` → `sloop/add-request-logging`) for you unless you
+set your own. That default requires the file stem to be a lowercase
+`abc-def` slug; a ticket named otherwise must set `worktree:` explicitly.
 
 ## Post it
 

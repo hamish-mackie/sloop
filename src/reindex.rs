@@ -162,11 +162,25 @@ pub fn run(
                 });
             }
         }
-        let worktree = authored_ticket
-            .frontmatter
-            .worktree
-            .clone()
-            .unwrap_or_else(|| format!("sloop/{id}"));
+        let worktree = match authored_ticket.frontmatter.worktree.clone() {
+            Some(worktree) => worktree,
+            None => {
+                let stem = authored_ticket
+                    .file_path
+                    .as_deref()
+                    .and_then(Path::file_stem)
+                    .and_then(|stem| stem.to_str());
+                match crate::ids::default_worktree(stem, &id) {
+                    Ok(branch) => branch,
+                    Err(reason) => {
+                        held_reason.get_or_insert_with(|| {
+                            format!("{}: {reason}", authored_ticket.source_ref)
+                        });
+                        format!("sloop/{id}")
+                    }
+                }
+            }
+        };
         if held_reason.is_none()
             && let (Some(path), Some(content)) = (
                 authored_ticket.file_path.as_ref(),

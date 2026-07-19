@@ -782,6 +782,7 @@ fn post_error_body(error: &crate::post::PostError) -> ErrorBody {
         | PostError::OutsideTicketDirectory { .. }
         | PostError::InvalidTicket { .. }
         | PostError::MissingName { .. }
+        | PostError::InvalidWorktreeStem { .. }
         | PostError::MissingBlockedBy { .. }
         | PostError::InvalidBlockedBy { .. }
         | PostError::EmptyBody { .. }
