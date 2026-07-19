@@ -390,7 +390,10 @@ async fn handle_connection(
         {
             ResponseEnvelope::failure(
                 Some(envelope.id),
-                unauthorized("worker verbs are not available on the operator socket"),
+                unauthorized(
+                    "worker verbs are not available on the operator socket; \
+                     run `sloop list` or `sloop show <ticket>` to inspect tickets from here",
+                ),
             )
         }
         Ok(envelope) => dispatch_envelope(envelope, RequestOrigin::Operator, &dispatcher).await,

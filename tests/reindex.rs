@@ -573,3 +573,30 @@ fn reindex_preserves_project_scoped_run_history_when_a_ticket_moves() {
         "not_found"
     );
 }
+
+#[test]
+fn reindex_names_the_file_to_edit_for_a_stale_blocked_by() {
+    let world = World::configured();
+    write_ticket(
+        &world,
+        "orphan.md",
+        "id: T1\nproject: default\nname: Orphan\nblocked_by: [T404]\n",
+        "# Depends on a ticket that does not exist",
+    );
+    world.commit_all("stale dependency");
+
+    let output = world.sloop(&["reindex"]);
+    assert!(!output.status.success());
+    let response = World::json_stdout_or_stderr(&output);
+    let message = response["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(
+        message.contains("references unknown ticket `T404`"),
+        "diagnostic changed: {message}"
+    );
+    assert!(
+        message.contains("orphan.md"),
+        "remedy does not name the file to edit: {message}"
+    );
+}
