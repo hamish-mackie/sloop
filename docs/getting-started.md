@@ -98,13 +98,12 @@ sloop logs <run-id>   # a run's captured output
 sloop wait <run-id>   # block until the run finishes; exit 0 only on merge
 ```
 
-When the agent exits, Sloop checks the process exit status, runs the bound
-flow's `exec` stages in order, and performs its `merge` stage if they pass. A
-configured test command runs immediately after the build, before other flow
-stages. An unchanged run branch is a successful no-op; Sloop does not use
-commit counts to decide whether successful work is complete. If aftercare
-fails, known committed work is retained for review, while a known unchanged
-branch fails.
+When the agent exits, Sloop evaluates its stage verdict, runs the bound flow's
+`exec` stages in order, and performs its `merge` stage if they pass. A
+configured test command runs immediately after the agent, before other flow
+stages. The default agent verdict requires exit 0 and at least one observed
+commit, so an unchanged run branch is retained for review rather than silently
+merged.
 
 ## Everyday controls
 

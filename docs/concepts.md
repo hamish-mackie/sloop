@@ -37,11 +37,11 @@ gate-then-claim atomic.
 
 ## Outcomes come from process and aftercare evidence
 
-Sloop never trusts what the agent says in its output or notes. It derives the
-outcome from the process exit and aftercare evidence:
+Sloop never trusts what the agent says in free-form output or notes. It derives
+the outcome from process, Git, check, merge, and policy-gated report evidence:
 
 - **Exit 0, flow stages pass** → the run branch merges.
-- **Exit 0, no commits** → the ticket completes as a successful no-op.
+- **Exit 0, default agent policy, no commits** → the ticket needs review.
 - **Exit 0, aftercare fails with commits** → the branch is kept for human review.
 - **Exit 0, aftercare fails with known no commits** → the ticket fails.
 - **Exit 0, aftercare fails while commit evidence is incomplete** → the branch
@@ -59,10 +59,9 @@ It matches only captured agent output, never test or merge output, and stores
 the matched class, vendor, rule ID, and catalog-authored diagnostic as evidence.
 Raw output remains in the run log rather than being copied into diagnostics.
 
-Commit OIDs are recorded for the project activity view, using the run branch's
-creation point as their baseline. They never gate a successful run or no-op.
-When aftercare fails, known committed work is retained for review; incomplete
-commit evidence is treated conservatively the same way.
+Commit OIDs are recorded using the run branch's creation point as their
+baseline. They feed the default agent-stage `commits` verdict and the project
+activity view. When evidence is incomplete, Sloop does not infer a pass.
 
 A worker's `sloop note "done, merged, ship it"` stores a note and moves
 nothing.
@@ -80,10 +79,11 @@ Two verb sets, enforced by two sockets rather than documentation:
   `SLOOP_SOCKET` with a random per-run `SLOOP_TOKEN`.
 
 The daemon rejects operator verbs on worker connections, scopes a worker's
-`show` and `note` to its own ticket, and invalidates the token when the run
-ends. The worker's whole vocabulary is `brief`, `show`, `note` — read,
-read, advisory write. An agent cannot claim work, change status, or merge,
-even at 3am, even if it tries.
+reads and notes to its own run, and invalidates the token when the run ends.
+The worker's vocabulary is `brief`, `show`, `note`, and `verdict`. The last is
+accepted only while that worker's current stage uses the `reported` policy,
+and its first persisted report is final. A worker cannot claim work, change
+status directly, or merge, even at 3am, even if it tries.
 
 This stops accidents and improvisation, not a determined adversary —
 same-uid isolation would need a real sandbox. Accidents are the actual

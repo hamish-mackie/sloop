@@ -143,7 +143,7 @@ tickets. It never bypasses gates or jumps the queue.
 ```yaml
 stages:
   - name: build
-    kind: build
+    kind: agent
   - name: review
     kind: exec
     cmd: [opencode, run, "Read .agents/sloop/prompts/review.md and follow its instructions."]
@@ -155,11 +155,26 @@ The filename is the flow name. Tickets bind to a flow at post time with
 `flow: <name>` in frontmatter or `sloop post --flow <name>`; the binding is
 validated against the flow files that exist.
 
-After the build agent exits, Sloop executes the bound flow's remaining stages
-in order. `exec` commands run in the run worktree and halt the flow when they
-fail; `merge` applies the run branch using Sloop's merge policy. A configured
-`aftercare.test_cmd` is inserted as an implicit stage named `test` immediately
-after `build`, before the flow's own `exec` stages.
+The first stage must be the flow's only `agent` stage. Sloop then executes
+`exec` commands in the run worktree; an optional final `merge` stage applies
+the branch using Sloop's merge policy. Every non-merge stage has one verdict
+policy:
+
+- `verdict: exit` passes when the stage process exits 0.
+- `verdict: commits` passes when the process exits 0 and Sloop observes at
+  least one new run-branch commit.
+- `verdict: { check: ["argv", "..."] }` requires the stage process to exit 0,
+  then runs the check command in the worktree and uses its exit code.
+- `verdict: reported` requires the process to call
+  `sloop verdict pass|fail [--reason <text>]`; no report is a failure, and the
+  first report is final.
+
+The default is `commits` for `agent` and `exit` for `exec`. Merge stages cannot
+declare a verdict because the merge result is their verdict. `kind: build`
+remains accepted as a deprecated alias for `kind: agent`.
+
+A configured `aftercare.test_cmd` is inserted as an implicit `exit` stage named
+`test` immediately after the `agent`, before the flow's own `exec` stages.
 
 ## Worker instructions
 

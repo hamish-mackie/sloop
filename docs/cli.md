@@ -9,8 +9,10 @@ The commands split into two sets, and the split is enforced by the daemon:
 
 - **Operator commands** decide what happens. They use the operator socket
   and implicitly start the daemon if it is not running.
-- **Worker commands** (`brief`, `show`, `note`) are for the agent inside a
-  run. They authenticate with a per-run token and cannot change any state.
+- **Worker commands** (`brief`, `show`, `note`, `verdict`) are for the process
+  inside a run. They authenticate with a per-run token. Only `verdict`, when
+  the current stage explicitly uses the `reported` policy, affects flow
+  evidence.
 
 ## Operator commands
 
@@ -140,7 +142,7 @@ must be idle before reindexing.
 
 ## Worker commands
 
-These are the agent's entire vocabulary. They require the `SLOOP_SOCKET`
+These are a worker process's entire vocabulary. They require the `SLOOP_SOCKET`
 and `SLOOP_TOKEN` environment variables that the daemon injects into every
 run, are scoped to that run's own ticket, and fail loudly when no daemon is
 running rather than starting one. The token stops working when the run
@@ -160,7 +162,13 @@ target, model, and effort. References to other tickets are rejected.
 
 ### sloop note <TEXT>...
 
-Append an advisory note to the current run. This is the worker's only
-write, and it moves nothing: no note changes a ticket's state, and claims
-like "done" carry no weight. Notes appear in `sloop show <project>` output
-and may not survive a state rebuild.
+Append an advisory note to the current run. It moves nothing: no note changes
+a ticket's state, and claims like "done" carry no weight. Notes appear in
+`sloop show <project>` output and may not survive a state rebuild.
+
+### sloop verdict pass|fail [--reason <TEXT>]
+
+Report the current stage's verdict when, and only when, that stage declares
+`verdict: reported`. The first report is persisted and final; a second report
+is rejected. A reported stage that exits without calling this command fails
+with `no verdict reported`.

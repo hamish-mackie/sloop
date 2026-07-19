@@ -313,6 +313,8 @@ pub struct StageRecord {
     pub finished_at_ms: i64,
     pub exit_code: Option<i32>,
     pub output_ref: String,
+    pub verdict_source: String,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1569,7 +1571,12 @@ impl Store {
         run_id: &str,
         stage: &StageRecord,
     ) -> Result<(), StoreError> {
-        let evidence_json = serde_json::json!({"output": stage.output_ref}).to_string();
+        let evidence_json = serde_json::json!({
+            "output": stage.output_ref,
+            "verdict_source": stage.verdict_source,
+            "reason": stage.reason,
+        })
+        .to_string();
         self.connection.execute(
             "INSERT INTO aftercare_stages
                  (run_id, stage_index, stage, state, started_at_ms, finished_at_ms, exit_code,
@@ -1610,6 +1617,9 @@ impl Store {
                     .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
                     .and_then(|value| value["output"].as_str().map(str::to_owned))
                     .unwrap_or_default();
+                let evidence = evidence_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
                 Ok(StageRecord {
                     stage_index: row.get::<_, i64>(0)? as usize,
                     stage: row.get(1)?,
@@ -1618,6 +1628,15 @@ impl Store {
                     finished_at_ms: row.get(4)?,
                     exit_code: row.get(5)?,
                     output_ref,
+                    verdict_source: evidence
+                        .as_ref()
+                        .and_then(|value| value["verdict_source"].as_str())
+                        .unwrap_or("exit_code")
+                        .to_owned(),
+                    reason: evidence
+                        .as_ref()
+                        .and_then(|value| value["reason"].as_str())
+                        .map(str::to_owned),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -1784,6 +1803,28 @@ impl Store {
             .query_map(params![run_id], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Records the first worker-reported verdict for one stage. The unique
+    /// dedupe key is the at-most-once gate; later reports cannot overwrite it.
+    pub(crate) fn record_stage_verdict(
+        &self,
+        run_id: &str,
+        stage: &str,
+        verdict: &str,
+        reason: Option<&str>,
+        now_ms: i64,
+    ) -> Result<bool, StoreError> {
+        let dedupe_key = format!("verdict:{run_id}:{stage}");
+        let data_json =
+            serde_json::json!({"stage": stage, "verdict": verdict, "reason": reason}).to_string();
+        let inserted = self.connection.execute(
+            "INSERT OR IGNORE INTO run_evidence
+                 (run_id, kind, observed_at_ms, dedupe_key, data_json)
+             VALUES (?1, 'stage_verdict', ?2, ?3, ?4)",
+            params![run_id, now_ms, dedupe_key, data_json],
+        )?;
+        Ok(inserted == 1)
     }
 
     pub fn notes_for_project(&self, project_id: &str) -> Result<Vec<ProjectNote>, StoreError> {
@@ -2509,7 +2550,7 @@ mod tests {
 
     use super::{ActivationKind, ClaimRequest, ExitClaim, NewActivation, Store, StoreError};
     use crate::domain::ticket::{TicketSnapshot, TicketState};
-    use crate::flow::{Flow, Stage, StageKind};
+    use crate::flow::{Flow, Stage, StageKind, VerdictPolicy};
     use crate::outcome::Outcome;
 
     fn open_seeded(path: &std::path::Path) -> Store {
@@ -2610,13 +2651,15 @@ mod tests {
             stages: vec![
                 Stage {
                     name: "build".into(),
-                    kind: StageKind::Build,
+                    kind: StageKind::Agent,
+                    verdict: VerdictPolicy::Commits,
                 },
                 Stage {
                     name: "check".into(),
                     kind: StageKind::Exec {
                         cmd: vec!["cargo".into(), "test".into()],
                     },
+                    verdict: VerdictPolicy::Exit,
                 },
             ],
         };
@@ -3599,6 +3642,8 @@ mod tests {
                     finished_at_ms: 2_900,
                     exit_code: Some(0),
                     output_ref: "runs/R1/output.ndjson".into(),
+                    verdict_source: "exit_code".into(),
+                    reason: None,
                 },
             )
             .unwrap();

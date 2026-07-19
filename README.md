@@ -100,7 +100,7 @@ creates `.agents/sloop/flows/default.yaml`:
 ```yaml
 stages:
   - name: build
-    kind: build
+    kind: agent
   - name: review
     kind: exec
     cmd: [opencode, run, "Read .agents/sloop/prompts/review.md and follow its instructions."]
@@ -111,9 +111,23 @@ stages:
 The filename is the flow name. Select one with `flow: <name>` in the ticket or
 with `sloop post my-ticket.md --flow <name>`.
 
-Sloop executes the bound flow in order after the build agent exits. `exec`
-stages run their argv in the run worktree and a failed stage stops the flow
-before merge. To add a test gate to every flow, set:
+The first stage is the supervised coding `agent`; `exec` stages run their argv
+in the run worktree, and `merge` applies the branch. Every non-merge stage has
+a verdict policy:
+
+- `commits` requires exit 0 and at least one observed commit.
+- `exit` requires exit 0.
+- `{ check: [cargo, test] }` requires exit 0, then uses the check command's
+  exit code.
+- `reported` requires the process to call
+  `sloop verdict pass|fail [--reason <text>]` exactly once.
+
+```yaml
+verdict: { check: [cargo, test] }
+```
+
+`agent` defaults to `commits`; `exec` defaults to `exit`. A failed verdict
+stops the flow before merge. To add a test gate to every flow, set:
 
 ```yaml
 aftercare:
@@ -121,7 +135,7 @@ aftercare:
 ```
 
 This compatibility command runs as an implicit `test` stage immediately after
-`build`, before the flow's own `exec` stages.
+the `agent` stage, before the flow's own `exec` stages.
 
 ## Logs
 

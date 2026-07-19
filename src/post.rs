@@ -510,7 +510,7 @@ mod tests {
 
     use super::{PostError, handle as handle_with_directory};
     use crate::config::AgentConfig;
-    use crate::flow::{Flow, Stage, StageKind};
+    use crate::flow::{Flow, Stage, StageKind, VerdictPolicy};
     use crate::protocol::{PostActivation, PostArgs};
     use crate::store::Store;
 
@@ -592,7 +592,8 @@ mod tests {
                     name: "default".into(),
                     stages: vec![Stage {
                         name: "build".into(),
-                        kind: StageKind::Build,
+                        kind: StageKind::Agent,
+                        verdict: VerdictPolicy::Commits,
                     }],
                 },
             ),
@@ -602,7 +603,8 @@ mod tests {
                     name: "release".into(),
                     stages: vec![Stage {
                         name: "build".into(),
-                        kind: StageKind::Build,
+                        kind: StageKind::Agent,
+                        verdict: VerdictPolicy::Commits,
                     }],
                 },
             ),

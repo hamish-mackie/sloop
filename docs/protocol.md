@@ -50,9 +50,10 @@ The operator/worker split is enforced at the transport layer:
 - **Worker socket** — created fresh for each run and torn down with it,
   also mode `0600`. Its path and token reach the agent as the
   `SLOOP_SOCKET` and `SLOOP_TOKEN` environment variables. Only `brief`,
-  `show`, and `note` are accepted, the token must match the run, `show`
-  and `note` are scoped to the run's own ticket, and the token stops
-  working when the run settles.
+  `show`, `note`, and `verdict` are accepted, the token must match the run,
+  and the token stops working when the run settles. `verdict` is accepted
+  only for the currently executing stage when its snapshotted policy is
+  `reported`; the first report for that stage wins.
 
 Both rejections use the same `unauthorized` error, so a probing worker
 learns nothing about what exists outside its scope.
@@ -78,9 +79,10 @@ Patterns that fall out of the verbs:
 - **Build a dashboard** — everything `status`, `list`, `show`, and `logs`
   return is structured JSON; render it however you like.
 
-The worker's verbs never grow: an agent, or anything holding only a worker
-token, can read its brief and leave notes, and nothing else. If your
-integration needs to move state, it belongs on the operator socket.
+A worker token can read its run-scoped brief and ticket, leave advisory notes,
+and report the verdict of a stage explicitly configured to accept one. It
+cannot claim, schedule, merge, or otherwise move operator-owned state. If your
+integration needs those capabilities, it belongs on the operator socket.
 
 ## Stability
 

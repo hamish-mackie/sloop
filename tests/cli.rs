@@ -35,7 +35,7 @@ fn init_scaffolds_the_default_flow_and_review_prompt() {
     let output = world.sloop(&["init"]);
     assert!(output.status.success());
     let flow = fs::read_to_string(world.root().join(".agents/sloop/flows/default.yaml")).unwrap();
-    assert!(flow.contains("kind: build"));
+    assert!(flow.contains("kind: agent"));
     assert!(flow.contains("kind: exec"));
     assert!(flow.contains("kind: merge"));
     assert!(flow.contains(".agents/sloop/prompts/review.md"));
@@ -77,7 +77,7 @@ fn documented_verbs_are_exposed_by_the_real_binary() {
     let help = response["data"]["text"].as_str().expect("help text");
     for verb in [
         "init", "daemon", "post", "run", "retry", "hold", "ready", "list", "status", "pause",
-        "resume", "cancel", "logs", "reindex", "brief", "show", "note",
+        "resume", "cancel", "logs", "reindex", "brief", "show", "note", "verdict",
     ] {
         assert!(help.contains(verb), "help did not contain {verb:?}");
     }

@@ -49,7 +49,7 @@ pub struct RunEvidence {
     /// work is then preserved for review, while a known unchanged branch
     /// failed. `None` means commit enumeration was incomplete.
     pub commit_count: Option<usize>,
-    /// Whether a flow stage after build failed.
+    /// Whether a flow stage after the first stage failed.
     pub aftercare_failed: bool,
     /// `None` when a merge was never attempted.
     pub merge: Option<MergeOutcome>,
