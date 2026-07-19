@@ -1,6 +1,6 @@
 stages:
   - name: build
-    kind: build
+    kind: agent
   - name: review
     kind: exec
     cmd: [opencode, run, "Read .agents/sloop/prompts/review.md and follow its instructions."]

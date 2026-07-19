@@ -14,7 +14,7 @@ use crate::ids::next_id;
 use crate::logging::{LogLevel, OperationalLog};
 use crate::store::{ClaimRequest, QueuedActivation, Store, TicketRecord};
 
-use super::aftercare::gather_exit_evidence;
+use super::aftercare::{WorkerCredentials, gather_exit_evidence};
 use super::dispatcher::{
     DispatcherState, RunEvent, close_worker_socket, mark_storage_full, recover_storage,
     settle_pending_exits,
@@ -403,6 +403,10 @@ pub(super) fn reconcile(
                     worker_token,
                     worker_socket_path,
                 } = launched;
+                let worker = WorkerCredentials {
+                    socket: worker_socket_path.clone(),
+                    token: worker_token.clone(),
+                };
                 state.worker_tokens.insert(run_id.clone(), worker_token);
                 state
                     .worker_socket_paths
@@ -486,6 +490,7 @@ pub(super) fn reconcile(
                             &worktree,
                             &branch,
                             &flow,
+                            &worker,
                             test_cmd.as_deref(),
                             clock.as_ref(),
                             &output_log,
