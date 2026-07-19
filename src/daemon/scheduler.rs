@@ -376,11 +376,13 @@ pub(super) fn reconcile(
                 continue;
             }
         };
-        let body = ticket
-            .file_path
-            .as_ref()
-            .and_then(|file_path| fs::read_to_string(state.root.join(file_path)).ok())
-            .unwrap_or_default();
+        let body = ticket.body.clone().unwrap_or_else(|| {
+            ticket
+                .file_path
+                .as_ref()
+                .and_then(|file_path| fs::read_to_string(state.root.join(file_path)).ok())
+                .unwrap_or_default()
+        });
         let ticket_snapshot = TicketSnapshot {
             id: ticket.id.clone(),
             name: ticket.name.clone(),

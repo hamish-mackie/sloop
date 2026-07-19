@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::domain::ticket::TicketState;
 
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 const CONNECTION_PRAGMAS: &str = "
 PRAGMA foreign_keys = ON;
@@ -42,6 +42,8 @@ CREATE TABLE tickets (
     model           TEXT,
     effort          TEXT,
     flow            TEXT,
+    body            TEXT,
+    held_reason     TEXT,
     missing_at_ms   INTEGER,
     created_at_ms   INTEGER NOT NULL,
     updated_at_ms   INTEGER NOT NULL,
@@ -201,6 +203,11 @@ CREATE TABLE IF NOT EXISTS events (
     ticket_id       TEXT,
     data_json       TEXT NOT NULL DEFAULT '{}'
 );
+";
+
+const TICKET_SOURCE_COLUMNS: &str = "
+ALTER TABLE tickets ADD COLUMN body TEXT;
+ALTER TABLE tickets ADD COLUMN held_reason TEXT;
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -450,6 +457,8 @@ pub struct TicketRecord {
     pub id: String,
     pub project_id: String,
     pub file_path: Option<String>,
+    pub source: String,
+    pub source_ref: Option<String>,
     pub state: String,
     pub name: String,
     pub blocked_by: Vec<String>,
@@ -459,13 +468,17 @@ pub struct TicketRecord {
     pub effort: Option<String>,
     pub flow: Option<String>,
     pub attempts: i64,
+    pub body: Option<String>,
+    pub held_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReindexTicket {
     pub id: String,
     pub project_id: String,
-    pub file_path: String,
+    pub source: String,
+    pub source_ref: String,
+    pub file_path: Option<String>,
     pub name: String,
     pub blocked_by: Vec<String>,
     pub worktree: String,
@@ -473,6 +486,8 @@ pub struct ReindexTicket {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub flow: String,
+    pub body: String,
+    pub held_reason: Option<String>,
     pub derived_state: Option<TicketState>,
 }
 
@@ -494,15 +509,19 @@ fn ticket_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TicketRecord> {
         id: row.get(0)?,
         project_id: row.get(1)?,
         file_path: row.get(2)?,
-        state: row.get(3)?,
-        name: row.get(4)?,
+        source: row.get(3)?,
+        source_ref: row.get(4)?,
+        state: row.get(5)?,
+        name: row.get(6)?,
         blocked_by: Vec::new(),
-        worktree: row.get(5)?,
-        target: row.get(6)?,
-        model: row.get(7)?,
-        effort: row.get(8)?,
-        flow: row.get(9)?,
-        attempts: row.get(10)?,
+        worktree: row.get(7)?,
+        target: row.get(8)?,
+        model: row.get(9)?,
+        effort: row.get(10)?,
+        flow: row.get(11)?,
+        attempts: row.get(12)?,
+        body: row.get(13)?,
+        held_reason: row.get(14)?,
     })
 }
 
@@ -589,6 +608,7 @@ impl Store {
                 transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
+                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -614,6 +634,7 @@ impl Store {
                 transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
+                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -638,6 +659,7 @@ impl Store {
                 transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
+                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -654,6 +676,7 @@ impl Store {
                 transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
+                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -669,6 +692,7 @@ impl Store {
                 transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
+                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -682,6 +706,7 @@ impl Store {
                 transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
+                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -693,6 +718,7 @@ impl Store {
                 transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
+                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -703,6 +729,7 @@ impl Store {
                     .transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
+                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -712,6 +739,16 @@ impl Store {
                     .connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
+                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.commit()?;
+                Ok(())
+            }
+            10 => {
+                let transaction = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -843,7 +880,7 @@ impl Store {
         transaction.execute(
             "UPDATE tickets
              SET name = ?2, worktree = ?3, target = ?4, model = ?5, effort = ?6, flow = ?7,
-                 missing_at_ms = NULL, updated_at_ms = ?8
+                  held_reason = NULL, missing_at_ms = NULL, updated_at_ms = ?8
              WHERE id = ?1",
             params![id, name, worktree, target, model, effort, flow, now_ms],
         )?;
@@ -852,7 +889,7 @@ impl Store {
         Ok(())
     }
 
-    /// Applies a complete committed ticket snapshot without disturbing runtime
+    /// Applies a complete authored ticket snapshot without disturbing runtime
     /// history for IDs that remain present. Missing local rows and everything
     /// that depends on them are removed explicitly so the operation can report
     /// how much non-derivable state was discarded.
@@ -873,8 +910,7 @@ impl Store {
         let transaction = self.connection.unchecked_transaction()?;
 
         let stale_tickets = {
-            let mut statement =
-                transaction.prepare("SELECT id FROM tickets WHERE source = 'local' ORDER BY id")?;
+            let mut statement = transaction.prepare("SELECT id FROM tickets ORDER BY id")?;
             statement
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
@@ -993,30 +1029,39 @@ impl Store {
         }
         let mut state_changes = Vec::new();
         for ticket in tickets {
-            let state = match (existing.get(&ticket.id), ticket.derived_state) {
-                (Some(existing), Some(derived)) => {
-                    if existing.state != derived.as_str() {
-                        state_changes.push(ReindexStateChange {
-                            ticket_id: ticket.id.clone(),
-                            previous_state: existing.state.clone(),
-                            state: derived.as_str().to_owned(),
-                        });
+            let previous = existing.get(&ticket.id);
+            let state = if ticket.held_reason.is_some() {
+                TicketState::Held.as_str()
+            } else {
+                match (previous, ticket.derived_state) {
+                    (Some(_), Some(derived)) => derived.as_str(),
+                    (Some(existing), None) if existing.held_reason.is_some() => {
+                        TicketState::Ready.as_str()
                     }
-                    derived.as_str()
+                    (Some(existing), None) => existing.state.as_str(),
+                    (None, Some(derived)) => derived.as_str(),
+                    (None, None) => TicketState::Ready.as_str(),
                 }
-                (Some(existing), None) => existing.state.as_str(),
-                (None, Some(derived)) => derived.as_str(),
-                (None, None) => TicketState::Ready.as_str(),
             };
+            if let Some(previous) = previous
+                && previous.state != state
+            {
+                state_changes.push(ReindexStateChange {
+                    ticket_id: ticket.id.clone(),
+                    previous_state: previous.state.clone(),
+                    state: state.to_owned(),
+                });
+            }
             transaction.execute(
                 "INSERT INTO tickets
-                     (id, project_id, file_path, source, state, name, worktree, target, model,
-                      effort, flow, created_at_ms, updated_at_ms)
-                 VALUES (?1, ?2, ?3, 'local', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+                     (id, project_id, file_path, source, source_ref, state, name, worktree, target,
+                      model, effort, flow, body, held_reason, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
                  ON CONFLICT(id) DO UPDATE SET
                      project_id = excluded.project_id,
                      file_path = excluded.file_path,
-                     source = 'local',
+                     source = excluded.source,
+                     source_ref = excluded.source_ref,
                      state = excluded.state,
                      name = excluded.name,
                      worktree = excluded.worktree,
@@ -1024,12 +1069,16 @@ impl Store {
                      model = excluded.model,
                      effort = excluded.effort,
                      flow = excluded.flow,
+                     body = excluded.body,
+                     held_reason = excluded.held_reason,
                      missing_at_ms = NULL,
                      updated_at_ms = excluded.updated_at_ms",
                 params![
                     ticket.id,
                     ticket.project_id,
                     ticket.file_path,
+                    ticket.source,
+                    ticket.source_ref,
                     state,
                     ticket.name,
                     ticket.worktree,
@@ -1037,6 +1086,8 @@ impl Store {
                     ticket.model,
                     ticket.effort,
                     ticket.flow,
+                    ticket.body,
+                    ticket.held_reason,
                     now_ms,
                 ],
             )?;
@@ -1072,6 +1123,14 @@ impl Store {
         Ok(())
     }
 
+    pub fn update_ticket_body(&self, id: &str, body: &str, now_ms: i64) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE tickets SET body = ?2, updated_at_ms = ?3 WHERE id = ?1",
+            params![id, body, now_ms],
+        )?;
+        Ok(())
+    }
+
     /// Version-two rows predate target snapshots. Once a repository has a
     /// target configuration, persist its default before dispatch can observe
     /// those rows.
@@ -1092,7 +1151,8 @@ impl Store {
         let mut ticket = self
             .connection
             .query_row(
-                "SELECT id, project_id, file_path, state, name, worktree, target, model, effort, flow, attempts
+                "SELECT id, project_id, file_path, source, source_ref, state, name, worktree,
+                        target, model, effort, flow, attempts, body, held_reason
                  FROM tickets WHERE id = ?1",
                 params![id],
                 ticket_record,
@@ -1108,7 +1168,8 @@ impl Store {
         let mut ticket = self
             .connection
             .query_row(
-                "SELECT id, project_id, file_path, state, name, worktree, target, model, effort, flow, attempts
+                "SELECT id, project_id, file_path, source, source_ref, state, name, worktree,
+                        target, model, effort, flow, attempts, body, held_reason
                  FROM tickets WHERE file_path = ?1",
                 params![file_path],
                 ticket_record,
@@ -1120,9 +1181,31 @@ impl Store {
         Ok(ticket)
     }
 
+    pub fn ticket_by_source_ref(
+        &self,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<TicketRecord>, StoreError> {
+        let mut ticket = self
+            .connection
+            .query_row(
+                "SELECT id, project_id, file_path, source, source_ref, state, name, worktree,
+                        target, model, effort, flow, attempts, body, held_reason
+                 FROM tickets WHERE source = ?1 AND source_ref = ?2",
+                params![source, source_ref],
+                ticket_record,
+            )
+            .optional()?;
+        if let Some(ticket) = ticket.as_mut() {
+            ticket.blocked_by = self.ticket_blockers(&ticket.id)?;
+        }
+        Ok(ticket)
+    }
+
     pub fn tickets(&self) -> Result<Vec<TicketRecord>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, project_id, file_path, state, name, worktree, target, model, effort, flow, attempts
+            "SELECT id, project_id, file_path, source, source_ref, state, name, worktree,
+                    target, model, effort, flow, attempts, body, held_reason
              FROM tickets ORDER BY project_id, id",
         )?;
         let mut tickets = statement
@@ -1136,7 +1219,8 @@ impl Store {
 
     pub fn tickets_for_project(&self, project_id: &str) -> Result<Vec<TicketRecord>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, project_id, file_path, state, name, worktree, target, model, effort, flow, attempts
+            "SELECT id, project_id, file_path, source, source_ref, state, name, worktree,
+                    target, model, effort, flow, attempts, body, held_reason
              FROM tickets WHERE project_id = ?1 ORDER BY id",
         )?;
         let mut tickets = statement
@@ -1274,7 +1358,7 @@ impl Store {
             _ => unreachable!("hold transitions only use ready and held"),
         };
         let changed = self.connection.execute(
-            "UPDATE tickets SET state = ?2, updated_at_ms = ?3
+            "UPDATE tickets SET state = ?2, held_reason = NULL, updated_at_ms = ?3
              WHERE id = ?1 AND state = ?4",
             params![id, requested, now_ms, allowed_previous],
         )?;
@@ -1297,7 +1381,7 @@ impl Store {
                 ticket_id: id.into(),
             })?;
         let changed = self.connection.execute(
-            "UPDATE tickets SET state = 'ready', attempts = 0, updated_at_ms = ?2
+            "UPDATE tickets SET state = 'ready', held_reason = NULL, attempts = 0, updated_at_ms = ?2
              WHERE id = ?1 AND state = 'failed'",
             params![id, now_ms],
         )?;
@@ -1568,7 +1652,7 @@ impl Store {
         evidence: &[EvidenceRecord],
         cooldown: Option<&CooldownUpdate<'_>>,
         now_ms: i64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         use crate::outcome::Outcome;
 
         let transaction = self
@@ -1591,7 +1675,7 @@ impl Store {
             match existing {
                 Some((_, Some(_))) => {
                     transaction.commit()?;
-                    return Ok(());
+                    return Ok(false);
                 }
                 Some((state, None)) => {
                     return Err(StoreError::RunStateConflict {
@@ -1611,7 +1695,7 @@ impl Store {
 
         let ticket_state = TicketState::after_outcome(outcome);
         transaction.execute(
-            "UPDATE tickets SET state = ?2, updated_at_ms = ?3
+            "UPDATE tickets SET state = ?2, held_reason = NULL, updated_at_ms = ?3
              WHERE id = ?1 AND state = 'claimed'",
             params![ticket_id, ticket_state.as_str(), now_ms],
         )?;
@@ -1649,7 +1733,7 @@ impl Store {
             .to_string(),
         )?;
         transaction.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     /// Records one completed flow stage. The flow index is the idempotency
@@ -2035,7 +2119,7 @@ impl Store {
             params![run_id, now_ms],
         )?;
         transaction.execute(
-            "UPDATE tickets SET state = 'ready', updated_at_ms = ?2
+            "UPDATE tickets SET state = 'ready', held_reason = NULL, updated_at_ms = ?2
              WHERE id = ?1 AND state = 'claimed'",
             params![ticket_id, now_ms],
         )?;
@@ -2293,7 +2377,7 @@ impl Store {
 
         let changed = transaction.execute(
             "UPDATE tickets
-             SET state = 'claimed', attempts = attempts + 1, updated_at_ms = ?2
+             SET state = 'claimed', held_reason = NULL, attempts = attempts + 1, updated_at_ms = ?2
              WHERE id = ?1 AND state = 'ready' AND missing_at_ms IS NULL
                AND NOT EXISTS (SELECT 1 FROM ticket_blockers b
                                JOIN tickets bt ON bt.id = b.blocker_id
@@ -2694,7 +2778,9 @@ impl std::error::Error for StoreError {}
 mod tests {
     use tempfile::tempdir;
 
-    use super::{ActivationKind, ClaimRequest, ExitClaim, NewActivation, Store, StoreError};
+    use super::{
+        ActivationKind, ClaimRequest, ExitClaim, NewActivation, ReindexTicket, Store, StoreError,
+    };
     use crate::domain::ticket::{TicketSnapshot, TicketState};
     use crate::flow::{Flow, Stage, StageKind, VerdictPolicy};
     use crate::outcome::Outcome;
@@ -3444,6 +3530,60 @@ mod tests {
     }
 
     #[test]
+    fn validation_hold_reasons_set_and_clear_without_releasing_operator_holds() {
+        let directory = tempdir().unwrap();
+        let store = open_seeded(&directory.path().join("sloop.db"));
+        let ticket = |held_reason: Option<&str>| ReindexTicket {
+            id: "T1".into(),
+            project_id: "default".into(),
+            source: "markdown".into(),
+            source_ref: ".agents/sloop/tickets/t1.md".into(),
+            file_path: Some(".agents/sloop/tickets/t1.md".into()),
+            name: "Ticket one".into(),
+            blocked_by: Vec::new(),
+            worktree: "sloop/T1".into(),
+            target: Some("claude".into()),
+            model: Some("sonnet".into()),
+            effort: Some("medium".into()),
+            flow: "default".into(),
+            body: "work".into(),
+            held_reason: held_reason.map(str::to_owned),
+            derived_state: None,
+        };
+
+        store
+            .apply_reindex(
+                &["default".into()],
+                &[ticket(Some("flow `missing` is not defined"))],
+                2_000,
+            )
+            .unwrap();
+        let held = store.ticket("T1").unwrap().unwrap();
+        assert_eq!(held.state, "held");
+        assert_eq!(
+            held.held_reason.as_deref(),
+            Some("flow `missing` is not defined")
+        );
+
+        store
+            .apply_reindex(&["default".into()], &[ticket(None)], 2_100)
+            .unwrap();
+        let released = store.ticket("T1").unwrap().unwrap();
+        assert_eq!(released.state, "ready");
+        assert_eq!(released.held_reason, None);
+
+        store
+            .set_ticket_hold("T1", TicketState::Held, 2_200)
+            .unwrap();
+        store
+            .apply_reindex(&["default".into()], &[ticket(None)], 2_300)
+            .unwrap();
+        let operator_held = store.ticket("T1").unwrap().unwrap();
+        assert_eq!(operator_held.state, "held");
+        assert_eq!(operator_held.held_reason, None);
+    }
+
+    #[test]
     fn operator_hold_cannot_steal_a_claim() {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
@@ -3681,6 +3821,8 @@ mod tests {
                  ALTER TABLE tickets DROP COLUMN name;
                  ALTER TABLE tickets DROP COLUMN worktree;
                  ALTER TABLE tickets DROP COLUMN flow;
+                 ALTER TABLE tickets DROP COLUMN body;
+                 ALTER TABLE tickets DROP COLUMN held_reason;
                  ALTER TABLE tickets DROP COLUMN missing_at_ms;
                  ALTER TABLE runs DROP COLUMN worker_socket_path;
                  ALTER TABLE runs DROP COLUMN flow_json;
@@ -3744,7 +3886,9 @@ mod tests {
         connection
             .execute_batch(
                 "ALTER TABLE runs DROP COLUMN flow_json;
-                 ALTER TABLE runs DROP COLUMN ticket_json;",
+                 ALTER TABLE runs DROP COLUMN ticket_json;
+                 ALTER TABLE tickets DROP COLUMN body;
+                 ALTER TABLE tickets DROP COLUMN held_reason;",
             )
             .unwrap();
         connection.pragma_update(None, "user_version", 8).unwrap();
@@ -3754,6 +3898,38 @@ mod tests {
         let run = store.run("R1").unwrap().unwrap();
         assert_eq!(run.flow_json, None);
         assert_eq!(run.ticket_json, None);
+    }
+
+    #[test]
+    fn version_ten_adds_source_metadata_without_disturbing_ticket_state() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("sloop.db");
+        let store = open_seeded(&path);
+        store
+            .connection
+            .execute(
+                "UPDATE tickets SET state = 'held', attempts = 3 WHERE id = 'T1'",
+                [],
+            )
+            .unwrap();
+        drop(store);
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE tickets DROP COLUMN body;
+                 ALTER TABLE tickets DROP COLUMN held_reason;",
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 10).unwrap();
+        drop(connection);
+
+        let store = Store::open(&path, 3_000).unwrap();
+        let ticket = store.ticket("T1").unwrap().unwrap();
+        assert_eq!(ticket.state, "held");
+        assert_eq!(ticket.attempts, 3);
+        assert_eq!(ticket.body, None);
+        assert_eq!(ticket.held_reason, None);
     }
 
     #[test]

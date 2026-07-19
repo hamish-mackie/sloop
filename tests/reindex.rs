@@ -575,7 +575,7 @@ fn reindex_preserves_project_scoped_run_history_when_a_ticket_moves() {
 }
 
 #[test]
-fn reindex_names_the_file_to_edit_for_a_stale_blocked_by() {
+fn reindex_holds_a_stale_blocked_by_and_names_the_file_to_edit() {
     let world = World::configured();
     write_ticket(
         &world,
@@ -586,11 +586,11 @@ fn reindex_names_the_file_to_edit_for_a_stale_blocked_by() {
     world.commit_all("stale dependency");
 
     let output = world.sloop(&["reindex"]);
-    assert!(!output.status.success());
-    let response = World::json_stdout_or_stderr(&output);
-    let message = response["error"]["message"]
-        .as_str()
-        .expect("error message");
+    assert!(output.status.success());
+    let response = World::json_stdout(&world.sloop(&["list"]));
+    let ticket = &response["data"]["tickets"][0];
+    assert_eq!(ticket["state"], "held");
+    let message = ticket["reason"].as_str().expect("held reason");
     assert!(
         message.contains("references unknown ticket `T404`"),
         "diagnostic changed: {message}"
@@ -599,4 +599,149 @@ fn reindex_names_the_file_to_edit_for_a_stale_blocked_by() {
         message.contains("orphan.md"),
         "remedy does not name the file to edit: {message}"
     );
+}
+
+#[test]
+fn reindex_holds_an_unknown_flow_without_blocking_valid_siblings_and_releases_when_fixed() {
+    let world = World::configured();
+    write_ticket(
+        &world,
+        "broken.md",
+        "id: T1\nproject: default\nname: Broken\nblocked_by: []\nflow: missing\n",
+        "# Uses a missing flow",
+    );
+    write_ticket(
+        &world,
+        "valid.md",
+        "id: T2\nproject: default\nname: Valid\nblocked_by: []\nflow: default\n",
+        "# Uses the default flow",
+    );
+    world.commit_all("tickets with mixed flow validity");
+
+    let output = world.sloop(&["reindex"]);
+    assert!(
+        output.status.success(),
+        "reindex failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response = World::json_stdout(&world.sloop(&["list"]));
+    let tickets = response["data"]["tickets"].as_array().unwrap();
+    let broken = tickets.iter().find(|ticket| ticket["id"] == "T1").unwrap();
+    let valid = tickets.iter().find(|ticket| ticket["id"] == "T2").unwrap();
+    assert_eq!(broken["state"], "held");
+    assert!(
+        broken["reason"]
+            .as_str()
+            .unwrap()
+            .contains("flow `missing` is not defined")
+    );
+    assert_eq!(valid["state"], "ready");
+    let human = world.sloop_plain(&["list"]);
+    assert!(String::from_utf8_lossy(&human.stdout).contains("flow `missing` is not defined"));
+
+    write_ticket(
+        &world,
+        "broken.md",
+        "id: T1\nproject: default\nname: Broken\nblocked_by: []\nflow: default\n",
+        "# Uses the default flow now",
+    );
+    commit_ticket_files(&world, "fix missing flow");
+    let output = world.sloop(&["reindex"]);
+    assert!(output.status.success());
+    let response = World::json_stdout(&world.sloop(&["list"]));
+    let broken = response["data"]["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ticket| ticket["id"] == "T1")
+        .unwrap();
+    assert_eq!(broken["state"], "ready");
+    assert!(
+        !broken["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("flow `missing`"))
+    );
+}
+
+#[test]
+fn reindex_holds_an_unknown_target_without_blocking_valid_siblings() {
+    let world = World::configured();
+    world.configure_fake_agent(FakeAgent::new().exit(0));
+    write_ticket(
+        &world,
+        "broken-target.md",
+        "id: T1\nproject: default\nname: Broken target\nblocked_by: []\ntarget: missing\n",
+        "# Uses a missing target",
+    );
+    write_ticket(
+        &world,
+        "valid-target.md",
+        "id: T2\nproject: default\nname: Valid target\nblocked_by: []\ntarget: fake\n",
+        "# Uses the configured target",
+    );
+    world.commit_all("tickets with mixed target validity");
+
+    let output = world.sloop(&["reindex"]);
+    assert!(
+        output.status.success(),
+        "reindex failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response = World::json_stdout(&world.sloop(&["list"]));
+    let tickets = response["data"]["tickets"].as_array().unwrap();
+    let broken = tickets.iter().find(|ticket| ticket["id"] == "T1").unwrap();
+    let valid = tickets.iter().find(|ticket| ticket["id"] == "T2").unwrap();
+    assert_eq!(broken["state"], "held");
+    assert!(
+        broken["reason"]
+            .as_str()
+            .unwrap()
+            .contains("agent target `missing` is not configured")
+    );
+    assert_eq!(valid["state"], "ready");
+}
+
+#[test]
+fn exec_source_pulls_tickets_and_receives_the_final_outcome() {
+    let world = World::configured();
+    world.configure_fake_agent(FakeAgent::new().exit(1));
+    let report_path = world.root().join("source-report.json");
+    let script = world.root().join("ticket-source.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nset -eu\nrequest=$(cat)\ncase \"$request\" in\n  *'\"verb\":\"pull\"'*) printf '%s\\n' '[{{\"id\":\"EXT-1\",\"name\":\"External ticket\",\"project\":\"default\",\"blocked_by\":[],\"target\":\"fake\",\"flow\":\"default\",\"body\":\"Do external work\"}}]' ;;\n  *'\"verb\":\"report\"'*) printf '%s' \"$request\" > '{}' ;;\n  *) exit 2 ;;\nesac\n",
+            report_path.display()
+        ),
+    )
+    .expect("write ticket source");
+    let config_path = world.root().join(".agents/sloop/config.yaml");
+    let mut config = fs::read_to_string(&config_path).expect("read config");
+    config.push_str("sources:\n  tickets:\n    exec: [\"sh\", \"./ticket-source.sh\"]\n");
+    fs::write(config_path, config).expect("configure ticket source");
+    world.commit_all("configure exec ticket source");
+
+    let output = world.sloop(&["reindex"]);
+    assert!(
+        output.status.success(),
+        "reindex failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let list = World::json_stdout(&world.sloop(&["list"]));
+    assert_eq!(list["data"]["tickets"][0]["id"], "EXT-1");
+    assert_eq!(list["data"]["tickets"][0]["state"], "ready");
+
+    let run = world.sloop(&["run", "EXT-1"]);
+    assert!(
+        run.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    wait_until("exec source report", || report_path.is_file());
+    let report: Value =
+        serde_json::from_str(&fs::read_to_string(&report_path).expect("read source report"))
+            .expect("parse source report");
+    assert_eq!(report["verb"], "report");
+    assert_eq!(report["ticket"], "EXT-1");
+    assert_eq!(report["outcome"], "failed");
 }

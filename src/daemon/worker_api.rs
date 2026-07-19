@@ -62,11 +62,13 @@ fn handle_brief(state: &DispatcherState, run_id: &str) -> Result<serde_json::Val
         None => {
             let ticket = lookup(state, |store| store.ticket(&run.ticket_id))?
                 .ok_or_else(|| internal("the ticket for this run no longer exists"))?;
-            let body = ticket
-                .file_path
-                .as_ref()
-                .and_then(|file_path| fs::read_to_string(state.root.join(file_path)).ok())
-                .unwrap_or_default();
+            let body = ticket.body.unwrap_or_else(|| {
+                ticket
+                    .file_path
+                    .as_ref()
+                    .and_then(|file_path| fs::read_to_string(state.root.join(file_path)).ok())
+                    .unwrap_or_default()
+            });
             TicketSnapshot {
                 id: ticket.id,
                 name: ticket.name,
