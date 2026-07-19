@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 05a1ed2971506a405eac2dbb48ea796fbdd460806c61cf01b3df2fb9b13d3c5a # shrinks to (yaml, expected) = ("stages:\n  - name: a\n    kind: agent\n  - name: a_\n    kind: merge\n    on_fail:\n      agent: a \n      attempts: 1\n", Flow { name: "generated", stages: [Stage { name: "a", kind: Agent, verdict: Commits, on_fail: None }, Stage { name: "a_", kind: Merge, verdict: Exit, on_fail: Some(OnFail { agent: "a ", attempts: 1, target: None, model: None, effort: None }) }] })
