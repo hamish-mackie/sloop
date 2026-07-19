@@ -8,6 +8,7 @@ use serde_json::json;
 
 use crate::clock::Clock;
 use crate::config::{AgentConfig, RunningHours, expand_agent_cmd};
+use crate::coordination::{Coordination, Exit, ExitDenial, RunExit, RunStart, Start, StartDenial};
 use crate::domain::ticket::TicketSnapshot;
 use crate::flow::{
     Flow, OnFail, Reported, Stage, StageEvidence, StageKind, Step, Verdict, VerdictPolicy,
@@ -20,7 +21,7 @@ use crate::runner::{
     AgentProcessCheckpoint, ExecLaunch, ExecProcessCheckpoint, ExecutionEvidence, ProcessIdentity,
     RunnerError, StageExecution, StageHooks, StageOrder, WorkerCredentials,
 };
-use crate::store::{ExitClaim, StageRecord, Store, StoreError};
+use crate::store::{RunState, StageRecord, Store, StoreError};
 use crate::vendor_error::VendorErrorMatch;
 
 use super::recovery::{
@@ -49,17 +50,29 @@ impl StageHooks for StoreStageHooks<'_> {
     }
 
     fn record_agent_process(&self, checkpoint: &AgentProcessCheckpoint) -> Result<(), Self::Error> {
-        self.store.mark_run_running(
-            &checkpoint.run_id,
-            &checkpoint.branch,
-            &checkpoint.worktree.to_string_lossy(),
-            checkpoint.process.pid,
-            checkpoint.process.start_time,
-            checkpoint.process.process_group_id,
-            &checkpoint.worker.token,
-            &checkpoint.worker.socket.to_string_lossy(),
-            checkpoint.started_at_ms,
-        )
+        let worktree_path = checkpoint.worktree.to_string_lossy();
+        let worker_socket_path = checkpoint.worker.socket.to_string_lossy();
+        let start = RunStart {
+            run_id: &checkpoint.run_id,
+            branch: &checkpoint.branch,
+            worktree_path: &worktree_path,
+            pid: checkpoint.process.pid,
+            pid_start_time: checkpoint.process.start_time,
+            process_group_id: checkpoint.process.process_group_id,
+            worker_token: &checkpoint.worker.token,
+            worker_socket_path: &worker_socket_path,
+        };
+        match Coordination::start(self.store, &start, checkpoint.started_at_ms)? {
+            Start::Granted => Ok(()),
+            // The launch raced a rollback or a recovery that already closed
+            // the run. Surfacing it as the same conflict error keeps the
+            // caller's abort path unchanged.
+            Start::Denied(StartDenial::NotClaimed { state }) => Err(StoreError::RunStateConflict {
+                run_id: checkpoint.run_id.clone(),
+                state,
+                requested: RunState::Running.as_str().into(),
+            }),
+        }
     }
 
     fn record_exec_process(&self, checkpoint: &ExecProcessCheckpoint) -> Result<(), Self::Error> {
@@ -112,17 +125,18 @@ pub(super) fn gather_exit_evidence(
     let commits = commit_observation.unwrap_or_default();
     wait_for_test_hook("before-agent-exit-checkpoint");
     let checkpointed = if let Some(store) = checkpoint_store.as_deref_mut() {
-        match store.record_agent_exit(
+        let exit = RunExit {
             run_id,
             exit_code,
             capture_complete,
-            &json!({"complete": commit_observation_complete, "oids": commits}).to_string(),
+            commits_json: &json!({"complete": commit_observation_complete, "oids": commits})
+                .to_string(),
             vendor_error,
             cooldown_until_ms,
-            clock.now_ms(),
-        ) {
-            Ok(ExitClaim::Claimed) => true,
-            Ok(ExitClaim::AlreadyClaimed { state }) => {
+        };
+        match Coordination::new(store).record_exit(&exit, clock.now_ms()) {
+            Ok(Exit::Granted) => true,
+            Ok(Exit::Denied(ExitDenial::AlreadyClaimed { state })) => {
                 operational_log.emit_with_fields(
                     LogLevel::Info,
                     "sloop::supervisor",

@@ -9,7 +9,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::config::expand_agent_cmd;
-use crate::coordination::{Claim, Coordination};
+use crate::coordination::{Claim, Coordination, Renewal, RenewalDenial};
 use crate::domain::ticket::TicketSnapshot;
 use crate::flow::Flow;
 use crate::frontmatter::Frontmatter;
@@ -19,7 +19,9 @@ use crate::runner::local::{
     compose_worker_prompt, launch_agent, run_output_path, wait_for_test_hook, worker_socket_path,
 };
 use crate::runner::{AgentLaunch, RunnerError, StageExecution, StageOrder};
-use crate::store::{ClaimRequest, QueuedActivation, Store, TicketRecord, WorktreeCleanupCandidate};
+use crate::store::{
+    ClaimRequest, QueuedActivation, RunState, Store, TicketRecord, WorktreeCleanupCandidate,
+};
 
 use super::aftercare::{
     RepairContext, StoreStageHooks, gather_exit_evidence, git_is_ancestor, git_stdout,
@@ -28,7 +30,9 @@ use super::dispatcher::{
     DispatcherState, RunEvent, close_worker_socket, mark_storage_full, recover_storage,
     settle_pending_exits,
 };
-use super::recovery::{classify_run_output, reconcile_run_liveness};
+use super::recovery::{
+    ProcessIdentity, classify_run_output, reconcile_run_liveness, recoverable_process_identity,
+};
 use super::server::{DaemonError, serve_worker_socket};
 
 pub(super) const DEFAULT_LEASE_MS: i64 = 10 * 60 * 1000;
@@ -295,6 +299,81 @@ pub(super) fn index_projects(
     Ok(indexed)
 }
 
+/// Whether the daemon should renew this run's lease.
+///
+/// Renewal states a fact the daemon can vouch for — *I am supervising a live
+/// run* — so it is refused whenever that cannot be shown. A run whose process
+/// identity check failed keeps its expiring lease: letting a dead run's lease
+/// live on is exactly what strict renewal exists to prevent. This decides
+/// nothing about scheduling; process identity remains the only liveness
+/// authority.
+pub(super) fn renews_lease(
+    run_state: RunState,
+    supervised: bool,
+    identity: ProcessIdentity,
+) -> bool {
+    if run_state.is_terminal() {
+        return false;
+    }
+    if run_state == RunState::Aftercare {
+        // An aftercare run has no agent process left to identify. The daemon
+        // driving its flow stages is the liveness evidence, the same reading
+        // run-liveness reconciliation takes.
+        return supervised;
+    }
+    identity != ProcessIdentity::GoneOrReused
+}
+
+/// Keeps `expires_at_ms` truthful for every run this daemon supervises, so a
+/// run outliving the initial TTL no longer executes on an expired lease.
+fn renew_supervised_leases(state: &mut DispatcherState, log: &OperationalLog, now_ms: i64) {
+    let runs = match state.store.recoverable_runs() {
+        Ok(runs) => runs,
+        Err(error) => {
+            log.emit_with_fields(
+                LogLevel::Error,
+                "sloop::dispatcher",
+                "lease_renewal_scan_failed",
+                json!({"error": error.to_string()}),
+            );
+            return;
+        }
+    };
+    for run in runs {
+        if state.recovering.contains(&run.id) {
+            continue;
+        }
+        let supervised = state.supervised.contains(&run.id);
+        if !renews_lease(run.state, supervised, recoverable_process_identity(&run)) {
+            continue;
+        }
+        let renewed = Coordination::new(&mut state.store).renew(
+            &run.ticket_id,
+            &run.id,
+            DEFAULT_LEASE_MS,
+            now_ms,
+        );
+        match renewed {
+            Ok(Renewal::Granted(_)) => {}
+            // The daemon believes it supervises this run yet does not hold a
+            // renewable lease on it. That is an anomaly worth surfacing, but
+            // recovery keys off process identity, so nothing changes here.
+            Ok(Renewal::Denied(RenewalDenial::LeaseNotHeld)) => log.emit_with_fields(
+                LogLevel::Warn,
+                "sloop::dispatcher",
+                "lease_renewal_denied",
+                json!({"run_id": run.id, "ticket_id": run.ticket_id}),
+            ),
+            Err(error) => log.emit_with_fields(
+                LogLevel::Error,
+                "sloop::dispatcher",
+                "lease_renewal_failed",
+                json!({"run_id": run.id, "ticket_id": run.ticket_id, "error": error.to_string()}),
+            ),
+        }
+    }
+}
+
 /// The single spawn decision point: every queued activation passes the same
 /// pause and capacity gates, selects deterministically, claims conditionally,
 /// and only then touches Git and processes.
@@ -313,6 +392,9 @@ pub(super) fn reconcile(
     // capacity, or outside running hours.
     reconcile_external_merges(state, log);
     reconcile_worktree_cleanup(state, log);
+    // Supervised runs keep their leases truthful regardless of the dispatch
+    // gates: a run outliving the TTL while the daemon is paused is still alive.
+    renew_supervised_leases(state, log, now_ms);
     if state.storage_full.get()
         || state.reconciliation_blocked
         || state.paused
@@ -986,11 +1068,51 @@ mod tests {
 
     use super::{
         OrphanDisposition::{Delete, Keep, MarkMissing},
-        index_projects, orphan_disposition, rearm_every_at, reconcile_tickets,
-        worktree_cleanup_due,
+        ProcessIdentity, RunState, index_projects, orphan_disposition, rearm_every_at,
+        reconcile_tickets, renews_lease, worktree_cleanup_due,
     };
     use crate::domain::ticket::TicketState;
     use crate::store::Store;
+
+    #[test]
+    fn only_runs_verified_alive_this_pass_renew_their_lease() {
+        // A supervised run whose process is still identifiable renews.
+        assert!(renews_lease(
+            RunState::Running,
+            true,
+            ProcessIdentity::Matches
+        ));
+        // So does one whose identity cannot be disproved: recovery already
+        // treats unverifiable as alive.
+        assert!(renews_lease(
+            RunState::Running,
+            true,
+            ProcessIdentity::Unverifiable
+        ));
+        // A failed identity check must leave the lease expiring, supervised or
+        // not — that is the whole point of strict renewal.
+        assert!(!renews_lease(
+            RunState::Running,
+            true,
+            ProcessIdentity::GoneOrReused
+        ));
+        // Aftercare has no agent process left; the daemon driving it is the
+        // liveness evidence, so supervision alone decides.
+        assert!(renews_lease(
+            RunState::Aftercare,
+            true,
+            ProcessIdentity::GoneOrReused
+        ));
+        assert!(!renews_lease(
+            RunState::Aftercare,
+            false,
+            ProcessIdentity::GoneOrReused
+        ));
+        // Terminal runs hold no lease worth keeping truthful.
+        for state in [RunState::Merged, RunState::Failed, RunState::Aborted] {
+            assert!(!renews_lease(state, true, ProcessIdentity::Matches));
+        }
+    }
 
     #[test]
     fn cleanup_eligibility_uses_retention_and_excludes_live_runs() {

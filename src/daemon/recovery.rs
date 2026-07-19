@@ -10,6 +10,7 @@ use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 
 use crate::clock::Clock;
+use crate::coordination::{Coordination, Exit, ExitDenial, Renewal, RenewalDenial, RunExit};
 use crate::flow::Flow;
 use crate::logging::{LogLevel, OperationalLog};
 use crate::run_log::OutputStream;
@@ -17,7 +18,7 @@ use crate::runner::WorkerCredentials;
 use crate::runner::local::{
     process_start_time, run_output_path, wait_for_test_hook, worker_socket_path,
 };
-use crate::store::{ExitClaim, RecoverableRun, Store};
+use crate::store::{RecoverableRun, RunState, Store};
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
 
 use super::aftercare::{
@@ -25,7 +26,7 @@ use super::aftercare::{
     git_is_ancestor, git_stdout, shared_checkout_has_git_operation, try_commits_on_branch,
 };
 use super::dispatcher::{DispatcherState, RunEvent};
-use super::scheduler::{VENDOR_COOLDOWN_MS, bound_flow};
+use super::scheduler::{DEFAULT_LEASE_MS, VENDOR_COOLDOWN_MS, bound_flow};
 use super::server::{DaemonError, serve_worker_socket};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +51,7 @@ pub(super) fn recover_inflight_runs(
         match recoverable_process_identity(&run) {
             ProcessIdentity::Matches | ProcessIdentity::Unverifiable => {
                 state.supervised.insert(run.id.clone());
+                rearm_adopted_lease(state, &run, log);
                 let cancellation_requested = state
                     .store
                     .cancellation_requested(&run.id)
@@ -82,7 +84,7 @@ pub(super) fn recover_inflight_runs(
             }
             ProcessIdentity::GoneOrReused => {
                 state.recovering.insert(run.id.clone());
-                if run.state == "aftercare" {
+                if run.state == RunState::Aftercare {
                     if let Err(error) = restore_worker_socket(state, &run) {
                         log.emit_with_fields(
                             LogLevel::Error,
@@ -99,6 +101,43 @@ pub(super) fn recover_inflight_runs(
         }
     }
     Ok(())
+}
+
+/// Re-arms the lease of a run this daemon has just adopted.
+///
+/// Strict renewal cannot lift a lease that lapsed while the daemon was down,
+/// so without this an adopted long-lived run would advertise an expired lease
+/// for the rest of its life. Adoption is the one moment where resetting expiry
+/// is sound: the run's process identity has just been verified alive, and a
+/// run whose identity failed is settled rather than adopted, so its lease
+/// stays expired and is then deleted by settlement.
+pub(super) fn rearm_adopted_lease(
+    state: &mut DispatcherState,
+    run: &RecoverableRun,
+    log: &OperationalLog,
+) {
+    let now_ms = state.clock.now_ms();
+    let readopted = Coordination::new(&mut state.store).readopt(
+        &run.ticket_id,
+        &run.id,
+        DEFAULT_LEASE_MS,
+        now_ms,
+    );
+    match readopted {
+        Ok(Renewal::Granted(_)) => {}
+        Ok(Renewal::Denied(RenewalDenial::LeaseNotHeld)) => log.emit_with_fields(
+            LogLevel::Warn,
+            "sloop::recovery",
+            "lease_rearm_denied",
+            json!({"run_id": run.id, "ticket_id": run.ticket_id}),
+        ),
+        Err(error) => log.emit_with_fields(
+            LogLevel::Error,
+            "sloop::recovery",
+            "lease_rearm_failed",
+            json!({"run_id": run.id, "ticket_id": run.ticket_id, "error": error.to_string()}),
+        ),
+    }
 }
 
 pub(super) fn restore_worker_socket(
@@ -199,7 +238,7 @@ pub(super) fn spawn_dead_run_recovery(
         while !shutdown.load(Ordering::Acquire) {
             match recovered_exit_event(&root, &state_dir, &classifier, clock.now_ms(), &run) {
                 Ok(event) => {
-                    let claim = if run.state == "running" {
+                    let claim = if run.state == RunState::Running {
                         claim_recovered_exit(&db_path, clock.as_ref(), &event, &log)
                     } else {
                         Ok(true)
@@ -530,19 +569,20 @@ fn claim_recovered_exit(
     } = event;
     let now_ms = clock.now_ms();
     let result = Store::open(db_path, now_ms).and_then(|mut store| {
-        store.record_agent_exit(
+        let exit = RunExit {
             run_id,
-            *exit_code,
-            *capture_complete,
-            &json!({"complete": commit_observation_complete, "oids": commits}).to_string(),
-            vendor_error.as_ref(),
-            *cooldown_until_ms,
-            now_ms,
-        )
+            exit_code: *exit_code,
+            capture_complete: *capture_complete,
+            commits_json: &json!({"complete": commit_observation_complete, "oids": commits})
+                .to_string(),
+            vendor_error: vendor_error.as_ref(),
+            cooldown_until_ms: *cooldown_until_ms,
+        };
+        Coordination::new(&mut store).record_exit(&exit, now_ms)
     });
     match result {
-        Ok(ExitClaim::Claimed) => Ok(true),
-        Ok(ExitClaim::AlreadyClaimed { state }) => {
+        Ok(Exit::Granted) => Ok(true),
+        Ok(Exit::Denied(ExitDenial::AlreadyClaimed { state })) => {
             log.emit_with_fields(
                 LogLevel::Info,
                 "sloop::recovery",
@@ -587,20 +627,28 @@ pub(super) fn reconcile_run_liveness(
         }
     };
     for run in runs {
-        state.active.insert(run.id.clone());
+        // A run this daemon has not seen before is being adopted now, so its
+        // lease is re-armed once its identity checks out below.
+        let adopted = state.active.insert(run.id.clone());
         if state.recovering.contains(&run.id) {
             continue;
         }
-        if run.state == "aftercare" && state.supervised.contains(&run.id) {
+        if run.state == RunState::Aftercare && state.supervised.contains(&run.id) {
             continue;
         }
         match recoverable_process_identity(&run) {
             ProcessIdentity::Matches => {
                 state.suspected_dead.remove(&run.id);
+                if adopted {
+                    rearm_adopted_lease(state, &run, log);
+                }
                 continue;
             }
             ProcessIdentity::Unverifiable => {
                 state.suspected_dead.remove(&run.id);
+                if adopted {
+                    rearm_adopted_lease(state, &run, log);
+                }
                 log.emit_with_fields(
                     LogLevel::Info,
                     "sloop::recovery",
@@ -623,7 +671,7 @@ pub(super) fn reconcile_run_liveness(
         }
 
         state.recovering.insert(run.id.clone());
-        if run.state == "aftercare" {
+        if run.state == RunState::Aftercare {
             if let Err(error) =
                 spawn_aftercare_recovery(state, events.clone(), run.clone(), log.clone())
             {
@@ -808,14 +856,14 @@ fn process_exists(pid: u32) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessIdentity {
+pub(super) enum ProcessIdentity {
     Matches,
     GoneOrReused,
     Unverifiable,
 }
 
-fn recoverable_process_identity(run: &RecoverableRun) -> ProcessIdentity {
-    if run.state != "running" {
+pub(super) fn recoverable_process_identity(run: &RecoverableRun) -> ProcessIdentity {
+    if run.state != RunState::Running {
         return ProcessIdentity::GoneOrReused;
     }
     let Some(pid) = run.pid.and_then(|pid| u32::try_from(pid).ok()) else {
@@ -854,14 +902,14 @@ mod tests {
         recoverable_process_identity, recoverable_process_matches,
     };
     use crate::runner::local::process_start_time;
-    use crate::store::RecoverableRun;
+    use crate::store::{RecoverableRun, RunState};
 
     fn recoverable_current_process(start_time: Option<i64>) -> RecoverableRun {
         RecoverableRun {
             id: "R1".into(),
             ticket_id: "T1".into(),
             target: "fake".into(),
-            state: "running".into(),
+            state: RunState::Running,
             branch: None,
             worktree_path: None,
             pid: Some(i64::from(std::process::id())),
