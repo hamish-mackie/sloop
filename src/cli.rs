@@ -112,8 +112,7 @@ pub enum Command {
     Reindex,
     /// Show the current worker's assignment.
     Brief,
-    /// Read a reference available to the current worker.
-    #[command(hide = true)]
+    /// Show a ticket, run, or project by reference.
     Show { r#ref: String },
     /// Append an advisory note to the current run.
     #[command(hide = true)]

@@ -1104,6 +1104,25 @@ impl Store {
         Ok(ticket)
     }
 
+    /// Resolves a ticket by its human-facing name. Names are not guaranteed
+    /// unique across projects, so the lowest id wins deterministically; `show`
+    /// tries this only after an exact id match fails.
+    pub fn ticket_by_name(&self, name: &str) -> Result<Option<TicketRecord>, StoreError> {
+        let mut ticket = self
+            .connection
+            .query_row(
+                "SELECT id, project_id, file_path, state, name, worktree, target, model, effort, flow, attempts
+                 FROM tickets WHERE name = ?1 ORDER BY id LIMIT 1",
+                params![name],
+                ticket_record,
+            )
+            .optional()?;
+        if let Some(ticket) = ticket.as_mut() {
+            ticket.blocked_by = self.ticket_blockers(&ticket.id)?;
+        }
+        Ok(ticket)
+    }
+
     pub fn ticket_by_file(&self, file_path: &str) -> Result<Option<TicketRecord>, StoreError> {
         let mut ticket = self
             .connection

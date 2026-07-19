@@ -275,6 +275,11 @@ fn a_running_agent_reads_its_brief_and_records_a_note() {
     assert_eq!(show["data"]["value"]["blocked_by"], serde_json::json!([]));
     assert_eq!(show["data"]["value"]["worktree"], "sloop/TICK-1");
     assert_eq!(show["data"]["value"]["target"], "fake");
+    // The worker's `show` is unchanged: it never gained the operator's body.
+    assert!(
+        show["data"]["value"]["body"].is_null(),
+        "worker show must not carry a body: {show}"
+    );
 
     // `show` is scoped to the run's own ticket; everything else is
     // unauthorized, whether or not it exists.
@@ -479,6 +484,111 @@ fn project_show_groups_notes_and_git_commits_without_writing_source_files() {
     assert!(human.contains(&format!("commit from {first}")), "{human}");
 
     assert_eq!(file_snapshot(&source_root), before_show);
+}
+
+#[test]
+fn operator_show_reads_a_ticket_by_id_and_name_with_its_body() {
+    let world = World::configured();
+    world.start_daemon();
+    let ticket = post_manual(
+        &world,
+        "cooldown.md",
+        "# Persist cooldowns\n\nSurvive restarts.\n",
+    );
+
+    // By id, as a `--json` envelope: the frontmatter summary plus the body
+    // read from the committed ticket file.
+    let output = world.sloop(&["show", &ticket]);
+    assert!(
+        output.status.success(),
+        "operator show by id failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let show = World::json_stdout(&output);
+    assert_eq!(show["ok"], true);
+    assert_eq!(show["data"]["ref"], ticket.as_str());
+    assert_eq!(show["data"]["kind"], "ticket");
+    let value = &show["data"]["value"];
+    assert_eq!(value["id"], ticket.as_str());
+    assert_eq!(value["name"], "cooldown");
+    assert_eq!(value["state"], "ready");
+    assert_eq!(value["project"], "default");
+    assert_eq!(value["worktree"], "sloop/TICK-1");
+    assert_eq!(value["blocked_by"], json!([]));
+    let body = value["body"].as_str().expect("ticket body");
+    assert!(
+        body.contains("Persist cooldowns") && body.contains("Survive restarts"),
+        "ticket body: {body}"
+    );
+
+    // The same ticket resolves by its human name, echoing the reference.
+    let by_name = World::json_stdout(&world.sloop(&["show", "cooldown"]));
+    assert_eq!(by_name["data"]["ref"], "cooldown");
+    assert_eq!(by_name["data"]["kind"], "ticket");
+    assert_eq!(by_name["data"]["value"]["id"], ticket.as_str());
+
+    // Human output stays scannable: a summary line, a blank line, then body.
+    let human = world.sloop_plain(&["show", &ticket]);
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).expect("human output is UTF-8");
+    assert!(
+        human.contains(&format!("{ticket}  cooldown  (ready)")),
+        "{human}"
+    );
+    assert!(human.contains("# Persist cooldowns"), "{human}");
+}
+
+#[test]
+fn operator_show_reports_a_run_by_id() {
+    let world = World::configured();
+    configure_worker_agent(&world, false);
+    world.commit_all("initial");
+    world.start_daemon();
+    let ticket = post_manual(&world, "cooldown.md", "# Persist cooldowns\n\nBody.\n");
+
+    assert!(world.sloop(&["run", &ticket]).status.success());
+    wait_until("the run settles", || run_settled(&world));
+
+    let output = world.sloop(&["show", "R1"]);
+    assert!(
+        output.status.success(),
+        "operator show of a run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let show = World::json_stdout(&output);
+    assert_eq!(show["ok"], true);
+    assert_eq!(show["data"]["ref"], "R1");
+    assert_eq!(show["data"]["kind"], "run");
+    let value = &show["data"]["value"];
+    assert_eq!(value["id"], "R1");
+    assert_eq!(value["ticket"], ticket.as_str());
+    assert_eq!(value["ticket_name"], "cooldown");
+    assert_eq!(value["state"], "merged");
+    assert_eq!(value["terminal"], true);
+    assert_eq!(value["exit_code"], 0);
+    assert!(
+        value["branch"]
+            .as_str()
+            .expect("branch")
+            .starts_with("sloop/"),
+        "branch: {value}"
+    );
+    assert!(
+        value["worktree"]
+            .as_str()
+            .expect("worktree")
+            .ends_with("R1"),
+        "worktree: {value}"
+    );
+
+    // Human output names the run and its settled evidence.
+    let human = world.sloop_plain(&["show", "R1"]);
+    let human = String::from_utf8(human.stdout).expect("human output is UTF-8");
+    assert!(human.contains("R1  (merged)"), "{human}");
+    assert!(
+        human.contains(&format!("ticket: {ticket}  cooldown")),
+        "{human}"
+    );
 }
 
 #[test]

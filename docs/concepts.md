@@ -85,6 +85,11 @@ accepted only while that worker's current stage uses the `reported` policy,
 and its first persisted report is final. A worker cannot claim work, change
 status directly, or merge, even at 3am, even if it tries.
 
+`show` is the one verb both sockets answer. On the worker socket it is
+scoped to the run's own ticket; on the operator socket it is an unrestricted
+read that resolves any ticket, run, or project. It stays read-only on both:
+the split adds an operator read, never a worker capability.
+
 This stops accidents and improvisation, not a determined adversary —
 same-uid isolation would need a real sandbox. Accidents are the actual
 threat model.

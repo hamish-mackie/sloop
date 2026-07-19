@@ -8,11 +8,16 @@ envelope verbatim. Scripts and agents should always use `--json` — see
 The commands split into two sets, and the split is enforced by the daemon:
 
 - **Operator commands** decide what happens. They use the operator socket
-  and implicitly start the daemon if it is not running.
+  and implicitly start the daemon if it is not running. They also include
+  read-only views — `list`, `status`, and `show`.
 - **Worker commands** (`brief`, `show`, `note`, `verdict`) are for the process
   inside a run. They authenticate with a per-run token. Only `verdict`, when
   the current stage explicitly uses the `reported` policy, affects flow
   evidence.
+
+`show` is available on both sockets: an operator can inspect any ticket,
+run, or project, while a worker's `show` is scoped to its own ticket. The
+verb is read-only on either socket.
 
 ## Operator commands
 
@@ -86,11 +91,21 @@ the safe vendor diagnostic when a built-in rule recognized the rejection.
 
 ### sloop show <REF>
 
-Read-only lookup. For a ticket, the structured ticket payload. For a
-project, its tickets with each ticket's recent notes (from runtime state)
-and commits (rendered from Git). Recognized vendor failures include their
-classification and safe diagnostic. Never writes generated activity into
-committed files.
+Read-only lookup that resolves, in order, a ticket id, a run id, a ticket
+name, or a project id:
+
+- **Ticket** (`TICK-5` or its name) — the frontmatter summary (id, name,
+  state, project, worktree, and `blocked_by`/`target`/`model`/`effort` when
+  set) followed by the ticket body read from its committed file.
+- **Run** (`R14`) — the run's ticket, state, branch, worktree, and exit
+  evidence summary (exit code plus any classified vendor error).
+- **Project** — its tickets with each ticket's recent notes (from runtime
+  state) and commits (rendered from Git).
+
+Recognized vendor failures include their classification and safe
+diagnostic. An unresolvable reference returns `not_found`, naming the
+reference kinds `show` accepts and pointing at `sloop list`. Never writes
+generated activity into committed files.
 
 ### sloop status
 
@@ -169,7 +184,9 @@ assignment.
 ### sloop show <REF>
 
 Read-only lookup of the current run's ticket, including its snapshotted
-target, model, and effort. References to other tickets are rejected.
+target, model, and effort. References to other tickets are rejected. (The
+same verb on the operator socket resolves any ticket, run, or project — see
+[Operator commands](#operator-commands).)
 
 ### sloop note <TEXT>...
 

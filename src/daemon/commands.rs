@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -7,6 +8,7 @@ use serde_json::json;
 use crate::clock::{format_timestamp, next_local_minute_ms};
 use crate::config::parse_local_time;
 use crate::domain::ticket::TicketState;
+use crate::frontmatter;
 use crate::logging::LogLevel;
 use crate::protocol::ErrorBody;
 use crate::runner::local::{process_identity_matches, run_output_path};
@@ -22,20 +24,107 @@ use super::recovery::{
 use super::scheduler::{index_projects, running_hours_open};
 use super::worker_api::{current_ticket_vendor_error, ticket_show};
 
+/// The operator read view for `show`. Resolution is ordered by how specific a
+/// reference is: an exact ticket id, then a run id, then a ticket name, and
+/// finally a project id. Every branch is read-only; nothing here transitions
+/// state. Workers reach `show` through a separate, run-scoped handler and never
+/// gain these resolutions.
 pub(super) fn handle_operator_show(
     state: &DispatcherState,
     reference: &str,
 ) -> Result<serde_json::Value, ErrorBody> {
     if let Some(ticket) = lookup(state, |store| store.ticket(reference))? {
-        let vendor_error = current_ticket_vendor_error(state, &ticket)?;
-        return Ok(ticket_show(reference, &ticket, vendor_error.as_ref()));
+        return ticket_detail(state, reference, &ticket);
     }
-    let project = lookup(state, |store| store.project(reference))?.ok_or_else(|| {
-        not_found(&format!(
-            "reference `{reference}` is not indexed; `show` accepts a ticket or project id — \
-             run `sloop list` to see ticket names"
-        ))
-    })?;
+    if let Some(run) = lookup(state, |store| store.run(reference))? {
+        return run_detail(state, reference, &run);
+    }
+    if let Some(ticket) = lookup(state, |store| store.ticket_by_name(reference))? {
+        return ticket_detail(state, reference, &ticket);
+    }
+    let Some(project) = lookup(state, |store| store.project(reference))? else {
+        return Err(not_found(&format!(
+            "reference `{reference}` is not a known ticket, run, or project; `show` accepts a \
+             ticket id or name, a run id like `R14`, or a project id — run `sloop list` to see \
+             tickets"
+        )));
+    };
+    project_activity(state, reference, &project)
+}
+
+/// A ticket's frontmatter summary plus its committed Markdown body. The body is
+/// read through the same committed-file path the daemon trusts for `brief` and
+/// claim-time snapshots, then stripped of the frontmatter the summary already
+/// renders.
+fn ticket_detail(
+    state: &DispatcherState,
+    reference: &str,
+    ticket: &crate::store::TicketRecord,
+) -> Result<serde_json::Value, ErrorBody> {
+    let vendor_error = current_ticket_vendor_error(state, ticket)?;
+    let mut detail = ticket_show(reference, ticket, vendor_error.as_ref());
+    let body = ticket
+        .file_path
+        .as_ref()
+        .and_then(|file_path| fs::read_to_string(state.root.join(file_path)).ok())
+        .map(|content| {
+            frontmatter::body(&content)
+                .unwrap_or(content.as_str())
+                .trim()
+                .to_owned()
+        })
+        .unwrap_or_default();
+    detail["value"]["body"] = json!(body);
+    Ok(detail)
+}
+
+/// A run's identity and settled evidence: which ticket it served, whether it
+/// reached a terminal state, its branch and worktree, and the exit summary
+/// (code plus any classified vendor error). Mirrors the facts `wait` exposes,
+/// framed as a detail view.
+fn run_detail(
+    state: &DispatcherState,
+    reference: &str,
+    run: &crate::store::RunRecord,
+) -> Result<serde_json::Value, ErrorBody> {
+    let ticket = lookup(state, |store| store.ticket(&run.ticket_id))?;
+    let vendor_error = lookup(state, |store| store.vendor_error_for_run(&run.id))?;
+    let terminal = matches!(
+        run.state.as_str(),
+        "merged"
+            | "failed"
+            | "needs_review"
+            | "cancelled"
+            | "rate_limited"
+            | "orphaned"
+            | "aborted"
+    );
+    Ok(json!({
+        "ref": reference,
+        "kind": "run",
+        "value": {
+            "id": run.id,
+            "ticket": run.ticket_id,
+            "ticket_name": ticket.as_ref().map(|ticket| ticket.name.as_str()),
+            "state": run.state,
+            "terminal": terminal,
+            "branch": run.branch,
+            "worktree": run.worktree_path,
+            "exit_code": run.exit_code,
+            "reason": vendor_error.as_ref().map(|error| error.diagnostic.as_str()),
+            "classification": vendor_error,
+        },
+    }))
+}
+
+/// A project's tickets with their runtime activity: recent notes and the Git
+/// commits observed against each run. Rendered from state and Git only; no
+/// generated activity is written back into committed source.
+fn project_activity(
+    state: &DispatcherState,
+    reference: &str,
+    project: &crate::store::ProjectRecord,
+) -> Result<serde_json::Value, ErrorBody> {
     let tickets = lookup(state, |store| store.tickets_for_project(reference))?;
     let mut vendor_errors = HashMap::new();
     for ticket in &tickets {
