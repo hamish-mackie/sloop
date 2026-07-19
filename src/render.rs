@@ -23,6 +23,7 @@ pub fn render(verb: Option<&str>, response: &ResponseEnvelope) -> String {
     }
     match verb {
         Some("daemon") => render_daemon(data),
+        Some("restart") => render_restart(data),
         Some("init") => render_init(data),
         Some("post") => render_post(data),
         Some("run") => render_run(data),
@@ -67,6 +68,12 @@ fn render_daemon(data: &Value) -> String {
         let _ = writeln!(text, "log: {log}");
     }
     text
+}
+
+fn render_restart(data: &Value) -> String {
+    let active = data["active_runs"].as_u64().unwrap_or(0);
+    let noun = if active == 1 { "run" } else { "runs" };
+    format!("daemon draining for restart ({active} {noun} active)\n")
 }
 
 fn render_init(data: &Value) -> String {
@@ -123,12 +130,16 @@ fn render_activation(activation: &Value) -> String {
 
 fn render_status(data: &Value) -> String {
     let daemon = &data["daemon"];
-    let paused = if daemon["paused"] == Value::Bool(true) {
-        ", paused"
+    let state = if daemon["draining"] == Value::Bool(true) {
+        let active = data["gate"]["active_agents"].as_u64().unwrap_or(0);
+        let noun = if active == 1 { "run" } else { "runs" };
+        format!(", draining for restart ({active} {noun} active)")
+    } else if daemon["paused"] == Value::Bool(true) {
+        ", paused".into()
     } else {
-        ""
+        String::new()
     };
-    let mut text = format!("daemon: pid {}{paused}\n", daemon["pid"]);
+    let mut text = format!("daemon: pid {}{state}\n", daemon["pid"]);
     let _ = writeln!(
         text,
         "agents: {} active of {} max",
@@ -762,6 +773,17 @@ mod tests {
             let response = ResponseEnvelope::success(None, json!({"paused": paused}));
             assert_eq!(render(Some(verb), &response), expected);
         }
+    }
+
+    #[test]
+    fn restart_renders_the_active_drain_count() {
+        assert_eq!(
+            render(
+                Some("restart"),
+                &ResponseEnvelope::success(None, json!({"active_runs": 1}))
+            ),
+            "daemon draining for restart (1 run active)\n"
+        );
     }
 
     #[test]

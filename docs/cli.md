@@ -34,6 +34,19 @@ along with the state directory and log path. Idempotent: connecting to a
 live daemon and starting a fresh one look the same. Every other operator
 command does this implicitly.
 
+### sloop daemon restart
+
+Ask the daemon to restart when it is safe. The command returns immediately
+with the number of active runs still draining. No new runs start during the
+drain; active runs continue through every flow and aftercare stage. When the
+last run settles, the daemon releases its sockets and lock, then replaces
+itself with the binary currently installed at the path from which it started.
+Queued activations remain queued and resume automatically in the replacement.
+
+Use `sloop status` or `sloop wait` to follow the drain. `sloop resume` cancels
+a pending restart and continues dispatching in the current process. For an
+immediate teardown, use `sloop stop`; restart has no force mode.
+
 ### sloop post <FILE> [--project P] [--flow F] [--auto | --at TIME | --manual | --hold]
 
 Validate and register a ticket file (which must live below the configured
@@ -112,12 +125,14 @@ generated activity into committed files.
 Snapshot of daemon state: active runs, ready and queued work, gate state,
 active target cooldowns, and the next wake time. The gate state includes
 database writability; a full database blocks new dispatch until a write
-probe succeeds.
+probe succeeds. A pending restart is shown as `draining for restart` with the
+number of active runs remaining.
 
 ### sloop pause / sloop resume
 
 Stop or resume spawning. In-flight agents finish and go through aftercare.
-The paused state is persisted and survives daemon restarts.
+The paused state is persisted and survives daemon restarts. Resume also
+cancels a pending `sloop daemon restart` and clears its draining state.
 
 ### sloop stop [--force]
 

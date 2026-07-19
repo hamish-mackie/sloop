@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::domain::ticket::TicketState;
 
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 const CONNECTION_PRAGMAS: &str = "
 PRAGMA foreign_keys = ON;
@@ -162,6 +162,7 @@ CREATE TABLE budget_reservations (
 CREATE TABLE scheduler_state (
     singleton       INTEGER PRIMARY KEY CHECK (singleton = 1),
     paused          INTEGER NOT NULL CHECK (paused IN (0, 1)),
+    draining        INTEGER NOT NULL DEFAULT 0 CHECK (draining IN (0, 1)),
     updated_at_ms   INTEGER NOT NULL
 );
 
@@ -208,6 +209,11 @@ CREATE TABLE IF NOT EXISTS events (
 const TICKET_SOURCE_COLUMNS: &str = "
 ALTER TABLE tickets ADD COLUMN body TEXT;
 ALTER TABLE tickets ADD COLUMN held_reason TEXT;
+";
+
+const RESTART_DRAINING_COLUMN: &str = "
+ALTER TABLE scheduler_state ADD COLUMN draining INTEGER NOT NULL DEFAULT 0
+CHECK (draining IN (0, 1));
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -587,8 +593,8 @@ impl Store {
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute(
-                    "INSERT INTO scheduler_state (singleton, paused, updated_at_ms)
-                     VALUES (1, 0, ?1)",
+                    "INSERT INTO scheduler_state (singleton, paused, draining, updated_at_ms)
+                     VALUES (1, 0, 0, ?1)",
                     params![now_ms],
                 )?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -619,6 +625,7 @@ impl Store {
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
+                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -645,6 +652,7 @@ impl Store {
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
+                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -670,6 +678,7 @@ impl Store {
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
+                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -687,6 +696,7 @@ impl Store {
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
+                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -703,6 +713,7 @@ impl Store {
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
+                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -717,6 +728,7 @@ impl Store {
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
+                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -729,6 +741,7 @@ impl Store {
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
+                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -740,6 +753,7 @@ impl Store {
                 transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
+                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -750,6 +764,7 @@ impl Store {
                     .transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
+                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -759,6 +774,16 @@ impl Store {
                     .connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
+                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.commit()?;
+                Ok(())
+            }
+            11 => {
+                let transaction = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -1181,8 +1206,9 @@ impl Store {
         let mut ticket = self
             .connection
             .query_row(
-                "SELECT id, project_id, file_path, state, name, worktree, target, model, effort, flow, attempts
-                 FROM tickets WHERE name = ?1 ORDER BY id LIMIT 1",
+                "SELECT id, project_id, file_path, source, source_ref, state, name, worktree,
+                        target, model, effort, flow, attempts, body, held_reason
+                  FROM tickets WHERE name = ?1 ORDER BY id LIMIT 1",
                 params![name],
                 ticket_record,
             )
@@ -2641,6 +2667,23 @@ impl Store {
         Ok(paused != 0)
     }
 
+    pub fn clear_restart_draining(&self, now_ms: i64) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE scheduler_state SET draining = 0, updated_at_ms = ?1 WHERE singleton = 1",
+            params![now_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn restart_draining(&self) -> Result<bool, StoreError> {
+        let draining: i64 = self.connection.query_row(
+            "SELECT draining FROM scheduler_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(draining != 0)
+    }
+
     pub fn active_cooldown_for_target(
         &self,
         target: &str,
@@ -2731,6 +2774,53 @@ impl Store {
             params![i64::from(paused), now_ms],
         )?;
         Ok(())
+    }
+
+    pub fn begin_restart_draining(
+        &mut self,
+        active_runs: usize,
+        now_ms: i64,
+    ) -> Result<bool, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE scheduler_state SET draining = 1, updated_at_ms = ?1
+             WHERE singleton = 1 AND draining = 0",
+            params![now_ms],
+        )? != 0;
+        if changed {
+            record_event(
+                &transaction,
+                now_ms,
+                "daemon_restart_requested",
+                None,
+                None,
+                &serde_json::json!({"active_runs": active_runs}).to_string(),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    /// Resuming cancels both scheduler holds in one durable transition.
+    pub fn resume_scheduler(&mut self, now_ms: i64) -> Result<bool, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let was_draining: bool = transaction.query_row(
+            "SELECT draining FROM scheduler_state WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0).map(|value| value != 0),
+        )?;
+        transaction.execute(
+            "UPDATE scheduler_state
+             SET paused = 0, draining = 0, updated_at_ms = ?1
+             WHERE singleton = 1",
+            params![now_ms],
+        )?;
+        transaction.commit()?;
+        Ok(was_draining)
     }
 
     /// Performs a small committed write used to detect when SQLite can make
@@ -2922,10 +3012,12 @@ impl std::error::Error for StoreError {}
 
 #[cfg(test)]
 mod tests {
+    use rusqlite::Connection;
     use tempfile::tempdir;
 
     use super::{
-        ActivationKind, ClaimRequest, ExitClaim, NewActivation, ReindexTicket, Store, StoreError,
+        ActivationKind, ClaimRequest, ExitClaim, NewActivation, ReindexTicket, SCHEMA_VERSION,
+        Store, StoreError,
     };
     use crate::domain::ticket::{TicketSnapshot, TicketState};
     use crate::flow::{Flow, Stage, StageKind, VerdictPolicy};
@@ -3972,6 +4064,7 @@ mod tests {
                  ALTER TABLE tickets DROP COLUMN body;
                  ALTER TABLE tickets DROP COLUMN held_reason;
                  ALTER TABLE tickets DROP COLUMN missing_at_ms;
+                 ALTER TABLE scheduler_state DROP COLUMN draining;
                  ALTER TABLE runs DROP COLUMN worker_socket_path;
                  ALTER TABLE runs DROP COLUMN flow_json;
                  ALTER TABLE runs DROP COLUMN ticket_json;",
@@ -4036,7 +4129,8 @@ mod tests {
                 "ALTER TABLE runs DROP COLUMN flow_json;
                  ALTER TABLE runs DROP COLUMN ticket_json;
                  ALTER TABLE tickets DROP COLUMN body;
-                 ALTER TABLE tickets DROP COLUMN held_reason;",
+                 ALTER TABLE tickets DROP COLUMN held_reason;
+                 ALTER TABLE scheduler_state DROP COLUMN draining;",
             )
             .unwrap();
         connection.pragma_update(None, "user_version", 8).unwrap();
@@ -4066,7 +4160,8 @@ mod tests {
         connection
             .execute_batch(
                 "ALTER TABLE tickets DROP COLUMN body;
-                 ALTER TABLE tickets DROP COLUMN held_reason;",
+                 ALTER TABLE tickets DROP COLUMN held_reason;
+                 ALTER TABLE scheduler_state DROP COLUMN draining;",
             )
             .unwrap();
         connection.pragma_update(None, "user_version", 10).unwrap();
@@ -4271,5 +4366,56 @@ mod tests {
         drop(store);
 
         assert!(Store::open(&path, 3_000).unwrap().paused().unwrap());
+    }
+
+    #[test]
+    fn restart_draining_is_durable_idempotent_and_cancelled_by_resume() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("sloop.db");
+        let mut store = Store::open(&path, 1_000).unwrap();
+
+        assert!(store.begin_restart_draining(2, 2_000).unwrap());
+        assert!(!store.begin_restart_draining(2, 2_100).unwrap());
+        assert!(store.restart_draining().unwrap());
+        assert_eq!(
+            store
+                .events_after(0, 10)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "daemon_restart_requested")
+                .count(),
+            1
+        );
+        drop(store);
+
+        let mut reopened = Store::open(&path, 3_000).unwrap();
+        assert!(reopened.restart_draining().unwrap());
+        assert!(reopened.resume_scheduler(4_000).unwrap());
+        assert!(!reopened.restart_draining().unwrap());
+    }
+
+    #[test]
+    fn version_eleven_adds_restart_draining_state() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("sloop.db");
+        drop(Store::open(&path, 1_000).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE scheduler_state DROP COLUMN draining;
+                 PRAGMA user_version = 11;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::open(&path, 2_000).unwrap();
+        assert!(!store.restart_draining().unwrap());
+        assert_eq!(
+            store
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
     }
 }

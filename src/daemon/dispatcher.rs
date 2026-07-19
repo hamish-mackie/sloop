@@ -31,11 +31,20 @@ use super::worker_api::dispatch_worker;
 
 pub(super) const LOGS_PAGE_LIMIT: usize = 64;
 
-pub(super) struct DispatcherMessage {
-    pub(super) id: RequestId,
-    pub(super) request: Request,
-    pub(super) origin: RequestOrigin,
-    pub(super) reply: oneshot::Sender<ResponseEnvelope>,
+pub(super) enum DispatcherMessage {
+    Request {
+        id: RequestId,
+        request: Request,
+        origin: RequestOrigin,
+        reply: oneshot::Sender<ResponseEnvelope>,
+    },
+    RestartAcknowledged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DaemonControl {
+    Stop,
+    Restart,
 }
 
 /// Which socket a request arrived on. Worker requests carry the run whose
@@ -52,6 +61,9 @@ pub(super) enum RequestOrigin {
 pub(super) struct DispatcherState {
     pub(super) pid: u32,
     pub(super) paused: bool,
+    pub(super) draining: bool,
+    pub(super) restart_acknowledged: bool,
+    pub(super) restart_signalled: bool,
     pub(super) max_agents: usize,
     pub(super) ticket_prefix: String,
     pub(super) project_prefix: String,
@@ -107,7 +119,7 @@ pub(super) struct DispatcherState {
     pub(super) classifier: Arc<VendorErrorClassifier>,
     /// Signals the accept loop to end the process; used by daemon-side
     /// exits such as the project-root liveness check.
-    pub(super) shutdown: mpsc::Sender<()>,
+    pub(super) shutdown: mpsc::Sender<DaemonControl>,
     pub(super) shutdown_flag: Arc<AtomicBool>,
 }
 
@@ -151,18 +163,25 @@ pub(super) async fn run_dispatcher(
         tokio::select! {
             message = requests.recv() => {
                 let Some(message) = message else { break };
-                let response = match message.origin {
-                    RequestOrigin::Operator => dispatch(&mut state, message.id, message.request),
-                    RequestOrigin::Worker { run_id, token } => dispatch_worker(
-                        &mut state,
-                        message.id,
-                        message.request,
-                        &run_id,
-                        token.as_deref(),
-                    ),
-                };
-                let _ = message.reply.send(response);
-                log.emit(LogLevel::Info, "sloop::dispatcher", "request_handled");
+                match message {
+                    DispatcherMessage::Request { id, request, origin, reply } => {
+                        let response = match origin {
+                            RequestOrigin::Operator => dispatch(&mut state, id, request),
+                            RequestOrigin::Worker { run_id, token } => dispatch_worker(
+                                &mut state,
+                                id,
+                                request,
+                                &run_id,
+                                token.as_deref(),
+                            ),
+                        };
+                        let _ = reply.send(response);
+                        log.emit(LogLevel::Info, "sloop::dispatcher", "request_handled");
+                    }
+                    DispatcherMessage::RestartAcknowledged => {
+                        state.restart_acknowledged = true;
+                    }
+                }
             }
             event = events.recv() => {
                 let Some(event) = event else { break };
@@ -176,14 +195,33 @@ pub(super) async fn run_dispatcher(
             _ = liveness_tick.tick() => {
                 if !state.root.join(".git").exists() {
                     log.emit(LogLevel::Error, "sloop::dispatcher", "project_root_missing");
-                    let _ = state.shutdown.send(()).await;
+                    let _ = state.shutdown.send(DaemonControl::Stop).await;
                     break;
                 }
                 reconcile_run_liveness(&mut state, &events_tx, &log);
             }
         }
         reconcile(&mut state, &events_tx, &log);
+        if complete_restart_if_ready(&mut state).await {
+            break;
+        }
     }
+}
+
+async fn complete_restart_if_ready(state: &mut DispatcherState) -> bool {
+    if !state.draining
+        || !state.restart_acknowledged
+        || state.restart_signalled
+        || !state.active.is_empty()
+    {
+        return false;
+    }
+    state.restart_signalled = true;
+    state
+        .log
+        .emit(LogLevel::Info, "sloop::daemon", "restart_drain_complete");
+    let _ = state.shutdown.send(DaemonControl::Restart).await;
+    true
 }
 
 async fn wait_for_deadline(clock: Arc<dyn Clock>, deadline: Option<i64>) {
@@ -429,6 +467,37 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
             "version": env!("CARGO_PKG_VERSION"),
             "started": false
         }),
+        Request::Restart(_) => {
+            let active_runs = state.active.len();
+            let changed = match state
+                .store
+                .begin_restart_draining(active_runs, state.clock.now_ms())
+            {
+                Ok(changed) => changed,
+                Err(error) => {
+                    mark_storage_full(state, &error);
+                    return ResponseEnvelope::failure(
+                        Some(id),
+                        internal(&format!("cannot begin daemon restart: {error}")),
+                    );
+                }
+            };
+            state.draining = true;
+            state.restart_acknowledged = false;
+            if changed {
+                state.log.emit_with_fields(
+                    LogLevel::Info,
+                    "sloop::daemon",
+                    "restart_drain_started",
+                    json!({"active_runs": active_runs}),
+                );
+            }
+            json!({
+                "draining": true,
+                "active_runs": active_runs,
+                "pid": state.pid,
+            })
+        }
         Request::Post(args) => {
             let now_ms = state.clock.now_ms();
             let at_eligible_ms = match &args.activation {
@@ -564,7 +633,11 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
             };
             gate["cooldowns"] = json!(cooldowns);
             let mut snapshot = json!({
-                "daemon": {"pid": state.pid, "paused": state.paused},
+                "daemon": {
+                    "pid": state.pid,
+                    "paused": state.paused,
+                    "draining": state.draining,
+                },
                 "gate": gate,
                 "runs": runs,
                 "queued_activations": queued,
@@ -597,15 +670,26 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
             json!({"paused": true})
         }
         Request::Resume(_) => {
-            if let Err(error) = state.store.set_paused(false, state.clock.now_ms()) {
-                mark_storage_full(state, &error);
-                return ResponseEnvelope::failure(
-                    Some(id),
-                    internal(&format!("cannot resume scheduler: {error}")),
-                );
-            }
+            let cancelled_restart = match state.store.resume_scheduler(state.clock.now_ms()) {
+                Ok(cancelled) => cancelled,
+                Err(error) => {
+                    mark_storage_full(state, &error);
+                    return ResponseEnvelope::failure(
+                        Some(id),
+                        internal(&format!("cannot resume scheduler: {error}")),
+                    );
+                }
+            };
             state.paused = false;
-            json!({"paused": false})
+            state.draining = false;
+            state.restart_acknowledged = false;
+            state.restart_signalled = false;
+            if cancelled_restart {
+                state
+                    .log
+                    .emit(LogLevel::Info, "sloop::daemon", "restart_cancelled");
+            }
+            json!({"paused": false, "restart_cancelled": cancelled_restart})
         }
         Request::Hold(args) => match handle_hold(state, &args) {
             Ok(data) => data,

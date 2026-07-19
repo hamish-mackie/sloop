@@ -20,4 +20,4 @@ targets = [
 checksum = "sha256"
 unix-archive = ".tar.gz"
 install-path = ["$SLOOP_INSTALL_DIR/", "~/.local/bin/"]
-install-success-msg = "sloop is installed. A running daemon continues using its previous version until restarted."
+install-success-msg = "sloop is installed. Run `sloop daemon restart` to drain a running daemon and use this version."

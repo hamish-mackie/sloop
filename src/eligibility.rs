@@ -6,6 +6,7 @@
 #[derive(Debug, Clone, Copy)]
 pub struct Gates {
     pub paused: bool,
+    pub draining: bool,
     pub storage_writable: bool,
     pub agent_configured: bool,
     pub hours_open: bool,
@@ -21,6 +22,7 @@ pub enum Ineligible {
     Claimed { run: String },
     NoAgentConfigured,
     Paused,
+    Draining,
     StorageFull,
     OutsideRunningHours,
     AtCapacity,
@@ -40,6 +42,9 @@ impl Ineligible {
             Self::Claimed { run } => format!("claimed by run {run}"),
             Self::NoAgentConfigured => "no agent targets configured".into(),
             Self::Paused => "scheduler is paused; resume with `sloop resume`".into(),
+            Self::Draining => {
+                "scheduler is draining for restart; cancel with `sloop resume`".into()
+            }
             Self::StorageFull => {
                 "database storage is full; free disk space to resume dispatch".into()
             }
@@ -89,6 +94,8 @@ pub fn ticket_ineligibility(
         Some(Ineligible::NoAgentConfigured)
     } else if gates.paused {
         Some(Ineligible::Paused)
+    } else if gates.draining {
+        Some(Ineligible::Draining)
     } else if !gates.storage_writable {
         Some(Ineligible::StorageFull)
     } else if !gates.hours_open {
@@ -109,6 +116,7 @@ mod tests {
     fn open_gates() -> Gates {
         Gates {
             paused: false,
+            draining: false,
             storage_writable: true,
             agent_configured: true,
             hours_open: true,
@@ -184,6 +192,13 @@ mod tests {
         assert!(matches!(
             ineligibility("ready", 0, None, &gates),
             Some(Ineligible::Paused)
+        ));
+
+        let mut gates = open_gates();
+        gates.draining = true;
+        assert!(matches!(
+            ineligibility("ready", 0, None, &gates),
+            Some(Ineligible::Draining)
         ));
 
         let mut gates = open_gates();

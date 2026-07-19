@@ -137,8 +137,16 @@ pub enum VerdictCliValue {
 
 #[derive(Debug, Args)]
 pub struct DaemonCliArgs {
+    #[command(subcommand)]
+    action: Option<DaemonAction>,
     #[arg(long, hide = true)]
     foreground: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonAction {
+    /// Drain active runs and restart with the binary currently installed.
+    Restart,
 }
 
 #[derive(Debug, Args)]
@@ -209,7 +217,10 @@ impl TryFrom<Command> for Request {
         let empty = EmptyArgs::default;
         Ok(match command {
             Command::Init => Self::Init(empty()),
-            Command::Daemon(_) => Self::Daemon(empty()),
+            Command::Daemon(args) => match args.action {
+                Some(DaemonAction::Restart) => Self::Restart(empty()),
+                None => Self::Daemon(empty()),
+            },
             Command::Post(args) => Self::Post(args.try_into()?),
             Command::Run(args) => Self::Run(args.into()),
             Command::Retry { ticket } => Self::Retry(TicketReferenceArgs { ticket }),
@@ -499,19 +510,19 @@ fn run_command(
 ) -> ExitCode {
     match command {
         Command::Init => run_init(mode, stdout, stderr),
-        Command::Daemon(args) if args.foreground => {
+        Command::Daemon(args) if args.foreground && args.action.is_none() => {
             match crate::daemon::serve_current_repository() {
                 Ok(()) | Err(crate::daemon::DaemonError::AlreadyRunning) => ExitCode::SUCCESS,
                 Err(_) => ExitCode::FAILURE,
             }
         }
-        Command::Daemon(_) => run_daemon_request(
-            Request::Daemon(EmptyArgs::default()),
-            true,
-            mode,
-            stdout,
-            stderr,
-        ),
+        Command::Daemon(args) => {
+            let (request, report_started) = match args.action {
+                Some(DaemonAction::Restart) => (Request::Restart(EmptyArgs::default()), false),
+                None => (Request::Daemon(EmptyArgs::default()), true),
+            };
+            run_daemon_request(request, report_started, mode, stdout, stderr)
+        }
         Command::Stop { force } => run_stop_request(force, mode, stdout, stderr),
         Command::Wait { run, timeout } => run_wait(run, timeout, mode, stdout, stderr),
         Command::Watch { tail } => run_watch(tail, mode, stdout, stderr),
@@ -786,6 +797,11 @@ fn format_event(event: &serde_json::Value) -> String {
             format!("{time}  {run} finished: {outcome} ({ticket} -> {state})")
         }
         "run_aborted" => format!("{time}  {run} aborted before launch ({ticket} back to ready)"),
+        "daemon_restart_requested" => {
+            let active = data["active_runs"].as_u64().unwrap_or(0);
+            let noun = if active == 1 { "run" } else { "runs" };
+            format!("{time}  daemon draining for restart ({active} {noun} active)")
+        }
         kind => format!("{time}  {kind} run={run} ticket={ticket}"),
     }
 }

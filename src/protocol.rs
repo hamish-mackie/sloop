@@ -82,6 +82,7 @@ impl RequestEnvelope {
 pub enum Request {
     Init(EmptyArgs),
     Daemon(EmptyArgs),
+    Restart(EmptyArgs),
     Post(PostArgs),
     Run(RunArgs),
     Retry(TicketReferenceArgs),
@@ -108,6 +109,7 @@ impl Request {
         match self {
             Self::Init(_) => "init",
             Self::Daemon(_) => "daemon",
+            Self::Restart(_) => "restart",
             Self::Post(_) => "post",
             Self::Run(_) => "run",
             Self::Retry(_) => "retry",
@@ -143,6 +145,7 @@ impl Request {
             verb,
             "init"
                 | "daemon"
+                | "restart"
                 | "post"
                 | "run"
                 | "retry"
@@ -409,6 +412,18 @@ mod tests {
 
         let decoded = RequestEnvelope::decode(&expected.encode().unwrap()).unwrap();
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn restart_is_a_public_operator_verb() {
+        let request = RequestEnvelope::decode(
+            r#"{"v":1,"id":"req-1","verb":"restart","args":{},"token":null}"#,
+        )
+        .unwrap()
+        .request;
+
+        assert!(matches!(request, Request::Restart(_)));
+        assert_eq!(request.capability(), super::Capability::Operator);
     }
 
     #[test]

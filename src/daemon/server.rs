@@ -4,6 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -32,8 +33,8 @@ use crate::store::{Store, StoreError};
 use crate::vendor_error::{CatalogError, VendorErrorClassifier};
 
 use super::dispatcher::{
-    DispatcherMessage, DispatcherState, RequestOrigin, internal, protocol_error, run_dispatcher,
-    unauthorized,
+    DaemonControl, DispatcherMessage, DispatcherState, RequestOrigin, internal, protocol_error,
+    run_dispatcher, unauthorized,
 };
 use super::recovery::recover_inflight_runs;
 use super::scheduler::{index_projects, reconcile_tickets};
@@ -95,6 +96,37 @@ pub fn request_running(request: Request) -> Result<Option<ResponseEnvelope>, Dae
 }
 
 pub fn serve_current_repository() -> Result<(), DaemonError> {
+    let executable = std::env::current_exe().map_err(DaemonError::CurrentExecutable)?;
+    loop {
+        match serve_current_repository_once()? {
+            ServeExit::Stopped => return Ok(()),
+            ServeExit::Restart { root, daemon_log } => {
+                if let Ok(log) = OperationalLog::open(&daemon_log) {
+                    log.emit(LogLevel::Info, "sloop::daemon", "restart_exec");
+                }
+                let error = Command::new(&executable)
+                    .args(["daemon", "--foreground"])
+                    .current_dir(root)
+                    .exec();
+                if let Ok(log) = OperationalLog::open(&daemon_log) {
+                    log.emit_with_fields(
+                        LogLevel::Error,
+                        "sloop::daemon",
+                        "restart_exec_failed",
+                        json!({"path": executable, "error": error.to_string()}),
+                    );
+                }
+            }
+        }
+    }
+}
+
+enum ServeExit {
+    Stopped,
+    Restart { root: PathBuf, daemon_log: PathBuf },
+}
+
+fn serve_current_repository_once() -> Result<ServeExit, DaemonError> {
     let cwd = std::env::current_dir().map_err(DaemonError::CurrentDirectory)?;
     let repository = Repository::discover(&cwd)?;
     let config = Config::load(&repository)?;
@@ -204,6 +236,11 @@ pub fn serve_current_repository() -> Result<(), DaemonError> {
         None => Arc::new(SystemClock),
     };
     let store = Store::open(&repository.db_path, clock.now_ms()).map_err(DaemonError::Store)?;
+    // A fresh process satisfies any persisted restart intent, including after
+    // a crash during a drain or a successful self-exec.
+    store
+        .clear_restart_draining(clock.now_ms())
+        .map_err(DaemonError::Store)?;
     // Bound the activity feed once per daemon lifetime; watchers page by
     // sequence, so trimming old rows never invalidates a held cursor.
     store
@@ -232,7 +269,9 @@ pub fn serve_current_repository() -> Result<(), DaemonError> {
         .enable_all()
         .build()
         .map_err(DaemonError::Runtime)?;
-    runtime.block_on(serve(
+    let root = repository.root.clone();
+    let daemon_log = repository.daemon_log.clone();
+    let control = runtime.block_on(serve(
         repository,
         config,
         store,
@@ -240,7 +279,12 @@ pub fn serve_current_repository() -> Result<(), DaemonError> {
         legacy_lock,
         clock,
         classifier,
-    ))
+    ))?;
+    drop(runtime);
+    Ok(match control {
+        DaemonControl::Stop => ServeExit::Stopped,
+        DaemonControl::Restart => ServeExit::Restart { root, daemon_log },
+    })
 }
 
 async fn serve(
@@ -251,7 +295,7 @@ async fn serve(
     _legacy_lock: fs::File,
     clock: Arc<dyn Clock>,
     classifier: Arc<VendorErrorClassifier>,
-) -> Result<(), DaemonError> {
+) -> Result<DaemonControl, DaemonError> {
     if repository.operator_socket.exists() {
         fs::remove_file(&repository.operator_socket).map_err(|source| DaemonError::Io {
             path: repository.operator_socket.clone(),
@@ -282,7 +326,7 @@ async fn serve(
     let paused = store.paused().map_err(DaemonError::Store)?;
     let (dispatcher_tx, dispatcher_rx) = mpsc::channel(DISPATCH_CHANNEL_CAPACITY);
     let (events_tx, events_rx) = mpsc::channel(DISPATCH_CHANNEL_CAPACITY);
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<DaemonControl>(1);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let ticket_source: Arc<dyn TicketSource> = match &config.ticket_source {
         TicketSourceConfig::Markdown => Arc::new(MarkdownTicketSource::new(
@@ -296,6 +340,9 @@ async fn serve(
     let mut state = DispatcherState {
         pid: std::process::id(),
         paused,
+        draining: false,
+        restart_acknowledged: false,
+        restart_signalled: false,
         max_agents: config.max_parallel_tasks,
         ticket_prefix: config.ticket_prefix.clone(),
         project_prefix: config.project_prefix.clone(),
@@ -333,7 +380,7 @@ async fn serve(
         shutdown_flag: shutdown_flag.clone(),
     };
     recover_inflight_runs(&mut state, &events_tx, &log)?;
-    tokio::spawn(run_dispatcher(
+    let dispatcher_task = tokio::spawn(run_dispatcher(
         state,
         dispatcher_rx,
         events_rx,
@@ -362,11 +409,16 @@ async fn serve(
                     }
                 });
             }
-            _ = shutdown_rx.recv() => {
+            control = shutdown_rx.recv() => {
+                let control = control.unwrap_or(DaemonControl::Stop);
                 shutdown_flag.store(true, Ordering::Release);
-                log.emit(LogLevel::Info, "sloop::daemon", "daemon_stopped");
+                if control == DaemonControl::Stop {
+                    log.emit(LogLevel::Info, "sloop::daemon", "daemon_stopped");
+                }
                 let _ = fs::remove_file(&repository.operator_socket);
-                return Ok(());
+                dispatcher_task.abort();
+                let _ = dispatcher_task.await;
+                return Ok(control);
             }
         }
     }
@@ -375,7 +427,7 @@ async fn serve(
 async fn handle_connection(
     stream: UnixStream,
     dispatcher: mpsc::Sender<DispatcherMessage>,
-    shutdown: mpsc::Sender<()>,
+    shutdown: mpsc::Sender<DaemonControl>,
 ) -> io::Result<()> {
     let reader = AsyncBufReader::new(stream);
     let mut limited = reader.take(MAX_ENVELOPE_BYTES + 1);
@@ -397,6 +449,10 @@ async fn handle_connection(
     let is_stop = matches!(
         &envelope,
         Ok(envelope) if matches!(envelope.request, Request::Stop(_))
+    );
+    let is_restart = matches!(
+        &envelope,
+        Ok(envelope) if matches!(envelope.request, Request::Restart(_))
     );
     let response = match envelope {
         Ok(envelope) if envelope.token.is_some() => ResponseEnvelope::failure(
@@ -429,7 +485,11 @@ async fn handle_connection(
     stream.write_all(b"\n").await?;
     stream.shutdown().await?;
     if stopping {
-        let _ = shutdown.send(()).await;
+        let _ = shutdown.send(DaemonControl::Stop).await;
+    } else if is_restart && response.ok {
+        let _ = dispatcher
+            .send(DispatcherMessage::RestartAcknowledged)
+            .await;
     }
     Ok(())
 }
@@ -497,7 +557,7 @@ async fn dispatch_envelope(
     let (reply_tx, reply_rx) = oneshot::channel();
     let id = envelope.id;
     if dispatcher
-        .send(DispatcherMessage {
+        .send(DispatcherMessage::Request {
             id: id.clone(),
             request: envelope.request,
             origin,

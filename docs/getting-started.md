@@ -44,6 +44,17 @@ This is idempotent — it connects to a running daemon or starts one, and
 prints the daemon's log and socket paths. Every other operator command
 ensures the daemon is running, so you rarely need to run it by hand.
 
+After installing a new binary, ask the current daemon to drain and replace
+itself with that binary:
+
+```sh
+./install
+sloop daemon restart
+```
+
+The command returns immediately. Active runs finish through aftercare, queued
+work waits without changing state, and dispatch resumes under the replacement.
+
 ## Write a ticket
 
 A ticket is a Markdown file: YAML frontmatter for the metadata Sloop needs,
@@ -113,6 +124,7 @@ sloop ready <ticket>    # release it again
 sloop retry <ticket>    # return a failed ticket to ready, reset attempts
 sloop pause             # stop spawning new agents (in-flight ones finish)
 sloop resume            # start spawning again
+sloop daemon restart    # drain active runs, then use the installed binary
 sloop cancel <run-id>   # kill a run's whole process group, keep its worktree
 sloop stop              # shut the daemon down (refuses while runs are active)
 ```
