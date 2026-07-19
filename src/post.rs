@@ -150,10 +150,20 @@ pub fn handle(
         return Err(PostError::DependencyCycle(chain));
     }
 
-    let worktree = stamped
-        .worktree
-        .clone()
-        .unwrap_or_else(|| format!("sloop/{ticket_id}"));
+    let worktree = match stamped.worktree.clone() {
+        Some(worktree) => worktree,
+        None => {
+            let stem = Path::new(&relative_str)
+                .file_stem()
+                .and_then(|stem| stem.to_str());
+            crate::ids::default_worktree(stem, &ticket_id).map_err(|reason| {
+                PostError::InvalidWorktreeStem {
+                    path: relative_str.clone(),
+                    reason,
+                }
+            })?
+        }
+    };
     if existing.is_some() {
         store.update_local_ticket(
             &ticket_id,
@@ -374,6 +384,10 @@ pub enum PostError {
     MissingName {
         path: String,
     },
+    InvalidWorktreeStem {
+        path: String,
+        reason: String,
+    },
     MissingBlockedBy {
         path: String,
     },
@@ -443,6 +457,9 @@ impl fmt::Display for PostError {
                 formatter,
                 "{path}: missing or empty `name`; add `name: Your ticket title`"
             ),
+            Self::InvalidWorktreeStem { path, reason } => {
+                write!(formatter, "{path}: {reason}")
+            }
             Self::MissingBlockedBy { path } => write!(
                 formatter,
                 "{path}: missing `blocked_by`; add `blocked_by: []` if there are no dependencies"

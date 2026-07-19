@@ -137,7 +137,7 @@ project: default               # optional, defaults to `default`
 target: claude                 # optional, defaults to agent.default_target
 model: sonnet                  # optional, filled into {model}
 effort: medium                 # optional, filled into {effort}
-worktree: sloop/TICK-7         # optional branch name, stamped if omitted
+worktree: sloop/add-request-logging  # optional branch, from the file stem if omitted
 flow: default                  # optional, defaults to the default flow
 ---
 

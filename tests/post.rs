@@ -38,7 +38,7 @@ fn post_manual_stamps_and_registers_without_an_activation() {
         response["data"]["ticket"]["blocked_by"],
         serde_json::json!([])
     );
-    assert_eq!(response["data"]["ticket"]["worktree"], "sloop/TICK-1");
+    assert_eq!(response["data"]["ticket"]["worktree"], "sloop/cooldown");
     assert_eq!(response["data"]["ticket"]["target"], "fake");
     assert_eq!(response["data"]["ticket"]["model"], "sonnet");
     assert_eq!(response["data"]["ticket"]["effort"], "medium");
@@ -51,7 +51,7 @@ fn post_manual_stamps_and_registers_without_an_activation() {
         "ticket was not stamped: {contents}"
     );
     assert!(contents.contains("project: default"));
-    assert!(contents.contains("worktree: sloop/TICK-1"));
+    assert!(contents.contains("worktree: sloop/cooldown"));
     assert!(contents.contains("# Persist cooldowns"));
 }
 
@@ -316,6 +316,43 @@ fn unknown_target_is_rejected_without_registering_or_activating_the_ticket() {
         !fs::read_to_string(world.root().join(ticket))
             .unwrap()
             .contains("id:")
+    );
+}
+
+#[test]
+fn post_rejects_a_file_stem_that_is_not_a_worktree_slug() {
+    let world = World::configured();
+    world.start_daemon();
+    let ticket = world.write_ticket("Fix_Login.md", "# The stem is not a slug\n");
+
+    let output = world.sloop(&["post", ticket.to_str().expect("UTF-8 ticket path")]);
+    assert!(!output.status.success());
+    let error = World::json_stdout_or_stderr(&output);
+    assert_eq!(error["error"]["code"], "invalid_arguments");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("`Fix_Login` is not a valid worktree slug"),
+        "diagnostic changed: {message}"
+    );
+    assert!(
+        !fs::read_to_string(world.root().join(ticket))
+            .unwrap()
+            .contains("id:")
+    );
+
+    let explicit = world.write_ticket(
+        "Fix_Login2.md",
+        "---\nworktree: sloop/fix-login\n---\n# An explicit worktree bypasses the stem\n",
+    );
+    let output = world.sloop(&[
+        "post",
+        explicit.to_str().expect("UTF-8 ticket path"),
+        "--manual",
+    ]);
+    assert!(
+        output.status.success(),
+        "explicit worktree rejected: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

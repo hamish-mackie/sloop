@@ -30,6 +30,34 @@ pub fn next_id<'a>(
     Ok(format!("{prefix}-{ordinal}"))
 }
 
+/// Worktree slugs are what a ticket file stem must look like to name a
+/// branch: lowercase alphanumeric segments separated by single hyphens,
+/// `abc-def`.
+pub fn valid_slug(value: &str) -> bool {
+    !value.is_empty()
+        && value.split('-').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
+}
+
+/// Chooses the worktree branch for a ticket whose frontmatter does not name
+/// one. `stem` is the ticket file's stem; exec-sourced tickets have none and
+/// always fall back to `sloop/<ticket_id>`. `Err` refuses the ticket with the
+/// given reason: reindex holds it, `sloop post` rejects it.
+pub fn default_worktree(stem: Option<&str>, ticket_id: &str) -> Result<String, String> {
+    match stem {
+        None => Ok(format!("sloop/{ticket_id}")),
+        Some(stem) if valid_slug(stem) => Ok(format!("sloop/{stem}")),
+        Some(stem) => Err(format!(
+            "file stem `{stem}` is not a valid worktree slug; \
+             rename the file to `abc-def` form or set `worktree:` explicitly"
+        )),
+    }
+}
+
 fn numeric_suffix(prefix: &str, id: &str) -> Option<u64> {
     let suffix = id.strip_prefix(prefix)?.strip_prefix('-')?;
     if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -55,7 +83,7 @@ impl std::error::Error for IdError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{next_id, valid_prefix};
+    use super::{default_worktree, next_id, valid_prefix, valid_slug};
 
     #[test]
     fn allocation_uses_the_greatest_matching_numeric_suffix() {
@@ -66,6 +94,28 @@ mod tests {
     #[test]
     fn allocation_starts_at_one_and_accepts_a_configured_prefix() {
         assert_eq!(next_id("WORK", []).unwrap(), "WORK-1");
+    }
+
+    #[test]
+    fn slug_validation_accepts_only_kebab_case() {
+        for slug in ["abc", "abc-def", "a-2-c", "fix-login2"] {
+            assert!(valid_slug(slug), "{slug}");
+        }
+        for slug in ["", "-abc", "abc-", "a--b", "Fix-Login", "fix_login", "a b"] {
+            assert!(!valid_slug(slug), "{slug}");
+        }
+    }
+
+    #[test]
+    fn worktree_defaults_to_the_stem_and_refuses_invalid_stems() {
+        assert_eq!(
+            default_worktree(Some("admission-snapshots"), "TICK-19").unwrap(),
+            "sloop/admission-snapshots"
+        );
+        assert_eq!(default_worktree(None, "TICK-19").unwrap(), "sloop/TICK-19");
+        let refusal = default_worktree(Some("Fix_Login"), "TICK-19").unwrap_err();
+        assert!(refusal.contains("`Fix_Login`"), "{refusal}");
+        assert!(refusal.contains("abc-def"), "{refusal}");
     }
 
     #[test]

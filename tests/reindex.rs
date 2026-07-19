@@ -407,10 +407,10 @@ fn reindex_drops_history_for_tickets_removed_from_files() {
     let kept_run = world.run_id(1);
     fs::remove_file(world.root().join(".agents/sloop/tickets/stale.md"))
         .expect("remove stale ticket file");
-    create_merged_branch(&world, "sloop/T3", "state-evidence.txt");
+    create_merged_branch(&world, "sloop/state", "state-evidence.txt");
     create_unmerged_worktree(&world, "sloop/T6-a1-deadbeef", "deadbeef");
     let status = Command::new("git")
-        .args(["branch", "sloop/T4"])
+        .args(["branch", "sloop/bare"])
         .current_dir(world.root())
         .status()
         .expect("create a bare ticket branch");
@@ -571,6 +571,71 @@ fn reindex_preserves_project_scoped_run_history_when_a_ticket_moves() {
     assert_eq!(
         World::json_stdout_or_stderr(&old)["error"]["code"],
         "not_found"
+    );
+}
+
+#[test]
+fn reindex_derives_the_worktree_from_the_file_stem_and_holds_invalid_stems() {
+    let world = World::configured();
+    write_ticket(
+        &world,
+        "persist-cooldowns.md",
+        "id: T1\nproject: default\nname: Persist cooldowns across restarts\nblocked_by: []\n",
+        "# Survive restarts",
+    );
+    write_ticket(
+        &world,
+        "Fix_Login.md",
+        "id: T2\nproject: default\nname: Fix login\nblocked_by: []\n",
+        "# The stem is not a slug",
+    );
+    write_ticket(
+        &world,
+        "explicit.md",
+        "id: T3\nproject: default\nname: Explicit\nblocked_by: []\nworktree: topic/explicit\n",
+        "# An explicit worktree always wins",
+    );
+    world.commit_all("worktree derivation tickets");
+
+    let output = world.sloop(&["reindex"]);
+    assert!(
+        output.status.success(),
+        "reindex failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stamped = fs::read_to_string(
+        world
+            .root()
+            .join(".agents/sloop/tickets/persist-cooldowns.md"),
+    )
+    .expect("read stamped ticket");
+    assert!(
+        stamped.contains("worktree: sloop/persist-cooldowns"),
+        "stem-derived worktree was not stamped: {stamped}"
+    );
+    let unstamped = fs::read_to_string(world.root().join(".agents/sloop/tickets/Fix_Login.md"))
+        .expect("read held ticket");
+    assert!(
+        !unstamped.contains("worktree:"),
+        "a held ticket must not be stamped with a fallback worktree: {unstamped}"
+    );
+
+    let response = World::json_stdout(&world.sloop(&["list"]));
+    let tickets = response["data"]["tickets"].as_array().unwrap();
+    let derived = tickets.iter().find(|ticket| ticket["id"] == "T1").unwrap();
+    let invalid = tickets.iter().find(|ticket| ticket["id"] == "T2").unwrap();
+    let explicit = tickets.iter().find(|ticket| ticket["id"] == "T3").unwrap();
+    assert_eq!(derived["state"], "ready");
+    assert_eq!(explicit["state"], "ready");
+    assert_eq!(invalid["state"], "held");
+    let reason = invalid["reason"].as_str().expect("held reason");
+    assert!(
+        reason.contains("`Fix_Login` is not a valid worktree slug"),
+        "diagnostic changed: {reason}"
+    );
+    assert!(
+        reason.contains("Fix_Login.md"),
+        "remedy does not name the file to edit: {reason}"
     );
 }
 
