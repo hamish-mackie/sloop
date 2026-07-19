@@ -28,10 +28,14 @@ agent:
   default_target: claude
   targets:
     claude:
+      model: opus
+      effort: high
       cmd: ["claude", "--print", "--model", "{model}", "--effort", "{effort}", "{prompt}"]
     opencode:
       cmd: ["opencode", "run", "--model", "{model}", "--variant", "{effort}", "{prompt}"]
     codex:
+      model: gpt-5.6-sol
+      effort: high
       cmd: ["codex", "exec", "--model", "{model}", "--config", 'model_reasoning_effort="{effort}"', "--sandbox", "workspace-write", "--ephemeral", "{prompt}"]
 
 # Optional: replace Markdown ticket pulls with an external source.
@@ -64,9 +68,13 @@ ids:
 
 Each named target is a command template. `{prompt}` must appear exactly
 once and is replaced with the worker instructions at launch; `{model}` and
-`{effort}` are filled from the ticket. A ticket that selects a target whose
-template uses `{model}` or `{effort}` must supply those values (or the post
-is rejected — before anything is registered).
+`{effort}` are filled from the ticket, falling back to the target's own
+`model:` and `effort:` when the ticket omits them. A ticket that selects a
+target whose template uses `{model}` or `{effort}` must resolve those values
+from one of the two places (or the post is rejected — before anything is
+registered). Model names are vendor-specific: `claude` accepts aliases like
+`opus`, while `opencode` expects provider-qualified names such as
+`anthropic/claude-opus-4-8`.
 
 `default_target` is used by tickets that do not name a `target`. Adding an
 agent vendor is a config block, not a code change. Keep API keys and other

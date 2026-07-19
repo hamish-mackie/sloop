@@ -543,7 +543,7 @@ mod tests {
 
     use super::{WORKER_BOOTSTRAP_PROMPT, compose_worker_prompt, run_exec_stage};
     use crate::clock::SystemClock;
-    use crate::config::expand_agent_cmd;
+    use crate::config::{AgentTarget, expand_agent_cmd};
     use crate::runner::{
         AgentProcessCheckpoint, ExecLaunch, ExecProcessCheckpoint, StageExecution, StageHooks,
         StageOrder,
@@ -573,15 +573,27 @@ mod tests {
         }
     }
 
+    fn target(cmd: &[&str], model: Option<&str>, effort: Option<&str>) -> AgentTarget {
+        AgentTarget {
+            cmd: cmd.iter().map(|argument| (*argument).to_owned()).collect(),
+            model: model.map(str::to_owned),
+            effort: effort.map(str::to_owned),
+        }
+    }
+
     #[test]
     fn agent_command_expands_ticket_model_and_effort() {
-        let template = vec![
-            "agent".to_owned(),
-            "--model={model}".to_owned(),
-            "--effort".to_owned(),
-            "{effort}".to_owned(),
-            "prompt={prompt}".to_owned(),
-        ];
+        let template = target(
+            &[
+                "agent",
+                "--model={model}",
+                "--effort",
+                "{effort}",
+                "prompt={prompt}",
+            ],
+            None,
+            None,
+        );
 
         assert_eq!(
             expand_agent_cmd(&template, Some("sonnet"), Some("medium"), "assignment").unwrap(),
@@ -597,11 +609,39 @@ mod tests {
 
     #[test]
     fn agent_command_rejects_a_missing_ticket_field() {
-        let template = vec!["agent".to_owned(), "{model}".to_owned()];
+        let template = target(&["agent", "{model}"], None, Some("medium"));
 
         assert_eq!(
             expand_agent_cmd(&template, None, Some("medium"), "assignment"),
             Err("does not specify `model`".to_owned())
+        );
+    }
+
+    #[test]
+    fn agent_command_falls_back_to_target_defaults() {
+        let template = target(
+            &["agent", "{model}", "{effort}", "{prompt}"],
+            Some("opus"),
+            Some("high"),
+        );
+
+        assert_eq!(
+            expand_agent_cmd(&template, None, None, "assignment").unwrap(),
+            ["agent", "opus", "high", "assignment"]
+        );
+    }
+
+    #[test]
+    fn agent_command_prefers_ticket_values_over_target_defaults() {
+        let template = target(
+            &["agent", "{model}", "{effort}", "{prompt}"],
+            Some("opus"),
+            Some("high"),
+        );
+
+        assert_eq!(
+            expand_agent_cmd(&template, Some("haiku"), Some("low"), "assignment").unwrap(),
+            ["agent", "haiku", "low", "assignment"]
         );
     }
 

@@ -13,7 +13,8 @@ Prebuilt binaries are also on the
 [releases page](https://github.com/hamish-mackie/sloop/releases).
 
 You also need at least one coding agent CLI installed and authenticated —
-Claude Code, Codex, or OpenCode work out of the box.
+Claude Code, Codex, or OpenCode work out of the box. The scaffolded
+defaults dispatch to Claude Code; a one-line config change selects another.
 
 ## Initialize a repository
 
@@ -64,9 +65,6 @@ then a body that becomes the agent's assignment.
 ---
 name: Add request logging
 blocked_by: []
-target: claude
-model: sonnet
-effort: medium
 ---
 
 Log each HTTP request with its method, path, status, and duration.
@@ -81,7 +79,11 @@ than guessing:
 - A non-empty body after the frontmatter.
 
 Everything else is optional. `target`, `model`, and `effort` select the
-agent; omitted values fall back to the repository configuration. Sloop
+agent; omitted values fall back to the config's `default_target` and that
+target's configured `model:` and `effort:`. The scaffolded config runs
+`claude` with `opus` at `high` effort, so the ticket above works as-is;
+the `codex` target defaults are filled in too, while `opencode` has
+provider-qualified model names you set yourself. Sloop
 stamps an `id` and a worktree branch derived from the filename
 (`add-request-logging.md` → `sloop/add-request-logging`) for you unless you
 set your own. That default requires the file stem to be a lowercase

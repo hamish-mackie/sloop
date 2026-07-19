@@ -85,16 +85,21 @@ agent:
   default_target: claude
   targets:
     claude:
+      model: opus
+      effort: high
       cmd: ["claude", "--print", "--model", "{model}", "--effort", "{effort}", "{prompt}"]
     opencode:
       cmd: ["opencode", "run", "--model", "{model}", "--variant", "{effort}", "{prompt}"]
     codex:
+      model: gpt-5.6-sol
+      effort: high
       cmd: ["codex", "exec", "--model", "{model}", "--config", 'model_reasoning_effort="{effort}"', "--sandbox", "workspace-write", "--ephemeral", "{prompt}"]
 ```
 
 Running hours use local time and may cross midnight; omit them to run at any
 time. Custom agent commands must include `{prompt}` exactly once; `{model}`
-and `{effort}` come from the ticket. Keep secrets in environment variables.
+and `{effort}` come from the ticket, falling back to the target's `model:`
+and `effort:` defaults. Keep secrets in environment variables.
 
 ## Flows
 
