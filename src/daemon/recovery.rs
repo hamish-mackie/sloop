@@ -17,8 +17,9 @@ use crate::store::{ExitClaim, RecoverableRun, Store};
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
 
 use super::aftercare::{
-    aftercare_cancelled, drive_flow, git_index_lock_path, git_index_matches_head, git_is_ancestor,
-    git_stdout, shared_checkout_has_git_operation, try_commits_on_branch,
+    WorkerCredentials, aftercare_cancelled, drive_flow, git_index_lock_path,
+    git_index_matches_head, git_is_ancestor, git_stdout, shared_checkout_has_git_operation,
+    try_commits_on_branch,
 };
 use super::dispatcher::{DispatcherState, RunEvent, wait_for_test_hook};
 use super::runner::{process_start_time, run_output_path, worker_socket_path};
@@ -80,6 +81,14 @@ pub(super) fn recover_inflight_runs(
             ProcessIdentity::GoneOrReused => {
                 state.recovering.insert(run.id.clone());
                 if run.state == "aftercare" {
+                    if let Err(error) = restore_worker_socket(state, &run) {
+                        log.emit_with_fields(
+                            LogLevel::Error,
+                            "sloop::recovery",
+                            "worker_socket_restore_failed",
+                            json!({"run_id": run.id, "error": error}),
+                        );
+                    }
                     spawn_aftercare_recovery(state, events.clone(), run, log.clone())?;
                 } else {
                     spawn_dead_run_recovery(state, events.clone(), run, log.clone());
@@ -273,6 +282,14 @@ pub(super) fn spawn_aftercare_recovery(
     let clock = state.clock.clone();
     let db_path = state.state_dir.join("sloop.db");
     let shutdown = state.shutdown_flag.clone();
+    let worker = WorkerCredentials {
+        socket: run
+            .worker_socket_path
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| worker_socket_path(&state.runtime_dir, &run.id)),
+        token: run.worker_token.clone().unwrap_or_default(),
+    };
     tokio::task::spawn_blocking(move || {
         while !shutdown.load(Ordering::Acquire) {
             let result = Store::open(&db_path, clock.now_ms())
@@ -282,6 +299,7 @@ pub(super) fn spawn_aftercare_recovery(
                         &root,
                         &state_dir,
                         &flow,
+                        &worker,
                         test_cmd.as_deref(),
                         clock.as_ref(),
                         &store,
@@ -314,6 +332,7 @@ pub(super) fn resume_aftercare(
     root: &Path,
     state_dir: &Path,
     flow: &Flow,
+    worker: &WorkerCredentials,
     test_cmd: Option<&[String]>,
     clock: &dyn Clock,
     store: &Store,
@@ -376,6 +395,7 @@ pub(super) fn resume_aftercare(
         Path::new(worktree),
         branch,
         flow,
+        worker,
         test_cmd,
         exit_code,
         vendor_error.is_some(),

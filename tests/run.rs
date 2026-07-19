@@ -32,7 +32,7 @@ fn configure_fake_agent_with_hours(
     fs::create_dir_all(world.root().join(".agents/sloop/flows")).unwrap();
     fs::write(
         world.root().join(".agents/sloop/flows/default.yaml"),
-        "stages:\n  - { name: build, kind: build }\n  - { name: merge, kind: merge }\n",
+        "stages:\n  - { name: build, kind: agent, verdict: exit }\n  - { name: merge, kind: merge }\n",
     )
     .unwrap();
     let script = world.root().join("fake-agent.sh");

@@ -7,7 +7,8 @@ use serde_json::json;
 
 use crate::clock::Clock;
 use crate::flow::{
-    Flow, Stage, StageEvidence, StageKind, Step, Verdict, VerdictSource, next_step, resolve_verdict,
+    Flow, Reported, Stage, StageEvidence, StageKind, Step, Verdict, VerdictPolicy, VerdictSource,
+    next_step, resolve_verdict,
 };
 use crate::logging::{LogLevel, OperationalLog};
 use crate::outcome::{ExitClass, MergeOutcome, classify_exit};
@@ -23,6 +24,12 @@ use super::recovery::{
 use super::runner::{process_start_time, spawn_output_reader};
 
 static MERGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[derive(Clone)]
+pub(super) struct WorkerCredentials {
+    pub(super) socket: PathBuf,
+    pub(super) token: String,
+}
 
 /// One executed flow stage as observed by the supervisor.
 pub(super) struct StageResult {
@@ -41,6 +48,7 @@ pub(super) fn gather_exit_evidence(
     worktree: &Path,
     branch: &str,
     flow: &Flow,
+    worker: &WorkerCredentials,
     test_cmd: Option<&[String]>,
     clock: &dyn Clock,
     output_log: &RunLogWriter,
@@ -107,6 +115,7 @@ pub(super) fn gather_exit_evidence(
         worktree,
         branch,
         flow,
+        worker,
         test_cmd,
         exit_code,
         vendor_error.is_some(),
@@ -179,6 +188,7 @@ pub(super) fn run_exec_stage(
     store: &Store,
     run_id: &str,
     operational_log: &OperationalLog,
+    worker: Option<&WorkerCredentials>,
 ) -> StageResult {
     let started_at_ms = clock.now_ms();
     let failed = |finished_at_ms| StageResult {
@@ -191,19 +201,41 @@ pub(super) fn run_exec_stage(
         return failed(clock.now_ms());
     }
 
-    let mut command = Command::new(&cmd[0]);
+    let mut command = if worker.is_some() {
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "IFS= read -r _ || exit 125; exec \"$@\"",
+                "sloop-stage",
+            ])
+            .args(cmd);
+        command
+    } else {
+        let mut command = Command::new(&cmd[0]);
+        command.args(&cmd[1..]);
+        command
+    };
     command
-        .args(&cmd[1..])
         .current_dir(worktree)
-        .env_remove("SLOOP_SOCKET")
-        .env_remove("SLOOP_TOKEN")
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    if let Some(worker) = worker {
+        command
+            .env("SLOOP_SOCKET", &worker.socket)
+            .env("SLOOP_TOKEN", &worker.token)
+            .stdin(Stdio::piped());
+    } else {
+        command
+            .env_remove("SLOOP_SOCKET")
+            .env_remove("SLOOP_TOKEN")
+            .stdin(Stdio::null());
+    }
     let Ok(mut child) = command.spawn() else {
         return failed(clock.now_ms());
     };
+    let mut gate = worker.map(|_| child.stdin.take().expect("reported stage stdin was piped"));
     let pid = child.id();
     let Some(pid_start_time) = process_start_time(pid) else {
         unsafe {
@@ -274,6 +306,21 @@ pub(super) fn run_exec_stage(
         }
         return failed(clock.now_ms());
     }
+    if let Some(gate) = gate.as_mut()
+        && gate.write_all(b"run\n").is_err()
+    {
+        if process_identity_matches(pid, Some(pid_start_time)) {
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+        }
+        let _ = child.wait();
+        for reader in readers {
+            let _ = reader.join();
+        }
+        return failed(clock.now_ms());
+    }
+    drop(gate);
 
     let status = child.wait();
     if kill_straggler_process_group(pid) {
@@ -461,6 +508,7 @@ pub(super) fn drive_flow(
     worktree: &Path,
     branch: &str,
     bound_flow: &Flow,
+    worker: &WorkerCredentials,
     test_cmd: Option<&[String]>,
     exit_code: Option<i32>,
     vendor_rejected: bool,
@@ -485,8 +533,12 @@ pub(super) fn drive_flow(
             } else {
                 Verdict::Fail
             },
-            source: VerdictSource::ExitCode,
-            reason: None,
+            source: if row.verdict_source == "reported" {
+                VerdictSource::Reported
+            } else {
+                VerdictSource::ExitCode
+            },
+            reason: row.reason.clone(),
         })
         .collect::<Vec<_>>();
     let mut merge = flow.stages.iter().find_map(|stage| {
@@ -518,12 +570,12 @@ pub(super) fn drive_flow(
         let stage = match next_step(&flow, &evidence) {
             Step::Run(stage) => stage,
             Step::Halted { failed_stage } => {
-                let build = flow
+                let first_stage_failed = flow
                     .stages
                     .first()
                     .is_some_and(|stage| stage.name == failed_stage);
                 return Ok(FlowRunResult {
-                    aftercare_failed: !build,
+                    aftercare_failed: !first_stage_failed,
                     merge,
                 });
             }
@@ -575,8 +627,8 @@ pub(super) fn drive_flow(
                 .clear_aftercare_process(run_id)
                 .map_err(|error| error.to_string())?;
         }
-        let result = match &stage.kind {
-            StageKind::Build => {
+        let mut result = match &stage.kind {
+            StageKind::Agent => {
                 let now = clock.now_ms();
                 StageResult {
                     verdict: if !vendor_rejected && classify_exit(exit_code) == ExitClass::Success {
@@ -598,6 +650,7 @@ pub(super) fn drive_flow(
                 store,
                 run_id,
                 log,
+                (stage.verdict == VerdictPolicy::Reported).then_some(worker),
             ),
             StageKind::Merge
                 if merge_recovery == Some(super::recovery::MergeRecovery::AlreadyCompleted) =>
@@ -652,7 +705,37 @@ pub(super) fn drive_flow(
                 }
             }
         };
-        let (verdict, source, reason) = resolve_verdict(&stage.kind, result.verdict, None);
+        match &stage.verdict {
+            VerdictPolicy::Exit | VerdictPolicy::Reported => {}
+            VerdictPolicy::Commits => {
+                if result.verdict != Verdict::Pass
+                    || !commit_observation_complete
+                    || commits.is_empty()
+                {
+                    result.verdict = Verdict::Fail;
+                }
+            }
+            VerdictPolicy::Check { cmd } if result.verdict == Verdict::Pass => {
+                result = run_exec_stage(
+                    worktree,
+                    &stage.name,
+                    cmd,
+                    output_log,
+                    clock,
+                    store,
+                    run_id,
+                    log,
+                    None,
+                );
+            }
+            VerdictPolicy::Check { .. } => {}
+        }
+        let reported = if stage.verdict == VerdictPolicy::Reported {
+            reported_verdict(store, run_id, &stage.name)?
+        } else {
+            None
+        };
+        let (verdict, source, reason) = resolve_verdict(&stage.verdict, result.verdict, reported);
         if let Err(error) = store.record_aftercare_stage(
             run_id,
             &StageRecord {
@@ -667,6 +750,12 @@ pub(super) fn drive_flow(
                 finished_at_ms: result.finished_at_ms,
                 exit_code: result.exit_code,
                 output_ref: format!("runs/{run_id}/output.ndjson"),
+                verdict_source: match source {
+                    VerdictSource::ExitCode => "exit_code",
+                    VerdictSource::Reported => "reported",
+                }
+                .into(),
+                reason: reason.clone(),
             },
         ) {
             log.emit_with_fields(
@@ -713,10 +802,41 @@ fn flow_with_implicit_test(flow: &Flow, test_cmd: Option<&[String]>) -> Result<F
             Stage {
                 name: "test".into(),
                 kind: StageKind::Exec { cmd: cmd.to_vec() },
+                verdict: VerdictPolicy::Exit,
             },
         );
     }
     Ok(flow)
+}
+
+fn reported_verdict(store: &Store, run_id: &str, stage: &str) -> Result<Option<Reported>, String> {
+    let rows = store
+        .run_evidence(run_id)
+        .map_err(|error| error.to_string())?;
+    let Some(data) = rows
+        .iter()
+        .rev()
+        .filter(|(kind, _)| kind == "stage_verdict")
+        .find_map(|(_, data)| {
+            let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
+            (value["stage"] == stage).then_some(value)
+        })
+    else {
+        return Ok(None);
+    };
+    let verdict = match data["verdict"].as_str() {
+        Some("pass") => Verdict::Pass,
+        Some("fail") => Verdict::Fail,
+        _ => {
+            return Err(format!(
+                "stage `{stage}` has invalid reported verdict evidence"
+            ));
+        }
+    };
+    Ok(Some(Reported {
+        verdict,
+        reason: data["reason"].as_str().map(str::to_owned),
+    }))
 }
 
 pub(super) fn git_stdout(root: &Path, args: &[&str]) -> Result<String, String> {

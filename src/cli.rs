@@ -7,13 +7,15 @@ use std::process::ExitCode;
 use std::str::FromStr;
 
 use clap::error::ErrorKind;
-use clap::{ArgGroup, Args, ColorChoice, CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{
+    ArgGroup, Args, ColorChoice, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
+};
 use serde_json::json;
 
 use crate::protocol::{
     EmptyArgs, ErrorBody, ErrorCode, NoteArgs, PostActivation, PostArgs, Request, RequestEnvelope,
     RequestId, ResponseEnvelope, RunActivation, RunArgs, RunReferenceArgs, ShowArgs, StopArgs,
-    TicketReferenceArgs,
+    TicketReferenceArgs, VerdictArgs, VerdictValue,
 };
 
 const TICKET_STATES_HELP: &str = "Ticket states:
@@ -113,6 +115,19 @@ pub enum Command {
         #[arg(required = true, trailing_var_arg = true)]
         text: Vec<String>,
     },
+    /// Report the current stage's verdict.
+    #[command(hide = true)]
+    Verdict {
+        verdict: VerdictCliValue,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum VerdictCliValue {
+    Pass,
+    Fail,
 }
 
 #[derive(Debug, Args)]
@@ -208,6 +223,13 @@ impl TryFrom<Command> for Request {
             Command::Show { r#ref } => Self::Show(ShowArgs { reference: r#ref }),
             Command::Note { text } => Self::Note(NoteArgs {
                 text: text.join(" "),
+            }),
+            Command::Verdict { verdict, reason } => Self::Verdict(VerdictArgs {
+                verdict: match verdict {
+                    VerdictCliValue::Pass => VerdictValue::Pass,
+                    VerdictCliValue::Fail => VerdictValue::Fail,
+                },
+                reason,
             }),
         })
     }
@@ -452,10 +474,12 @@ fn run_command(
             Ok(request) => run_daemon_request(request, false, mode, stdout, stderr),
             Err(error) => write_cli_error(mode, stderr, error.to_string()),
         },
-        command @ (Command::Brief | Command::Note { .. }) => match Request::try_from(command) {
-            Ok(request) => run_worker_request(request, mode, stdout, stderr),
-            Err(error) => write_cli_error(mode, stderr, error.to_string()),
-        },
+        command @ (Command::Brief | Command::Note { .. } | Command::Verdict { .. }) => {
+            match Request::try_from(command) {
+                Ok(request) => run_worker_request(request, mode, stdout, stderr),
+                Err(error) => write_cli_error(mode, stderr, error.to_string()),
+            }
+        }
     }
 }
 
@@ -843,6 +867,7 @@ mod tests {
             &["sloop", "brief"],
             &["sloop", "show", "T1"],
             &["sloop", "note", "work", "in", "progress"],
+            &["sloop", "verdict", "fail", "--reason", "changes requested"],
         ];
 
         for command in commands {
@@ -872,6 +897,7 @@ mod tests {
             &["sloop", "brief"],
             &["sloop", "show", "T1"],
             &["sloop", "note", "working"],
+            &["sloop", "verdict", "pass"],
         ];
 
         for command in commands {
@@ -931,6 +957,24 @@ mod tests {
         assert_eq!(
             serde_json::to_value(request).unwrap(),
             json!({"verb": "note", "args": {"text": "work in progress"}})
+        );
+    }
+
+    #[test]
+    fn verdict_becomes_a_worker_request() {
+        let request =
+            Cli::try_parse_from(["sloop", "verdict", "fail", "--reason", "changes requested"])
+                .unwrap()
+                .into_request()
+                .unwrap();
+
+        assert_eq!(request.capability(), Capability::Worker);
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            json!({
+                "verb": "verdict",
+                "args": {"verdict": "fail", "reason": "changes requested"}
+            })
         );
     }
 
