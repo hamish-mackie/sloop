@@ -4,7 +4,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_TOKEN;
@@ -512,6 +511,8 @@ fn kill_process_group_if_matches(process: ProcessIdentity) {
 
 #[cfg(debug_assertions)]
 pub fn wait_for_test_hook(name: &str) {
+    use std::time::Duration;
+
     let Some(directory) = std::env::var_os("SLOOP_TEST_HOOK_DIR").map(PathBuf::from) else {
         return;
     };
