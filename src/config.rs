@@ -269,6 +269,7 @@ impl Config {
         )?;
 
         let flows = load_flows(&repository.root)?;
+        validate_on_fail_targets(&flows, agent.as_ref(), &repository.config_path)?;
         if aftercare_test_cmd.is_some()
             && let Some(flow) = flows
                 .values()
@@ -311,6 +312,38 @@ impl Config {
             delete_missing_after_ms,
         })
     }
+}
+
+/// Rejects `on_fail.target` overrides that do not name a configured agent
+/// target. Overrides without an explicit target resolve against the ticket's
+/// snapshot at spawn time, so they are left alone here.
+fn validate_on_fail_targets(
+    flows: &BTreeMap<String, Flow>,
+    agent: Option<&AgentConfig>,
+    path: &Path,
+) -> Result<(), ConfigError> {
+    for flow in flows.values() {
+        for stage in &flow.stages {
+            let Some(target) = stage
+                .on_fail
+                .as_ref()
+                .and_then(|on_fail| on_fail.target.as_ref())
+            else {
+                continue;
+            };
+            let known = agent.is_some_and(|agent| agent.targets.contains_key(target));
+            if !known {
+                return Err(ConfigError::Invalid {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "flow `{}` stage `{}` on_fail names unknown agent target `{target}`",
+                        flow.name, stage.name
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn load_flows(root: &Path) -> Result<BTreeMap<String, Flow>, ConfigError> {
@@ -1247,6 +1280,54 @@ mod tests {
                 .map(|stage| stage.name.as_str())
                 .collect::<Vec<_>>(),
             ["build", "ship"]
+        );
+    }
+
+    #[test]
+    fn on_fail_target_must_name_a_configured_agent_target() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".agents/sloop/flows")).unwrap();
+        fs::write(
+            root.path().join(".agents/sloop/config.yaml"),
+            "version: 1\nagent:\n  default_target: fake\n  targets:\n    fake:\n      cmd: [fake, '{prompt}']\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(".agents/sloop/flows/default.yaml"),
+            "- { name: build, kind: agent }\n- name: check\n  kind: exec\n  cmd: ['true']\n  on_fail:\n    agent: fix it\n    target: ghost\n- { name: merge, kind: merge }\n",
+        )
+        .unwrap();
+
+        let repository = Repository::discover(root.path()).unwrap();
+        let error = Config::load(&repository).unwrap_err().to_string();
+        assert!(error.contains("stage `check`"), "{error}");
+        assert!(error.contains("unknown agent target `ghost`"), "{error}");
+    }
+
+    #[test]
+    fn on_fail_without_a_target_override_loads_without_an_agent() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".agents/sloop/flows")).unwrap();
+        fs::write(
+            root.path().join(".agents/sloop/config.yaml"),
+            "version: 1\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(".agents/sloop/flows/default.yaml"),
+            "- { name: build, kind: agent }\n- name: check\n  kind: exec\n  cmd: ['true']\n  on_fail:\n    agent: fix it\n- { name: merge, kind: merge }\n",
+        )
+        .unwrap();
+
+        let repository = Repository::discover(root.path()).unwrap();
+        let config = Config::load(&repository).unwrap();
+        assert_eq!(
+            config.flows["default"].stages[1]
+                .on_fail
+                .as_ref()
+                .unwrap()
+                .agent,
+            "fix it"
         );
     }
 

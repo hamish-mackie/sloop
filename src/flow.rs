@@ -23,7 +23,37 @@ pub struct Stage {
     pub name: String,
     pub kind: StageKind,
     pub verdict: VerdictPolicy,
+    /// Optional repair agent for `exec` and `merge` stages. When the stage
+    /// fails, this agent is spawned in the run worktree to fix the tree in
+    /// place; the stage is then re-run and its own verdict policy re-applied.
+    /// The repair agent never produces the verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_fail: Option<OnFail>,
 }
+
+/// A stage's optional repair configuration. It configures the repair worker
+/// (prompt, attempt budget, and target/model/effort overrides) but can never
+/// alter the stage's verdict policy, command, or ordering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnFail {
+    /// The prompt handed to the repair agent.
+    pub agent: String,
+    /// How many repair-then-retry cycles are allowed per stage per run.
+    pub attempts: u32,
+    /// Agent target override; defaults to the ticket's target, then the
+    /// configured default target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Model override; defaults to the ticket's model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Effort override; defaults to the ticket's effort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// The inclusive upper bound on `on_fail.attempts`.
+pub const MAX_ON_FAIL_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StageKind {
@@ -53,6 +83,8 @@ impl<'de> Deserialize<'de> for Stage {
             name: String,
             kind: StageKind,
             verdict: Option<VerdictPolicy>,
+            #[serde(default)]
+            on_fail: Option<OnFail>,
         }
 
         let stage = SnapshotStage::deserialize(deserializer)?;
@@ -64,6 +96,7 @@ impl<'de> Deserialize<'de> for Stage {
             name: stage.name,
             kind: stage.kind,
             verdict,
+            on_fail: stage.on_fail,
         })
     }
 }
@@ -136,10 +169,21 @@ pub(crate) fn parse(name: &str, contents: &str) -> Result<Flow, String> {
                 VerdictPolicy::Check { cmd: check }
             }
         };
+        let on_fail = match raw.on_fail {
+            None => None,
+            Some(_) if kind == StageKind::Agent => {
+                return Err(format!(
+                    "agent stage `{}` must not define `on_fail`",
+                    raw.name
+                ));
+            }
+            Some(on_fail) => Some(validate_on_fail(&raw.name, on_fail)?),
+        };
         stages.push(Stage {
             name: raw.name,
             kind,
             verdict,
+            on_fail,
         });
     }
 
@@ -150,17 +194,42 @@ pub(crate) fn parse(name: &str, contents: &str) -> Result<Flow, String> {
     })
 }
 
+/// Validates an `on_fail` block's own shape. Target existence is checked
+/// later, where the configured agent targets are known (see `config.rs`).
+fn validate_on_fail(stage: &str, raw: RawOnFail) -> Result<OnFail, String> {
+    if raw.agent.trim().is_empty() {
+        return Err(format!(
+            "stage `{stage}` on_fail must define a non-empty `agent` prompt"
+        ));
+    }
+    let attempts = raw.attempts.unwrap_or(1);
+    if attempts == 0 || attempts > MAX_ON_FAIL_ATTEMPTS {
+        return Err(format!(
+            "stage `{stage}` on_fail attempts must be between 1 and {MAX_ON_FAIL_ATTEMPTS}"
+        ));
+    }
+    Ok(OnFail {
+        agent: raw.agent,
+        attempts,
+        target: raw.target,
+        model: raw.model,
+        effort: raw.effort,
+    })
+}
+
 pub(crate) fn built_in_default() -> Flow {
     let stages = vec![
         Stage {
             name: "build".into(),
             kind: StageKind::Agent,
             verdict: VerdictPolicy::Commits,
+            on_fail: None,
         },
         Stage {
             name: "merge".into(),
             kind: StageKind::Merge,
             verdict: VerdictPolicy::Exit,
+            on_fail: None,
         },
     ];
     Flow {
@@ -308,6 +377,17 @@ struct RawStage {
     kind: String,
     cmd: Option<Vec<String>>,
     verdict: Option<RawVerdict>,
+    on_fail: Option<RawOnFail>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOnFail {
+    agent: String,
+    attempts: Option<u32>,
+    target: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -345,6 +425,7 @@ mod tests {
                         name: "build".into(),
                         kind: StageKind::Agent,
                         verdict: VerdictPolicy::Commits,
+                        on_fail: None,
                     },
                     Stage {
                         name: "test".into(),
@@ -354,11 +435,13 @@ mod tests {
                         verdict: VerdictPolicy::Check {
                             cmd: vec!["cargo".into(), "clippy".into()],
                         },
+                        on_fail: None,
                     },
                     Stage {
                         name: "merge".into(),
                         kind: StageKind::Merge,
                         verdict: VerdictPolicy::Exit,
+                        on_fail: None,
                     },
                 ],
             }
@@ -400,6 +483,71 @@ mod tests {
         .unwrap();
         assert_eq!(defaults.stages[0].verdict, VerdictPolicy::Commits);
         assert_eq!(defaults.stages[1].verdict, VerdictPolicy::Exit);
+    }
+
+    #[test]
+    fn on_fail_parses_with_defaults_and_overrides() {
+        let flow = parse(
+            "example",
+            "- { name: build, kind: agent }\n- name: test\n  kind: exec\n  cmd: [cargo, test]\n  on_fail:\n    agent: fix the tests\n- name: merge\n  kind: merge\n  on_fail:\n    agent: integrate the default branch\n    attempts: 2\n    target: claude\n    model: haiku\n    effort: low\n",
+        )
+        .unwrap();
+
+        let test = flow.stages[1].on_fail.as_ref().unwrap();
+        assert_eq!(test.agent, "fix the tests");
+        assert_eq!(test.attempts, 1);
+        assert_eq!(test.target, None);
+
+        let merge = flow.stages[2].on_fail.as_ref().unwrap();
+        assert_eq!(merge.attempts, 2);
+        assert_eq!(merge.target.as_deref(), Some("claude"));
+        assert_eq!(merge.model.as_deref(), Some("haiku"));
+        assert_eq!(merge.effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn on_fail_survives_a_snapshot_round_trip() {
+        let flow = parse(
+            "example",
+            "- { name: build, kind: agent }\n- name: test\n  kind: exec\n  cmd: [cargo, test]\n  on_fail:\n    agent: fix the tests\n    attempts: 3\n    model: haiku\n",
+        )
+        .unwrap();
+        let snapshot = serde_json::to_string(&flow).unwrap();
+        let restored: Flow = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(flow, restored);
+        assert_eq!(restored.stages[1].on_fail.as_ref().unwrap().attempts, 3);
+    }
+
+    #[test]
+    fn on_fail_is_rejected_on_agent_stages() {
+        let error = error(
+            "- name: build\n  kind: agent\n  on_fail:\n    agent: patch it\n- { name: merge, kind: merge }\n",
+        );
+        assert!(error.contains("agent stage `build`"), "{error}");
+        assert!(error.contains("must not define `on_fail`"), "{error}");
+    }
+
+    #[test]
+    fn on_fail_rejects_an_empty_prompt() {
+        let error = error(
+            "- { name: build, kind: agent }\n- name: test\n  kind: exec\n  cmd: ['true']\n  on_fail:\n    agent: '   '\n",
+        );
+        assert!(error.contains("stage `test`"), "{error}");
+        assert!(error.contains("non-empty `agent` prompt"), "{error}");
+    }
+
+    #[test]
+    fn on_fail_rejects_out_of_range_attempts() {
+        for attempts in ["0", "4"] {
+            let error = error(&format!(
+                "- {{ name: build, kind: agent }}\n- name: test\n  kind: exec\n  cmd: ['true']\n  on_fail:\n    agent: fix it\n    attempts: {attempts}\n",
+            ));
+            assert!(error.contains("stage `test`"), "{error}");
+            assert!(
+                error.contains("attempts must be between 1 and 3"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -469,6 +617,7 @@ mod tests {
                     name: "build".into(),
                     kind: StageKind::Agent,
                     verdict: VerdictPolicy::Commits,
+                    on_fail: None,
                 },
                 Stage {
                     name: "review".into(),
@@ -476,11 +625,13 @@ mod tests {
                         cmd: vec!["true".into()],
                     },
                     verdict: VerdictPolicy::Exit,
+                    on_fail: None,
                 },
                 Stage {
                     name: "merge".into(),
                     kind: StageKind::Merge,
                     verdict: VerdictPolicy::Exit,
+                    on_fail: None,
                 },
             ],
         }
