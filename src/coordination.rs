@@ -4,6 +4,35 @@
 //! claims, leases, and run settlement. Read-only queries are not coordination
 //! and remain on [`Store`]. Rust's sibling-module visibility cannot enforce the
 //! boundary, so daemon code must not call the wrapped store methods directly.
+//!
+//! # Lease invariants
+//!
+//! A lease is time-bounded ownership of a ticket by the daemon, taken
+//! atomically at claim time. In the `leases` table `ticket_id` is the PRIMARY
+//! KEY and `run_id` is UNIQUE, so the database engine enforces at most one
+//! lease per ticket and per run. That is the durable guard against
+//! double-spawn, backstopping the conditional `UPDATE ... WHERE state='ready'`
+//! inside `claim_ticket`.
+//!
+//! Leases are held only by the daemon. `owner_id` records which daemon process
+//! took the claim. Workers never hold, renew, or observe leases: a worker's
+//! only credential is a per-run capability token granting the worker verbs on
+//! its own run. The daemon-to-worker relationship is delegation of access to a
+//! run, never sub-leasing of ownership of a ticket.
+//!
+//! `expires_at_ms` gates renewal only. An expired lease cannot be renewed, so a
+//! revived process cannot resurrect a claim recovery has decided is lost.
+//! Liveness of a run is determined by process identity — pid, pid start time,
+//! and process group id — never by lease expiry. An expired lease on a live,
+//! supervised run is currently normal.
+//!
+//! A lease is released by deleting its row: on settlement (`finish_run`) or on
+//! claim rollback (`abort_claim`). An expired-but-present lease row is evidence
+//! of an owner that died mid-work.
+//!
+//! [`Coordination::renew`] currently has no production caller, so any run
+//! outliving its initial lease executes on an expired one and nothing depends
+//! on that. The expiry vocabulary in the schema is ahead of the implementation.
 
 use crate::outcome::Outcome;
 use crate::store::{ClaimRequest, ClaimedRun, CooldownUpdate, EvidenceRecord, Store, StoreError};

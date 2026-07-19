@@ -109,6 +109,26 @@ CREATE TABLE runs (
 CREATE INDEX runs_by_ticket ON runs(ticket_id, created_at_ms);
 CREATE INDEX runs_by_activation ON runs(activation_id, created_at_ms);
 
+-- A lease is time-bounded ownership of a ticket by the daemon, taken
+-- atomically at claim time. `ticket_id` is the PRIMARY KEY and `run_id` is
+-- UNIQUE, so the engine itself enforces at most one lease per ticket and per
+-- run: the durable guard against double-spawn, backstopping the conditional
+-- `UPDATE ... WHERE state='ready'` in `claim_ticket`.
+--
+-- Leases are held only by the daemon; `owner_id` records which daemon process
+-- took the claim. Workers never hold, renew, or observe leases — a worker's
+-- only credential is a per-run capability token granting the worker verbs on
+-- its own run.
+--
+-- `expires_at_ms` gates renewal only: an expired lease cannot be renewed, so a
+-- revived process cannot resurrect a claim recovery has decided is lost.
+-- Liveness of a run is determined by process identity (pid + pid start time +
+-- process group id), never by lease expiry. An expired lease on a live,
+-- supervised run is currently normal.
+--
+-- A lease is released by deleting its row: on settlement (`finish_run`) or on
+-- claim rollback (`abort_claim`). An expired-but-present row is evidence of an
+-- owner that died mid-work.
 CREATE TABLE leases (
     ticket_id       TEXT PRIMARY KEY REFERENCES tickets(id),
     run_id          TEXT NOT NULL UNIQUE REFERENCES runs(id),
