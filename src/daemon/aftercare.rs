@@ -12,23 +12,67 @@ use crate::flow::{
 };
 use crate::logging::{LogLevel, OperationalLog};
 use crate::outcome::{ExitClass, MergeOutcome, classify_exit};
-use crate::run_log::{OutputSource, OutputStream, RunLogWriter};
+use crate::runner::local::{process_start_time, run_exec_stage, wait_for_test_hook};
+use crate::runner::{
+    AgentProcessCheckpoint, ExecLaunch, ExecProcessCheckpoint, ExecutionEvidence, RunnerError,
+    StageExecution, StageHooks, StageOrder, WorkerCredentials,
+};
 use crate::store::{ExitClaim, StageRecord, Store, StoreError};
 use crate::vendor_error::VendorErrorMatch;
 
-use super::dispatcher::wait_for_test_hook;
 use super::recovery::{
     MergeProcessCheckpoint, PersistedProcessStop, inspect_interrupted_merge,
-    kill_straggler_process_group, process_identity_matches, stop_interrupted_process,
+    stop_interrupted_process,
 };
-use super::runner::{process_start_time, spawn_output_reader};
 
 static MERGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[derive(Clone)]
-pub(super) struct WorkerCredentials {
-    pub(super) socket: PathBuf,
-    pub(super) token: String,
+pub(super) struct StoreStageHooks<'a> {
+    store: &'a Store,
+    log: &'a OperationalLog,
+}
+
+impl<'a> StoreStageHooks<'a> {
+    pub(super) fn new(store: &'a Store, log: &'a OperationalLog) -> Self {
+        Self { store, log }
+    }
+}
+
+impl StageHooks for StoreStageHooks<'_> {
+    type Error = StoreError;
+
+    fn cancellation_requested(&self, run_id: &str) -> bool {
+        aftercare_cancelled(self.store, run_id, self.log)
+    }
+
+    fn record_agent_process(&self, checkpoint: &AgentProcessCheckpoint) -> Result<(), Self::Error> {
+        self.store.mark_run_running(
+            &checkpoint.run_id,
+            &checkpoint.branch,
+            &checkpoint.worktree.to_string_lossy(),
+            checkpoint.process.pid,
+            checkpoint.process.start_time,
+            checkpoint.process.process_group_id,
+            &checkpoint.worker.token,
+            &checkpoint.worker.socket.to_string_lossy(),
+            checkpoint.started_at_ms,
+        )
+    }
+
+    fn record_exec_process(&self, checkpoint: &ExecProcessCheckpoint) -> Result<(), Self::Error> {
+        self.store.record_aftercare_evidence(
+            &checkpoint.run_id,
+            "aftercare_process",
+            &json!({
+                "stage": checkpoint.stage,
+                "pid": checkpoint.process.pid,
+                "pid_start_time": checkpoint.process.start_time,
+                "process_group_id": checkpoint.process.process_group_id,
+            })
+            .to_string(),
+            checkpoint.started_at_ms,
+        )
+    }
 }
 
 /// One executed flow stage as observed by the supervisor.
@@ -51,7 +95,7 @@ pub(super) fn gather_exit_evidence(
     worker: &WorkerCredentials,
     test_cmd: Option<&[String]>,
     clock: &dyn Clock,
-    output_log: &RunLogWriter,
+    output_path: &Path,
     exit_code: Option<i32>,
     capture_complete: bool,
     vendor_error: Option<&VendorErrorMatch>,
@@ -121,7 +165,7 @@ pub(super) fn gather_exit_evidence(
         vendor_error.is_some(),
         &commits,
         commit_observation_complete,
-        output_log,
+        output_path,
         clock,
         store,
         run_id,
@@ -176,180 +220,75 @@ pub(super) fn try_commits_on_branch(root: &Path, branch: &str) -> Result<Vec<Str
     .map(|output| output.lines().map(str::to_owned).collect())
 }
 
-/// Runs one exec stage in the run's worktree, capturing its output as
-/// `aftercare` evidence in the same ordered run log.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn run_exec_stage(
+fn execute_stage_order(
     worktree: &Path,
+    branch: &str,
     stage: &str,
     cmd: &[String],
-    output_log: &RunLogWriter,
+    output_path: &Path,
     clock: &dyn Clock,
     store: &Store,
     run_id: &str,
-    operational_log: &OperationalLog,
+    log: &OperationalLog,
     worker: Option<&WorkerCredentials>,
 ) -> StageResult {
-    let started_at_ms = clock.now_ms();
-    let failed = |finished_at_ms| StageResult {
-        verdict: Verdict::Fail,
-        exit_code: None,
-        started_at_ms,
-        finished_at_ms,
+    let order = StageOrder {
+        run_id: run_id.into(),
+        stage: stage.into(),
+        execution: StageExecution::Exec(ExecLaunch {
+            argv: cmd.to_vec(),
+            worker: worker.cloned(),
+        }),
+        worktree: worktree.into(),
+        branch: branch.into(),
+        output_path: output_path.into(),
     };
-    if aftercare_cancelled(store, run_id, operational_log) {
-        return failed(clock.now_ms());
-    }
+    let hooks = StoreStageHooks::new(store, log);
+    let evidence = match run_exec_stage(&order, &hooks, clock) {
+        Ok(evidence) => evidence,
+        Err(failure) => {
+            if let RunnerError::Hook(error) = failure.error {
+                log.emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::supervisor",
+                    "aftercare_process_checkpoint_failed",
+                    json!({"run_id": run_id, "stage": stage, "error": error.to_string()}),
+                );
+            }
+            failure.evidence
+        }
+    };
+    stage_result_from_execution(run_id, stage, evidence, log)
+}
 
-    let mut command = if worker.is_some() {
-        let mut command = Command::new("sh");
-        command
-            .args([
-                "-c",
-                "IFS= read -r _ || exit 125; exec \"$@\"",
-                "sloop-stage",
-            ])
-            .args(cmd);
-        command
-    } else {
-        let mut command = Command::new(&cmd[0]);
-        command.args(&cmd[1..]);
-        command
-    };
-    command
-        .current_dir(worktree)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    if let Some(worker) = worker {
-        command
-            .env("SLOOP_SOCKET", &worker.socket)
-            .env("SLOOP_TOKEN", &worker.token)
-            .stdin(Stdio::piped());
-    } else {
-        command
-            .env_remove("SLOOP_SOCKET")
-            .env_remove("SLOOP_TOKEN")
-            .stdin(Stdio::null());
-    }
-    let Ok(mut child) = command.spawn() else {
-        return failed(clock.now_ms());
-    };
-    let mut gate = worker.map(|_| child.stdin.take().expect("reported stage stdin was piped"));
-    let pid = child.id();
-    let Some(pid_start_time) = process_start_time(pid) else {
-        unsafe {
-            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-        }
-        let _ = child.wait();
-        return failed(clock.now_ms());
-    };
-    let readers = vec![
-        spawn_output_reader(
-            child.stdout.take().expect("stdout was piped"),
-            output_log.clone(),
-            OutputSource::Aftercare,
-            Some(stage.to_owned()),
-            OutputStream::Stdout,
-        ),
-        spawn_output_reader(
-            child.stderr.take().expect("stderr was piped"),
-            output_log.clone(),
-            OutputSource::Aftercare,
-            Some(stage.to_owned()),
-            OutputStream::Stderr,
-        ),
-    ];
-    if stage == "test" {
-        wait_for_test_hook("before-test-process-checkpoint");
-    }
-    wait_for_test_hook(&format!("before-aftercare-process-checkpoint-{stage}"));
-    if let Err(error) = store.record_aftercare_evidence(
-        run_id,
-        "aftercare_process",
-        &json!({
-            "stage": stage,
-            "pid": pid,
-            "pid_start_time": pid_start_time,
-            "process_group_id": pid,
-        })
-        .to_string(),
-        clock.now_ms(),
-    ) {
-        operational_log.emit_with_fields(
-            LogLevel::Error,
-            "sloop::supervisor",
-            "aftercare_process_checkpoint_failed",
-            json!({"run_id": run_id, "stage": stage, "error": error.to_string()}),
-        );
-        if process_identity_matches(pid, Some(pid_start_time)) {
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-            }
-        }
-        let _ = child.wait();
-        for reader in readers {
-            let _ = reader.join();
-        }
-        return failed(clock.now_ms());
-    }
-    wait_for_test_hook(&format!("after-aftercare-process-checkpoint-{stage}"));
-    if aftercare_cancelled(store, run_id, operational_log) {
-        if process_identity_matches(pid, Some(pid_start_time)) {
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-            }
-        }
-        let _ = child.wait();
-        for reader in readers {
-            let _ = reader.join();
-        }
-        return failed(clock.now_ms());
-    }
-    if let Some(gate) = gate.as_mut()
-        && gate.write_all(b"run\n").is_err()
-    {
-        if process_identity_matches(pid, Some(pid_start_time)) {
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-            }
-        }
-        let _ = child.wait();
-        for reader in readers {
-            let _ = reader.join();
-        }
-        return failed(clock.now_ms());
-    }
-    drop(gate);
-
-    let status = child.wait();
-    if kill_straggler_process_group(pid) {
-        operational_log.emit_with_fields(
+fn stage_result_from_execution(
+    run_id: &str,
+    stage: &str,
+    evidence: ExecutionEvidence,
+    log: &OperationalLog,
+) -> StageResult {
+    if evidence.stragglers_killed {
+        log.emit_with_fields(
             LogLevel::Info,
             "sloop::supervisor",
             "aftercare_stragglers_killed",
-            json!({"run_id": run_id, "stage": stage, "process_group_id": pid}),
+            json!({
+                "run_id": run_id,
+                "stage": stage,
+                "process_group_id": evidence.process.map(|process| process.process_group_id),
+            }),
         );
     }
-    let mut capture_complete = true;
-    for reader in readers {
-        capture_complete &= reader.join().unwrap_or(false);
-    }
-    if !capture_complete {
-        return failed(clock.now_ms());
-    }
-    let Ok(status) = status else {
-        return failed(clock.now_ms());
-    };
     StageResult {
-        verdict: if status.success() {
+        verdict: if evidence.output_capture_complete && evidence.exit_code == Some(0) {
             Verdict::Pass
         } else {
             Verdict::Fail
         },
-        exit_code: status.code(),
-        started_at_ms,
-        finished_at_ms: clock.now_ms(),
+        exit_code: evidence.exit_code,
+        started_at_ms: evidence.started_at_ms,
+        finished_at_ms: evidence.finished_at_ms,
     }
 }
 
@@ -514,7 +453,7 @@ pub(super) fn drive_flow(
     vendor_rejected: bool,
     commits: &[String],
     commit_observation_complete: bool,
-    output_log: &RunLogWriter,
+    output_path: &Path,
     clock: &dyn Clock,
     store: &Store,
     run_id: &str,
@@ -641,11 +580,12 @@ pub(super) fn drive_flow(
                     finished_at_ms: now,
                 }
             }
-            StageKind::Exec { cmd } => run_exec_stage(
+            StageKind::Exec { cmd } => execute_stage_order(
                 worktree,
+                branch,
                 &stage.name,
                 cmd,
-                output_log,
+                output_path,
                 clock,
                 store,
                 run_id,
@@ -716,11 +656,12 @@ pub(super) fn drive_flow(
                 }
             }
             VerdictPolicy::Check { cmd } if result.verdict == Verdict::Pass => {
-                result = run_exec_stage(
+                result = execute_stage_order(
                     worktree,
+                    branch,
                     &stage.name,
                     cmd,
-                    output_log,
+                    output_path,
                     clock,
                     store,
                     run_id,

@@ -12,17 +12,19 @@ use tokio::sync::mpsc;
 use crate::clock::Clock;
 use crate::flow::Flow;
 use crate::logging::{LogLevel, OperationalLog};
-use crate::run_log::{OutputStream, RunLogWriter};
+use crate::run_log::OutputStream;
+use crate::runner::WorkerCredentials;
+use crate::runner::local::{
+    process_start_time, run_output_path, wait_for_test_hook, worker_socket_path,
+};
 use crate::store::{ExitClaim, RecoverableRun, Store};
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
 
 use super::aftercare::{
-    WorkerCredentials, aftercare_cancelled, drive_flow, git_index_lock_path,
-    git_index_matches_head, git_is_ancestor, git_stdout, shared_checkout_has_git_operation,
-    try_commits_on_branch,
+    aftercare_cancelled, drive_flow, git_index_lock_path, git_index_matches_head, git_is_ancestor,
+    git_stdout, shared_checkout_has_git_operation, try_commits_on_branch,
 };
-use super::dispatcher::{DispatcherState, RunEvent, wait_for_test_hook};
-use super::runner::{process_start_time, run_output_path, worker_socket_path};
+use super::dispatcher::{DispatcherState, RunEvent};
 use super::scheduler::{VENDOR_COOLDOWN_MS, bound_flow};
 use super::server::{DaemonError, serve_worker_socket};
 
@@ -365,8 +367,7 @@ pub(super) fn resume_aftercare(
         .and_then(|data| serde_json::from_value::<VendorErrorMatch>(data).ok());
     let cooldown_until_ms =
         value("vendor_error_classified").and_then(|data| data["cooldown_until_ms"].as_i64());
-    let output_log = RunLogWriter::open(&run_output_path(state_dir, &run.id))
-        .map_err(|error| format!("cannot open run output: {error}"))?;
+    let output_path = run_output_path(state_dir, &run.id);
     if aftercare_cancelled(store, &run.id, log) {
         return Ok(RunEvent::Exited {
             run_id: run.id.clone(),
@@ -401,7 +402,7 @@ pub(super) fn resume_aftercare(
         vendor_error.is_some(),
         &commits,
         commit_observation_complete,
-        &output_log,
+        &output_path,
         clock,
         store,
         &run.id,
@@ -487,13 +488,6 @@ pub(super) fn aftercare_process_identity(
 
 pub(super) fn recoverable_process_matches(run: &RecoverableRun) -> bool {
     recoverable_process_identity(run) == ProcessIdentity::Matches
-}
-
-pub(super) fn process_identity_matches(pid: u32, expected_start_time: Option<i64>) -> bool {
-    matches!(
-        (expected_start_time, process_start_time(pid)),
-        (Some(expected), Some(actual)) if expected == actual
-    )
 }
 
 /// Claims the same durable exit handoff used by the normal supervisor. A
@@ -816,19 +810,6 @@ fn recoverable_process_identity(run: &RecoverableRun) -> ProcessIdentity {
     }
 }
 
-/// SIGKILLs whatever is still alive in an exited run's process group and
-/// returns whether live members were found; ESRCH is the clean common case.
-pub(super) fn kill_straggler_process_group(group: u32) -> bool {
-    let group = -(group as libc::pid_t);
-    let stragglers_present = unsafe { libc::kill(group, 0) } == 0;
-    if stragglers_present {
-        unsafe {
-            libc::kill(group, libc::SIGKILL);
-        }
-    }
-    stragglers_present
-}
-
 pub(super) fn classify_run_output(
     classifier: &VendorErrorClassifier,
     state_dir: &Path,
@@ -852,7 +833,7 @@ mod tests {
         PersistedProcessState, ProcessIdentity, classify_persisted_process,
         recoverable_process_identity, recoverable_process_matches,
     };
-    use crate::daemon::runner::process_start_time;
+    use crate::runner::local::process_start_time;
     use crate::store::RecoverableRun;
 
     fn recoverable_current_process(start_time: Option<i64>) -> RecoverableRun {

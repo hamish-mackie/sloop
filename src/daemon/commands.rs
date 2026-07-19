@@ -9,6 +9,7 @@ use crate::config::parse_local_time;
 use crate::domain::ticket::TicketState;
 use crate::logging::LogLevel;
 use crate::protocol::ErrorBody;
+use crate::runner::local::{process_identity_matches, run_output_path};
 use crate::store::{ActivationKind, NewActivation, Store, StoreError};
 
 use super::dispatcher::{
@@ -16,10 +17,8 @@ use super::dispatcher::{
     not_found,
 };
 use super::recovery::{
-    PersistedProcessStop, aftercare_process_identity, process_identity_matches,
-    stop_persisted_process_group,
+    PersistedProcessStop, aftercare_process_identity, stop_persisted_process_group,
 };
-use super::runner::run_output_path;
 use super::scheduler::{index_projects, running_hours_open};
 use super::worker_api::{current_ticket_vendor_error, ticket_show};
 

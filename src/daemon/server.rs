@@ -24,6 +24,7 @@ use crate::logging::{LogLevel, OperationalLog};
 use crate::protocol::{
     Capability, ErrorBody, ErrorCode, Request, RequestEnvelope, RequestId, ResponseEnvelope,
 };
+use crate::runner::local::{process_identity_matches, process_start_time};
 use crate::store::{Store, StoreError};
 use crate::vendor_error::{CatalogError, VendorErrorClassifier};
 
@@ -31,8 +32,7 @@ use super::dispatcher::{
     DispatcherMessage, DispatcherState, RequestOrigin, internal, protocol_error, run_dispatcher,
     unauthorized,
 };
-use super::recovery::{process_identity_matches, recover_inflight_runs};
-use super::runner::process_start_time;
+use super::recovery::recover_inflight_runs;
 use super::scheduler::{index_projects, reconcile_tickets};
 
 const MAX_ENVELOPE_BYTES: u64 = 1024 * 1024;
