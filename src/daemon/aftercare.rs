@@ -442,6 +442,18 @@ pub(super) fn attempt_merge(
     }
 }
 
+/// Restores the default checkout after a conflicting merge so a following
+/// `on_fail` retry is not wedged by the leftover `MERGE_HEAD`. Only used before
+/// a repair actually runs: an exhausted merge preserves the conflict for review.
+fn abort_conflicted_merge(root: &Path) {
+    let _ = Command::new("git")
+        .args(["merge", "--abort"])
+        .current_dir(root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 pub(super) struct FlowRunResult {
     pub(super) aftercare_failed: bool,
     pub(super) merge: Option<MergeOutcome>,
@@ -915,6 +927,14 @@ pub(super) fn drive_flow(
             {
                 let target = resolve_repair_target(ctx, on_fail);
                 if repair_gates_open(ctx, store, &target, clock, clock.now_ms()) {
+                    // A conflicting merge left the default checkout mid-merge.
+                    // Restore it now — only because a repair will run — so the
+                    // repair's integration and the retried merge start clean. An
+                    // exhausted merge that never reaches here keeps the conflict
+                    // for review, exactly as today.
+                    if stage.kind == StageKind::Merge {
+                        abort_conflicted_merge(root);
+                    }
                     let attempt = repair_used + 1;
                     // Record the attempt before spawning so a crash mid-repair
                     // still counts it: recovery re-runs the stage, never the

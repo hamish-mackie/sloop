@@ -209,6 +209,51 @@ remains accepted as a deprecated alias for `kind: agent`.
 A configured `aftercare.test_cmd` is inserted as an implicit `exit` stage named
 `test` immediately after the `agent`, before the flow's own `exec` stages.
 
+### Repairing a failed stage with `on_fail`
+
+By default a failing `exec` stage ends the run and a conflicted `merge` stage
+parks the ticket in `needs_review`. Both often stem from mechanical problems an
+agent could fix in place — a test that broke after the build, or a run branch
+that conflicts with the default branch because other work merged first. An
+optional `on_fail` block on an `exec` or `merge` stage attaches a repair agent:
+
+```yaml
+stages:
+  - name: build
+    kind: agent
+  - name: test
+    kind: exec
+    cmd: [cargo, test, --all-targets]
+    on_fail:
+      agent: "Tests are failing in this worktree. Fix them without weakening assertions, then commit."
+      attempts: 2      # optional, default 1, at most 3
+      target: claude   # optional, defaults to the ticket's target
+      model: haiku     # optional, defaults to the ticket's model
+      effort: low      # optional, defaults to the ticket's effort
+  - name: merge
+    kind: merge
+```
+
+When the stage fails, Sloop spawns the repair agent in the run worktree with the
+configured prompt, and when it exits — however it exits — re-runs the original
+stage and re-applies the stage's own verdict policy. The retried run is the only
+evidence: the repair agent never reports a verdict, and `on_fail` cannot change a
+stage's verdict, command, or ordering. `attempts` allows up to that many
+repair-then-retry cycles (capped at 3); when they run out the outcome is exactly
+today's — an exhausted `exec` stage ends the run `failed`, an exhausted `merge`
+stage parks `needs_review` with the branch preserved.
+
+For a `merge` stage, the repair agent's job is to integrate the **default branch
+into the run branch** (merge or rebase) and resolve conflicts there; the retried
+merge then applies Sloop's normal merge policy. Repair agents only ever work in
+the run worktree — no agent process touches the default-branch checkout.
+
+`target`, `model`, and `effort` configure the repair worker only; `target` is
+validated against your configured agent targets at post time. Each repair spawn
+passes the same running-hours, capacity, cooldown, and budget gates as any other
+agent spawn and counts against those budgets and rate limits, so a closed gate
+simply skips the repair and lets the stage settle as if `on_fail` were absent.
+
 ## Worker instructions
 
 Sloop composes the agent's prompt itself: a fixed bootstrap tells the
