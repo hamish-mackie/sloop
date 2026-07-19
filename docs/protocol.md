@@ -46,7 +46,8 @@ The operator/worker split is enforced at the transport layer:
 
 - **Operator socket** — a fixed per-repository path with mode `0600`,
   printed by `sloop daemon`. Connections on it may use every operator
-  verb; worker tokens are rejected here.
+  verb, plus the read-only `show`, which resolves any ticket, run, or
+  project; worker tokens are rejected here.
 - **Worker socket** — created fresh for each run and torn down with it,
   also mode `0600`. Its path and token reach the agent as the
   `SLOOP_SOCKET` and `SLOOP_TOKEN` environment variables. Only `brief`,
