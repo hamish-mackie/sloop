@@ -21,7 +21,10 @@ Sloop's socket API.
    `max_parallel_tasks`.
 3. **Claim.** The ticket is claimed with a conditional database update that
    takes a lease. Exactly one claimant can win; a ticket is never
-   double-spawned, even when two runs race for it.
+   double-spawned, even when two runs race for it. The lease is the daemon's
+   own — it records which daemon process holds the ticket, and the database
+   itself permits at most one lease per ticket. Workers never hold or see
+   leases; a worker gets a scoped token for its own run instead.
 4. **Dispatch.** Ticket → branch → fresh Git worktree → agent, spawned as a
    supervised child process group with its worker socket and token in the
    environment.
@@ -123,6 +126,13 @@ live agent. At startup, every in-flight run is classified:
   classification.
 - Daemon died mid-aftercare → aftercare stages are individually evidenced,
   so the interrupted stage is re-run idempotently.
+
+Recovery is driven entirely by that process identity, never by how old a
+lease is. A lease's expiry only decides whether it may be renewed, so a
+lease that has outlived its deadline while its run is alive and supervised
+is normal and harmless. The lease row is dropped when the ticket settles or
+its claim is rolled back, so a stale row left behind is evidence of an owner
+that died mid-work.
 
 A lock file guarantees at most one daemon per repository; a second
 `sloop daemon` connects to the first instead of racing it.
