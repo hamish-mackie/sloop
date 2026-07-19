@@ -62,13 +62,13 @@ fn status(world: &World) -> Value {
     World::json_stdout(&output)["data"].clone()
 }
 
-fn repair_attempts(world: &World, run: &str) -> Vec<Value> {
+fn repair_attempts(world: &World, position: usize) -> Vec<Value> {
     let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
     let mut statement = connection
         .prepare("SELECT data_json FROM run_evidence WHERE run_id = ?1 AND kind = 'repair_attempt' ORDER BY dedupe_key")
         .expect("prepare repair query");
     statement
-        .query_map([run], |row| row.get::<_, String>(0))
+        .query_map([world.run_id(position)], |row| row.get::<_, String>(0))
         .expect("query repair attempts")
         .map(|data| serde_json::from_str(&data.unwrap()).unwrap())
         .collect()
@@ -116,7 +116,7 @@ fn exec_repair_fixes_the_tree_and_the_run_merges() {
     });
 
     // Exactly one repair attempt, and the fix reached the default branch.
-    let attempts = repair_attempts(&world, "R1");
+    let attempts = repair_attempts(&world, 1);
     assert_eq!(attempts.len(), 1, "{attempts:?}");
     assert_eq!(attempts[0]["stage"], "test");
     assert_eq!(attempts[0]["attempt"], 1);
@@ -155,7 +155,7 @@ fn exec_repair_that_does_not_fix_exhausts_attempts_and_fails() {
     });
 
     // The full attempt budget was spent before giving up.
-    let attempts = repair_attempts(&world, "R1");
+    let attempts = repair_attempts(&world, 1);
     assert_eq!(attempts.len(), 2, "{attempts:?}");
     assert_eq!(fs::read_to_string(&log).unwrap().len(), 2);
     assert_eq!(status(&world)["tickets"]["merged"], 0);
@@ -208,7 +208,7 @@ fn repair_honors_target_model_and_effort_overrides() {
     assert!(argv.contains("--model haiku"), "{argv}");
     assert!(argv.contains("--effort low"), "{argv}");
     assert!(argv.contains("REPAIR with overrides"), "{argv}");
-    assert_eq!(repair_attempts(&world, "R1")[0]["target"], "special");
+    assert_eq!(repair_attempts(&world, 1)[0]["target"], "special");
 }
 
 #[test]
@@ -248,7 +248,7 @@ fn a_closed_gate_skips_repair_and_settles_as_if_absent() {
     wait_until_slow("the gated run fails without repair", || {
         status(&world)["tickets"]["failed"] == 1
     });
-    assert!(repair_attempts(&world, "R1").is_empty());
+    assert!(repair_attempts(&world, 1).is_empty());
     assert_eq!(fs::read_to_string(&spawn_log).unwrap(), "");
 }
 
@@ -262,7 +262,6 @@ fn merge_repair_integrates_the_default_branch_and_merges() {
     let release = world.root().join("release");
     let ready = world.root().join("build-ready");
     let pwd_log = world.root().join("repair-pwd.log");
-    let worktree = world.root().join(".worktrees/R1");
     // Build changes the shared file and blocks so the default branch can
     // advance with a conflicting change before the merge is attempted. The
     // repair agent — running only in the worktree — merges the default branch
@@ -313,10 +312,11 @@ fn merge_repair_integrates_the_default_branch_and_merges() {
         status(&world)["tickets"]["merged"] == 1
     });
 
-    let attempts = repair_attempts(&world, "R1");
+    let attempts = repair_attempts(&world, 1);
     assert_eq!(attempts.len(), 1, "{attempts:?}");
     assert_eq!(attempts[0]["stage"], "merge");
     // The repair worked only in the run worktree, never the default checkout.
+    let worktree = world.run_worktree(1);
     let pwd = fs::read_to_string(&pwd_log).unwrap();
     assert!(
         pwd.trim().ends_with(worktree.to_string_lossy().as_ref()),
@@ -381,12 +381,16 @@ fn merge_repair_that_leaves_conflicts_parks_needs_review() {
     wait_until_slow("the unrepaired merge parks for review", || {
         status(&world)["tickets"]["needs_review"] == 1
     });
-    assert_eq!(repair_attempts(&world, "R1").len(), 1);
+    assert_eq!(repair_attempts(&world, 1).len(), 1);
     // The run branch is preserved for a human to reconcile.
     assert!(
         git_root(
             &world,
-            &["rev-parse", "--verify", &format!("sloop/{ticket}-a1-R1")]
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("sloop/{ticket}-a1-{}", &world.run_id(1)[..8])
+            ]
         )
         .status
         .success()
@@ -438,7 +442,7 @@ fn a_restart_mid_repair_resumes_without_double_spawning() {
     // Exactly one repair spawn survived the restart: the attempt was neither
     // lost nor repeated.
     assert_eq!(fs::read_to_string(&spawn_log).unwrap(), "x");
-    assert_eq!(repair_attempts(&world, "R1").len(), 1);
+    assert_eq!(repair_attempts(&world, 1).len(), 1);
 }
 
 fn git_root(world: &World, args: &[&str]) -> std::process::Output {

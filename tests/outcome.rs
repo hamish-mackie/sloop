@@ -79,7 +79,8 @@ fn write_flow(world: &World, contents: &str) {
     .expect("write test flow");
 }
 
-fn aftercare_stages(world: &World, run_id: &str) -> Vec<(i64, String, String, String)> {
+fn aftercare_stages(world: &World, position: usize) -> Vec<(i64, String, String, String)> {
+    let run_id = world.run_id(position);
     let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
     let mut statement = connection
         .prepare(
@@ -88,7 +89,7 @@ fn aftercare_stages(world: &World, run_id: &str) -> Vec<(i64, String, String, St
         )
         .expect("prepare aftercare stage query");
     statement
-        .query_map([run_id], |row| {
+        .query_map([&run_id], |row| {
             let evidence: String = row.get(3)?;
             let evidence: serde_json::Value = serde_json::from_str(&evidence).unwrap();
             Ok((
@@ -103,12 +104,13 @@ fn aftercare_stages(world: &World, run_id: &str) -> Vec<(i64, String, String, St
         .expect("read aftercare stages")
 }
 
-fn aftercare_stage_evidence(world: &World, run_id: &str, stage: &str) -> serde_json::Value {
+fn aftercare_stage_evidence(world: &World, position: usize, stage: &str) -> serde_json::Value {
+    let run_id = world.run_id(position);
     let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
     let evidence: String = connection
         .query_row(
             "SELECT evidence_json FROM aftercare_stages WHERE run_id = ?1 AND stage = ?2",
-            [run_id, stage],
+            [run_id.as_str(), stage],
             |row| row.get(0),
         )
         .expect("read aftercare stage evidence");
@@ -199,7 +201,7 @@ fn committed_work_with_passing_tests_is_merged() {
     assert!(default_branch_has(&world, "work.txt"));
 
     // The aftercare test stage's output is captured evidence.
-    let output = world.sloop(&["logs", "R1"]);
+    let output = world.sloop(&["logs", &world.run_id(1)]);
     assert!(output.status.success());
     let entries = World::json_stdout(&output)["data"]["entries"].clone();
     assert!(
@@ -257,7 +259,7 @@ fn flow_executes_in_order_and_records_one_row_per_stage() {
 
     wait_until("the flow merges", || tickets(&world)["merged"] == 1);
     assert!(default_branch_has(&world, "work.txt"));
-    let stages = aftercare_stages(&world, "R1");
+    let stages = aftercare_stages(&world, 1);
     assert_eq!(
         stages
             .iter()
@@ -272,9 +274,9 @@ fn flow_executes_in_order_and_records_one_row_per_stage() {
     assert!(
         stages
             .iter()
-            .all(|(_, _, _, output)| output == "runs/R1/output.ndjson")
+            .all(|(_, _, _, output)| *output == format!("runs/{}/output.ndjson", world.run_id(1)))
     );
-    let logs = world.sloop(&["logs", "R1"]);
+    let logs = world.sloop(&["logs", &world.run_id(1)]);
     let entries = World::json_stdout(&logs)["data"]["entries"]
         .as_array()
         .unwrap()
@@ -303,7 +305,7 @@ fn failed_exec_halts_before_merge_and_preserves_commits_for_review() {
     });
     assert!(!default_branch_has(&world, "work.txt"));
     assert_eq!(
-        aftercare_stages(&world, "R1")
+        aftercare_stages(&world, 1)
             .into_iter()
             .map(|(_, name, state, _)| (name, state))
             .collect::<Vec<_>>(),
@@ -342,7 +344,7 @@ fn check_verdict_uses_the_check_commands_exit() {
         tickets(&failing)["needs_review"] == 1
     });
     assert_eq!(
-        aftercare_stages(&failing, "R1")
+        aftercare_stages(&failing, 1)
             .into_iter()
             .map(|(_, name, state, _)| (name, state))
             .collect::<Vec<_>>(),
@@ -368,7 +370,7 @@ fn reported_stage_without_a_report_fails_with_a_reason() {
     wait_until("the unreported stage needs review", || {
         tickets(&world)["needs_review"] == 1
     });
-    let evidence = aftercare_stage_evidence(&world, "R1", "review");
+    let evidence = aftercare_stage_evidence(&world, 1, "review");
     assert_eq!(evidence["verdict_source"], "reported");
     assert_eq!(evidence["reason"], "no verdict reported");
 }
@@ -393,7 +395,7 @@ fn unknown_bound_flow_never_falls_back_to_default() {
         fs::read_to_string(world.daemon_log())
             .is_ok_and(|log| log.contains("bound_flow_resolution_failed"))
     });
-    assert!(!world.root().join(".worktrees/R1").exists());
+    assert!(!world.run_worktree(1).exists());
     let runs: i64 = connection
         .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
         .unwrap();
@@ -452,7 +454,7 @@ fn merge_success_survives_merge_stage_evidence_failure() {
     );
     assert!(default_branch_has(&world, "work.txt"));
     assert_eq!(
-        aftercare_stages(&world, "R1")
+        aftercare_stages(&world, 1)
             .into_iter()
             .map(|(_, stage, _, _)| stage)
             .collect::<Vec<_>>(),
@@ -480,7 +482,9 @@ fn incomplete_commit_observation_keeps_failed_aftercare_for_review() {
         tickets(&world)["needs_review"] == 1
     });
     assert_eq!(
-        world.run_evidence("R1", "commits_observed").unwrap()["complete"],
+        world
+            .run_evidence(&world.run_id(1), "commits_observed")
+            .unwrap()["complete"],
         false
     );
 }
@@ -546,7 +550,7 @@ fn restart_between_exec_stages_skips_the_completed_stage() {
         tickets(&world)["merged"] == 1
     });
     assert_eq!(fs::read_to_string(invocations).unwrap(), "12");
-    assert_eq!(aftercare_stages(&world, "R1").len(), 4);
+    assert_eq!(aftercare_stages(&world, 1).len(), 4);
 }
 
 #[test]
@@ -565,17 +569,20 @@ fn cancel_kills_a_custom_exec_process_group_and_preserves_the_worktree() {
     world.start_daemon();
     post_and_run(&world, "cancel-flow.md");
     wait_until("the custom stage is checkpointed", || {
-        process_ids.is_file() && world.run_evidence("R1", "aftercare_process").is_some()
+        process_ids.is_file()
+            && world
+                .run_evidence(&world.run_id(1), "aftercare_process")
+                .is_some()
     });
     let process_ids = read_process_ids(process_ids);
 
-    assert!(world.sloop(&["cancel", "R1"]).status.success());
+    assert!(world.sloop(&["cancel", &world.run_id(1)]).status.success());
     wait_until("the cancelled flow releases its ticket", || {
         let counts = tickets(&world);
         counts["ready"] == 1 && counts["claimed"] == 0
     });
     wait_for_processes_to_exit(process_ids);
-    assert!(world.root().join(".worktrees/R1").is_dir());
+    assert!(world.run_worktree(1).is_dir());
 }
 
 #[test]
@@ -594,7 +601,10 @@ fn cancel_never_signals_a_recycled_aftercare_process_group() {
     world.start_daemon();
     post_and_run(&world, "recycled-aftercare-pgid.md");
     wait_until("the custom stage is checkpointed", || {
-        process_ids.is_file() && world.run_evidence("R1", "aftercare_process").is_some()
+        process_ids.is_file()
+            && world
+                .run_evidence(&world.run_id(1), "aftercare_process")
+                .is_some()
     });
     let original_processes = read_process_ids(process_ids);
     let mut unrelated = spawn_unrelated_process_group();
@@ -603,18 +613,21 @@ fn cancel_never_signals_a_recycled_aftercare_process_group() {
     connection
         .execute(
             "UPDATE run_evidence SET data_json = ?1
-             WHERE run_id = 'R1' AND kind = 'aftercare_process'",
-            [serde_json::json!({
-                "stage": "wait",
-                "pid": unrelated_pid,
-                "pid_start_time": 0,
-                "process_group_id": unrelated_pid,
-            })
-            .to_string()],
+             WHERE run_id = ?2 AND kind = 'aftercare_process'",
+            [
+                serde_json::json!({
+                    "stage": "wait",
+                    "pid": unrelated_pid,
+                    "pid_start_time": 0,
+                    "process_group_id": unrelated_pid,
+                })
+                .to_string(),
+                world.run_id(1),
+            ],
         )
         .unwrap();
 
-    assert!(world.sloop(&["cancel", "R1"]).status.success());
+    assert!(world.sloop(&["cancel", &world.run_id(1)]).status.success());
     assert!(
         unrelated.try_wait().unwrap().is_none(),
         "a recycled process group must not be signalled"
@@ -673,7 +686,9 @@ fn recovery_does_not_signal_a_group_after_the_recorded_leader_exits() {
     post_and_run(&world, "orphaned-exec-child.md");
     wait_until("the exec checkpoint is durable", || {
         world.test_hook_reached(HOOK)
-            && world.run_evidence("R1", "aftercare_process").is_some()
+            && world
+                .run_evidence(&world.run_id(1), "aftercare_process")
+                .is_some()
             && process_ids.is_file()
     });
     let first_processes = read_process_ids(process_ids.clone());
@@ -712,7 +727,10 @@ fn recovery_preserves_partial_merge_state_and_fails_for_review() {
     let daemon_pid = world.start_daemon()["data"]["pid"].as_u64().unwrap() as u32;
     post_and_run(&world, "interrupted-merge.md");
     wait_until("the first merge reaches its hook", || {
-        fixture.started.is_file() && world.run_evidence("R1", "aftercare_process").is_some()
+        fixture.started.is_file()
+            && world
+                .run_evidence(&world.run_id(1), "aftercare_process")
+                .is_some()
     });
 
     world.kill_daemon(daemon_pid);
@@ -764,7 +782,9 @@ fn recovery_settles_a_completed_uncheckpointed_merge_idempotently() {
     wait_until("the merge completes before its stage checkpoint", || {
         world.test_hook_reached(HOOK)
             && default_branch_has(&world, "work.txt")
-            && world.run_evidence("R1", "aftercare_process").is_some()
+            && world
+                .run_evidence(&world.run_id(1), "aftercare_process")
+                .is_some()
     });
 
     world.kill_daemon(daemon_pid);
@@ -775,7 +795,7 @@ fn recovery_settles_a_completed_uncheckpointed_merge_idempotently() {
     });
     assert!(default_branch_has(&world, "work.txt"));
     assert_eq!(
-        aftercare_stages(&world, "R1")
+        aftercare_stages(&world, 1)
             .into_iter()
             .map(|(_, stage, state, _)| (stage, state))
             .collect::<Vec<_>>(),
@@ -805,7 +825,7 @@ fn recovery_does_not_reapply_a_completed_merge_after_target_reset() {
     wait_until("the merge completes before target reset", || {
         world.test_hook_reached(HOOK)
             && world
-                .run_evidence("R1", "aftercare_process")
+                .run_evidence(&world.run_id(1), "aftercare_process")
                 .is_some_and(|evidence| evidence["merge"]["completed_target"].is_string())
     });
 
@@ -849,7 +869,7 @@ fn recovery_does_not_reapply_a_completed_merge_after_target_moves() {
     wait_until("the merge completes before target move", || {
         world.test_hook_reached(HOOK)
             && world
-                .run_evidence("R1", "aftercare_process")
+                .run_evidence(&world.run_id(1), "aftercare_process")
                 .is_some_and(|evidence| evidence["merge"]["completed_target"].is_string())
     });
 
@@ -934,12 +954,12 @@ fn recovery_does_not_merge_an_advanced_run_branch() {
     wait_until("the blocked merge has its baseline checkpoint", || {
         world.test_hook_reached(HOOK)
             && world
-                .run_evidence("R1", "aftercare_process")
+                .run_evidence(&world.run_id(1), "aftercare_process")
                 .is_some_and(|evidence| evidence["merge"]["branch_tip"].is_string())
     });
 
     world.kill_daemon(daemon_pid);
-    let worktree = world.root().join(".worktrees/R1");
+    let worktree = world.run_worktree(1);
     fs::write(worktree.join("advanced.txt"), "advanced\n").unwrap();
     assert!(
         Command::new("git")
@@ -1008,10 +1028,14 @@ fn recovery_preserves_conflicted_and_unrelated_operator_edits_after_merge_exit()
     post_and_run(&world, "exited-conflict.md");
     wait_until("the failed merge exits with owned conflict state", || {
         world.test_hook_reached(HOOK)
-            && world.run_evidence("R1", "aftercare_process").is_some()
+            && world
+                .run_evidence(&world.run_id(1), "aftercare_process")
+                .is_some()
             && world.root().join(".git/MERGE_HEAD").is_file()
     });
-    let merge_pid = world.run_evidence("R1", "aftercare_process").unwrap()["pid"]
+    let merge_pid = world
+        .run_evidence(&world.run_id(1), "aftercare_process")
+        .unwrap()["pid"]
         .as_u64()
         .unwrap() as u32;
     assert!(!process_alive(merge_pid));
@@ -1090,9 +1114,14 @@ fn recovery_preserves_operator_changes_made_during_an_interrupted_merge() {
     let daemon_pid = world.start_daemon()["data"]["pid"].as_u64().unwrap() as u32;
     post_and_run(&world, "operator-changed-merge.md");
     wait_until("the merge reaches its hook", || {
-        fixture.started.is_file() && world.run_evidence("R1", "aftercare_process").is_some()
+        fixture.started.is_file()
+            && world
+                .run_evidence(&world.run_id(1), "aftercare_process")
+                .is_some()
     });
-    let merge_pid = world.run_evidence("R1", "aftercare_process").unwrap()["pid"]
+    let merge_pid = world
+        .run_evidence(&world.run_id(1), "aftercare_process")
+        .unwrap()["pid"]
         .as_u64()
         .unwrap() as u32;
 
@@ -1138,9 +1167,14 @@ fn recovery_preserves_unrelated_merge_state() {
     let daemon_pid = world.start_daemon()["data"]["pid"].as_u64().unwrap() as u32;
     post_and_run(&world, "unrelated-merge.md");
     wait_until("the merge reaches its hook", || {
-        fixture.started.is_file() && world.run_evidence("R1", "aftercare_process").is_some()
+        fixture.started.is_file()
+            && world
+                .run_evidence(&world.run_id(1), "aftercare_process")
+                .is_some()
     });
-    let merge_pid = world.run_evidence("R1", "aftercare_process").unwrap()["pid"]
+    let merge_pid = world
+        .run_evidence(&world.run_id(1), "aftercare_process")
+        .unwrap()["pid"]
         .as_u64()
         .unwrap() as u32;
     world.kill_daemon(daemon_pid);
@@ -1200,9 +1234,14 @@ fn recovery_never_removes_an_unowned_index_lock() {
     let daemon_pid = world.start_daemon()["data"]["pid"].as_u64().unwrap() as u32;
     post_and_run(&world, "unowned-index-lock.md");
     wait_until("the merge reaches its hook", || {
-        fixture.started.is_file() && world.run_evidence("R1", "aftercare_process").is_some()
+        fixture.started.is_file()
+            && world
+                .run_evidence(&world.run_id(1), "aftercare_process")
+                .is_some()
     });
-    let merge_pid = world.run_evidence("R1", "aftercare_process").unwrap()["pid"]
+    let merge_pid = world
+        .run_evidence(&world.run_id(1), "aftercare_process")
+        .unwrap()["pid"]
         .as_u64()
         .unwrap() as u32;
     world.kill_daemon(daemon_pid);
@@ -1258,9 +1297,13 @@ fn cancellation_at_arbitrary_exec_startup_kills_the_stage_group() {
     wait_until("the arbitrary exec reaches its startup gate", || {
         world.test_hook_reached(HOOK) && process_ids.is_file()
     });
-    assert!(world.run_evidence("R1", "aftercare_process").is_none());
+    assert!(
+        world
+            .run_evidence(&world.run_id(1), "aftercare_process")
+            .is_none()
+    );
 
-    assert!(world.sloop(&["cancel", "R1"]).status.success());
+    assert!(world.sloop(&["cancel", &world.run_id(1)]).status.success());
     let process_ids = read_process_ids(process_ids);
     world.release_test_hook(HOOK);
     wait_until("the startup-racing exec is cancelled", || {
@@ -1323,17 +1366,20 @@ fn cancel_stops_an_active_aftercare_process_and_releases_the_ticket() {
     world.start_daemon();
     post_and_run(&world, "cancel-aftercare.md");
     wait_until("the aftercare process checkpoint is durable", || {
-        process_ids.is_file() && world.run_evidence("R1", "aftercare_process").is_some()
+        process_ids.is_file()
+            && world
+                .run_evidence(&world.run_id(1), "aftercare_process")
+                .is_some()
     });
     let process_ids = read_process_ids(process_ids);
 
-    let cancelled = world.sloop(&["cancel", "R1"]);
+    let cancelled = world.sloop(&["cancel", &world.run_id(1)]);
     assert!(cancelled.status.success());
     wait_until("cancelled aftercare settles", || {
         let counts = tickets(&world);
         counts["ready"] == 1 && counts["claimed"] == 0
     });
-    let waited = world.sloop(&["wait", "R1", "--timeout", "5"]);
+    let waited = world.sloop(&["wait", &world.run_id(1), "--timeout", "5"]);
     assert!(!waited.status.success());
     assert_eq!(
         World::json_stdout_or_stderr(&waited)["data"]["state"],
@@ -1360,12 +1406,24 @@ fn cancellation_before_the_test_process_checkpoint_stops_aftercare() {
     wait_until("the test process reaches its checkpoint gate", || {
         world.test_hook_reached(HOOK) && process_ids.is_file()
     });
-    assert!(world.run_evidence("R1", "aftercare_process").is_none());
+    assert!(
+        world
+            .run_evidence(&world.run_id(1), "aftercare_process")
+            .is_none()
+    );
 
-    let cancelled = world.sloop(&["cancel", "R1"]);
+    let cancelled = world.sloop(&["cancel", &world.run_id(1)]);
     assert!(cancelled.status.success());
-    assert!(world.run_evidence("R1", "cancel_requested").is_some());
-    assert!(world.run_evidence("R1", "aftercare_process").is_none());
+    assert!(
+        world
+            .run_evidence(&world.run_id(1), "cancel_requested")
+            .is_some()
+    );
+    assert!(
+        world
+            .run_evidence(&world.run_id(1), "aftercare_process")
+            .is_none()
+    );
     let process_ids = read_process_ids(process_ids);
     world.release_test_hook(HOOK);
 
@@ -1373,13 +1431,17 @@ fn cancellation_before_the_test_process_checkpoint_stops_aftercare() {
         let counts = tickets(&world);
         counts["ready"] == 1 && counts["claimed"] == 0
     });
-    let waited = world.sloop(&["wait", "R1", "--timeout", "5"]);
+    let waited = world.sloop(&["wait", &world.run_id(1), "--timeout", "5"]);
     assert!(!waited.status.success());
     assert_eq!(
         World::json_stdout_or_stderr(&waited)["data"]["state"],
         "cancelled"
     );
-    assert!(world.run_evidence("R1", "aftercare_process").is_none());
+    assert!(
+        world
+            .run_evidence(&world.run_id(1), "aftercare_process")
+            .is_none()
+    );
     wait_for_processes_to_exit(process_ids);
 }
 
@@ -1470,7 +1532,7 @@ fn exit_zero_without_commits_needs_review_before_tests() {
     wait_until("the ticket reaches needs review", || {
         tickets(&world)["needs_review"] == 1
     });
-    assert!(!world.root().join(".worktrees/R1/tested.txt").exists());
+    assert!(!world.run_worktree(1).join("tested.txt").exists());
 }
 
 #[test]
@@ -1523,7 +1585,7 @@ fn a_nonzero_exit_fails_even_when_the_agent_committed() {
     wait_until("the ticket reaches failed", || {
         tickets(&world)["failed"] == 1
     });
-    assert!(!world.root().join(".worktrees/R1/tested.txt").exists());
+    assert!(!world.run_worktree(1).join("tested.txt").exists());
 }
 
 #[test]
@@ -1578,21 +1640,21 @@ fn cancel_kills_the_whole_process_group_and_frees_the_ticket() {
     world.start_daemon();
     post_and_run(&world, "cancel-me.md");
 
-    let pid_file: PathBuf = world.root().join(".worktrees/R1/grandchild.pid");
+    let pid_file: PathBuf = world.run_worktree(1).join("grandchild.pid");
     wait_until("the agent starts and records its grandchild", || {
         pid_file.is_file()
     });
     let grandchild = fs::read_to_string(&pid_file).unwrap().trim().to_owned();
     assert!(pid_alive(&grandchild));
 
-    let output = world.sloop(&["cancel", "R1"]);
+    let output = world.sloop(&["cancel", &world.run_id(1)]);
     assert!(
         output.status.success(),
         "cancel failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let data = World::json_stdout(&output)["data"].clone();
-    assert_eq!(data["run"], "R1");
+    assert_eq!(data["id"], world.run_id(1));
     assert_eq!(data["state"], "cancelling");
     assert_eq!(data["preserved"], true);
 
@@ -1604,8 +1666,8 @@ fn cancel_kills_the_whole_process_group_and_frees_the_ticket() {
     });
 
     // Worktree, branch, and captured logs survive cancellation as evidence.
-    assert!(world.root().join(".worktrees/R1").is_dir());
-    let output = world.sloop(&["logs", "R1"]);
+    assert!(world.run_worktree(1).is_dir());
+    let output = world.sloop(&["logs", &world.run_id(1)]);
     assert!(output.status.success());
     assert!(
         !World::json_stdout(&output)["data"]["entries"]
@@ -1615,7 +1677,7 @@ fn cancel_kills_the_whole_process_group_and_frees_the_ticket() {
     );
 
     // Cancelling twice while the exit is already resolved cannot double-free.
-    let repeat = world.sloop(&["cancel", "R1"]);
+    let repeat = world.sloop(&["cancel", &world.run_id(1)]);
     let response = json_stderr(&repeat);
     assert_eq!(response["ok"], false);
     assert_eq!(response["error"]["code"], "conflict");
@@ -1631,7 +1693,7 @@ fn a_finished_run_cannot_be_cancelled() {
 
     wait_until("the run finishes", || tickets(&world)["needs_review"] == 1);
 
-    let output = world.sloop(&["cancel", "R1"]);
+    let output = world.sloop(&["cancel", &world.run_id(1)]);
     let response = json_stderr(&output);
     assert_eq!(response["ok"], false);
     assert_eq!(response["error"]["code"], "conflict");
@@ -1699,7 +1761,7 @@ fn authentication_and_configuration_rejections_fail_without_aftercare() {
         wait_until("the rejected run fails", || tickets(&world)["failed"] == 1);
         assert!(!aftercare_marker.exists());
         let evidence = world
-            .run_evidence("R1", "vendor_error_classified")
+            .run_evidence(&world.run_id(1), "vendor_error_classified")
             .expect("vendor classification evidence");
         assert_eq!(evidence["class"], class);
         assert_eq!(evidence["vendor"], "codex");
@@ -1752,7 +1814,7 @@ fn retryable_and_unknown_rejections_release_under_a_target_cooldown() {
             let counts = tickets(&world);
             counts["ready"] == 1 && counts["claimed"] == 0
         });
-        let waited = world.sloop(&["wait", "R1", "--timeout", "5"]);
+        let waited = world.sloop(&["wait", &world.run_id(1), "--timeout", "5"]);
         assert!(!waited.status.success());
         let response = World::json_stdout_or_stderr(&waited);
         assert_eq!(response["data"]["state"], "rate_limited");
@@ -1791,7 +1853,7 @@ fn cooldown_and_automatic_retry_survive_a_daemon_restart() {
     wait_until("the first run enters cooldown", || {
         tickets(&world)["ready"] == 1
             && world
-                .run_evidence("R1", "vendor_error_classified")
+                .run_evidence(&world.run_id(1), "vendor_error_classified")
                 .is_some()
     });
 
@@ -1847,17 +1909,19 @@ fn a_recognized_rejection_with_commits_never_tests_or_merges_the_work() {
     assert!(!aftercare_marker.exists());
     assert!(!world.root().join("rejected-work.txt").exists());
     assert_eq!(
-        world.run_evidence("R1", "vendor_error_classified").unwrap()["class"],
+        world
+            .run_evidence(&world.run_id(1), "vendor_error_classified")
+            .unwrap()["class"],
         "unknown_rejection"
     );
     assert_eq!(
-        aftercare_stages(&world, "R1")
+        aftercare_stages(&world, 1)
             .into_iter()
             .map(|(_, stage, state, _)| (stage, state))
             .collect::<Vec<_>>(),
         [("build".into(), "failed".into())]
     );
-    let waited = world.sloop_plain(&["wait", "R1", "--timeout", "5"]);
+    let waited = world.sloop_plain(&["wait", &world.run_id(1), "--timeout", "5"]);
     let text = String::from_utf8_lossy(&waited.stderr);
     assert!(text.contains("OpenCode rejected the request"), "{text}");
 }
@@ -1938,14 +2002,14 @@ fn cancellation_after_rejection_checkpoint_wins_without_a_cooldown() {
     wait_until("the rejection checkpoint is durable", || {
         world.test_hook_reached(HOOK)
             && world
-                .run_evidence("R1", "vendor_error_classified")
+                .run_evidence(&world.run_id(1), "vendor_error_classified")
                 .is_some()
     });
 
-    assert!(world.sloop(&["cancel", "R1"]).status.success());
+    assert!(world.sloop(&["cancel", &world.run_id(1)]).status.success());
     world.release_test_hook(HOOK);
     wait_until("cancellation settles", || tickets(&world)["ready"] == 1);
-    let waited = world.sloop(&["wait", "R1", "--timeout", "5"]);
+    let waited = world.sloop(&["wait", &world.run_id(1), "--timeout", "5"]);
     assert_eq!(
         World::json_stdout_or_stderr(&waited)["data"]["state"],
         "cancelled"
@@ -1974,13 +2038,14 @@ fn recovery_preserves_the_checkpointed_cooldown_deadline() {
     wait_until("the rejection deadline is checkpointed", || {
         world.test_hook_reached(HOOK)
             && world
-                .run_evidence("R1", "vendor_error_classified")
+                .run_evidence(&world.run_id(1), "vendor_error_classified")
                 .is_some()
     });
-    let deadline =
-        world.run_evidence("R1", "vendor_error_classified").unwrap()["cooldown_until_ms"]
-            .as_i64()
-            .unwrap();
+    let deadline = world
+        .run_evidence(&world.run_id(1), "vendor_error_classified")
+        .unwrap()["cooldown_until_ms"]
+        .as_i64()
+        .unwrap();
 
     world.kill_daemon(daemon["data"]["pid"].as_u64().unwrap() as u32);
     world.tick(Duration::from_secs(240));

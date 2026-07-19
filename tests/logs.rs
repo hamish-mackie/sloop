@@ -51,14 +51,15 @@ fn logs_returns_ordered_captured_output_from_both_streams() {
         World::json_stdout(&output)["data"]["gate"]["active_agents"] == 0
     });
 
-    let output = world.sloop(&["logs", "R1"]);
+    let output = world.sloop(&["logs", &world.run_id(1)]);
     assert!(
         output.status.success(),
         "logs failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let data = World::json_stdout(&output)["data"].clone();
-    assert_eq!(data["run"], "R1");
+    assert_eq!(data["id"], world.run_id(1));
+    assert_eq!(data["alias"], world.run_alias(1));
     assert_eq!(data["complete"], true);
 
     let entries = data["entries"].as_array().unwrap();
@@ -114,7 +115,7 @@ fn logs_for_a_missing_run_names_the_run_id_shape() {
         .as_str()
         .expect("error message");
     assert!(
-        message.contains("`R14`") && message.contains("sloop list"),
+        message.contains("`TICK-20-r1`") && message.contains("sloop list"),
         "remedy does not name the run id shape: {message}"
     );
 }

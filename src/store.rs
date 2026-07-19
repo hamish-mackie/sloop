@@ -182,8 +182,6 @@ CREATE TABLE IF NOT EXISTS id_counters (
 INSERT OR IGNORE INTO id_counters (kind, next_ordinal)
 SELECT 'activation', COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) + 1 FROM activations;
 INSERT OR IGNORE INTO id_counters (kind, next_ordinal)
-SELECT 'run', COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) + 1 FROM runs;
-INSERT OR IGNORE INTO id_counters (kind, next_ordinal)
 SELECT 'note', COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) + 1 FROM notes;
 ";
 
@@ -387,6 +385,9 @@ pub struct QueuedActivation {
 pub struct ActiveRun {
     pub id: String,
     pub ticket_id: String,
+    /// Carried so callers can render the run's alias without a second lookup.
+    pub attempt: i64,
+    pub ticket_name: String,
     pub project_id: String,
     pub state: String,
 }
@@ -395,6 +396,9 @@ pub struct ActiveRun {
 pub struct RunRecord {
     pub id: String,
     pub ticket_id: String,
+    /// The per-ticket attempt this run served. Frozen at claim, so it is the
+    /// second half of the run's alias.
+    pub attempt: i64,
     pub state: String,
     pub branch: Option<String>,
     pub worktree_path: Option<String>,
@@ -405,6 +409,31 @@ pub struct RunRecord {
     pub exited_at_ms: Option<i64>,
     pub flow_json: Option<String>,
     pub ticket_json: Option<String>,
+}
+
+/// Every `RunRecord` read uses this projection so the column order and the
+/// mapper below can never drift apart.
+const RUN_RECORD_SELECT: &str = "SELECT id, ticket_id, attempt, state, branch, worktree_path, pid,
+            pid_start_time, process_group_id, exit_code, exited_at_ms,
+            flow_json, ticket_json
+     FROM runs";
+
+fn run_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
+    Ok(RunRecord {
+        id: row.get(0)?,
+        ticket_id: row.get(1)?,
+        attempt: row.get(2)?,
+        state: row.get(3)?,
+        branch: row.get(4)?,
+        worktree_path: row.get(5)?,
+        pid: row.get(6)?,
+        pid_start_time: row.get(7)?,
+        process_group_id: row.get(8)?,
+        exit_code: row.get(9)?,
+        exited_at_ms: row.get(10)?,
+        flow_json: row.get(11)?,
+        ticket_json: row.get(12)?,
+    })
 }
 
 /// A `needs_review` ticket paired with the preserved run branch whose tip the
@@ -1612,22 +1641,6 @@ impl Store {
             .map_err(StoreError::from)
     }
 
-    /// Returns the next run ordinal. A successful claim advances the durable
-    /// high-water counter so IDs and output paths cannot be reused.
-    pub fn next_run_ordinal(&self) -> Result<i64, StoreError> {
-        self.next_ordinal("run", "runs")
-    }
-
-    pub fn ensure_next_run_ordinal(&self, minimum: i64) -> Result<(), StoreError> {
-        self.connection.execute(
-            "UPDATE id_counters
-             SET next_ordinal = MAX(next_ordinal, ?1)
-             WHERE kind = 'run'",
-            params![minimum],
-        )?;
-        Ok(())
-    }
-
     /// Records a successful launch: the run turns `running` and carries the
     /// worktree, branch, and durable process identity.
     #[allow(clippy::too_many_arguments)]
@@ -2236,30 +2249,59 @@ impl Store {
         let run = self
             .connection
             .query_row(
-                "SELECT id, ticket_id, state, branch, worktree_path, pid,
-                        pid_start_time, process_group_id, exit_code, exited_at_ms,
-                        flow_json, ticket_json
-                 FROM runs WHERE id = ?1",
+                &format!("{RUN_RECORD_SELECT} WHERE id = ?1"),
                 params![id],
-                |row| {
-                    Ok(RunRecord {
-                        id: row.get(0)?,
-                        ticket_id: row.get(1)?,
-                        state: row.get(2)?,
-                        branch: row.get(3)?,
-                        worktree_path: row.get(4)?,
-                        pid: row.get(5)?,
-                        pid_start_time: row.get(6)?,
-                        process_group_id: row.get(7)?,
-                        exit_code: row.get(8)?,
-                        exited_at_ms: row.get(9)?,
-                        flow_json: row.get(10)?,
-                        ticket_json: row.get(11)?,
-                    })
-                },
+                run_record,
             )
             .optional()?;
         Ok(run)
+    }
+
+    /// The run a `<ticket>-r<attempt>` alias names. The pair is unique because
+    /// attempts are allocated once per ticket at claim time.
+    pub fn run_for_ticket_attempt(
+        &self,
+        ticket_id: &str,
+        attempt: i64,
+    ) -> Result<Option<RunRecord>, StoreError> {
+        let run = self
+            .connection
+            .query_row(
+                &format!(
+                    "{RUN_RECORD_SELECT} WHERE ticket_id = ?1 AND attempt = ?2
+                     ORDER BY created_at_ms DESC LIMIT 1"
+                ),
+                params![ticket_id, attempt],
+                run_record,
+            )
+            .optional()?;
+        Ok(run)
+    }
+
+    /// Every run a ticket has produced, newest attempt first, so a bare ticket
+    /// reference can name the latest run and still report the earlier ones.
+    pub fn runs_for_ticket(&self, ticket_id: &str) -> Result<Vec<RunRecord>, StoreError> {
+        let mut statement = self.connection.prepare(&format!(
+            "{RUN_RECORD_SELECT} WHERE ticket_id = ?1 ORDER BY attempt DESC, created_at_ms DESC"
+        ))?;
+        let runs = statement
+            .query_map(params![ticket_id], run_record)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(runs)
+    }
+
+    /// Runs whose internal id starts with `prefix`. More than one row means the
+    /// reference is ambiguous, so the caller needs the candidates, not a pick.
+    pub fn runs_with_id_prefix(&self, prefix: &str) -> Result<Vec<RunRecord>, StoreError> {
+        // `LIKE` would treat `%` and `_` in a prefix as wildcards; run ids are
+        // hexadecimal, but comparing on the substring keeps that beyond doubt.
+        let mut statement = self.connection.prepare(&format!(
+            "{RUN_RECORD_SELECT} WHERE SUBSTR(id, 1, ?2) = ?1 ORDER BY created_at_ms, id"
+        ))?;
+        let runs = statement
+            .query_map(params![prefix, prefix.len() as i64], run_record)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(runs)
     }
 
     /// Every `needs_review` ticket paired with the branch of the run that
@@ -2343,18 +2385,23 @@ impl Store {
         Ok(true)
     }
 
-    pub fn active_run_for_ticket(&self, ticket_id: &str) -> Result<Option<String>, StoreError> {
+    /// The ticket's live run as `(id, attempt)`. The attempt travels with the
+    /// id so callers can name the run by alias without re-reading the row.
+    pub fn active_run_for_ticket(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<(String, i64)>, StoreError> {
         let run = self
             .connection
             .query_row(
-                "SELECT r.id FROM runs r
+                "SELECT r.id, r.attempt FROM runs r
                  JOIN leases l ON l.run_id = r.id
                  WHERE r.ticket_id = ?1
                    AND r.state IN ('claimed', 'running', 'aftercare')
                    AND r.exited_at_ms IS NULL
                  ORDER BY r.created_at_ms DESC, r.id DESC LIMIT 1",
                 params![ticket_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
         Ok(run)
@@ -2363,7 +2410,7 @@ impl Store {
     /// Leased nonterminal runs that consume capacity, oldest first.
     pub fn active_runs(&self) -> Result<Vec<ActiveRun>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT r.id, r.ticket_id, t.project_id, r.state FROM runs r
+            "SELECT r.id, r.ticket_id, r.attempt, t.name, t.project_id, r.state FROM runs r
              JOIN leases l ON l.run_id = r.id
              JOIN tickets t ON t.id = r.ticket_id
              WHERE r.exited_at_ms IS NULL
@@ -2375,8 +2422,10 @@ impl Store {
                 Ok(ActiveRun {
                     id: row.get(0)?,
                     ticket_id: row.get(1)?,
-                    project_id: row.get(2)?,
-                    state: row.get(3)?,
+                    attempt: row.get(2)?,
+                    ticket_name: row.get(3)?,
+                    project_id: row.get(4)?,
+                    state: row.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2487,20 +2536,6 @@ impl Store {
         Ok(ordinal)
     }
 
-    fn next_ordinal(&self, kind: &str, table: &str) -> Result<i64, StoreError> {
-        let reserved: i64 = self.connection.query_row(
-            "SELECT next_ordinal FROM id_counters WHERE kind = ?1",
-            params![kind],
-            |row| row.get(0),
-        )?;
-        let existing: i64 = self.connection.query_row(
-            &format!("SELECT COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) + 1 FROM {table}"),
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(reserved.max(existing))
-    }
-
     /// Claims a ready ticket for one run in a single transaction. The
     /// conditional update plus the primary key on `leases.ticket_id` are the
     /// durable guards against a double claim.
@@ -2566,8 +2601,12 @@ impl Store {
             });
         }
 
+        // The run's attempt counts runs, not the ticket's retry budget:
+        // `retry` resets `tickets.attempts`, and a reused number would make two
+        // runs answer to the same alias. Allocating inside the claim
+        // transaction keeps the sequence gap-free under concurrent claims.
         let attempt: i64 = transaction.query_row(
-            "SELECT attempts FROM tickets WHERE id = ?1",
+            "SELECT COALESCE(MAX(attempt), 0) + 1 FROM runs WHERE ticket_id = ?1",
             params![claim.ticket_id],
             |row| row.get(0),
         )?;
@@ -2602,18 +2641,6 @@ impl Store {
                 expires_at_ms,
             ],
         )?;
-        if let Some(ordinal) = claim
-            .run_id
-            .strip_prefix('R')
-            .and_then(|value| value.parse::<i64>().ok())
-        {
-            transaction.execute(
-                "UPDATE id_counters
-                 SET next_ordinal = MAX(next_ordinal, ?1)
-                 WHERE kind = 'run'",
-                params![ordinal + 1],
-            )?;
-        }
         record_event(
             &transaction,
             now_ms,
@@ -3424,8 +3451,8 @@ mod tests {
 
         store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
         assert_eq!(
-            store.active_run_for_ticket("T1").unwrap().as_deref(),
-            Some("R1")
+            store.active_run_for_ticket("T1").unwrap(),
+            Some(("R1".into(), 1))
         );
         store
             .mark_run_running(
@@ -3441,8 +3468,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            store.active_run_for_ticket("T1").unwrap().as_deref(),
-            Some("R1")
+            store.active_run_for_ticket("T1").unwrap(),
+            Some(("R1".into(), 1))
         );
 
         store
@@ -3872,7 +3899,11 @@ mod tests {
                 2_300,
             )
             .unwrap();
-        assert_eq!(retried.attempt, 1);
+        // `retry` resets the ticket's attempt budget, but a run's attempt
+        // counts runs of that ticket: it must keep climbing, or two runs would
+        // answer to the same `T1-r1` alias.
+        assert_eq!(retried.attempt, 2);
+        assert_eq!(store.ticket("T1").unwrap().unwrap().attempts, 1);
 
         assert!(matches!(
             store.retry_ticket("T1", 2_400),

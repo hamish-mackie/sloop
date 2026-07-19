@@ -18,7 +18,6 @@ pub fn run(
     root: &Path,
     ticket_source: &dyn TicketSource,
     worktree_dir: &Path,
-    state_dir: &Path,
     store: &Store,
     now_ms: i64,
     ticket_prefix: &str,
@@ -232,7 +231,6 @@ pub fn run(
     let result = store
         .apply_reindex(project_ids, &tickets, now_ms)
         .map_err(|error| ReindexError(error.to_string()))?;
-    crate::reindex_evidence::seed_run_counter(root, worktree_dir, state_dir, store)?;
     let state_changes: Vec<Value> = result
         .state_changes
         .into_iter()

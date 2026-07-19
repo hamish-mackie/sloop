@@ -16,6 +16,7 @@ use crate::flow::Flow;
 use crate::logging::{LogLevel, OperationalLog};
 use crate::outcome::{MergeOutcome, RunEvidence, classify_exit, derive_outcome};
 use crate::protocol::{ErrorBody, ErrorCode, Request, RequestId, ResponseEnvelope};
+use crate::run_ref::RunIdSource;
 use crate::runner::local::worker_socket_path;
 use crate::sources::TicketSource;
 use crate::store::{CooldownUpdate, EvidenceRecord, Store, StoreError};
@@ -116,6 +117,9 @@ pub(super) struct DispatcherState {
     pub(super) requests_tx: mpsc::Sender<DispatcherMessage>,
     pub(super) log: OperationalLog,
     pub(super) clock: Arc<dyn Clock>,
+    /// Mints internal run ids at claim time. Injected so claim-time logic can
+    /// be driven with predictable identities in tests.
+    pub(super) run_ids: Arc<dyn RunIdSource>,
     pub(super) classifier: Arc<VendorErrorClassifier>,
     /// Signals the accept loop to end the process; used by daemon-side
     /// exits such as the project-root liveness check.
@@ -563,8 +567,10 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
                     .map(|run| {
                         json!({
                             "id": run.id,
+                            "alias": crate::run_ref::alias(&run.ticket_id, run.attempt),
                             "project": run.project_id,
                             "ticket": run.ticket_id,
+                            "ticket_name": run.ticket_name,
                             "state": run.state,
                         })
                     })

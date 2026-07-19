@@ -162,7 +162,7 @@ fn restart_drains_active_aftercare_before_resuming_the_queue() {
     assert_eq!(draining["daemon"]["draining"], true);
     assert_eq!(draining["gate"]["active_agents"], 1);
     assert_eq!(draining["queued_activations"].as_array().unwrap().len(), 1);
-    assert!(!world.root().join(".worktrees/R2").exists());
+    assert!(!world.run_worktree(2).exists());
     let human = world.sloop_plain(&["status"]);
     assert!(String::from_utf8_lossy(&human.stdout).contains("draining for restart (1 run active)"));
 
@@ -174,7 +174,7 @@ fn restart_drains_active_aftercare_before_resuming_the_queue() {
             && snapshot["daemon"]["draining"] == false
             && snapshot["tickets"]["merged"] == 2
     });
-    assert!(world.root().join(".worktrees/R2").exists());
+    assert!(world.run_worktree(2).exists());
 }
 
 #[test]

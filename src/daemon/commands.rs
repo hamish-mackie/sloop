@@ -25,10 +25,13 @@ use super::scheduler::{index_projects, running_hours_open};
 use super::worker_api::{current_ticket_vendor_error, ticket_show};
 
 /// The operator read view for `show`. Resolution is ordered by how specific a
-/// reference is: an exact ticket id, then a run id, then a ticket name, and
-/// finally a project id. Every branch is read-only; nothing here transitions
-/// state. Workers reach `show` through a separate, run-scoped handler and never
-/// gain these resolutions.
+/// reference is: an exact ticket id, then any run reference, then a ticket
+/// name, and finally a project id. Every branch is read-only; nothing here
+/// transitions state. Workers reach `show` through a separate, run-scoped
+/// handler and never gain these resolutions.
+///
+/// Tickets win over runs so that a bare ticket id still shows the ticket; the
+/// shared run resolver is consulted for the alias, prefix, and legacy-id forms.
 pub(super) fn handle_operator_show(
     state: &DispatcherState,
     reference: &str,
@@ -37,16 +40,34 @@ pub(super) fn handle_operator_show(
         return ticket_detail(state, reference, &ticket);
     }
     if let Some(run) = lookup(state, |store| store.run(reference))? {
-        return run_detail(state, reference, &run);
+        return run_detail(state, reference, &ResolvedRun::only(run));
     }
     if let Some(ticket) = lookup(state, |store| store.ticket_by_name(reference))? {
         return ticket_detail(state, reference, &ticket);
     }
+    if let Some((ticket_id, attempt)) = crate::run_ref::parse_alias(reference)
+        && let Some(run) = lookup(state, |store| {
+            store.run_for_ticket_attempt(ticket_id, attempt)
+        })?
+    {
+        return run_detail(state, reference, &ResolvedRun::only(run));
+    }
+    if let Some(prefix) = crate::run_ref::as_id_prefix(reference) {
+        let mut candidates = lookup(state, |store| store.runs_with_id_prefix(&prefix))?;
+        if candidates.len() == 1 {
+            let resolved = ResolvedRun::only(candidates.remove(0));
+            return run_detail(state, reference, &resolved);
+        }
+        if candidates.len() > 1 {
+            return Err(ambiguous_run_prefix(reference, &candidates));
+        }
+    }
     let Some(project) = lookup(state, |store| store.project(reference))? else {
         return Err(not_found(&format!(
             "reference `{reference}` is not a known ticket, run, or project; `show` accepts a \
-             ticket id or name, a run id like `R14`, or a project id — run `sloop list` to see \
-             tickets"
+             ticket id or name, a project id, or a run named by {} — run `sloop list` to see \
+             tickets",
+            crate::run_ref::ACCEPTED_RUN_REFERENCES
         )));
     };
     project_activity(state, reference, &project)
@@ -85,8 +106,9 @@ fn ticket_detail(
 fn run_detail(
     state: &DispatcherState,
     reference: &str,
-    run: &crate::store::RunRecord,
+    resolved: &ResolvedRun,
 ) -> Result<serde_json::Value, ErrorBody> {
+    let run = &resolved.run;
     let ticket = lookup(state, |store| store.ticket(&run.ticket_id))?;
     let vendor_error = lookup(state, |store| store.vendor_error_for_run(&run.id))?;
     let terminal = matches!(
@@ -104,6 +126,8 @@ fn run_detail(
         "kind": "run",
         "value": {
             "id": run.id,
+            "alias": resolved.alias,
+            "note": resolved.note(),
             "ticket": run.ticket_id,
             "ticket_name": ticket.as_ref().map(|ticket| ticket.name.as_str()),
             "state": run.state,
@@ -133,11 +157,28 @@ fn project_activity(
         }
     }
 
+    // Notes and commits are attributed to a run in output a human reads, so
+    // they are attributed by alias. One lookup per ticket covers every run the
+    // project's activity can mention.
+    let mut aliases: HashMap<String, String> = HashMap::new();
+    for ticket in &tickets {
+        for run in lookup(state, |store| store.runs_for_ticket(&ticket.id))? {
+            aliases.insert(run.id, crate::run_ref::alias(&run.ticket_id, run.attempt));
+        }
+    }
+    let alias_of = |run_id: &str| {
+        aliases
+            .get(run_id)
+            .cloned()
+            .unwrap_or_else(|| crate::run_ref::short(run_id).to_owned())
+    };
+
     let mut notes: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
     for note in lookup(state, |store| store.notes_for_project(reference))? {
         notes.entry(note.ticket_id).or_default().push(json!({
             "id": note.id,
-            "run": note.run_id,
+            "run": alias_of(&note.run_id),
+            "run_id": note.run_id,
             "text": note.text,
             "recorded_at_ms": note.recorded_at_ms,
         }));
@@ -159,7 +200,8 @@ fn project_activity(
                 .entry(evidence.ticket_id.clone())
                 .or_default()
                 .push(json!({
-                    "run": evidence.run_id.clone(),
+                    "run": alias_of(&evidence.run_id),
+                    "run_id": evidence.run_id.clone(),
                     "hash": short_hash,
                     "message": message,
                 }));
@@ -231,6 +273,11 @@ pub(super) fn handle_list(state: &DispatcherState) -> Result<serde_json::Value, 
     let mut rows = Vec::new();
     for ticket in lookup(state, Store::tickets)? {
         let active_run = lookup(state, |store| store.active_run_for_ticket(&ticket.id))?;
+        // Every ineligibility reason and list row names the run by alias; the
+        // internal id rides alongside for machine consumers.
+        let active_alias = active_run
+            .as_ref()
+            .map(|(_, attempt)| crate::run_ref::alias(&ticket.id, *attempt));
         let blockers = lookup(state, |store| store.unmerged_blockers(&ticket.id))?;
         let mut vendor_error = lookup(state, |store| {
             store.latest_vendor_error_for_ticket(&ticket.id)
@@ -251,7 +298,7 @@ pub(super) fn handle_list(state: &DispatcherState) -> Result<serde_json::Value, 
         let ineligibility = crate::eligibility::ticket_ineligibility(
             &ticket.state,
             ticket.attempts,
-            active_run.as_deref(),
+            active_alias.as_deref(),
             &blockers,
             &gates,
         );
@@ -285,7 +332,8 @@ pub(super) fn handle_list(state: &DispatcherState) -> Result<serde_json::Value, 
             "name": ticket.name,
             "project": ticket.project_id,
             "state": display_state,
-            "run": active_run,
+            "run": active_alias,
+            "run_id": active_run.map(|(id, _)| id),
             "reason": reason,
             "classification": vendor_error,
         }));
@@ -502,9 +550,8 @@ pub(super) fn handle_wait(
     state: &DispatcherState,
     args: &crate::protocol::RunReferenceArgs,
 ) -> Result<serde_json::Value, ErrorBody> {
-    let Some(run) = lookup(state, |store| store.run(&args.run))? else {
-        return Err(run_not_found(&args.run));
-    };
+    let resolved = resolve_run(state, &args.run)?;
+    let run = &resolved.run;
     let terminal = matches!(
         run.state.as_str(),
         "merged"
@@ -517,7 +564,9 @@ pub(super) fn handle_wait(
     );
     let vendor_error = lookup(state, |store| store.vendor_error_for_run(&run.id))?;
     Ok(json!({
-        "run": run.id,
+        "id": run.id,
+        "alias": resolved.alias,
+        "note": resolved.note(),
         "state": run.state,
         "terminal": terminal,
         "exit_code": run.exit_code,
@@ -532,11 +581,11 @@ pub(super) fn handle_logs(
     state: &DispatcherState,
     args: &crate::protocol::RunReferenceArgs,
 ) -> Result<serde_json::Value, ErrorBody> {
-    if lookup(state, |store| store.run(&args.run))?.is_none() {
-        return Err(run_not_found(&args.run));
-    }
+    let resolved = resolve_run(state, &args.run)?;
+    // The log lives under the resolved run's own id, never under whatever
+    // shorthand the caller happened to type.
     let page = crate::run_log::read_page(
-        &run_output_path(&state.state_dir, &args.run),
+        &run_output_path(&state.state_dir, &resolved.run.id),
         0,
         LOGS_PAGE_LIMIT,
     )
@@ -548,7 +597,9 @@ pub(super) fn handle_logs(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| internal(&format!("cannot encode run log: {error}")))?;
     Ok(json!({
-        "run": args.run,
+        "id": resolved.run.id,
+        "alias": resolved.alias,
+        "note": resolved.note(),
         "entries": entries,
         "next_cursor": page.next_cursor,
         "complete": page.complete,
@@ -602,13 +653,12 @@ pub(super) fn handle_cancel(
     state: &mut DispatcherState,
     args: &crate::protocol::RunReferenceArgs,
 ) -> Result<serde_json::Value, ErrorBody> {
-    let Some(run) = lookup(state, |store| store.run(&args.run))? else {
-        return Err(run_not_found(&args.run));
-    };
+    let resolved = resolve_run(state, &args.run)?;
+    let run = resolved.run.clone();
     if !matches!(run.state.as_str(), "running" | "aftercare") || run.exited_at_ms.is_some() {
         return Err(conflict(&format!(
             "run `{}` is `{}` and cannot be cancelled",
-            run.id, run.state
+            resolved.alias, run.state
         )));
     }
 
@@ -663,7 +713,8 @@ pub(super) fn handle_cancel(
     }
 
     Ok(json!({
-        "run": run.id,
+        "id": run.id,
+        "alias": resolved.alias,
         "state": "cancelling",
         "worktree": run.worktree_path,
         "preserved": true,
@@ -677,26 +728,18 @@ pub(super) fn handle_stop(
     state: &mut DispatcherState,
     args: &crate::protocol::StopArgs,
 ) -> Result<serde_json::Value, ErrorBody> {
-    let mut active: Vec<String> = state.active.iter().cloned().collect();
-    active.sort();
+    let active = active_run_aliases(state)?;
     if !active.is_empty() && !args.force {
         return Err(conflict(&format!(
             "{} active run(s): {}; stop --force cancels them",
             active.len(),
-            active.join(", "),
+            aliases_of(&active).join(", "),
         )));
     }
     let mut cancelled = Vec::new();
-    for run_id in active {
-        if handle_cancel(
-            state,
-            &crate::protocol::RunReferenceArgs {
-                run: run_id.clone(),
-            },
-        )
-        .is_ok()
-        {
-            cancelled.push(run_id);
+    for (run_id, alias) in active {
+        if handle_cancel(state, &crate::protocol::RunReferenceArgs { run: run_id }).is_ok() {
+            cancelled.push(alias);
         }
     }
     Ok(json!({
@@ -706,14 +749,31 @@ pub(super) fn handle_stop(
     }))
 }
 
+/// The daemon's live runs as `(internal id, alias)`, alias-ordered. Messages
+/// name runs by alias; the id stays alongside for the verbs that act on one.
+fn active_run_aliases(state: &DispatcherState) -> Result<Vec<(String, String)>, ErrorBody> {
+    let mut active = Vec::new();
+    for run_id in &state.active {
+        let alias = lookup(state, |store| store.run(run_id))?
+            .map(|run| crate::run_ref::alias(&run.ticket_id, run.attempt))
+            .unwrap_or_else(|| crate::run_ref::short(run_id).to_owned());
+        active.push((run_id.clone(), alias));
+    }
+    active.sort_by(|left, right| left.1.cmp(&right.1));
+    Ok(active)
+}
+
+fn aliases_of(active: &[(String, String)]) -> Vec<&str> {
+    active.iter().map(|(_, alias)| alias.as_str()).collect()
+}
+
 pub(super) fn handle_reindex(state: &mut DispatcherState) -> Result<serde_json::Value, ErrorBody> {
-    let mut active: Vec<String> = state.active.iter().cloned().collect();
-    active.sort();
+    let active = active_run_aliases(state)?;
     if !active.is_empty() {
         return Err(conflict(&format!(
             "{} active run(s): {}; reindex requires an idle daemon — wait for them to finish or cancel with `sloop cancel <run>`",
             active.len(),
-            active.join(", "),
+            aliases_of(&active).join(", "),
         )));
     }
     let now_ms = state.clock.now_ms();
@@ -729,7 +789,6 @@ pub(super) fn handle_reindex(state: &mut DispatcherState) -> Result<serde_json::
         &state.root,
         state.ticket_source.as_ref(),
         &state.worktree_dir,
-        &state.state_dir,
         &state.store,
         now_ms,
         &state.ticket_prefix,
@@ -741,12 +800,124 @@ pub(super) fn handle_reindex(state: &mut DispatcherState) -> Result<serde_json::
     .map_err(|error| internal(&format!("cannot reindex tickets: {error}")))
 }
 
-/// The `logs`, `wait`, and `cancel` verbs all address a run by id; agents that
-/// pass a ticket name instead land here. Naming the `R14` shape and pointing at
-/// `sloop list` turns the dead end into a next step.
+/// A run named by a reference, together with the alias every human-facing
+/// surface shows it by. `earlier_attempts` is populated only when a bare ticket
+/// reference selected the latest of several runs, so the caller can say which
+/// attempts it passed over.
+pub(super) struct ResolvedRun {
+    pub(super) run: crate::store::RunRecord,
+    pub(super) alias: String,
+    pub(super) earlier_attempts: Vec<i64>,
+}
+
+impl ResolvedRun {
+    fn only(run: crate::store::RunRecord) -> Self {
+        Self {
+            alias: crate::run_ref::alias(&run.ticket_id, run.attempt),
+            run,
+            earlier_attempts: Vec::new(),
+        }
+    }
+
+    /// The `showing TICK-16-r3; earlier attempts: r1, r2` note, or nothing when
+    /// the reference named the only run there was.
+    pub(super) fn note(&self) -> Option<String> {
+        if self.earlier_attempts.is_empty() {
+            return None;
+        }
+        let attempts = self
+            .earlier_attempts
+            .iter()
+            .map(|attempt| format!("r{attempt}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "showing {}; earlier attempts: {attempts}",
+            self.alias
+        ))
+    }
+}
+
+/// The single resolution used by every verb that takes a run reference.
+///
+/// Ordering is by specificity, and exact-id first is what keeps legacy `R<n>`
+/// ids working without a compatibility branch of their own. A bare ticket is
+/// the most forgiving form, so it comes before the prefix search that could
+/// otherwise claim a short hexadecimal ticket name.
+pub(super) fn resolve_run(
+    state: &DispatcherState,
+    reference: &str,
+) -> Result<ResolvedRun, ErrorBody> {
+    if let Some(run) = lookup(state, |store| store.run(reference))? {
+        return Ok(ResolvedRun::only(run));
+    }
+    if let Some((ticket_id, attempt)) = crate::run_ref::parse_alias(reference)
+        && let Some(run) = lookup(state, |store| {
+            store.run_for_ticket_attempt(ticket_id, attempt)
+        })?
+    {
+        return Ok(ResolvedRun::only(run));
+    }
+    if let Some(ticket_id) = ticket_id_for(state, reference)? {
+        let mut runs = lookup(state, |store| store.runs_for_ticket(&ticket_id))?;
+        if runs.is_empty() {
+            return Err(not_found(&format!(
+                "ticket `{ticket_id}` has no runs yet; start one with `sloop run {ticket_id}`"
+            )));
+        }
+        let latest = runs.remove(0);
+        let mut earlier_attempts: Vec<i64> = runs.iter().map(|run| run.attempt).collect();
+        earlier_attempts.sort_unstable();
+        return Ok(ResolvedRun {
+            earlier_attempts,
+            ..ResolvedRun::only(latest)
+        });
+    }
+    if let Some(prefix) = crate::run_ref::as_id_prefix(reference) {
+        let mut candidates = lookup(state, |store| store.runs_with_id_prefix(&prefix))?;
+        if candidates.len() == 1 {
+            return Ok(ResolvedRun::only(candidates.remove(0)));
+        }
+        if candidates.len() > 1 {
+            return Err(ambiguous_run_prefix(reference, &candidates));
+        }
+    }
+    Err(run_not_found(reference))
+}
+
+fn ticket_id_for(state: &DispatcherState, reference: &str) -> Result<Option<String>, ErrorBody> {
+    if let Some(ticket) = lookup(state, |store| store.ticket(reference))? {
+        return Ok(Some(ticket.id));
+    }
+    Ok(lookup(state, |store| store.ticket_by_name(reference))?.map(|ticket| ticket.id))
+}
+
+/// Git's ambiguous-object error, in Sloop's terms: name the candidates so the
+/// operator can retype one character more rather than guess.
+fn ambiguous_run_prefix(reference: &str, candidates: &[crate::store::RunRecord]) -> ErrorBody {
+    let listed = candidates
+        .iter()
+        .map(|run| {
+            format!(
+                "\n  {} {}",
+                crate::run_ref::short(&run.id),
+                crate::run_ref::alias(&run.ticket_id, run.attempt)
+            )
+        })
+        .collect::<String>();
+    invalid_arguments(&format!(
+        "run reference `{reference}` is ambiguous; it matches {} runs:{listed}\nuse more \
+         characters of a run id, or name a run by its alias",
+        candidates.len()
+    ))
+}
+
+/// The `logs`, `wait`, and `cancel` verbs all address a run by reference; a
+/// dead end here names every accepted form so the caller has a next move.
 fn run_not_found(run: &str) -> ErrorBody {
     not_found(&format!(
-        "run `{run}` does not exist; pass a run id like `R14` — run `sloop list` to see each ticket's runs"
+        "run `{run}` does not exist; pass {} — run `sloop list` to see each ticket's runs",
+        crate::run_ref::ACCEPTED_RUN_REFERENCES
     ))
 }
 
