@@ -1,5 +1,6 @@
 version: 1
 worktree_dir: .worktrees
+worktree_retention: 7d
 
 agent:
   default_target: opencode

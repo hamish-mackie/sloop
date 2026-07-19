@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::domain::ticket::TicketState;
 
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 const CONNECTION_PRAGMAS: &str = "
 PRAGMA foreign_keys = ON;
@@ -98,6 +98,8 @@ CREATE TABLE runs (
     started_at_ms         INTEGER,
     exited_at_ms          INTEGER,
     exit_code             INTEGER,
+    cleanup_eligible_at_ms INTEGER,
+    cleaned_at_ms         INTEGER,
     flow_json             TEXT,
     ticket_json           TEXT,
     created_at_ms         INTEGER NOT NULL,
@@ -212,6 +214,11 @@ ALTER TABLE tickets ADD COLUMN held_reason TEXT;
 const RESTART_DRAINING_COLUMN: &str = "
 ALTER TABLE scheduler_state ADD COLUMN draining INTEGER NOT NULL DEFAULT 0
 CHECK (draining IN (0, 1));
+";
+
+const WORKTREE_CLEANUP_COLUMNS: &str = "
+ALTER TABLE runs ADD COLUMN cleanup_eligible_at_ms INTEGER;
+ALTER TABLE runs ADD COLUMN cleaned_at_ms INTEGER;
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,6 +452,15 @@ pub(crate) struct NeedsReviewBranch {
     pub(crate) branch: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeCleanupCandidate {
+    pub(crate) run_id: String,
+    pub(crate) ticket_id: String,
+    pub(crate) branch: String,
+    pub(crate) worktree_path: String,
+    pub(crate) cleanup_eligible_at_ms: i64,
+}
+
 /// One lease that must be classified when a daemon starts. Process identity
 /// and worker credentials are returned only to the daemon recovery path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -655,6 +671,7 @@ impl Store {
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
+                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -682,6 +699,7 @@ impl Store {
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
+                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -708,6 +726,7 @@ impl Store {
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
+                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -726,6 +745,7 @@ impl Store {
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
+                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -743,6 +763,7 @@ impl Store {
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
+                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -758,6 +779,7 @@ impl Store {
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
+                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -771,6 +793,7 @@ impl Store {
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
+                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -783,6 +806,7 @@ impl Store {
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
+                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -794,6 +818,7 @@ impl Store {
                 transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
+                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -804,6 +829,7 @@ impl Store {
                     .transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
                 transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
+                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -813,6 +839,16 @@ impl Store {
                     .connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
+                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.commit()?;
+                Ok(())
+            }
+            12 => {
+                let transaction = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -1115,6 +1151,16 @@ impl Store {
                     previous_state: previous.state.clone(),
                     state: state.to_owned(),
                 });
+                if state == TicketState::Merged.as_str()
+                    && matches!(previous.state.as_str(), "failed" | "needs_review")
+                {
+                    transaction.execute(
+                        "UPDATE runs SET cleanup_eligible_at_ms = ?2
+                         WHERE ticket_id = ?1 AND state IN ('failed', 'needs_review')
+                           AND cleanup_eligible_at_ms IS NULL AND cleaned_at_ms IS NULL",
+                        params![ticket.id, now_ms],
+                    )?;
+                }
             }
             transaction.execute(
                 "INSERT INTO tickets
@@ -1464,7 +1510,8 @@ impl Store {
             .ok_or_else(|| StoreError::TicketNotFound {
                 ticket_id: id.into(),
             })?;
-        let changed = self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
             "UPDATE tickets SET state = 'ready', held_reason = NULL, attempts = 0, updated_at_ms = ?2
              WHERE id = ?1 AND state = 'failed'",
             params![id, now_ms],
@@ -1476,6 +1523,13 @@ impl Store {
                 requested: TicketState::Ready.as_str().into(),
             });
         }
+        transaction.execute(
+            "UPDATE runs SET cleanup_eligible_at_ms = ?2
+             WHERE ticket_id = ?1 AND state = 'failed'
+               AND cleanup_eligible_at_ms IS NULL AND cleaned_at_ms IS NULL",
+            params![id, now_ms],
+        )?;
+        transaction.commit()?;
         Ok(previous)
     }
 
@@ -1728,7 +1782,8 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
             "UPDATE runs
-             SET state = ?2, exited_at_ms = ?3, exit_code = ?4, updated_at_ms = ?3
+             SET state = ?2, exited_at_ms = ?3, exit_code = ?4, updated_at_ms = ?3,
+                 cleanup_eligible_at_ms = CASE WHEN ?2 = 'merged' THEN ?3 ELSE NULL END
              WHERE id = ?1 AND exited_at_ms IS NULL",
             params![run_id, outcome.as_str(), now_ms, exit_code],
         )?;
@@ -2334,6 +2389,86 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    pub(crate) fn worktree_cleanup_candidates(
+        &self,
+    ) -> Result<Vec<WorktreeCleanupCandidate>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT r.id, r.ticket_id, r.branch, r.worktree_path, r.cleanup_eligible_at_ms
+             FROM runs r
+             WHERE r.cleanup_eligible_at_ms IS NOT NULL
+               AND r.cleaned_at_ms IS NULL
+               AND r.branch IS NOT NULL
+               AND r.worktree_path IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.run_id = r.id)
+             ORDER BY r.cleanup_eligible_at_ms, r.id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(WorktreeCleanupCandidate {
+                    run_id: row.get(0)?,
+                    ticket_id: row.get(1)?,
+                    branch: row.get(2)?,
+                    worktree_path: row.get(3)?,
+                    cleanup_eligible_at_ms: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub(crate) fn next_worktree_cleanup_at_ms(
+        &self,
+        retention_ms: i64,
+        now_ms: i64,
+    ) -> Result<Option<i64>, StoreError> {
+        let eligible_at: Option<i64> = self.connection.query_row(
+            "SELECT MIN(r.cleanup_eligible_at_ms)
+             FROM runs r
+             WHERE r.cleanup_eligible_at_ms IS NOT NULL
+               AND r.cleaned_at_ms IS NULL
+               AND r.branch IS NOT NULL
+               AND r.worktree_path IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.run_id = r.id)",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(eligible_at.and_then(|value| {
+            let deadline = value.saturating_add(retention_ms);
+            (deadline > now_ms).then_some(deadline)
+        }))
+    }
+
+    pub(crate) fn mark_run_worktree_cleaned(
+        &self,
+        candidate: &WorktreeCleanupCandidate,
+        now_ms: i64,
+    ) -> Result<bool, StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE runs SET cleaned_at_ms = ?2, updated_at_ms = ?2
+             WHERE id = ?1 AND cleanup_eligible_at_ms IS NOT NULL
+               AND cleaned_at_ms IS NULL
+               AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.run_id = runs.id)",
+            params![candidate.run_id, now_ms],
+        )?;
+        if changed == 1 {
+            record_event(
+                &transaction,
+                now_ms,
+                "run_worktree_cleaned",
+                Some(&candidate.run_id),
+                Some(&candidate.ticket_id),
+                &serde_json::json!({
+                    "branch": candidate.branch,
+                    "worktree": candidate.worktree_path,
+                })
+                .to_string(),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
+
     /// Settles a `needs_review` ticket whose run branch an operator merged by
     /// hand: the ticket becomes `merged`, releasing its `blocked_by` dependents
     /// exactly as a flow merge would, and the observation is recorded as
@@ -2361,6 +2496,11 @@ impl Store {
             transaction.commit()?;
             return Ok(false);
         }
+        transaction.execute(
+            "UPDATE runs SET cleanup_eligible_at_ms = ?2
+             WHERE id = ?1 AND cleanup_eligible_at_ms IS NULL AND cleaned_at_ms IS NULL",
+            params![run_id, now_ms],
+        )?;
         let data_json = serde_json::json!({
             "branch": branch,
             "branch_tip": branch_tip,
@@ -4098,7 +4238,9 @@ mod tests {
                  ALTER TABLE scheduler_state DROP COLUMN draining;
                  ALTER TABLE runs DROP COLUMN worker_socket_path;
                  ALTER TABLE runs DROP COLUMN flow_json;
-                 ALTER TABLE runs DROP COLUMN ticket_json;",
+                 ALTER TABLE runs DROP COLUMN ticket_json;
+                 ALTER TABLE runs DROP COLUMN cleanup_eligible_at_ms;
+                 ALTER TABLE runs DROP COLUMN cleaned_at_ms;",
             )
             .unwrap();
         connection.pragma_update(None, "user_version", 3).unwrap();
@@ -4161,7 +4303,9 @@ mod tests {
                  ALTER TABLE runs DROP COLUMN ticket_json;
                  ALTER TABLE tickets DROP COLUMN body;
                  ALTER TABLE tickets DROP COLUMN held_reason;
-                 ALTER TABLE scheduler_state DROP COLUMN draining;",
+                 ALTER TABLE scheduler_state DROP COLUMN draining;
+                 ALTER TABLE runs DROP COLUMN cleanup_eligible_at_ms;
+                 ALTER TABLE runs DROP COLUMN cleaned_at_ms;",
             )
             .unwrap();
         connection.pragma_update(None, "user_version", 8).unwrap();
@@ -4192,7 +4336,9 @@ mod tests {
             .execute_batch(
                 "ALTER TABLE tickets DROP COLUMN body;
                  ALTER TABLE tickets DROP COLUMN held_reason;
-                 ALTER TABLE scheduler_state DROP COLUMN draining;",
+                 ALTER TABLE scheduler_state DROP COLUMN draining;
+                 ALTER TABLE runs DROP COLUMN cleanup_eligible_at_ms;
+                 ALTER TABLE runs DROP COLUMN cleaned_at_ms;",
             )
             .unwrap();
         connection.pragma_update(None, "user_version", 10).unwrap();
@@ -4434,6 +4580,8 @@ mod tests {
         connection
             .execute_batch(
                 "ALTER TABLE scheduler_state DROP COLUMN draining;
+                 ALTER TABLE runs DROP COLUMN cleanup_eligible_at_ms;
+                 ALTER TABLE runs DROP COLUMN cleaned_at_ms;
                  PRAGMA user_version = 11;",
             )
             .unwrap();

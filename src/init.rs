@@ -175,6 +175,7 @@ mod tests {
             .expect("read default config");
         assert_eq!(config, DEFAULT_CONFIG);
         assert!(config.contains("default_target: opencode"));
+        assert!(config.contains("worktree_retention: 7d"));
         assert!(config.contains("- claude"));
         assert!(config.contains("- opencode"));
         assert!(config.contains("- codex"));

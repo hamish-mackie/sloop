@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -18,7 +19,7 @@ use crate::runner::local::{
     compose_worker_prompt, launch_agent, run_output_path, wait_for_test_hook, worker_socket_path,
 };
 use crate::runner::{AgentLaunch, RunnerError, StageExecution, StageOrder};
-use crate::store::{ClaimRequest, QueuedActivation, Store, TicketRecord};
+use crate::store::{ClaimRequest, QueuedActivation, Store, TicketRecord, WorktreeCleanupCandidate};
 
 use super::aftercare::{
     RepairContext, StoreStageHooks, gather_exit_evidence, git_is_ancestor, git_stdout,
@@ -311,6 +312,7 @@ pub(super) fn reconcile(
     // gates below: it releases blocked dependents even while paused, at
     // capacity, or outside running hours.
     reconcile_external_merges(state, log);
+    reconcile_worktree_cleanup(state, log);
     if state.storage_full.get()
         || state.reconciliation_blocked
         || state.paused
@@ -737,6 +739,142 @@ fn reconcile_external_merges(state: &mut DispatcherState, log: &OperationalLog) 
     }
 }
 
+fn worktree_cleanup_due(
+    cleanup_eligible_at_ms: i64,
+    retention_ms: i64,
+    now_ms: i64,
+    is_live: bool,
+) -> bool {
+    !is_live && now_ms >= cleanup_eligible_at_ms.saturating_add(retention_ms)
+}
+
+fn reconcile_worktree_cleanup(state: &mut DispatcherState, log: &OperationalLog) {
+    if state.draining {
+        return;
+    }
+    let Some(retention_ms) = state.worktree_retention_ms else {
+        return;
+    };
+    let candidates = match state.store.worktree_cleanup_candidates() {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            log.emit_with_fields(
+                LogLevel::Error,
+                "sloop::dispatcher",
+                "worktree_cleanup_scan_failed",
+                json!({"error": error.to_string()}),
+            );
+            return;
+        }
+    };
+    let now_ms = state.clock.now_ms();
+    for candidate in candidates {
+        let is_live = state.active.contains(&candidate.run_id);
+        let worktree_missing = !Path::new(&candidate.worktree_path).exists();
+        if is_live
+            || (!worktree_missing
+                && !worktree_cleanup_due(
+                    candidate.cleanup_eligible_at_ms,
+                    retention_ms,
+                    now_ms,
+                    false,
+                ))
+        {
+            continue;
+        }
+        if let Err(error) = remove_run_worktree(&state.root, &candidate) {
+            log.emit_with_fields(
+                LogLevel::Warn,
+                "sloop::dispatcher",
+                "run_worktree_cleanup_failed",
+                json!({
+                    "run_id": candidate.run_id,
+                    "ticket_id": candidate.ticket_id,
+                    "branch": candidate.branch,
+                    "worktree": candidate.worktree_path,
+                    "error": error,
+                }),
+            );
+            continue;
+        }
+        match state
+            .store
+            .mark_run_worktree_cleaned(&candidate, state.clock.now_ms())
+        {
+            Ok(true) => log.emit_with_fields(
+                LogLevel::Info,
+                "sloop::dispatcher",
+                "run_worktree_cleaned",
+                json!({
+                    "run_id": candidate.run_id,
+                    "ticket_id": candidate.ticket_id,
+                    "branch": candidate.branch,
+                    "worktree": candidate.worktree_path,
+                }),
+            ),
+            Ok(false) => {}
+            Err(error) => {
+                mark_storage_full(state, &error);
+                log.emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::dispatcher",
+                    "run_worktree_cleanup_record_failed",
+                    json!({"run_id": candidate.run_id, "error": error.to_string()}),
+                );
+            }
+        }
+    }
+}
+
+fn remove_run_worktree(root: &Path, candidate: &WorktreeCleanupCandidate) -> Result<(), String> {
+    let worktree = Path::new(&candidate.worktree_path);
+    if worktree.exists() {
+        git_status(root, "worktree remove", |command| {
+            command
+                .args(["worktree", "remove", "--force"])
+                .arg(worktree);
+        })?;
+    }
+    git_status(root, "worktree prune", |command| {
+        command.args(["worktree", "prune"]);
+    })?;
+
+    let branch_ref = format!("refs/heads/{}", candidate.branch);
+    let branch_exists = Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", &branch_ref])
+        .current_dir(root)
+        .status()
+        .map_err(|error| format!("git show-ref failed: {error}"))?;
+    match branch_exists.code() {
+        Some(0) => git_status(root, "branch deletion", |command| {
+            command.args(["branch", "-D", &candidate.branch]);
+        }),
+        Some(1) => Ok(()),
+        _ => Err(format!("git show-ref failed: {branch_exists}")),
+    }
+}
+
+fn git_status(
+    root: &Path,
+    operation: &str,
+    configure: impl FnOnce(&mut Command),
+) -> Result<(), String> {
+    let mut command = Command::new("git");
+    command.current_dir(root);
+    configure(&mut command);
+    let output = command
+        .output()
+        .map_err(|error| format!("git {operation} failed: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "git {operation} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
 pub(super) fn running_hours_open(state: &DispatcherState, now_ms: i64) -> bool {
     state
         .running_hours
@@ -770,7 +908,14 @@ pub(super) fn next_dispatch_deadline(state: &DispatcherState) -> Option<i64> {
             next_eligible
         }
     };
-    [hours_deadline, cooldown_deadline]
+    let cleanup_deadline = state.worktree_retention_ms.and_then(|retention_ms| {
+        state
+            .store
+            .next_worktree_cleanup_at_ms(retention_ms, now_ms)
+            .ok()
+            .flatten()
+    });
+    [hours_deadline, cooldown_deadline, cleanup_deadline]
         .into_iter()
         .flatten()
         .min()
@@ -842,9 +987,18 @@ mod tests {
     use super::{
         OrphanDisposition::{Delete, Keep, MarkMissing},
         index_projects, orphan_disposition, rearm_every_at, reconcile_tickets,
+        worktree_cleanup_due,
     };
     use crate::domain::ticket::TicketState;
     use crate::store::Store;
+
+    #[test]
+    fn cleanup_eligibility_uses_retention_and_excludes_live_runs() {
+        assert!(!worktree_cleanup_due(1_000, 500, 1_499, false));
+        assert!(worktree_cleanup_due(1_000, 500, 1_500, false));
+        assert!(!worktree_cleanup_due(1_000, 500, 2_000, true));
+        assert!(worktree_cleanup_due(i64::MIN, i64::MAX, 0, false));
+    }
 
     #[test]
     fn recurring_rearm_preserves_cadence_and_skips_missed_slots() {

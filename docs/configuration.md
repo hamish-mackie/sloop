@@ -13,6 +13,7 @@ file is the unit of configuration and scheduling.
 version: 1
 
 worktree_dir: .worktrees
+worktree_retention: 7d
 
 scheduler:
   max_parallel_tasks: 2
@@ -112,6 +113,12 @@ Explicit IDs in frontmatter are always preserved.
 ### Directories
 
 - `worktree_dir` (default `.worktrees`) — where run worktrees are created.
+- `worktree_retention` (default `7d`) — how long a settled run's worktree and
+  run branch remain available before periodic cleanup. Durations use `s`, `m`,
+  `h`, `d`, or `w`; set it to `never` to disable cleanup. Merged runs are
+  eligible immediately. Failed and `needs_review` runs are retained as evidence
+  until the ticket is resolved by retry, external merge, or reindex; their
+  retention period starts at that resolution.
 - `project_dir` (default `.agents/sloop/projects`) — project files.
 - `ticket_dir` (default `.agents/sloop/tickets`) — ticket files.
 

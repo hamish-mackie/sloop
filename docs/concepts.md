@@ -30,6 +30,11 @@ Sloop's socket API.
 6. **Aftercare.** After the agent exits, Sloop gathers evidence, executes the
    ticket's bound flow stages in order, and merges the work if they pass.
 
+Merged run worktrees and run branches remain inspectable for the configured
+retention period, then periodic reconciliation removes them. Failed and
+`needs_review` worktrees remain as evidence until their ticket is resolved;
+run output and recorded evidence are retained when cleanup removes Git state.
+
 One async dispatcher task owns every spawn decision. Socket handlers and
 run supervisors send it requests; they never spawn anything themselves.
 That single ownership — not politeness between callers — is what makes

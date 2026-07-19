@@ -742,6 +742,9 @@ pub(super) fn handle_stop(
             cancelled.push(alias);
         }
     }
+    // The accept loop exits after replying. Close every reconcile side effect
+    // immediately so the dispatcher cannot spawn or clean Git state meanwhile.
+    state.draining = true;
     Ok(json!({
         "stopping": true,
         "pid": state.pid,
