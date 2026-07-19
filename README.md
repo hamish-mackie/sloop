@@ -6,6 +6,10 @@ Sloop runs agentic coding work autonomously: each ticket gets its own Git
 worktree and agent (Claude Code, Codex, or OpenCode), and Sloop reviews the
 result and merges it when it passes.
 
+The model is small: **flows are behaviour, tickets are work, projects are
+scope.** A flow says how work proceeds, a ticket says what the work is, and a
+project says which work belongs together.
+
 - **Agent orchestration** — each ticket picks its agent, model, and effort:
   design with a powerful model, send implementation and review to specialized
   workers.
