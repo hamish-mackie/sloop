@@ -76,8 +76,11 @@ fn agent_stage_order(
     }
     let path = std::env::join_paths(path_entries)
         .map_err(|source| error(format!("cannot construct agent PATH: {source}")))?;
-    let branch = format!("sloop/{}-a{attempt}-{run_id}", ticket.id);
-    let worktree = state.worktree_dir.join(run_id);
+    // Paths and branches carry the short id: filesystem names are internal
+    // plumbing, and a 32-character suffix would drown the readable part.
+    let short_id = crate::run_ref::short(run_id);
+    let branch = format!("sloop/{}-a{attempt}-{short_id}", ticket.id);
+    let worktree = state.worktree_dir.join(short_id);
     let stage = flow
         .stages
         .iter()
@@ -405,23 +408,20 @@ pub(super) fn reconcile(
             serde_json::to_string(&ticket_snapshot).expect("ticket snapshots serialize to JSON");
 
         let now_ms = state.clock.now_ms();
-        let run_ordinal = match state.store.next_run_ordinal() {
-            Ok(ordinal) => ordinal,
+        // Minting reads the OS CSPRNG, so it happens here at the effect
+        // boundary; everything downstream just carries the id it was handed.
+        let run_id = match state.run_ids.mint() {
+            Ok(run_id) => run_id,
             Err(error) => {
-                mark_storage_full(state, &error);
                 log.emit_with_fields(
                     LogLevel::Error,
                     "sloop::dispatcher",
-                    "run_id_reservation_failed",
-                    json!({"error": error.to_string()}),
+                    "run_id_minting_failed",
+                    json!({"error": error}),
                 );
-                if error.is_disk_full() {
-                    break;
-                }
                 continue;
             }
         };
-        let run_id = format!("R{run_ordinal}");
         let owner = format!("daemon-{}", state.pid);
         let claim = ClaimRequest {
             ticket_id: &ticket_id,

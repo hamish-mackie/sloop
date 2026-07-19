@@ -89,10 +89,16 @@ pub enum Command {
     },
     /// Cancel a run and preserve its worktree.
     #[command(hide = true)]
-    Cancel { run: String },
+    Cancel {
+        /// Run alias, ticket reference, or run-id prefix.
+        run: String,
+    },
     /// Show output from a run.
     #[command(hide = true)]
-    Logs { run: String },
+    Logs {
+        /// Run alias, ticket reference, or run-id prefix.
+        run: String,
+    },
     /// Follow ticket and run activity as it happens.
     Watch {
         /// Number of recent events to show before following.
@@ -102,6 +108,7 @@ pub enum Command {
     /// Block until a run reaches a terminal state.
     #[command(hide = true)]
     Wait {
+        /// Run alias, ticket reference, or run-id prefix.
         run: String,
         /// Give up after this many seconds.
         #[arg(long, default_value_t = 3600)]

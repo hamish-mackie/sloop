@@ -216,8 +216,8 @@ fn run_settled(world: &World) -> bool {
     World::json_stdout(&output)["data"]["gate"]["active_agents"] == 0
 }
 
-fn worktree_json(world: &World, run: &str, name: &str) -> Value {
-    let path = world.root().join(".worktrees").join(run).join(name);
+fn worktree_json(world: &World, position: usize, name: &str) -> Value {
+    let path = world.run_worktree(position).join(name);
     let text = fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
     serde_json::from_str(text.trim()).unwrap_or_else(|error| panic!("{name} is JSON: {error}"))
@@ -238,9 +238,9 @@ fn a_running_agent_reads_its_brief_and_records_a_note() {
     assert!(world.sloop(&["run", &ticket]).status.success());
     wait_until("the run settles", || run_settled(&world));
 
-    let brief = worktree_json(&world, "R1", "brief.json");
+    let brief = worktree_json(&world, 1, "brief.json");
     assert_eq!(brief["ok"], true, "brief failed: {brief}");
-    assert_eq!(brief["data"]["run"], "R1");
+    assert_eq!(brief["data"]["run"], world.run_id(1));
     assert_eq!(brief["data"]["ticket"]["id"], ticket.as_str());
     assert_eq!(brief["data"]["ticket"]["name"], "cooldown");
     assert_eq!(brief["data"]["ticket"]["blocked_by"], serde_json::json!([]));
@@ -252,7 +252,7 @@ fn a_running_agent_reads_its_brief_and_records_a_note() {
         brief["data"]["worktree"]
             .as_str()
             .expect("worktree")
-            .ends_with("R1")
+            .ends_with(&world.run_id(1)[..8])
     );
     assert!(
         brief["data"]["branch"]
@@ -267,7 +267,7 @@ fn a_running_agent_reads_its_brief_and_records_a_note() {
             .is_empty()
     );
 
-    let show = worktree_json(&world, "R1", "show.json");
+    let show = worktree_json(&world, 1, "show.json");
     assert_eq!(show["ok"], true, "show failed: {show}");
     assert_eq!(show["data"]["ref"], ticket.as_str());
     assert_eq!(show["data"]["kind"], "ticket");
@@ -283,18 +283,18 @@ fn a_running_agent_reads_its_brief_and_records_a_note() {
 
     // `show` is scoped to the run's own ticket; everything else is
     // unauthorized, whether or not it exists.
-    let foreign = worktree_json(&world, "R1", "foreign-show.json");
+    let foreign = worktree_json(&world, 1, "foreign-show.json");
     assert_eq!(foreign["ok"], false);
     assert_eq!(foreign["error"]["code"], "unauthorized");
 
-    let note = worktree_json(&world, "R1", "note.json");
+    let note = worktree_json(&world, 1, "note.json");
     assert_eq!(note["ok"], true, "note failed: {note}");
-    assert_eq!(note["data"]["note"]["run"], "R1");
+    assert_eq!(note["data"]["note"]["run"], world.run_id(1));
     assert_eq!(note["data"]["note"]["text"], "work in progress");
 
     // The note is durable evidence, not a courtesy reply.
     let store = sloop::store::Store::open(&world.db_path(), 0).expect("open runtime store");
-    let notes = store.notes_for_run("R1").expect("read notes");
+    let notes = store.notes_for_run(&world.run_id(1)).expect("read notes");
     assert_eq!(notes, vec!["work in progress".to_owned()]);
 }
 
@@ -331,23 +331,23 @@ fn reported_stage_records_the_first_verdict_and_rejects_the_second() {
     assert!(world.sloop(&["run", &ticket]).status.success());
     wait_until("the reported failure settles", || run_settled(&world));
 
-    let first = worktree_json(&world, "R1", "verdict.json");
+    let first = worktree_json(&world, 1, "verdict.json");
     assert_eq!(first["ok"], true, "first verdict failed: {first}");
     assert_eq!(first["data"]["verdict"]["stage"], "review");
     assert_eq!(first["data"]["verdict"]["verdict"], "fail");
     assert_eq!(first["data"]["verdict"]["reason"], "changes requested");
 
-    let duplicate = worktree_json(&world, "R1", "duplicate.json");
+    let duplicate = worktree_json(&world, 1, "duplicate.json");
     assert_eq!(duplicate["ok"], false);
     assert_eq!(duplicate["error"]["code"], "conflict");
     assert_eq!(
-        fs::read_to_string(world.root().join(".worktrees/R1/duplicate.exit"))
+        fs::read_to_string(world.run_worktree(1).join("duplicate.exit"))
             .expect("read duplicate exit")
             .trim(),
         "1"
     );
     let persisted = world
-        .run_evidence("R1", "stage_verdict")
+        .run_evidence(&world.run_id(1), "stage_verdict")
         .expect("reported verdict evidence");
     assert_eq!(persisted["verdict"], "fail");
     assert_eq!(persisted["reason"], "changes requested");
@@ -367,7 +367,7 @@ fn a_worker_brief_uses_the_ticket_body_captured_at_claim() {
 
     assert!(world.sloop(&["run", &ticket]).status.success());
     wait_until("the claimed run starts", || {
-        world.worker_socket("R1").exists()
+        world.worker_socket(&world.run_id(1)).exists()
     });
     fs::write(
         world.root().join(".agents/sloop/tickets/admission.md"),
@@ -377,7 +377,7 @@ fn a_worker_brief_uses_the_ticket_body_captured_at_claim() {
     fs::write(world.root().join("release"), "go\n").expect("release the agent");
     wait_until("the run settles", || run_settled(&world));
 
-    let brief = worktree_json(&world, "R1", "brief.json");
+    let brief = worktree_json(&world, 1, "brief.json");
     let body = brief["data"]["ticket"]["body"].as_str().expect("body");
     assert!(body.contains("Original instructions"), "brief body: {body}");
     assert!(!body.contains("Changed after claim"), "brief body: {body}");
@@ -444,16 +444,21 @@ fn project_show_groups_notes_and_git_commits_without_writing_source_files() {
     let tickets = show["data"]["value"]["tickets"]
         .as_array()
         .expect("project tickets");
-    for (ticket_id, run_id) in [(&first, "R1"), (&second, "R2")] {
+    for (ticket_id, run_id, alias) in [
+        (&first, world.run_id(1), world.run_alias(1)),
+        (&second, world.run_id(2), world.run_alias(2)),
+    ] {
         let ticket = tickets
             .iter()
             .find(|ticket| ticket["id"] == ticket_id.as_str())
             .expect("ticket activity group");
         assert_eq!(ticket["notes"].as_array().expect("notes").len(), 1);
-        assert_eq!(ticket["notes"][0]["run"], run_id);
+        assert_eq!(ticket["notes"][0]["run"], alias);
+        assert_eq!(ticket["notes"][0]["run_id"], run_id);
         assert_eq!(ticket["notes"][0]["text"], format!("note from {ticket_id}"));
         assert_eq!(ticket["commits"].as_array().expect("commits").len(), 1);
-        assert_eq!(ticket["commits"][0]["run"], run_id);
+        assert_eq!(ticket["commits"][0]["run"], alias);
+        assert_eq!(ticket["commits"][0]["run_id"], run_id);
         assert_eq!(
             ticket["commits"][0]["message"],
             format!("commit from {ticket_id}")
@@ -465,7 +470,7 @@ fn project_show_groups_notes_and_git_commits_without_writing_source_files() {
         );
     }
 
-    let ticket_show = worktree_json(&world, "R1", "ticket-show.json");
+    let ticket_show = worktree_json(&world, 1, "ticket-show.json");
     assert_eq!(ticket_show["data"]["ref"], first);
     assert_eq!(ticket_show["data"]["kind"], "ticket");
     assert_eq!(ticket_show["data"]["value"]["name"], "first");
@@ -549,7 +554,8 @@ fn operator_show_reports_a_run_by_id() {
     assert!(world.sloop(&["run", &ticket]).status.success());
     wait_until("the run settles", || run_settled(&world));
 
-    let output = world.sloop(&["show", "R1"]);
+    let run_id = world.run_id(1);
+    let output = world.sloop(&["show", &run_id]);
     assert!(
         output.status.success(),
         "operator show of a run failed: {}",
@@ -557,10 +563,10 @@ fn operator_show_reports_a_run_by_id() {
     );
     let show = World::json_stdout(&output);
     assert_eq!(show["ok"], true);
-    assert_eq!(show["data"]["ref"], "R1");
+    assert_eq!(show["data"]["ref"], run_id);
     assert_eq!(show["data"]["kind"], "run");
     let value = &show["data"]["value"];
-    assert_eq!(value["id"], "R1");
+    assert_eq!(value["id"], run_id);
     assert_eq!(value["ticket"], ticket.as_str());
     assert_eq!(value["ticket_name"], "cooldown");
     assert_eq!(value["state"], "merged");
@@ -577,14 +583,17 @@ fn operator_show_reports_a_run_by_id() {
         value["worktree"]
             .as_str()
             .expect("worktree")
-            .ends_with("R1"),
+            .ends_with(&run_id[..8]),
         "worktree: {value}"
     );
 
     // Human output names the run and its settled evidence.
-    let human = world.sloop_plain(&["show", "R1"]);
+    let human = world.sloop_plain(&["show", &run_id]);
     let human = String::from_utf8(human.stdout).expect("human output is UTF-8");
-    assert!(human.contains("R1  (merged)"), "{human}");
+    assert!(
+        human.contains(&format!("{}  (merged)", world.run_alias(1))),
+        "{human}"
+    );
     assert!(
         human.contains(&format!("ticket: {ticket}  cooldown")),
         "{human}"
@@ -600,8 +609,10 @@ fn the_worker_socket_rejects_wrong_tokens_and_operator_verbs() {
     let ticket = post_manual(&world, "gate.md", "# Gate\n");
     assert!(world.sloop(&["run", &ticket]).status.success());
 
-    let socket: PathBuf = world.worker_socket("R1");
-    wait_until("the worker socket appears", || socket.exists());
+    wait_until("the worker socket appears", || {
+        world.worker_socket(&world.run_id(1)).exists()
+    });
+    let socket: PathBuf = world.worker_socket(&world.run_id(1));
 
     let wrong_token = World::socket_exchange(
         &socket,

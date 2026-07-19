@@ -25,6 +25,7 @@ use crate::logging::{LogLevel, OperationalLog};
 use crate::protocol::{
     Capability, ErrorBody, ErrorCode, Request, RequestEnvelope, RequestId, ResponseEnvelope,
 };
+use crate::run_ref::{RandomRunIds, RunIdSource};
 use crate::runner::local::{process_identity_matches, process_start_time};
 use crate::sources::TicketSource;
 use crate::sources::exec::ExecTicketSource;
@@ -375,6 +376,7 @@ async fn serve(
         requests_tx: dispatcher_tx.clone(),
         log: log.clone(),
         clock,
+        run_ids: Arc::new(RandomRunIds) as Arc<dyn RunIdSource>,
         classifier,
         shutdown: shutdown_tx.clone(),
         shutdown_flag: shutdown_flag.clone(),

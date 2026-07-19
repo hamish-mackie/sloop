@@ -367,6 +367,57 @@ impl World {
         wait_until("the process group leader exits", || !process_alive(leader));
     }
 
+    /// The internal id of the `position`-th run the daemon claimed, counting
+    /// from 1. Ids are minted randomly, so tests name runs by the order they
+    /// were created rather than by a predictable literal.
+    ///
+    /// Returns a placeholder when that run does not exist yet. Polling helpers
+    /// call this before a claim lands, and a path built from the placeholder
+    /// simply does not exist — which is the answer such a poll wants.
+    pub fn run_id(&self, position: usize) -> String {
+        self.run_ids()
+            .into_iter()
+            .nth(position - 1)
+            .unwrap_or_else(|| "pending".into())
+    }
+
+    /// The `<ticket>-r<attempt>` alias of the `position`-th run.
+    pub fn run_alias(&self, position: usize) -> String {
+        let connection = rusqlite::Connection::open(self.db_path()).expect("open state database");
+        connection
+            .query_row(
+                "SELECT ticket_id || '-r' || attempt FROM runs WHERE id = ?1",
+                [self.run_id(position)],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "pending".into())
+    }
+
+    /// Every run id in claim order.
+    pub fn run_ids(&self) -> Vec<String> {
+        let Ok(connection) = rusqlite::Connection::open(self.db_path()) else {
+            return Vec::new();
+        };
+        let Ok(mut statement) =
+            connection.prepare("SELECT id FROM runs ORDER BY created_at_ms, rowid")
+        else {
+            return Vec::new();
+        };
+        let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0)) else {
+            return Vec::new();
+        };
+        rows.filter_map(Result::ok).collect()
+    }
+
+    /// The worktree directory the `position`-th run was given. Worktrees are
+    /// named by the short form of the internal id.
+    pub fn run_worktree(&self, position: usize) -> PathBuf {
+        let id = self.run_id(position);
+        self.root()
+            .join(".worktrees")
+            .join(id.get(..8).unwrap_or(&id))
+    }
+
     pub fn run_process_id(&self, run_id: &str) -> u32 {
         let connection = rusqlite::Connection::open(self.db_path()).expect("open state database");
         let pid: i64 = connection

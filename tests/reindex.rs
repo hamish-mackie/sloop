@@ -251,7 +251,14 @@ fn reindex_rebuilds_files_and_git_but_not_deleted_runtime_history() {
         1
     );
     let status = Command::new("git")
-        .args(["worktree", "remove", ".worktrees/R1"])
+        .args([
+            "worktree",
+            "remove",
+            world
+                .run_worktree(1)
+                .to_str()
+                .expect("worktree path is UTF-8"),
+        ])
         .current_dir(world.root())
         .status()
         .expect("remove completed run worktree");
@@ -328,11 +335,9 @@ fn reindex_rebuilds_files_and_git_but_not_deleted_runtime_history() {
     wait_until("a fresh run succeeds after database recovery", || {
         World::json_stdout(&world.sloop(&["status"]))["data"]["tickets"]["merged"] == 2
     });
-    let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
-    let run_id: String = connection
-        .query_row("SELECT id FROM runs", [], |row| row.get(0))
-        .expect("read recovered run ID");
-    assert_eq!(run_id, "R2");
+    let recovered = world.run_ids();
+    assert_eq!(recovered.len(), 1, "{recovered:?}");
+    assert_eq!(recovered[0].len(), 32, "{recovered:?}");
 }
 
 #[test]
@@ -399,10 +404,11 @@ fn reindex_drops_history_for_tickets_removed_from_files() {
     });
     assert_eq!(database_count(&world, "runs"), 2);
     assert_eq!(database_count(&world, "notes"), 2);
+    let kept_run = world.run_id(1);
     fs::remove_file(world.root().join(".agents/sloop/tickets/stale.md"))
         .expect("remove stale ticket file");
     create_merged_branch(&world, "sloop/T3", "state-evidence.txt");
-    create_unmerged_worktree(&world, "sloop/T6-a1-R99", "R99");
+    create_unmerged_worktree(&world, "sloop/T6-a1-deadbeef", "deadbeef");
     let status = Command::new("git")
         .args(["branch", "sloop/T4"])
         .current_dir(world.root())
@@ -455,15 +461,9 @@ fn reindex_drops_history_for_tickets_removed_from_files() {
     wait_until("the post-reindex run finishes", || {
         World::json_stdout(&world.sloop(&["status"]))["data"]["tickets"]["merged"] == 3
     });
-    let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
-    let run_ids = connection
-        .prepare("SELECT id FROM runs ORDER BY id")
-        .expect("prepare run ID query")
-        .query_map([], |row| row.get::<_, String>(0))
-        .expect("query run IDs")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("read run IDs");
-    assert_eq!(run_ids, ["R1", "R100"]);
+    let run_ids = world.run_ids();
+    assert_eq!(run_ids.len(), 2, "{run_ids:?}");
+    assert_eq!(run_ids[0], kept_run, "{run_ids:?}");
     assert_eq!(database_count(&world, "notes"), 2);
 }
 
@@ -498,7 +498,7 @@ fn reindex_is_rejected_while_an_agent_is_active() {
         response["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("R1")
+            .contains(&world.run_alias(1))
     );
 
     world.release("active");

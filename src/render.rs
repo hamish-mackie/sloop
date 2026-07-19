@@ -180,17 +180,38 @@ fn render_status(data: &Value) -> String {
     .collect();
     let _ = writeln!(text, "tickets: {}", counts.join(", "));
 
-    for (title, items) in [
-        ("runs", &data["runs"]),
-        ("queued", &data["queued_activations"]),
-    ] {
-        let items = items.as_array().map(Vec::as_slice).unwrap_or_default();
-        if items.is_empty() {
-            let _ = writeln!(text, "{title}: none");
-            continue;
+    // Run lines lead with the alias and the ticket's name, so the line answers
+    // "what is this working on" without a second command. Queued activations
+    // are not runs and keep their own shape.
+    let runs = data["runs"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if runs.is_empty() {
+        text.push_str("runs: none\n");
+    } else {
+        text.push_str("runs:\n");
+        for run in runs {
+            let _ = writeln!(
+                text,
+                "  {} {} — {} (project {})",
+                run["alias"].as_str().unwrap_or("?"),
+                run["state"].as_str().unwrap_or("?"),
+                run["ticket_name"].as_str().unwrap_or("?"),
+                run["project"].as_str().unwrap_or("-"),
+            );
         }
-        let _ = writeln!(text, "{title}:");
-        for item in items {
+    }
+
+    let queued = data["queued_activations"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if queued.is_empty() {
+        text.push_str("queued: none\n");
+    } else {
+        text.push_str("queued:\n");
+        for item in queued {
             let _ = writeln!(
                 text,
                 "  {} {} (ticket {}, project {})",
@@ -276,9 +297,14 @@ fn render_stop(data: &Value) -> String {
 }
 
 fn render_wait(data: &Value) -> String {
-    let mut rendered = format!(
-        "run {} {}\n",
-        data["run"].as_str().unwrap_or("?"),
+    let mut rendered = String::new();
+    if let Some(note) = data["note"].as_str() {
+        let _ = writeln!(rendered, "{note}");
+    }
+    let _ = writeln!(
+        rendered,
+        "run {} {}",
+        data["alias"].as_str().unwrap_or("?"),
         data["state"].as_str().unwrap_or("?"),
     );
     if let Some(reason) = data["reason"].as_str() {
@@ -288,7 +314,7 @@ fn render_wait(data: &Value) -> String {
 }
 
 fn render_cancel(data: &Value) -> String {
-    let mut text = format!("run {} cancelling\n", data["run"].as_str().unwrap_or("?"));
+    let mut text = format!("run {} cancelling\n", data["alias"].as_str().unwrap_or("?"));
     if let Some(worktree) = data["worktree"].as_str() {
         let _ = writeln!(text, "worktree preserved at {worktree}");
     }
@@ -300,13 +326,18 @@ fn render_logs(data: &Value) -> String {
         .as_array()
         .map(Vec::as_slice)
         .unwrap_or_default();
-    if entries.is_empty() {
-        return format!(
-            "no output captured for run {}\n",
-            data["run"].as_str().unwrap_or("?")
-        );
-    }
     let mut text = String::new();
+    if let Some(note) = data["note"].as_str() {
+        let _ = writeln!(text, "{note}");
+    }
+    if entries.is_empty() {
+        let _ = writeln!(
+            text,
+            "no output captured for run {}",
+            data["alias"].as_str().unwrap_or("?")
+        );
+        return text;
+    }
     for entry in entries {
         let timestamp = entry["timestamp"].as_str().unwrap_or("?");
         let mut origin = entry["source"].as_str().unwrap_or("?").to_owned();
@@ -386,9 +417,14 @@ fn render_ticket_show(data: &Value) -> String {
 /// A run's identity and settled evidence, one fact per line.
 fn render_run_show(data: &Value) -> String {
     let value = &data["value"];
-    let mut text = format!(
-        "{}  ({})\n",
-        value["id"].as_str().unwrap_or("?"),
+    let mut text = String::new();
+    if let Some(note) = value["note"].as_str() {
+        let _ = writeln!(text, "{note}");
+    }
+    let _ = writeln!(
+        text,
+        "{}  ({})",
+        value["alias"].as_str().unwrap_or("?"),
         value["state"].as_str().unwrap_or("?"),
     );
     let ticket = value["ticket"].as_str().unwrap_or("?");
@@ -520,7 +556,11 @@ mod tests {
                     "running_hours": {"start": "22:00", "end": "06:00", "open": false}
                 },
                 "next_wake": "2026-07-15T22:00:00Z",
-                "runs": [{"id": "R1", "state": "running", "ticket": "T1", "project": "default"}],
+                "runs": [{
+                    "id": "3f2a9c1b7d4e5061a2b3c4d5e6f70819", "alias": "T1-r1",
+                    "state": "running", "ticket": "T1", "ticket_name": "Generalized stages",
+                    "project": "default"
+                }],
                 "queued_activations": [],
                 "tickets": {
                     "ready": 1, "held": 2, "blocked": 0, "claimed": 1,
@@ -544,7 +584,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("R1 running (ticket T1, project default)"),
+            text.contains("T1-r1 running — Generalized stages (project default)"),
             "{text}"
         );
         assert!(text.contains("queued: none"), "{text}");
@@ -739,6 +779,7 @@ mod tests {
                 "kind": "run",
                 "value": {
                     "id": "R14",
+                    "alias": "TICK-1-r2",
                     "ticket": "TICK-1",
                     "ticket_name": "cooldown",
                     "state": "merged",
@@ -755,7 +796,7 @@ mod tests {
         assert_eq!(
             render(Some("show"), &response),
             concat!(
-                "R14  (merged)\n",
+                "TICK-1-r2  (merged)\n",
                 "ticket: TICK-1  cooldown\n",
                 "branch: sloop/R14-TICK-1\n",
                 "worktree: /repo/.worktrees/R14\n",

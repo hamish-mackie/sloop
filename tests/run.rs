@@ -111,12 +111,15 @@ fn post_manual_blocked(world: &World, name: &str, blockers: &[&str]) -> String {
         .to_owned()
 }
 
-fn worktree_marker(world: &World, run: &str) -> std::path::PathBuf {
-    world
-        .root()
-        .join(".worktrees")
-        .join(run)
-        .join("agent-ran.txt")
+fn worktree_marker(world: &World, position: usize) -> std::path::PathBuf {
+    world.run_worktree(position).join("agent-ran.txt")
+}
+
+/// The short form of a run's internal id: what names its worktree directory
+/// and the tail of its run branch.
+fn short_run_id(world: &World, position: usize) -> String {
+    let id = world.run_id(position);
+    id.get(..8).unwrap_or(&id).to_owned()
 }
 
 fn status(world: &World) -> serde_json::Value {
@@ -148,8 +151,10 @@ fn run_executes_the_fake_agent_in_an_isolated_worktree() {
     assert_eq!(response["data"]["activation"]["state"], "queued");
     assert_eq!(response["data"]["activation"]["ticket"], ticket.as_str());
 
-    let marker = worktree_marker(&world, "R1");
-    wait_until("the fake agent runs in its worktree", || marker.is_file());
+    wait_until("the fake agent runs in its worktree", || {
+        worktree_marker(&world, 1).is_file()
+    });
+    let marker = worktree_marker(&world, 1);
     assert_eq!(fs::read_to_string(&marker).unwrap().trim(), ticket);
     assert!(is_git_worktree(marker.parent().unwrap()));
 
@@ -192,10 +197,10 @@ fn agent_receives_composed_prompt_and_sloop_binary_environment() {
     let ticket = post_manual(&world, "prompt.md", "# Record launch context\n");
 
     assert!(world.sloop(&["run", &ticket]).status.success());
-    let worktree = world.root().join(".worktrees/R1");
     wait_until("the fake agent records its launch context", || {
-        worktree.join("sloop-resolved.txt").is_file()
+        world.run_worktree(1).join("sloop-resolved.txt").is_file()
     });
+    let worktree = world.run_worktree(1);
 
     let prompt = fs::read_to_string(worktree.join("prompt.txt")).unwrap();
     let bootstrap = include_str!("../src/worker-instructions.md").trim_ascii();
@@ -242,13 +247,20 @@ fn run_honors_a_custom_worktree_directory_end_to_end() {
 
     assert!(world.sloop(&["run", &ticket]).status.success());
 
-    let marker = world.root().join("local/agent-worktrees/R1/agent-ran.txt");
+    let marker = |world: &World| {
+        world
+            .root()
+            .join("local/agent-worktrees")
+            .join(short_run_id(world, 1))
+            .join("agent-ran.txt")
+    };
     wait_until("the fake agent runs in the configured directory", || {
-        marker.is_file()
+        marker(&world).is_file()
     });
+    let marker = marker(&world);
     assert_eq!(fs::read_to_string(&marker).unwrap().trim(), ticket);
     assert!(is_git_worktree(marker.parent().unwrap()));
-    assert!(!world.root().join(".worktrees/R1").exists());
+    assert!(!world.run_worktree(1).exists());
     assert!(!world.root().join(".sloop").exists());
 }
 
@@ -286,17 +298,19 @@ fn tickets_launch_the_command_for_their_snapshotted_target() {
         "---\ntarget: second\n---\n# Explicit target\n",
     );
     assert!(world.sloop(&["run", &first]).status.success());
-    let first_marker = world.root().join(".worktrees/R1/selected-target.txt");
-    wait_until("the default target command runs", || first_marker.is_file());
+    wait_until("the default target command runs", || {
+        world.run_worktree(1).join("selected-target.txt").is_file()
+    });
+    let first_marker = world.run_worktree(1).join("selected-target.txt");
     wait_until("the default target run settles", || {
         status(&world)["gate"]["active_agents"] == 0
     });
 
     assert!(world.sloop(&["run", &second]).status.success());
-    let second_marker = world.root().join(".worktrees/R2/selected-target.txt");
     wait_until("the explicit target command runs", || {
-        second_marker.is_file()
+        world.run_worktree(2).join("selected-target.txt").is_file()
     });
+    let second_marker = world.run_worktree(2).join("selected-target.txt");
     assert_eq!(fs::read_to_string(first_marker).unwrap().trim(), "first");
     assert_eq!(fs::read_to_string(second_marker).unwrap().trim(), "second");
 }
@@ -334,7 +348,7 @@ fn retry_requeues_a_failed_ticket_and_allows_another_run() {
 
     assert!(world.sloop(&["run", &ticket]).status.success());
     wait_until("the retried ticket dispatches again", || {
-        worktree_marker(&world, "R2").is_file()
+        worktree_marker(&world, 2).is_file()
     });
 }
 
@@ -394,8 +408,11 @@ fn list_explains_paused_failed_held_and_claimed_tickets() {
     assert_eq!(row(&failed)["name"], "failed");
     assert_eq!(row(&held)["name"], "held");
     assert_eq!(row(&claimed)["name"], "claimed");
-    assert_eq!(row(&claimed)["run"], "R2");
-    assert_eq!(row(&claimed)["reason"], "claimed by run R2");
+    assert_eq!(row(&claimed)["run"], world.run_alias(2));
+    assert_eq!(
+        row(&claimed)["reason"],
+        format!("claimed by run {}", world.run_alias(2))
+    );
 
     let human = world.sloop_plain(&["list"]);
     assert!(human.status.success());
@@ -469,10 +486,10 @@ fn blocked_dependencies_are_reported_and_release_after_every_blocker_merges() {
     assert!(world.sloop(&["ready", &second]).status.success());
     assert!(world.sloop(&["run", &second]).status.success());
     wait_until("the dependent runs after its last blocker merges", || {
-        worktree_marker(&world, "R3").is_file()
+        worktree_marker(&world, 3).is_file()
     });
     assert_eq!(
-        fs::read_to_string(worktree_marker(&world, "R3"))
+        fs::read_to_string(worktree_marker(&world, 3))
             .unwrap()
             .trim(),
         dependent
@@ -502,7 +519,7 @@ fn a_failed_blocker_keeps_its_dependent_blocked() {
     assert_eq!(snapshot["tickets"]["failed"], 1);
     assert_eq!(snapshot["tickets"]["blocked"], 1);
     assert_eq!(snapshot["queued_activations"].as_array().unwrap().len(), 1);
-    assert!(!worktree_marker(&world, "R2").exists());
+    assert!(!worktree_marker(&world, 2).exists());
 }
 
 #[test]
@@ -518,20 +535,20 @@ fn parallelism_never_exceeds_the_configured_capacity() {
     assert!(world.sloop(&["run", &second]).status.success());
 
     wait_until("the first agent starts", || {
-        worktree_marker(&world, "R1").is_file()
+        worktree_marker(&world, 1).is_file()
     });
     let data = status(&world);
     assert_eq!(data["gate"]["active_agents"], 1);
     assert_eq!(data["runs"].as_array().unwrap().len(), 1);
     assert_eq!(data["queued_activations"].as_array().unwrap().len(), 1);
     assert!(
-        !world.root().join(".worktrees/R2").exists(),
+        !world.run_worktree(2).exists(),
         "the second run spawned past the capacity gate"
     );
 
     fs::write(world.root().join("release"), "go\n").unwrap();
     wait_until("the second agent runs after capacity frees", || {
-        worktree_marker(&world, "R2").is_file()
+        worktree_marker(&world, 2).is_file()
     });
     wait_until("both runs finish", || {
         status(&world)["gate"]["active_agents"] == 0
@@ -556,7 +573,7 @@ fn pause_gates_the_queue_survives_restart_and_resume_drains_it() {
         );
     }
     wait_until("the first agent starts", || {
-        worktree_marker(&world, "R1").is_file()
+        worktree_marker(&world, 1).is_file()
     });
 
     let paused = world.sloop(&["pause"]);
@@ -573,7 +590,7 @@ fn pause_gates_the_queue_survives_restart_and_resume_drains_it() {
         assert_eq!(data["gate"]["active_agents"], 0);
         assert_eq!(data["queued_activations"].as_array().unwrap().len(), 1);
         assert!(
-            !worktree_marker(&world, "R2").exists(),
+            !worktree_marker(&world, 2).exists(),
             "the second ticket started while paused"
         );
     }
@@ -585,13 +602,13 @@ fn pause_gates_the_queue_survives_restart_and_resume_drains_it() {
     let restarted = status(&world);
     assert_eq!(restarted["daemon"]["paused"], true);
     assert_eq!(restarted["gate"]["active_agents"], 0);
-    assert!(!worktree_marker(&world, "R2").exists());
+    assert!(!worktree_marker(&world, 2).exists());
 
     let resumed = world.sloop(&["resume"]);
     assert!(resumed.status.success());
     assert_eq!(World::json_stdout(&resumed)["data"]["paused"], false);
     wait_until("the second agent starts after resume", || {
-        worktree_marker(&world, "R2").is_file()
+        worktree_marker(&world, 2).is_file()
     });
 }
 
@@ -629,7 +646,7 @@ fn a_project_scoped_run_selects_only_that_projects_tickets() {
         "backend"
     );
 
-    let marker = worktree_marker(&world, "R1");
+    let marker = worktree_marker(&world, 1);
     wait_until("the scoped agent runs", || marker.is_file());
     assert_eq!(fs::read_to_string(&marker).unwrap().trim(), scoped);
 
@@ -638,7 +655,7 @@ fn a_project_scoped_run_selects_only_that_projects_tickets() {
     });
     let data = status(&world);
     assert_eq!(data["tickets"]["ready"], 1, "{other} must stay untouched");
-    assert!(!world.root().join(".worktrees/R2").exists());
+    assert!(!world.run_worktree(2).exists());
 }
 
 #[test]
@@ -669,11 +686,11 @@ fn a_held_ticket_rejects_named_runs_until_an_operator_releases_it() {
     let repeated = world.sloop(&["ready", &ticket]);
     assert!(repeated.status.success());
     assert_eq!(World::json_stdout(&repeated)["data"]["overridden"], false);
-    assert!(!world.root().join(".worktrees/R1").exists());
+    assert!(!world.run_worktree(1).exists());
 
     assert!(world.sloop(&["run", &ticket]).status.success());
     wait_until("released ticket runs", || {
-        worktree_marker(&world, "R1").is_file()
+        worktree_marker(&world, 1).is_file()
     });
     wait_until("the ticket reaches its derived outcome", || {
         status(&world)["tickets"]["merged"] == 1
@@ -701,11 +718,11 @@ fn running_hours_hold_queued_work_until_the_opening_boundary() {
     let data = status(&world);
     assert_eq!(data["gate"]["running_hours"]["open"], false);
     assert!(data["next_wake"].is_string());
-    assert!(!worktree_marker(&world, "R1").exists());
+    assert!(!worktree_marker(&world, 1).exists());
 
     world.tick(Duration::from_secs(2 * 60));
     wait_until("the opening boundary wakes the dispatcher", || {
-        worktree_marker(&world, "R1").is_file()
+        worktree_marker(&world, 1).is_file()
     });
 }
 
@@ -727,26 +744,26 @@ fn overnight_dispatches_once_inside_the_window() {
         World::json_stdout(&output)["data"]["activation"]["kind"],
         "overnight"
     );
-    assert!(!worktree_marker(&world, "R1").exists());
+    assert!(!worktree_marker(&world, 1).exists());
 
     world.tick(Duration::from_secs(2 * 60));
     wait_until("overnight work starts after the window opens", || {
-        worktree_marker(&world, "R1").is_file()
+        worktree_marker(&world, 1).is_file()
     });
     assert_eq!(
-        fs::read_to_string(worktree_marker(&world, "R1"))
+        fs::read_to_string(worktree_marker(&world, 1))
             .unwrap()
             .trim(),
         first
     );
-    assert!(!worktree_marker(&world, "R2").exists());
+    assert!(!worktree_marker(&world, 2).exists());
 
     fs::write(world.root().join("release"), "go\n").unwrap();
     wait_until("the overnight run settles", || {
         status(&world)["gate"]["active_agents"] == 0
     });
     world.tick(Duration::from_secs(60));
-    assert!(!worktree_marker(&world, "R2").exists());
+    assert!(!worktree_marker(&world, 2).exists());
     assert_eq!(status(&world)["tickets"]["ready"], 1);
 }
 
@@ -761,7 +778,7 @@ fn overnight_without_running_hours_dispatches_immediately() {
     let output = world.sloop(&["run", &ticket, "--overnight"]);
     assert!(output.status.success());
     wait_until("overnight work starts without configured hours", || {
-        worktree_marker(&world, "R1").is_file()
+        worktree_marker(&world, 1).is_file()
     });
 }
 
@@ -790,33 +807,33 @@ fn every_waits_for_the_window_rearms_and_dispatches_again() {
     assert_eq!(response["data"]["activation"]["interval_ms"], 120_000);
 
     world.tick(Duration::from_secs(2 * 60));
-    assert!(!worktree_marker(&world, "R1").exists());
+    assert!(!worktree_marker(&world, 1).exists());
     world.tick(Duration::from_secs(3 * 60));
     wait_until("the overdue recurring run starts at opening", || {
-        worktree_marker(&world, "R1").is_file()
+        worktree_marker(&world, 1).is_file()
     });
     assert_eq!(
-        fs::read_to_string(worktree_marker(&world, "R1"))
+        fs::read_to_string(worktree_marker(&world, 1))
             .unwrap()
             .trim(),
         first
     );
-    assert!(!worktree_marker(&world, "R2").exists());
+    assert!(!worktree_marker(&world, 2).exists());
 
     fs::write(world.root().join("release"), "go\n").unwrap();
     wait_until("the first recurring run settles", || {
         status(&world)["gate"]["active_agents"] == 0
     });
-    assert!(!worktree_marker(&world, "R2").exists());
+    assert!(!worktree_marker(&world, 2).exists());
 
     // The original two-minute cadence makes the next slot one minute after
     // this delayed dispatch, rather than immediately or two minutes from now.
     world.tick(Duration::from_secs(60));
     wait_until("the rearmed recurring activation dispatches again", || {
-        worktree_marker(&world, "R2").is_file()
+        worktree_marker(&world, 2).is_file()
     });
     assert_eq!(
-        fs::read_to_string(worktree_marker(&world, "R2"))
+        fs::read_to_string(worktree_marker(&world, 2))
             .unwrap()
             .trim(),
         second
@@ -858,11 +875,11 @@ fn at_dispatches_only_once_its_scheduled_time_passes() {
     );
 
     world.tick(Duration::from_secs(60));
-    assert!(!worktree_marker(&world, "R1").exists());
+    assert!(!worktree_marker(&world, 1).exists());
 
     world.tick(Duration::from_secs(2 * 60));
     wait_until("the timed activation dispatches once due", || {
-        worktree_marker(&world, "R1").is_file()
+        worktree_marker(&world, 1).is_file()
     });
 }
 
@@ -887,11 +904,11 @@ fn at_outside_running_hours_waits_for_the_window() {
 
     world.tick(Duration::from_secs(3 * 60));
     assert_eq!(status(&world)["gate"]["running_hours"]["open"], false);
-    assert!(!worktree_marker(&world, "R1").exists());
+    assert!(!worktree_marker(&world, 1).exists());
 
     world.tick(Duration::from_secs(3 * 60));
     wait_until("the due timed run starts at the opening boundary", || {
-        worktree_marker(&world, "R1").is_file()
+        worktree_marker(&world, 1).is_file()
     });
 }
 
@@ -909,7 +926,7 @@ fn closing_time_does_not_cancel_active_work_or_start_the_next_run() {
     assert!(world.sloop(&["run", &first]).status.success());
     assert!(world.sloop(&["run", &second]).status.success());
     wait_until("the first run starts", || {
-        worktree_marker(&world, "R1").is_file()
+        worktree_marker(&world, 1).is_file()
     });
     let rejected = world.sloop(&["hold", &first]);
     assert!(!rejected.status.success());
@@ -925,7 +942,7 @@ fn closing_time_does_not_cancel_active_work_or_start_the_next_run() {
     let data = status(&world);
     assert_eq!(data["gate"]["running_hours"]["open"], false);
     assert_eq!(data["queued_activations"].as_array().unwrap().len(), 1);
-    assert!(!worktree_marker(&world, "R2").exists());
+    assert!(!worktree_marker(&world, 2).exists());
 }
 
 #[test]
@@ -954,7 +971,7 @@ fn hold_then_ready_round_trips_an_auto_activation_without_dispatching_while_held
     wait_until("running-hours gate opens", || {
         status(&world)["gate"]["running_hours"]["open"] == true
     });
-    assert!(!worktree_marker(&world, "R1").exists());
+    assert!(!worktree_marker(&world, 1).exists());
     assert_eq!(
         status(&world)["queued_activations"]
             .as_array()
@@ -968,7 +985,7 @@ fn hold_then_ready_round_trips_an_auto_activation_without_dispatching_while_held
     assert_eq!(World::json_stdout(&ready)["data"]["previous_state"], "held");
     assert_eq!(World::json_stdout(&ready)["data"]["state"], "ready");
     wait_until("released activation runs", || {
-        worktree_marker(&world, "R1").is_file()
+        worktree_marker(&world, 1).is_file()
     });
 }
 
@@ -1006,7 +1023,7 @@ fn restart_readopts_a_matching_live_process_until_it_exits() {
     wait_until("the agent reaches its blocking point", || {
         world.fake_agent_reached("recovery")
     });
-    let agent_pid = world.run_process_id("R1");
+    let agent_pid = world.run_process_id(&world.run_id(1));
 
     world.kill_daemon(daemon_pid);
     assert!(
@@ -1019,7 +1036,7 @@ fn restart_readopts_a_matching_live_process_until_it_exits() {
     assert!(restarted.status.success());
     wait_until("the restarted daemon adopts the run", || {
         let snapshot = status(&world);
-        snapshot["gate"]["active_agents"] == 1 && snapshot["runs"][0]["id"] == "R1"
+        snapshot["gate"]["active_agents"] == 1 && snapshot["runs"][0]["id"] == world.run_id(1)
     });
 
     world.release("recovery");
@@ -1029,8 +1046,9 @@ fn restart_readopts_a_matching_live_process_until_it_exits() {
             && snapshot["runs"].as_array().is_some_and(Vec::is_empty)
             && snapshot["tickets"]["ready"] == 1
     });
-    assert_eq!(world.run_note_count("R1"), 1);
-    let waited = world.sloop(&["wait", "R1", "--timeout", "5"]);
+    assert_eq!(world.run_note_count(&world.run_id(1)), 1);
+    let run_id = world.run_id(1);
+    let waited = world.sloop(&["wait", &run_id, "--timeout", "5"]);
     assert!(!waited.status.success());
     assert_eq!(
         World::json_stdout_or_stderr(&waited)["data"]["state"],
@@ -1052,10 +1070,13 @@ fn restart_does_not_orphan_a_live_process_with_unverifiable_identity() {
     wait_until("the agent reaches its blocking point", || {
         world.fake_agent_reached("unverifiable-recovery")
     });
-    let agent_pid = world.run_process_id("R1");
+    let agent_pid = world.run_process_id(&world.run_id(1));
     rusqlite::Connection::open(world.db_path())
         .expect("open state database")
-        .execute("UPDATE runs SET pid_start_time = NULL WHERE id = 'R1'", [])
+        .execute(
+            "UPDATE runs SET pid_start_time = NULL WHERE id = ?1",
+            [world.run_id(1)],
+        )
         .expect("make process identity unverifiable");
 
     world.kill_daemon(daemon_pid);
@@ -1097,7 +1118,7 @@ fn restart_orphans_a_dead_process_without_using_commits_as_a_verdict() {
     wait_until("the agent commits before the crash", || {
         world.fake_agent_reached("committed")
     });
-    let agent_pid = world.run_process_id("R1");
+    let agent_pid = world.run_process_id(&world.run_id(1));
 
     world.kill_daemon(daemon_pid);
     world.kill_process_group(agent_pid);
@@ -1107,7 +1128,8 @@ fn restart_orphans_a_dead_process_without_using_commits_as_a_verdict() {
         let snapshot = status(&world);
         snapshot["gate"]["active_agents"] == 0 && snapshot["tickets"]["ready"] == 1
     });
-    let waited = world.sloop(&["wait", "R1", "--timeout", "5"]);
+    let run_id = world.run_id(1);
+    let waited = world.sloop(&["wait", &run_id, "--timeout", "5"]);
     assert!(!waited.status.success());
     assert_eq!(
         World::json_stdout_or_stderr(&waited)["data"]["state"],
@@ -1149,7 +1171,7 @@ fn periodic_reconciliation_leaves_a_healthy_live_agent_untouched() {
     wait_until("the healthy agent reaches its blocking point", || {
         world.fake_agent_reached("healthy-periodic")
     });
-    let agent_pid = world.run_process_id("R1");
+    let agent_pid = world.run_process_id(&world.run_id(1));
 
     // Observe continuously across two liveness intervals rather than sleeping
     // and checking only the final state.
@@ -1180,12 +1202,12 @@ fn periodic_reconciliation_treats_a_mismatched_start_time_as_pid_reuse() {
     wait_until("the agent reaches its blocking point", || {
         world.fake_agent_reached("pid-reuse")
     });
-    let agent_pid = world.run_process_id("R1");
+    let agent_pid = world.run_process_id(&world.run_id(1));
     let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
     connection
         .execute(
-            "UPDATE runs SET pid_start_time = pid_start_time + 1 WHERE id = 'R1'",
-            [],
+            "UPDATE runs SET pid_start_time = pid_start_time + 1 WHERE id = ?1",
+            [world.run_id(1)],
         )
         .expect("fabricate reused PID identity");
 
@@ -1316,8 +1338,8 @@ fn periodic_reconciliation_does_not_duplicate_supervisor_aftercare() {
     let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
     let stage_count: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM aftercare_stages WHERE run_id = 'R1'",
-            [],
+            "SELECT COUNT(*) FROM aftercare_stages WHERE run_id = ?1",
+            [world.run_id(1)],
             |row| row.get(0),
         )
         .expect("count aftercare stages");
@@ -1325,8 +1347,8 @@ fn periodic_reconciliation_does_not_duplicate_supervisor_aftercare() {
     let exit_evidence_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM run_evidence
-             WHERE run_id = 'R1' AND kind = 'exit_classified'",
-            [],
+             WHERE run_id = ?1 AND kind = 'exit_classified'",
+            [world.run_id(1)],
             |row| row.get(0),
         )
         .expect("count exit evidence");
@@ -1423,7 +1445,7 @@ fn a_hand_merged_review_branch_settles_to_merged_and_releases_its_dependent() {
 
     // An operator reviews and merges the preserved run branch by hand.
     advance_default_branch(&world, "unrelated.txt");
-    let branch = format!("sloop/{blocker}-a1-R1");
+    let branch = format!("sloop/{blocker}-a1-{}", short_run_id(&world, 1));
     let merged = git_root(
         &world,
         &[
@@ -1483,7 +1505,7 @@ fn a_squash_merged_review_branch_stays_in_needs_review() {
 
     // A squash-merge rewrites the commits, so the run branch tip is not an
     // ancestor of the default branch and ancestry cannot prove integration.
-    let branch = format!("sloop/{blocker}-a1-R1");
+    let branch = format!("sloop/{blocker}-a1-{}", short_run_id(&world, 1));
     assert!(
         git_root(&world, &["merge", "--squash", &branch])
             .status
@@ -1531,7 +1553,7 @@ fn a_deleted_review_branch_leaves_the_ticket_and_daemon_untouched() {
 
     // The operator discards the run branch entirely. Its worktree must be
     // released first, since Git refuses to delete a checked-out branch.
-    let worktree = world.root().join(".worktrees/R1");
+    let worktree = world.run_worktree(1);
     assert!(
         git_root(
             &world,
@@ -1540,7 +1562,7 @@ fn a_deleted_review_branch_leaves_the_ticket_and_daemon_untouched() {
         .status
         .success()
     );
-    let branch = format!("sloop/{blocker}-a1-R1");
+    let branch = format!("sloop/{blocker}-a1-{}", short_run_id(&world, 1));
     assert!(
         git_root(&world, &["branch", "-D", &branch])
             .status
@@ -1571,7 +1593,7 @@ fn external_merge_reconciliation_survives_a_restart_without_duplicating_evidence
     });
 
     advance_default_branch(&world, "unrelated.txt");
-    let branch = format!("sloop/{blocker}-a1-R1");
+    let branch = format!("sloop/{blocker}-a1-{}", short_run_id(&world, 1));
     assert!(
         git_root(
             &world,
@@ -1618,7 +1640,7 @@ fn assert_periodic_dead_agent_is_orphaned(world: &World, ticket_name: &str, mark
         world.fake_agent_reached(marker)
     });
 
-    let agent_pid = world.run_process_id("R1");
+    let agent_pid = world.run_process_id(&world.run_id(1));
     world.kill_process_group(agent_pid);
     wait_until("the supervisor reaches the exit handoff", || {
         world.test_hook_reached("before-agent-exit-checkpoint")
@@ -1631,7 +1653,8 @@ fn assert_periodic_dead_agent_is_orphaned(world: &World, ticket_name: &str, mark
     });
 
     world.release_test_hook("before-agent-exit-checkpoint");
-    let waited = world.sloop(&["wait", "R1", "--timeout", "5"]);
+    let run_id = world.run_id(1);
+    let waited = world.sloop(&["wait", &run_id, "--timeout", "5"]);
     assert!(!waited.status.success());
     assert_eq!(
         World::json_stdout_or_stderr(&waited)["data"]["state"],
@@ -1716,7 +1739,8 @@ fn wait_blocks_until_a_run_finishes_and_reports_the_outcome() {
 
     // The fake agent exits nonzero, so the derived outcome is `failed`; wait
     // must return nonzero with the terminal state in the envelope.
-    let output = world.sloop(&["wait", "R1", "--timeout", "30"]);
+    let run_id = world.run_id(1);
+    let output = world.sloop(&["wait", &run_id, "--timeout", "30"]);
     assert!(!output.status.success());
     let response = World::json_stdout_or_stderr(&output);
     assert_eq!(response["data"]["terminal"], true);
@@ -1779,11 +1803,14 @@ fn events_feed_reports_the_run_lifecycle_in_order() {
     let events = response["data"]["events"].as_array().expect("events array");
     let lifecycle: Vec<&str> = events
         .iter()
-        .filter(|event| event["run"] == "R1")
+        .filter(|event| event["run"] == world.run_id(1))
         .map(|event| event["kind"].as_str().unwrap())
         .collect();
     assert_eq!(lifecycle, ["run_claimed", "run_started", "run_finished"]);
-    for event in events.iter().filter(|event| event["run"] == "R1") {
+    for event in events
+        .iter()
+        .filter(|event| event["run"] == world.run_id(1))
+    {
         assert_eq!(event["ticket"], ticket.as_str());
     }
     let finished = events

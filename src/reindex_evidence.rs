@@ -5,47 +5,7 @@ use std::process::Command;
 
 use crate::domain::ticket::TicketState;
 use crate::reindex::ReindexError;
-use crate::store::{ReindexTicket, Store};
-
-pub(crate) fn seed_run_counter(
-    root: &Path,
-    worktree_dir: &Path,
-    state_dir: &Path,
-    store: &Store,
-) -> Result<(), ReindexError> {
-    let mut greatest = 0;
-    for directory in [worktree_dir.to_path_buf(), state_dir.join("runs")] {
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(source) => return Err(ReindexError::io(&directory, source)),
-        };
-        for entry in entries {
-            let name = entry
-                .map_err(|source| ReindexError::io(&directory, source))?
-                .file_name();
-            if let Some(ordinal) = run_ordinal(&name.to_string_lossy()) {
-                greatest = greatest.max(ordinal);
-            }
-        }
-    }
-    for branch in git_branches(root)? {
-        if let Some(ordinal) = branch.rsplit('-').next().and_then(run_ordinal) {
-            greatest = greatest.max(ordinal);
-        }
-    }
-    store
-        .ensure_next_run_ordinal(greatest + 1)
-        .map_err(|error| ReindexError(error.to_string()))
-}
-
-fn run_ordinal(value: &str) -> Option<i64> {
-    value
-        .strip_prefix('R')?
-        .parse::<i64>()
-        .ok()
-        .filter(|ordinal| *ordinal > 0)
-}
+use crate::store::ReindexTicket;
 
 pub(crate) fn derive_states(
     root: &Path,
