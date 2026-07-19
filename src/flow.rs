@@ -101,7 +101,7 @@ impl<'de> Deserialize<'de> for Stage {
     }
 }
 
-pub(crate) fn parse(name: &str, contents: &str) -> Result<Flow, String> {
+pub fn parse(name: &str, contents: &str) -> Result<Flow, String> {
     let file: RawFlowFile = serde_yaml::from_str(contents).map_err(|error| error.to_string())?;
     let raw_stages = match file {
         RawFlowFile::List(stages) => stages,

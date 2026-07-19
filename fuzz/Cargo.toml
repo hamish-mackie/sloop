@@ -1,0 +1,40 @@
+[package]
+name = "sloop-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.sloop-daemon]
+path = ".."
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "flow"
+path = "fuzz_targets/flow.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frontmatter"
+path = "fuzz_targets/frontmatter.rs"
+test = false
+doc = false
+bench = false
+
+# Detached from the root package's implicit workspace: this crate builds only
+# under `cargo +nightly fuzz`, never as part of ordinary builds.
+[workspace]
+members = ["."]

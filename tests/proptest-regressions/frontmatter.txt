@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 18ae7efab6b78bd14bb5aa7279ba48bfdd48f6d549d5832828a35fa40d632fdb # shrinks to contents = "---\nid:\r¡title: Fix the flaky test\nblocked_by: [t-100, t-101]\ntarget: claude\n---\n\n# Fix the flaky test\n\nBody text.\n"
+cc f4fe0db89ee153f2cab8d1055709122ea525b7a632f0d72914705dc3c4eb56ec # shrinks to contents = "---\n~\n---\n"

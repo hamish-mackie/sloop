@@ -38,6 +38,13 @@
 !/fixtures/
 !/fixtures/**
 
+# Fuzzing: the cargo-fuzz crate is tracked; its corpus, artifacts, and
+# build output stay ignored by the default `*`.
+!/fuzz/
+!/fuzz/Cargo.toml
+!/fuzz/fuzz_targets/
+!/fuzz/fuzz_targets/**
+
 # Dogfooding configuration: only the config file is tracked. The local
 # queue (projects/, tickets/) stays ignored by the default `*`; do not
 # force-add it.
