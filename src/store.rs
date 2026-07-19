@@ -1049,7 +1049,7 @@ impl Store {
         state: TicketState,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = self.immediate_transaction()?;
         transaction.execute(
             "INSERT INTO tickets
                  (id, project_id, file_path, source, state, name, worktree, target, model, effort,
@@ -1087,7 +1087,7 @@ impl Store {
         flow: &str,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = self.immediate_transaction()?;
         transaction.execute(
             "UPDATE tickets
              SET name = ?2, worktree = ?3, target = ?4, model = ?5, effort = ?6, flow = ?7,
@@ -1118,7 +1118,7 @@ impl Store {
         let desired_ticket_ids: BTreeSet<&str> =
             tickets.iter().map(|ticket| ticket.id.as_str()).collect();
         let desired_project_ids: BTreeSet<&str> = project_ids.iter().map(String::as_str).collect();
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = self.immediate_transaction()?;
 
         let stale_tickets = {
             let mut statement = transaction.prepare("SELECT id FROM tickets ORDER BY id")?;
@@ -1452,8 +1452,9 @@ impl Store {
         let mut tickets = statement
             .query_map([], ticket_record)?
             .collect::<Result<Vec<_>, _>>()?;
+        let mut blockers = self.all_ticket_blockers()?;
         for ticket in &mut tickets {
-            ticket.blocked_by = self.ticket_blockers(&ticket.id)?;
+            ticket.blocked_by = blockers.remove(&ticket.id).unwrap_or_default();
         }
         Ok(tickets)
     }
@@ -1467,8 +1468,9 @@ impl Store {
         let mut tickets = statement
             .query_map(params![project_id], ticket_record)?
             .collect::<Result<Vec<_>, _>>()?;
+        let mut blockers = self.all_ticket_blockers()?;
         for ticket in &mut tickets {
-            ticket.blocked_by = self.ticket_blockers(&ticket.id)?;
+            ticket.blocked_by = blockers.remove(&ticket.id).unwrap_or_default();
         }
         Ok(tickets)
     }
@@ -1477,10 +1479,36 @@ impl Store {
         &self,
     ) -> Result<std::collections::BTreeMap<String, Vec<String>>, StoreError> {
         let mut dependencies = std::collections::BTreeMap::new();
-        for ticket in self.tickets()? {
-            dependencies.insert(ticket.id, ticket.blocked_by);
+        let mut statement = self.connection.prepare("SELECT id FROM tickets")?;
+        let ids = statement.query_map([], |row| row.get::<_, String>(0))?;
+        for id in ids {
+            dependencies.insert(id?, Vec::new());
+        }
+        for (ticket_id, blockers) in self.all_ticket_blockers()? {
+            if let Some(entry) = dependencies.get_mut(&ticket_id) {
+                *entry = blockers;
+            }
         }
         Ok(dependencies)
+    }
+
+    /// Every ticket's blockers in one pass, keeping each list in declared
+    /// order. Loading these per ticket turns any all-tickets read into a
+    /// query per row, which is what the post path pays cycle checks against.
+    fn all_ticket_blockers(&self) -> Result<BTreeMap<String, Vec<String>>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT ticket_id, blocker_id FROM ticket_blockers
+             ORDER BY ticket_id, position, blocker_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut blockers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for row in rows {
+            let (ticket_id, blocker_id) = row?;
+            blockers.entry(ticket_id).or_default().push(blocker_id);
+        }
+        Ok(blockers)
     }
 
     fn ticket_blockers(&self, id: &str) -> Result<Vec<String>, StoreError> {
@@ -1621,7 +1649,7 @@ impl Store {
             .ok_or_else(|| StoreError::TicketNotFound {
                 ticket_id: id.into(),
             })?;
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = self.immediate_transaction()?;
         let changed = transaction.execute(
             "UPDATE tickets SET state = 'ready', held_reason = NULL, attempts = 0, updated_at_ms = ?2
              WHERE id = ?1 AND state = 'failed'",
@@ -1821,7 +1849,7 @@ impl Store {
         worker_socket_path: &str,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = self.immediate_transaction()?;
         let changed = transaction.execute(
             "UPDATE runs
              SET state = ?10, branch = ?2, worktree_path = ?3, pid = ?4,
@@ -2569,7 +2597,7 @@ impl Store {
         candidate: &WorktreeCleanupCandidate,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = self.immediate_transaction()?;
         let changed = transaction.execute(
             "UPDATE runs SET cleaned_at_ms = ?2, updated_at_ms = ?2
              WHERE id = ?1 AND cleanup_eligible_at_ms IS NOT NULL
@@ -2786,8 +2814,17 @@ impl Store {
         self.reserve_ordinal("activation", "activations")
     }
 
+    /// Begins a write transaction that takes the write lock up front. A
+    /// deferred transaction that reads before its first write can hit an
+    /// immediate `SQLITE_BUSY` when a sibling connection commits in between:
+    /// its snapshot is stale, so SQLite fails fast instead of honoring
+    /// `busy_timeout`. Starting immediate makes contending writers queue.
+    fn immediate_transaction(&self) -> Result<rusqlite::Transaction<'_>, rusqlite::Error> {
+        rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+    }
+
     fn reserve_ordinal(&self, kind: &str, table: &str) -> Result<i64, StoreError> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = self.immediate_transaction()?;
         let reserved: i64 = transaction.query_row(
             "SELECT next_ordinal FROM id_counters WHERE kind = ?1",
             params![kind],
