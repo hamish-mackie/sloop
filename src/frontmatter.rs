@@ -43,6 +43,19 @@ pub fn parse(content: &str) -> Result<Frontmatter, FrontmatterError> {
     let mapping: serde_yaml::Value = serde_yaml::from_str(block.yaml)
         .map_err(|error| FrontmatterError::InvalidYaml(error.to_string()))?;
     if mapping.is_null() {
+        // Null covers both a genuinely empty block and explicit null content
+        // (`~`, `null`). Only the former is an empty frontmatter; the latter
+        // is content that is not a mapping, and accepting it would let
+        // stamping append keys after a scalar and corrupt the file.
+        let blank = block
+            .yaml
+            .lines()
+            .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#'));
+        if !blank {
+            return Err(FrontmatterError::InvalidYaml(
+                "frontmatter must be a mapping".into(),
+            ));
+        }
         return Ok(Frontmatter::default());
     }
     let mapping = mapping
@@ -127,6 +140,11 @@ fn insert_lines(content: &str, lines: String) -> Result<Option<String>, Frontmat
         }
         None => format!("---\n{lines}---\n{content}"),
     };
+    // Line insertion assumes a block-style mapping; exotic-but-parseable
+    // blocks (a flow mapping like `{id: x}`) would end up invalid. Verify
+    // the write before handing it back: refusing with an error is always
+    // preferable to corrupting a user's committed file.
+    parse(&stamped)?;
     Ok(Some(stamped))
 }
 
@@ -146,8 +164,17 @@ fn split(content: &str) -> Result<Option<RawBlock<'_>>, FrontmatterError> {
     let mut offset = 0;
     for line in after_open.split_inclusive('\n') {
         if line == "---\n" || line == "---" {
+            let yaml = &after_open[..offset];
+            // This module reads the block as LF-separated lines, but YAML
+            // also breaks lines on CR, NEL, LS, and PS. A block containing
+            // one would make `parse` see keys at positions `stamp`'s byte
+            // model does not, so stamping could write a duplicate key and
+            // corrupt the file. Reject the ambiguity instead.
+            if yaml.contains(['\r', '\u{0085}', '\u{2028}', '\u{2029}']) {
+                return Err(FrontmatterError::ForeignLineBreak);
+            }
             return Ok(Some(RawBlock {
-                yaml: &after_open[..offset],
+                yaml,
                 close_at: yaml_start + offset,
                 body_at: yaml_start + offset + line.len(),
             }));
@@ -198,6 +225,8 @@ pub enum FrontmatterError {
     Unterminated,
     InvalidYaml(String),
     InvalidBlockedBy,
+    /// The block contains a line break other than LF (CR, NEL, LS, or PS).
+    ForeignLineBreak,
 }
 
 impl fmt::Display for FrontmatterError {
@@ -208,6 +237,10 @@ impl fmt::Display for FrontmatterError {
             Self::InvalidBlockedBy => {
                 formatter.write_str("frontmatter field `blocked_by` must be a YAML list of strings")
             }
+            Self::ForeignLineBreak => formatter.write_str(
+                "frontmatter block contains a line break other than LF \
+                 (carriage return, NEL, LS, or PS); use Unix line endings",
+            ),
         }
     }
 }
@@ -363,5 +396,57 @@ mod tests {
     #[test]
     fn an_unterminated_block_is_rejected() {
         assert_eq!(parse("---\nid: T1\n"), Err(FrontmatterError::Unterminated));
+    }
+
+    /// Found by fuzzing: YAML breaks lines on CR/NEL/LS/PS where this module
+    /// only breaks on LF, so YAML saw an empty `id:` here while stamping's
+    /// byte model did not — and stamping then wrote a second `id`, corrupting
+    /// the file. Such blocks are rejected outright.
+    #[test]
+    fn non_lf_line_breaks_in_the_block_are_rejected() {
+        for content in [
+            "---\nid:\r¡title: Fix the flaky test\n---\nbody\n",
+            "---\nid:\r\ntitle: t\n---\n",
+            "---\nid:\u{0085}title: t\n---\n",
+            "---\nid:\u{2028}title: t\n---\n",
+            "---\nid:\u{2029}title: t\n---\n",
+        ] {
+            assert_eq!(parse(content), Err(FrontmatterError::ForeignLineBreak));
+            assert_eq!(
+                stamp(content, "id-1", "default", "sloop/t", "default"),
+                Err(FrontmatterError::ForeignLineBreak)
+            );
+        }
+        // Body bytes are user Markdown and stay unrestricted.
+        assert!(parse("---\nid: T1\n---\nbody\rwith\u{0085}breaks\n").is_ok());
+    }
+
+    /// Found by fuzzing: `~` is YAML for null, which the empty-block shortcut
+    /// accepted — and stamping keys after a null scalar corrupts the file.
+    /// Null now only passes for genuinely blank or comment-only blocks.
+    #[test]
+    fn explicit_null_content_is_rejected_but_blank_blocks_are_not() {
+        for content in ["---\n~\n---\n", "---\nnull\n---\n"] {
+            assert!(matches!(
+                parse(content),
+                Err(FrontmatterError::InvalidYaml(_))
+            ));
+        }
+        for content in ["---\n---\n", "---\n\n---\n", "---\n# note\n---\nbody\n"] {
+            assert!(parse(content).is_ok(), "blank-ish block: {content:?}");
+            let stamped = stamp(content, "id-1", "default", "sloop/t", "default")
+                .unwrap()
+                .unwrap();
+            assert_eq!(parse(&stamped).unwrap().id.as_deref(), Some("id-1"));
+        }
+    }
+
+    /// A flow-style mapping parses but cannot take line-inserted keys;
+    /// stamping must refuse with an error rather than corrupt the file.
+    #[test]
+    fn unstampable_blocks_error_instead_of_corrupting() {
+        let content = "---\n{title: Flow style}\n---\nbody\n";
+        assert!(parse(content).is_ok());
+        assert!(stamp(content, "id-1", "default", "sloop/t", "default").is_err());
     }
 }
