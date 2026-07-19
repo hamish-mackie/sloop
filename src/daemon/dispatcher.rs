@@ -20,8 +20,8 @@ use crate::store::{CooldownUpdate, EvidenceRecord, Store, StoreError};
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
 
 use super::commands::{
-    handle_cancel, handle_hold, handle_list, handle_logs, handle_operator_show, handle_ready,
-    handle_reindex, handle_retry, handle_run, handle_stop, handle_wait,
+    handle_cancel, handle_events, handle_hold, handle_list, handle_logs, handle_operator_show,
+    handle_ready, handle_reindex, handle_retry, handle_run, handle_stop, handle_wait,
 };
 use super::recovery::{RecoveryClassification, reconcile_run_liveness};
 use super::runner::worker_socket_path;
@@ -604,6 +604,10 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
             Err(error) => return ResponseEnvelope::failure(Some(id), error),
         },
         Request::Logs(args) => match handle_logs(state, &args) {
+            Ok(data) => data,
+            Err(error) => return ResponseEnvelope::failure(Some(id), error),
+        },
+        Request::Events(args) => match handle_events(state, &args) {
             Ok(data) => data,
             Err(error) => return ResponseEnvelope::failure(Some(id), error),
         },

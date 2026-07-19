@@ -129,6 +129,17 @@ in the response.
 Show a run's captured output — both stdout and stderr, in order. The
 underlying file is `runs/<run-id>/output.ndjson` in the state directory.
 
+### sloop watch [--tail N]
+
+Follow ticket and run activity as it happens: claims, starts, and settled
+outcomes, one line per event. Prints the `--tail` most recent events
+(default 20), then streams new ones until interrupted. With `--json`, each
+event is written as one NDJSON object, ready to pipe into other tools.
+
+Under the hood this is the `events` verb: a cursor-paginated read of the
+daemon's activity feed. Any client — a dashboard, a websocket bridge — can
+stream the same feed by polling with the returned cursor.
+
 ### sloop reindex
 
 Rebuild the derivable SQLite index from the configured project and ticket

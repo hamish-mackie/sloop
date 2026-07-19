@@ -1482,3 +1482,59 @@ fn dropping_a_world_reaps_daemons_it_never_explicitly_started() {
     drop(world);
     wait_until("the reaped daemon exits", || !process_alive(pid));
 }
+
+#[test]
+fn events_feed_reports_the_run_lifecycle_in_order() {
+    let world = World::configured();
+    configure_fake_agent(&world, 1, false);
+    world.commit_all("initial");
+    world.start_daemon();
+    let ticket = post_manual(&world, "watched.md", "# Watched work\n");
+    let output = world.sloop(&["run", &ticket]);
+    assert!(output.status.success());
+
+    wait_until("the run settles", || {
+        status(&world)["tickets"]["merged"] == 1
+    });
+
+    let response = world.operator_exchange(
+        r#"{"v":1,"id":"req-events","verb":"events","args":{"after":0},"token":null}"#,
+    );
+    assert_eq!(response["ok"], true, "events failed: {response}");
+    let events = response["data"]["events"].as_array().expect("events array");
+    let lifecycle: Vec<&str> = events
+        .iter()
+        .filter(|event| event["run"] == "R1")
+        .map(|event| event["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(lifecycle, ["run_claimed", "run_started", "run_finished"]);
+    for event in events.iter().filter(|event| event["run"] == "R1") {
+        assert_eq!(event["ticket"], ticket.as_str());
+    }
+    let finished = events
+        .iter()
+        .find(|event| event["kind"] == "run_finished")
+        .expect("finished event");
+    assert_eq!(finished["data"]["outcome"], "merged");
+    assert_eq!(finished["data"]["ticket_state"], "merged");
+    assert_eq!(
+        response["data"]["next_cursor"],
+        events.last().unwrap()["sequence"]
+    );
+
+    // `tail` starts near the newest event; a cursor at the end returns an
+    // empty page, which is what a live watcher polls on.
+    let tail = world.operator_exchange(
+        r#"{"v":1,"id":"req-tail","verb":"events","args":{"tail":1},"token":null}"#,
+    );
+    let tail_events = tail["data"]["events"].as_array().expect("tail events");
+    assert_eq!(tail_events.len(), 1);
+    assert_eq!(tail_events[0]["kind"], "run_finished");
+
+    let cursor = response["data"]["next_cursor"].as_i64().unwrap();
+    let empty = world.operator_exchange(&format!(
+        r#"{{"v":1,"id":"req-empty","verb":"events","args":{{"after":{cursor}}},"token":null}}"#,
+    ));
+    assert_eq!(empty["data"]["events"].as_array().unwrap().len(), 0);
+    assert_eq!(empty["data"]["next_cursor"], cursor);
+}

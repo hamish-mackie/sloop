@@ -39,6 +39,9 @@ const MAX_ENVELOPE_BYTES: u64 = 1024 * 1024;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 const DISPATCH_CHANNEL_CAPACITY: usize = 64;
+/// Activity-feed rows kept across daemon restarts; events are tiny, so this
+/// is weeks of history for a busy repository.
+const EVENT_RETENTION: i64 = 10_000;
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -198,6 +201,11 @@ pub fn serve_current_repository() -> Result<(), DaemonError> {
         None => Arc::new(SystemClock),
     };
     let store = Store::open(&repository.db_path, clock.now_ms()).map_err(DaemonError::Store)?;
+    // Bound the activity feed once per daemon lifetime; watchers page by
+    // sequence, so trimming old rows never invalidates a held cursor.
+    store
+        .trim_events(EVENT_RETENTION)
+        .map_err(DaemonError::Store)?;
     if let Some(agent) = &config.agent {
         store
             .backfill_ticket_targets(&agent.default_target, clock.now_ms())

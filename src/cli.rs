@@ -13,9 +13,9 @@ use clap::{
 use serde_json::json;
 
 use crate::protocol::{
-    EmptyArgs, ErrorBody, ErrorCode, NoteArgs, PostActivation, PostArgs, Request, RequestEnvelope,
-    RequestId, ResponseEnvelope, RunActivation, RunArgs, RunReferenceArgs, ShowArgs, StopArgs,
-    TicketReferenceArgs, VerdictArgs, VerdictValue,
+    EmptyArgs, ErrorBody, ErrorCode, EventsArgs, NoteArgs, PostActivation, PostArgs, Request,
+    RequestEnvelope, RequestId, ResponseEnvelope, RunActivation, RunArgs, RunReferenceArgs,
+    ShowArgs, StopArgs, TicketReferenceArgs, VerdictArgs, VerdictValue,
 };
 
 const TICKET_STATES_HELP: &str = "Ticket states:
@@ -93,6 +93,12 @@ pub enum Command {
     /// Show output from a run.
     #[command(hide = true)]
     Logs { run: String },
+    /// Follow ticket and run activity as it happens.
+    Watch {
+        /// Number of recent events to show before following.
+        #[arg(long, default_value_t = 20)]
+        tail: u32,
+    },
     /// Block until a run reaches a terminal state.
     #[command(hide = true)]
     Wait {
@@ -217,6 +223,11 @@ impl TryFrom<Command> for Request {
             Command::Stop { force } => Self::Stop(StopArgs { force }),
             Command::Cancel { run } => Self::Cancel(RunReferenceArgs { run }),
             Command::Logs { run } => Self::Logs(RunReferenceArgs { run }),
+            Command::Watch { tail } => Self::Events(EventsArgs {
+                after: None,
+                tail: Some(tail),
+                limit: None,
+            }),
             Command::Wait { run, .. } => Self::Wait(RunReferenceArgs { run }),
             Command::Reindex => Self::Reindex(empty()),
             Command::Brief => Self::Brief(empty()),
@@ -504,6 +515,7 @@ fn run_command(
         ),
         Command::Stop { force } => run_stop_request(force, mode, stdout, stderr),
         Command::Wait { run, timeout } => run_wait(run, timeout, mode, stdout, stderr),
+        Command::Watch { tail } => run_watch(tail, mode, stdout, stderr),
         command @ (Command::Post(_)
         | Command::Run(_)
         | Command::Retry { .. }
@@ -674,6 +686,108 @@ fn run_wait(
             return write_cli_error(mode, stderr, format!("timed out waiting for run `{run}`"));
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+/// Follows the activity feed until interrupted. Same client-side polling
+/// model as `wait`: each iteration asks the daemon for events past the
+/// cursor from the previous page, so the daemon stays stateless and any
+/// other client (a dashboard, a websocket bridge) can stream the same way.
+/// In `--json` mode each event is written as one NDJSON line.
+fn run_watch(
+    tail: u32,
+    mode: OutputMode,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> ExitCode {
+    let mut cursor: Option<i64> = None;
+    loop {
+        let args = match cursor {
+            Some(after) => EventsArgs {
+                after: Some(after),
+                tail: None,
+                limit: None,
+            },
+            None => EventsArgs {
+                after: None,
+                tail: Some(tail),
+                limit: None,
+            },
+        };
+        match crate::daemon::request(Request::Events(args)) {
+            Ok(result) if result.response.ok => {
+                let data = result.response.data.unwrap_or_default();
+                let events = data["events"].as_array().cloned().unwrap_or_default();
+                for event in &events {
+                    let written = match mode {
+                        OutputMode::Json => serde_json::to_writer(&mut *stdout, event)
+                            .map_err(|_| ())
+                            .and_then(|()| stdout.write_all(b"\n").map_err(|_| ())),
+                        OutputMode::Human => {
+                            writeln!(stdout, "{}", format_event(event)).map_err(|_| ())
+                        }
+                    };
+                    if written.is_err() {
+                        return ExitCode::FAILURE;
+                    }
+                }
+                if stdout.flush().is_err() {
+                    return ExitCode::FAILURE;
+                }
+                if let Some(next) = data["next_cursor"].as_i64() {
+                    cursor = Some(next);
+                }
+                // A full page means more events are already waiting; skip the
+                // sleep and drain them before pausing.
+                if !events.is_empty() && data["next_cursor"] != data["latest"] {
+                    continue;
+                }
+            }
+            Ok(result) => {
+                return write_response(
+                    mode,
+                    Some("events"),
+                    stderr,
+                    &result.response,
+                    ExitCode::FAILURE,
+                );
+            }
+            Err(error) => {
+                return write_response(
+                    mode,
+                    Some("events"),
+                    stderr,
+                    &ResponseEnvelope::failure(None, error.error_body()),
+                    ExitCode::FAILURE,
+                );
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+/// Renders one activity event as a human `watch` line.
+fn format_event(event: &serde_json::Value) -> String {
+    let time = event["occurred_at_ms"]
+        .as_i64()
+        .and_then(crate::clock::format_timestamp)
+        .unwrap_or_default();
+    let run = event["run"].as_str().unwrap_or("?");
+    let ticket = event["ticket"].as_str().unwrap_or("?");
+    let data = &event["data"];
+    match event["kind"].as_str().unwrap_or("?") {
+        "run_claimed" => {
+            let attempt = data["attempt"].as_i64().unwrap_or(1);
+            format!("{time}  {ticket} claimed by {run} (attempt {attempt})")
+        }
+        "run_started" => format!("{time}  {run} started on {ticket}"),
+        "run_finished" => {
+            let outcome = data["outcome"].as_str().unwrap_or("?");
+            let state = data["ticket_state"].as_str().unwrap_or("?");
+            format!("{time}  {run} finished: {outcome} ({ticket} -> {state})")
+        }
+        "run_aborted" => format!("{time}  {run} aborted before launch ({ticket} back to ready)"),
+        kind => format!("{time}  {kind} run={run} ticket={ticket}"),
     }
 }
 
@@ -976,6 +1090,8 @@ mod tests {
             &["sloop", "resume"],
             &["sloop", "cancel", "R1"],
             &["sloop", "logs", "R1"],
+            &["sloop", "watch"],
+            &["sloop", "watch", "--tail", "50"],
             &["sloop", "reindex"],
             &["sloop", "brief"],
             &["sloop", "show", "T1"],
@@ -1006,6 +1122,7 @@ mod tests {
             &["sloop", "resume"],
             &["sloop", "cancel", "R1"],
             &["sloop", "logs", "R1"],
+            &["sloop", "watch"],
             &["sloop", "reindex"],
             &["sloop", "brief"],
             &["sloop", "show", "T1"],

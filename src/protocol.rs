@@ -95,6 +95,7 @@ pub enum Request {
     Cancel(RunReferenceArgs),
     Logs(RunReferenceArgs),
     Wait(RunReferenceArgs),
+    Events(EventsArgs),
     Reindex(EmptyArgs),
     Brief(EmptyArgs),
     Show(ShowArgs),
@@ -120,6 +121,7 @@ impl Request {
             Self::Cancel(_) => "cancel",
             Self::Logs(_) => "logs",
             Self::Wait(_) => "wait",
+            Self::Events(_) => "events",
             Self::Reindex(_) => "reindex",
             Self::Brief(_) => "brief",
             Self::Show(_) => "show",
@@ -154,6 +156,7 @@ impl Request {
                 | "cancel"
                 | "logs"
                 | "wait"
+                | "events"
                 | "reindex"
                 | "brief"
                 | "show"
@@ -225,6 +228,21 @@ pub struct StopArgs {
 #[serde(deny_unknown_fields)]
 pub struct RunReferenceArgs {
     pub run: String,
+}
+
+/// A cursor-paginated read of the activity feed. `after` resumes from a
+/// previously returned cursor; `tail` starts that many events before the
+/// newest one and wins when both are given. One page per request — clients
+/// stream by polling with the returned cursor.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventsArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

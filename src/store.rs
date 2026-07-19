@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::domain::ticket::TicketState;
 
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 const CONNECTION_PRAGMAS: &str = "
 PRAGMA foreign_keys = ON;
@@ -189,6 +189,20 @@ ALTER TABLE runs ADD COLUMN flow_json TEXT;
 ALTER TABLE runs ADD COLUMN ticket_json TEXT;
 ";
 
+// The activity feed read by `sloop watch`. Rows are written inside the same
+// transaction as the state transition they describe, so the feed can never
+// disagree with the tables it narrates.
+const EVENTS_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS events (
+    sequence        INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at_ms  INTEGER NOT NULL,
+    kind            TEXT NOT NULL,
+    run_id          TEXT,
+    ticket_id       TEXT,
+    data_json       TEXT NOT NULL DEFAULT '{}'
+);
+";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
     Claimed,
@@ -287,6 +301,35 @@ pub struct TicketCounts {
 pub struct EvidenceRecord {
     pub kind: &'static str,
     pub data_json: String,
+}
+
+/// One row of the activity feed, ordered by `sequence`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventRecord {
+    pub sequence: i64,
+    pub occurred_at_ms: i64,
+    pub kind: String,
+    pub run_id: Option<String>,
+    pub ticket_id: Option<String>,
+    pub data_json: String,
+}
+
+/// Appends one activity-feed row. Callers pass the transaction performing the
+/// transition so the event commits or rolls back with it.
+fn record_event(
+    connection: &Connection,
+    now_ms: i64,
+    kind: &str,
+    run_id: Option<&str>,
+    ticket_id: Option<&str>,
+    data_json: &str,
+) -> Result<(), rusqlite::Error> {
+    connection.execute(
+        "INSERT INTO events (occurred_at_ms, kind, run_id, ticket_id, data_json)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![now_ms, kind, run_id, ticket_id, data_json],
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -513,6 +556,7 @@ impl Store {
                     .transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute_batch(SCHEMA_V1)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
+                transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.execute(
                     "INSERT INTO scheduler_state (singleton, paused, updated_at_ms)
                      VALUES (1, 0, ?1)",
@@ -544,6 +588,7 @@ impl Store {
                 )?;
                 transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
+                transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -568,6 +613,7 @@ impl Store {
                 )?;
                 transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
+                transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -591,6 +637,7 @@ impl Store {
                 )?;
                 transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
+                transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -606,6 +653,7 @@ impl Store {
                 )?;
                 transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
+                transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -620,6 +668,7 @@ impl Store {
                 )?;
                 transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
+                transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -632,6 +681,7 @@ impl Store {
                     .execute_batch("ALTER TABLE runs ADD COLUMN worker_socket_path TEXT;")?;
                 transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
+                transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -642,6 +692,7 @@ impl Store {
                     .transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
                 transaction.execute_batch(ID_COUNTER_SCHEMA)?;
+                transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -651,6 +702,16 @@ impl Store {
                     .connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
+                transaction.execute_batch(EVENTS_SCHEMA)?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.commit()?;
+                Ok(())
+            }
+            9 => {
+                let transaction = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute_batch(EVENTS_SCHEMA)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
                 Ok(())
@@ -1443,7 +1504,8 @@ impl Store {
         worker_socket_path: &str,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        let changed = self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
             "UPDATE runs
              SET state = 'running', branch = ?2, worktree_path = ?3, pid = ?4,
                  pid_start_time = ?5, process_group_id = ?6, worker_token = ?7,
@@ -1462,8 +1524,7 @@ impl Store {
             ],
         )?;
         if changed != 1 {
-            let state = self
-                .connection
+            let state = transaction
                 .query_row(
                     "SELECT state FROM runs WHERE id = ?1",
                     params![run_id],
@@ -1476,6 +1537,20 @@ impl Store {
                 requested: "running".into(),
             });
         }
+        let ticket_id: String = transaction.query_row(
+            "SELECT ticket_id FROM runs WHERE id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        record_event(
+            &transaction,
+            now_ms,
+            "run_started",
+            Some(run_id),
+            Some(&ticket_id),
+            "{}",
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1560,6 +1635,19 @@ impl Store {
                 params![run_id, record.kind, now_ms, record.data_json],
             )?;
         }
+        record_event(
+            &transaction,
+            now_ms,
+            "run_finished",
+            Some(run_id),
+            Some(ticket_id),
+            &serde_json::json!({
+                "outcome": outcome.as_str(),
+                "exit_code": exit_code,
+                "ticket_state": ticket_state.as_str(),
+            })
+            .to_string(),
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -1951,7 +2039,57 @@ impl Store {
              WHERE id = ?1 AND state = 'claimed'",
             params![ticket_id, now_ms],
         )?;
+        record_event(
+            &transaction,
+            now_ms,
+            "run_aborted",
+            Some(run_id),
+            Some(ticket_id),
+            "{}",
+        )?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    /// Reads activity-feed rows with `sequence > after`, oldest first. The
+    /// last row's sequence is the caller's next cursor.
+    pub fn events_after(&self, after: i64, limit: usize) -> Result<Vec<EventRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT sequence, occurred_at_ms, kind, run_id, ticket_id, data_json
+             FROM events WHERE sequence > ?1 ORDER BY sequence LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![after, limit as i64], |row| {
+                Ok(EventRecord {
+                    sequence: row.get(0)?,
+                    occurred_at_ms: row.get(1)?,
+                    kind: row.get(2)?,
+                    run_id: row.get(3)?,
+                    ticket_id: row.get(4)?,
+                    data_json: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn latest_event_sequence(&self) -> Result<i64, StoreError> {
+        let latest = self.connection.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM events",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(latest)
+    }
+
+    /// Drops all but the newest `keep` activity-feed rows. Sequences are never
+    /// reused after a trim, so cursors held by watchers stay valid.
+    pub fn trim_events(&self, keep: i64) -> Result<(), StoreError> {
+        self.connection.execute(
+            "DELETE FROM events
+             WHERE sequence <= (SELECT COALESCE(MAX(sequence), 0) FROM events) - ?1",
+            params![keep],
+        )?;
         Ok(())
     }
 
@@ -2254,6 +2392,14 @@ impl Store {
                 params![ordinal + 1],
             )?;
         }
+        record_event(
+            &transaction,
+            now_ms,
+            "run_claimed",
+            Some(claim.run_id),
+            Some(claim.ticket_id),
+            &serde_json::json!({"attempt": attempt}).to_string(),
+        )?;
 
         transaction.commit()?;
         Ok(ClaimedRun {
@@ -3218,6 +3364,57 @@ mod tests {
         assert_eq!(run.exit_code, Some(0));
         assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("merged"));
         assert_eq!(store.run_evidence("R1").unwrap(), evidence);
+    }
+
+    #[test]
+    fn lifecycle_transitions_append_ordered_events() {
+        let directory = tempdir().unwrap();
+        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        running_r1(&mut store);
+        store
+            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, 2_300)
+            .unwrap();
+
+        let events = store.events_after(0, 10).unwrap();
+        let kinds: Vec<&str> = events.iter().map(|event| event.kind.as_str()).collect();
+        assert_eq!(kinds, ["run_claimed", "run_started", "run_finished"]);
+        assert!(events.iter().all(|event| {
+            event.run_id.as_deref() == Some("R1") && event.ticket_id.as_deref() == Some("T1")
+        }));
+        let finished: serde_json::Value = serde_json::from_str(&events[2].data_json).unwrap();
+        assert_eq!(finished["outcome"], "merged");
+        assert_eq!(finished["ticket_state"], "merged");
+
+        // Settling twice is idempotent, so no duplicate event appears.
+        store
+            .finish_run("R1", "T1", Some(1), Outcome::Failed, &[], None, 2_400)
+            .unwrap();
+        assert_eq!(store.latest_event_sequence().unwrap(), events[2].sequence);
+
+        let rest = store.events_after(events[0].sequence, 10).unwrap();
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest[0].kind, "run_started");
+
+        store.trim_events(1).unwrap();
+        let kept = store.events_after(0, 10).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].sequence, events[2].sequence);
+    }
+
+    #[test]
+    fn abandoned_claims_append_an_abort_event() {
+        let directory = tempdir().unwrap();
+        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        store.abort_claim("R1", "T1", 2_100).unwrap();
+
+        let kinds: Vec<String> = store
+            .events_after(0, 10)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.kind)
+            .collect();
+        assert_eq!(kinds, ["run_claimed", "run_aborted"]);
     }
 
     #[test]
