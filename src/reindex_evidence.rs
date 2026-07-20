@@ -115,11 +115,43 @@ fn branch_state(root: &Path, branch: &str) -> Result<Option<TicketState>, Reinde
     if !has_work {
         return Ok(None);
     }
-    Ok(Some(if merged.success() {
+    if merged.success() {
+        return Ok(Some(TicketState::Merged));
+    }
+    // The ancestor test only sees merges that keep the branch tip reachable from
+    // HEAD. Sloop's merge stage, an operator squash and a rebase all land the
+    // same changes as new commits, so a branch whose work is demonstrably on the
+    // default branch still fails that test. Fall back to patch equivalence
+    // before calling the branch unreviewed; only a genuinely unlanded commit
+    // earns `NeedsReview`.
+    Ok(Some(if patch_equivalent(root, branch)? {
         TicketState::Merged
     } else {
         TicketState::NeedsReview
     }))
+}
+
+/// Reports whether every commit unique to `branch` has a patch-equivalent
+/// commit reachable from HEAD.
+///
+/// `git cherry HEAD <branch>` prefixes each commit unique to the branch with
+/// `-` when an equivalent patch is already upstream and `+` when it is not, so
+/// the absence of any `+` line means the branch's work has landed. This runs at
+/// most once per matched branch, and only after the cheaper ancestor test has
+/// failed. When `git cherry` cannot decide — an unrelated history has no merge
+/// base, for instance — the branch keeps the conservative `NeedsReview` answer.
+fn patch_equivalent(root: &Path, branch: &str) -> Result<bool, ReindexError> {
+    let cherry = Command::new("git")
+        .args(["cherry", "HEAD", branch])
+        .current_dir(root)
+        .output()
+        .map_err(|source| ReindexError::io(root, source))?;
+    if !cherry.status.success() {
+        return Ok(false);
+    }
+    Ok(!String::from_utf8_lossy(&cherry.stdout)
+        .lines()
+        .any(|line| line.starts_with('+')))
 }
 
 fn git_output(root: &Path, args: &[&str], branch: &str) -> Result<String, ReindexError> {
@@ -137,6 +169,17 @@ fn git_output(root: &Path, args: &[&str], branch: &str) -> Result<String, Reinde
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// Folds one branch's derived state into the ticket's, completing the decision
+/// ladder that [`branch_state`] starts.
+///
+/// Per branch: an ancestor of HEAD is `Merged`; otherwise a branch whose unique
+/// commits are all patch-equivalent upstream is `Merged`; otherwise
+/// `NeedsReview`. Across a ticket's branches — its recorded worktree branch and
+/// every `sloop/<id>-a*` attempt branch — `NeedsReview` wins over `Merged`,
+/// because a branch that survives both landing tests carries work an operator
+/// has not seen. Patch equivalence is what keeps that precedence honest:
+/// without it a leftover attempt branch whose changes were squashed onto the
+/// default branch would drag a settled ticket back out of `Merged`.
 fn merge_state(current: &mut Option<TicketState>, observed: TicketState) {
     if observed == TicketState::NeedsReview || current.is_none() {
         *current = Some(observed);

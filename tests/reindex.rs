@@ -146,6 +146,138 @@ fn create_unmerged_worktree(world: &World, branch: &str, directory: &str) {
     }
 }
 
+fn git(world: &World, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(world.root())
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {args:?} failed with {status}");
+}
+
+fn git_commit(world: &World, message: &str) {
+    git(
+        world,
+        &[
+            "-c",
+            "user.name=sloop-test",
+            "-c",
+            "user.email=sloop-test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            message,
+        ],
+    );
+}
+
+fn default_branch(world: &World) -> String {
+    let output = Command::new("git")
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .current_dir(world.root())
+        .output()
+        .expect("read default branch");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .expect("default branch is UTF-8")
+        .trim()
+        .to_owned()
+}
+
+/// Commits `file` on `branch` and leaves the branch behind unlanded.
+fn create_branch_with_work(world: &World, branch: &str, file: &str) {
+    let default = default_branch(world);
+    git(world, &["checkout", "--quiet", "-b", branch]);
+    fs::write(world.root().join(file), "branch work\n").expect("write branch work");
+    git(world, &["add", file]);
+    git_commit(world, "branch work");
+    git(world, &["checkout", "--quiet", &default]);
+}
+
+/// Lands `branch` on the default branch as a squash, so its changes are
+/// upstream as a patch-equivalent commit while its tip stays unreachable.
+fn squash_branch_onto_default(world: &World, branch: &str, file: &str) {
+    create_branch_with_work(world, branch, file);
+    git(world, &["merge", "--quiet", "--squash", branch]);
+    git_commit(world, "squashed branch work");
+    let ancestor = Command::new("git")
+        .args(["merge-base", "--is-ancestor", branch, "HEAD"])
+        .current_dir(world.root())
+        .status()
+        .expect("compare branch with HEAD");
+    assert!(
+        !ancestor.success(),
+        "a squashed branch tip must not be an ancestor of HEAD"
+    );
+}
+
+#[test]
+fn reindex_derives_merged_for_a_branch_squashed_onto_the_default_branch() {
+    let world = World::configured();
+    write_ticket(
+        &world,
+        "squashed.md",
+        "id: T1\nproject: default\nname: Squashed\nblocked_by: []\nworktree: sloop/T1\n",
+        "# Land this branch as a squash",
+    );
+    world.commit_all("initial ticket");
+    squash_branch_onto_default(&world, "sloop/T1", "squashed-evidence.txt");
+
+    let output = world.sloop(&["reindex"]);
+    assert!(
+        output.status.success(),
+        "reindex failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let shown = World::json_stdout(&world.sloop(&["show", "T1"]))["data"]["value"].clone();
+    assert_eq!(shown["state"], "merged");
+}
+
+#[test]
+fn reindex_derives_needs_review_for_a_branch_holding_an_unlanded_commit() {
+    let world = World::configured();
+    write_ticket(
+        &world,
+        "unlanded.md",
+        "id: T1\nproject: default\nname: Unlanded\nblocked_by: []\nworktree: sloop/T1\n",
+        "# Keep this branch unlanded",
+    );
+    world.commit_all("initial ticket");
+    create_branch_with_work(&world, "sloop/T1", "unlanded-evidence.txt");
+
+    let output = world.sloop(&["reindex"]);
+    assert!(
+        output.status.success(),
+        "reindex failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let shown = World::json_stdout(&world.sloop(&["show", "T1"]))["data"]["value"].clone();
+    assert_eq!(shown["state"], "needs_review");
+}
+
+#[test]
+fn reindex_keeps_merged_when_a_leftover_attempt_branch_was_squashed() {
+    let world = World::configured();
+    write_ticket(
+        &world,
+        "leftover.md",
+        "id: T1\nproject: default\nname: Leftover\nblocked_by: []\nworktree: sloop/T1\n",
+        "# Ignore a squashed leftover attempt branch",
+    );
+    world.commit_all("initial ticket");
+    create_merged_branch(&world, "sloop/T1", "merged-evidence.txt");
+    squash_branch_onto_default(&world, "sloop/T1-a1-deadbeef", "attempt-evidence.txt");
+
+    let output = world.sloop(&["reindex"]);
+    assert!(
+        output.status.success(),
+        "reindex failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let shown = World::json_stdout(&world.sloop(&["show", "T1"]))["data"]["value"].clone();
+    assert_eq!(shown["state"], "merged");
+}
+
 #[test]
 fn reindex_does_not_treat_an_untouched_branch_as_work_after_a_rewrite() {
     let world = World::configured();
