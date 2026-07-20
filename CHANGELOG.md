@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.0] - 2026-07-20
 
+### Fixed
+
+- Draw run-id entropy from `getrandom` on Linux, which musl libc exports,
+  instead of `getentropy`, which it does not, so musl builds compile.
+- Wait out a stopping predecessor's lock for up to two seconds when the
+  daemon starts, so a stop followed by an immediate start cannot lose the
+  race against the old process releasing its lock.
+
 ### Added
 
 - Initial command-line surface and local daemon implementation.

@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
@@ -42,6 +42,12 @@ use super::scheduler::{index_projects, reconcile_tickets};
 
 const MAX_ENVELOPE_BYTES: u64 = 1024 * 1024;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a starting daemon waits for a predecessor to drop its lock. A
+/// stopping daemon replies before its flock is released, so an immediate
+/// restart can arrive while the old process is still exiting. Shorter than
+/// `STARTUP_TIMEOUT` so a client that spawned this daemon still connects.
+const LOCK_GRACE: Duration = Duration::from_secs(2);
+const LOCK_POLL: Duration = Duration::from_millis(20);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 const DISPATCH_CHANNEL_CAPACITY: usize = 64;
 /// Activity-feed rows kept across daemon restarts; events are tiny, so this
@@ -183,50 +189,12 @@ fn serve_current_repository_once() -> Result<ServeExit, DaemonError> {
         },
     )?;
 
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&repository.lock_path)
-        .map_err(|source| DaemonError::Io {
-            path: repository.lock_path.clone(),
-            source,
-        })?;
-    lock.try_lock_exclusive().map_err(|source| {
-        if source.kind() == io::ErrorKind::WouldBlock {
-            DaemonError::AlreadyRunning
-        } else {
-            DaemonError::Io {
-                path: repository.lock_path.clone(),
-                source,
-            }
-        }
-    })?;
+    let lock = acquire_daemon_lock(&repository.lock_path)?;
     // Hold the pre-v7 runtime lock as well during the lock-location
     // transition, preventing an already-running older daemon in this runtime
     // root from sharing the database with the new process.
     let legacy_lock_path = repository.runtime_dir.join("daemon.lock");
-    let legacy_lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&legacy_lock_path)
-        .map_err(|source| DaemonError::Io {
-            path: legacy_lock_path.clone(),
-            source,
-        })?;
-    legacy_lock.try_lock_exclusive().map_err(|source| {
-        if source.kind() == io::ErrorKind::WouldBlock {
-            DaemonError::AlreadyRunning
-        } else {
-            DaemonError::Io {
-                path: legacy_lock_path,
-                source,
-            }
-        }
-    })?;
+    let legacy_lock = acquire_daemon_lock(&legacy_lock_path)?;
     // Identity is advisory; the flock is the guard, so write errors are
     // ignored rather than fatal.
     let identity = json!({
@@ -611,6 +579,39 @@ pub(super) async fn serve_worker_socket(
                 );
             }
         });
+    }
+}
+
+/// Opens and exclusively locks a daemon lock file, waiting out `LOCK_GRACE`
+/// for a stopping predecessor before concluding another daemon is running.
+fn acquire_daemon_lock(path: &Path) -> Result<File, DaemonError> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|source| DaemonError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let deadline = Instant::now() + LOCK_GRACE;
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => return Ok(lock),
+            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(DaemonError::AlreadyRunning);
+                }
+                std::thread::sleep(LOCK_POLL);
+            }
+            Err(source) => {
+                return Err(DaemonError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        }
     }
 }
 
