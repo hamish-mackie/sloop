@@ -102,9 +102,13 @@ fn merged_worktree_and_branch_expire_after_retention() {
     assert!(branch_exists(world.root(), &branch));
 
     world.tick(Duration::from_secs(2 * 60));
-    wait_until("expired worktree is cleaned", || !worktree.exists());
+    // `cleaned_at_ms` is recorded only after both the worktree and the branch
+    // are removed; waiting on the worktree alone races the branch deletion.
+    wait_until("expired worktree cleanup is recorded", || {
+        run_value::<Option<i64>>(&world, "cleaned_at_ms").is_some()
+    });
+    assert!(!worktree.exists());
     assert!(!branch_exists(world.root(), &branch));
-    assert!(run_value::<Option<i64>>(&world, "cleaned_at_ms").is_some());
     let connection = Connection::open(world.db_path()).unwrap();
     let events: i64 = connection
         .query_row(
