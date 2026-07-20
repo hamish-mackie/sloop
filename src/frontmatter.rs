@@ -35,9 +35,32 @@ impl Frontmatter {
 /// Parses the leading `---` frontmatter block. A file without a block parses
 /// to an empty `Frontmatter`; a malformed block is an error so a typo never
 /// silently registers a ticket under the wrong identity.
+///
+/// Reports only the first problem. Callers that want every problem at once
+/// use [`parse_collecting`].
 pub fn parse(content: &str) -> Result<Frontmatter, FrontmatterError> {
+    let (frontmatter, problems) = parse_collecting(content)?;
+    match problems.into_iter().next() {
+        Some(problem) => Err(problem),
+        None => Ok(frontmatter),
+    }
+}
+
+/// Parses the block, accumulating field-level problems rather than stopping
+/// at the first one.
+///
+/// The returned `Err` is reserved for failures that make further validation
+/// meaningless — no block at all, an unterminated block, YAML that does not
+/// parse, or a block that is not a mapping. Past that point every field is
+/// read independently, so a bad value for one key says nothing about the
+/// others and each problem is collected into the returned list. A field that
+/// fails takes its default value in the returned `Frontmatter`, which callers
+/// must therefore only trust when the list is empty.
+pub fn parse_collecting(
+    content: &str,
+) -> Result<(Frontmatter, Vec<FrontmatterError>), FrontmatterError> {
     let Some(block) = split(content)? else {
-        return Ok(Frontmatter::default());
+        return Ok((Frontmatter::default(), Vec::new()));
     };
 
     let mapping: serde_yaml::Value = serde_yaml::from_str(block.yaml)
@@ -56,26 +79,41 @@ pub fn parse(content: &str) -> Result<Frontmatter, FrontmatterError> {
                 "frontmatter must be a mapping".into(),
             ));
         }
-        return Ok(Frontmatter::default());
+        return Ok((Frontmatter::default(), Vec::new()));
     }
     let mapping = mapping
         .as_mapping()
         .ok_or_else(|| FrontmatterError::InvalidYaml("frontmatter must be a mapping".into()))?;
 
-    let (blocked_by, blocked_by_present) = string_list_field(mapping, "blocked_by")?;
-    Ok(Frontmatter {
-        id: string_field(mapping, "id")?,
-        project: string_field(mapping, "project")?,
-        title: string_field(mapping, "title")?,
-        name: string_field(mapping, "name")?.unwrap_or_default(),
+    let mut problems = Vec::new();
+    let (blocked_by, blocked_by_present) = match string_list_field(mapping, "blocked_by") {
+        Ok(value) => value,
+        Err(error) => {
+            problems.push(error);
+            (Vec::new(), false)
+        }
+    };
+    let mut string = |key| match string_field(mapping, key) {
+        Ok(value) => value,
+        Err(error) => {
+            problems.push(error);
+            None
+        }
+    };
+    let frontmatter = Frontmatter {
+        id: string("id"),
+        project: string("project"),
+        title: string("title"),
+        name: string("name").unwrap_or_default(),
         blocked_by,
-        worktree: string_field(mapping, "worktree")?,
-        target: string_field(mapping, "target")?,
-        model: string_field(mapping, "model")?,
-        effort: string_field(mapping, "effort")?,
-        flow: string_field(mapping, "flow")?,
+        worktree: string("worktree"),
+        target: string("target"),
+        model: string("model"),
+        effort: string("effort"),
+        flow: string("flow"),
         blocked_by_present,
-    })
+    };
+    Ok((frontmatter, problems))
 }
 
 /// Returns the Markdown body after the leading frontmatter block.
@@ -214,9 +252,9 @@ fn string_field(
         None | Some(serde_yaml::Value::Null) => Ok(None),
         Some(serde_yaml::Value::String(value)) => Ok(Some(value.clone())),
         Some(serde_yaml::Value::Number(value)) => Ok(Some(value.to_string())),
-        Some(_) => Err(FrontmatterError::InvalidYaml(format!(
-            "frontmatter field `{key}` must be a scalar"
-        ))),
+        Some(_) => Err(FrontmatterError::InvalidFieldType {
+            key: key.to_owned(),
+        }),
     }
 }
 
@@ -224,6 +262,10 @@ fn string_field(
 pub enum FrontmatterError {
     Unterminated,
     InvalidYaml(String),
+    /// A known scalar field holds a sequence or mapping.
+    InvalidFieldType {
+        key: String,
+    },
     InvalidBlockedBy,
     /// The block contains a line break other than LF (CR, NEL, LS, or PS).
     ForeignLineBreak,
@@ -234,6 +276,10 @@ impl fmt::Display for FrontmatterError {
         match self {
             Self::Unterminated => formatter.write_str("frontmatter block is not terminated"),
             Self::InvalidYaml(message) => write!(formatter, "invalid frontmatter: {message}"),
+            Self::InvalidFieldType { key } => write!(
+                formatter,
+                "invalid frontmatter: frontmatter field `{key}` must be a scalar"
+            ),
             Self::InvalidBlockedBy => {
                 formatter.write_str("frontmatter field `blocked_by` must be a YAML list of strings")
             }
@@ -249,7 +295,32 @@ impl std::error::Error for FrontmatterError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{FrontmatterError, parse, stamp, stamp_id};
+    use super::{FrontmatterError, parse, parse_collecting, stamp, stamp_id};
+
+    #[test]
+    fn every_bad_field_is_collected_and_parse_reports_the_first() {
+        let content = "---\nblocked_by: T1\nname: [a]\ntarget: claude\n---\nbody\n";
+        let (frontmatter, problems) = parse_collecting(content).unwrap();
+        assert_eq!(
+            problems,
+            [
+                FrontmatterError::InvalidBlockedBy,
+                FrontmatterError::InvalidFieldType { key: "name".into() },
+            ]
+        );
+        // Failed fields fall back to defaults; readable ones still parse.
+        assert_eq!(frontmatter.name, "");
+        assert!(!frontmatter.has_blocked_by());
+        assert_eq!(frontmatter.target.as_deref(), Some("claude"));
+        assert_eq!(parse(content), Err(FrontmatterError::InvalidBlockedBy));
+    }
+
+    #[test]
+    fn a_block_that_cannot_be_read_is_fatal_rather_than_collected() {
+        for content in ["---\nname: [oops\n---\nbody\n", "---\nid: T1\n"] {
+            assert!(parse_collecting(content).is_err(), "{content:?}");
+        }
+    }
 
     #[test]
     fn a_file_without_frontmatter_parses_to_empty_fields() {

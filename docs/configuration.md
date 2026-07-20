@@ -182,6 +182,11 @@ ticket has no dependencies. Every listed blocker must already be
 registered, and the resulting dependency graph must stay acyclic — a
 rejected post registers nothing.
 
+A post that fails validation reports every problem with the file at once,
+one per line under the file path, so a partially filled ticket takes one
+edit rather than one edit per field. Frontmatter that cannot be parsed at
+all is still reported on its own: nothing after it can be read.
+
 `target`, `model`, and `effort` are snapshotted when the ticket is posted:
 later config changes do not retroactively change an already-posted ticket.
 Reposting an edited file refreshes `name`, `blocked_by`, and `worktree`

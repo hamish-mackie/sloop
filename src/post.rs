@@ -249,39 +249,62 @@ pub fn handle(
     }))
 }
 
+/// Validates a ticket file, reporting *every* independent problem at once so
+/// authoring a ticket does not turn into one round-trip per mistake.
+///
+/// The split between short-circuiting and accumulating is deliberate. A file
+/// whose frontmatter cannot be read at all — no block, unterminated, YAML
+/// that does not parse, a block that is not a mapping — fails fast: no field
+/// can be read out of it, so every other check would either be unanswerable
+/// or degenerate into "everything is missing". Once a mapping is in hand,
+/// each field and the body are independent, and the caller deserves the full
+/// list. Checks that need the store (unknown blockers, dependency cycles,
+/// project/flow/target resolution) stay in `handle`: they are registration
+/// problems rather than problems with the file, and they carry their own
+/// error codes.
 pub(crate) fn parse_ticket_frontmatter(
     content: &str,
     path: &str,
 ) -> Result<frontmatter::Frontmatter, PostError> {
-    let stamped = frontmatter::parse(content).map_err(|error| match error {
-        FrontmatterError::InvalidBlockedBy => PostError::InvalidBlockedBy {
-            path: path.to_owned(),
-        },
-        error => PostError::InvalidTicket {
+    let (stamped, field_errors) =
+        frontmatter::parse_collecting(content).map_err(|error| PostError::InvalidTicket {
             path: path.to_owned(),
             error,
-        },
-    })?;
-    if stamped.name.trim().is_empty() {
-        return Err(PostError::MissingName {
-            path: path.to_owned(),
-        });
+        })?;
+
+    // A field that failed to parse is already reported by its own problem;
+    // adding "missing" on top of "wrong type" would only muddy the list.
+    let name_is_reported = field_errors
+        .iter()
+        .any(|error| matches!(error, FrontmatterError::InvalidFieldType { key } if key == "name"));
+    let blocked_by_is_reported = field_errors
+        .iter()
+        .any(|error| matches!(error, FrontmatterError::InvalidBlockedBy));
+
+    let mut problems = Vec::new();
+    if !name_is_reported && stamped.name.trim().is_empty() {
+        problems.push(TicketProblem::MissingName);
     }
-    if !stamped.has_blocked_by() {
-        return Err(PostError::MissingBlockedBy {
-            path: path.to_owned(),
-        });
+    if !blocked_by_is_reported && !stamped.has_blocked_by() {
+        problems.push(TicketProblem::MissingBlockedBy);
     }
     if frontmatter::body(content)
         .expect("frontmatter was already parsed")
         .trim()
         .is_empty()
     {
-        return Err(PostError::EmptyBody {
-            path: path.to_owned(),
-        });
+        problems.push(TicketProblem::EmptyBody);
     }
-    Ok(stamped)
+    problems.extend(field_errors.into_iter().map(TicketProblem::from));
+
+    if problems.is_empty() {
+        Ok(stamped)
+    } else {
+        Err(PostError::InvalidTicketFields {
+            path: path.to_owned(),
+            problems,
+        })
+    }
 }
 
 /// Reuses an existing queued activation of the same kind so reposting cannot
@@ -369,6 +392,46 @@ fn repository_relative(root: &Path, ticket_dir: &Path, file: &str) -> Result<Pat
     Ok(relative)
 }
 
+/// A single problem with a ticket file, phrased without the file path so
+/// several can be listed under one path heading.
+#[derive(Debug)]
+pub enum TicketProblem {
+    Frontmatter(FrontmatterError),
+    MissingName,
+    MissingBlockedBy,
+    InvalidBlockedBy,
+    EmptyBody,
+}
+
+impl From<FrontmatterError> for TicketProblem {
+    fn from(error: FrontmatterError) -> Self {
+        match error {
+            FrontmatterError::InvalidBlockedBy => Self::InvalidBlockedBy,
+            error => Self::Frontmatter(error),
+        }
+    }
+}
+
+impl fmt::Display for TicketProblem {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Frontmatter(error) => error.fmt(formatter),
+            Self::MissingName => {
+                formatter.write_str("missing or empty `name`; add `name: Your ticket title`")
+            }
+            Self::MissingBlockedBy => formatter.write_str(
+                "missing `blocked_by`; add `blocked_by: []` if there are no dependencies",
+            ),
+            Self::InvalidBlockedBy => formatter.write_str(
+                "invalid `blocked_by`; use `blocked_by: []` or a YAML list of ticket IDs",
+            ),
+            Self::EmptyBody => {
+                formatter.write_str("empty `body`; add a ticket description after the frontmatter")
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum PostError {
     TicketFileNotFound(String),
@@ -381,21 +444,15 @@ pub enum PostError {
         path: String,
         error: FrontmatterError,
     },
-    MissingName {
+    /// One or more independent problems with the ticket file itself,
+    /// reported together. Never empty.
+    InvalidTicketFields {
         path: String,
+        problems: Vec<TicketProblem>,
     },
     InvalidWorktreeStem {
         path: String,
         reason: String,
-    },
-    MissingBlockedBy {
-        path: String,
-    },
-    InvalidBlockedBy {
-        path: String,
-    },
-    EmptyBody {
-        path: String,
     },
     UnknownBlockedBy {
         ticket: String,
@@ -453,25 +510,21 @@ impl fmt::Display for PostError {
                 directory.display()
             ),
             Self::InvalidTicket { path, error } => write!(formatter, "{path}: {error}"),
-            Self::MissingName { path } => write!(
-                formatter,
-                "{path}: missing or empty `name`; add `name: Your ticket title`"
-            ),
+            // A lone problem keeps the original one-line `path: problem`
+            // shape; only a genuine list needs the heading and bullets.
+            Self::InvalidTicketFields { path, problems } => match problems.as_slice() {
+                [problem] => write!(formatter, "{path}: {problem}"),
+                problems => {
+                    write!(formatter, "{path}:")?;
+                    for problem in problems {
+                        write!(formatter, "\n  - {problem}")?;
+                    }
+                    Ok(())
+                }
+            },
             Self::InvalidWorktreeStem { path, reason } => {
                 write!(formatter, "{path}: {reason}")
             }
-            Self::MissingBlockedBy { path } => write!(
-                formatter,
-                "{path}: missing `blocked_by`; add `blocked_by: []` if there are no dependencies"
-            ),
-            Self::InvalidBlockedBy { path } => write!(
-                formatter,
-                "{path}: invalid `blocked_by`; use `blocked_by: []` or a YAML list of ticket IDs"
-            ),
-            Self::EmptyBody { path } => write!(
-                formatter,
-                "{path}: empty `body`; add a ticket description after the frontmatter"
-            ),
             Self::UnknownBlockedBy { ticket, blocker } => write!(
                 formatter,
                 "ticket `{ticket}` field `blocked_by` references unknown ticket `{blocker}`"

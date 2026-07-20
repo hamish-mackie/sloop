@@ -152,7 +152,51 @@ fn post_rejects_each_incomplete_judgment_field() {
         let message = error["error"]["message"].as_str().unwrap();
         assert!(message.contains(field), "{message}");
         assert!(message.contains("add "), "{message}");
+        // A single problem keeps the one-line phrasing it has always had.
+        assert_eq!(message.lines().count(), 1, "{message}");
     }
+}
+
+#[test]
+fn post_reports_every_incomplete_judgment_field_in_one_error() {
+    let world = World::configured();
+    world.start_daemon();
+    let ticket = raw_ticket(&world, "all-wrong.md", "---\ntitle: Wrong key\n---\n  \n");
+
+    let error = post_error(&world, &ticket);
+    assert_eq!(error["error"]["code"], "invalid_arguments");
+    let message = error["error"]["message"].as_str().unwrap();
+    let lines: Vec<&str> = message.lines().collect();
+    assert_eq!(lines.len(), 4, "{message}");
+    assert!(lines[0].ends_with("all-wrong.md:"), "{message}");
+    assert!(
+        lines[1].contains("missing or empty `name`; add `name: Your ticket title`"),
+        "{message}"
+    );
+    assert!(
+        lines[2].contains("missing `blocked_by`; add `blocked_by: []`"),
+        "{message}"
+    );
+    assert!(
+        lines[3].contains("empty `body`; add a ticket description"),
+        "{message}"
+    );
+    // The path is a heading, not repeated on every problem.
+    assert_eq!(message.matches("all-wrong.md").count(), 1, "{message}");
+}
+
+#[test]
+fn post_still_fails_fast_on_unparseable_frontmatter() {
+    let world = World::configured();
+    world.start_daemon();
+    let ticket = raw_ticket(&world, "bad-yaml.md", "---\nname: [unterminated\n---\n  \n");
+
+    let error = post_error(&world, &ticket);
+    assert_eq!(error["error"]["code"], "invalid_arguments");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("invalid frontmatter"), "{message}");
+    // Nothing past the parse is reported: the fields were never readable.
+    assert!(!message.contains("empty `body`"), "{message}");
 }
 
 #[test]

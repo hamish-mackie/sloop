@@ -782,11 +782,8 @@ fn post_error_body(error: &crate::post::PostError) -> ErrorBody {
         PostError::OutsideRepository(_)
         | PostError::OutsideTicketDirectory { .. }
         | PostError::InvalidTicket { .. }
-        | PostError::MissingName { .. }
+        | PostError::InvalidTicketFields { .. }
         | PostError::InvalidWorktreeStem { .. }
-        | PostError::MissingBlockedBy { .. }
-        | PostError::InvalidBlockedBy { .. }
-        | PostError::EmptyBody { .. }
         | PostError::UnknownTarget(_)
         | PostError::MissingTargetValue { .. } => ErrorCode::InvalidArguments,
         PostError::ProjectConflict { .. }

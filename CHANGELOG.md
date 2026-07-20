@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `sloop post` now reports every problem with a ticket file in a single
+  `invalid_arguments` error, one per line under the file path, instead of
+  stopping at the first one. A file whose frontmatter cannot be parsed at
+  all still fails fast with the parse error, and a file with exactly one
+  problem reads as it always has.
+
 ## [0.2.1] - 2026-07-20
 
 ### Fixed
