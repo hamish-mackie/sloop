@@ -152,11 +152,49 @@ name, or a project id:
 
 - **Ticket** (`TICK-5` or its name) — the frontmatter summary (id, name,
   state, project, worktree, and `blocked_by`/`target`/`model`/`effort` when
-  set) followed by the ticket body read from its committed file.
-- **Run** (`R14`) — the run's ticket, state, branch, worktree, and exit
-  evidence summary (exit code plus any classified vendor error).
+  set), then a `runs:` section, then the ticket body read from its committed
+  file. A ticket that has never run prints `runs: none`.
+- **Run** (`R14`) — the run's ticket, state, branch, worktree, timeline,
+  agent exit, derived reason, and per-stage table.
 - **Project** — its tickets with each ticket's recent notes (from runtime
   state) and commits (rendered from Git).
+
+The `runs:` section lists every run of the ticket, newest attempt first: run
+alias, outcome, wall-clock span, and a strip of the run's flow stages marked
+`ok`, `FAIL`, `..` (running), or `-` (not reached).
+
+```
+runs:
+  TICK-5-r2  merged        20:15-20:21  build:ok  test:ok  merge:ok
+  TICK-5-r1  needs_review  19:02-19:09  build:ok  test:FAIL  merge:-
+```
+
+`sloop show <run>` expands one of those lines:
+
+```
+TICK-5-r1  (needs_review)
+ticket: TICK-5  Persist cooldowns
+branch: sloop/TICK-5-r1
+timeline: claimed 19:02  started 19:02  finished 19:09
+agent exit: 0
+reason: stage `test` failed (exit 1) after agent completed with commits
+stages:
+  build  passed   19:02-19:05  3m0s   exit 0  verdict from exit_code
+  test   failed   19:05-19:09  4m12s  exit 1  verdict from exit_code
+  merge  pending  -
+```
+
+Two things about that output are deliberate. `agent exit` is labeled rather
+than bare, because `exit: 0` on a run whose later stage failed reads as "the
+run passed". And `reason` is *derived from the stored stage and evidence
+rows* — never from an agent's own claim about its work — so it appears on
+every non-merged terminal run, naming the stage that actually failed. A
+merged run carries no reason, and a run still in flight shows its current
+stage as `..` with an open-ended span rather than a guessed ending.
+
+Stage names come from the run's admitted flow snapshot, so a run still shows
+the stages it actually had even if the flow file changed afterwards. A stage
+retried by an `on_fail` repair agent reports the total attempts it cost.
 
 Recognized vendor failures include their classification and safe
 diagnostic. An unresolvable reference returns `not_found`, naming the

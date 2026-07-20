@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -441,6 +441,16 @@ pub struct EventRecord {
     pub run_id: Option<String>,
     pub ticket_id: Option<String>,
     pub data_json: String,
+}
+
+/// One run's wall-clock boundaries, derived from the activity feed. Every
+/// field is optional because a run is observable at each stage of its life:
+/// claimed but not started, started but not finished.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunTimeline {
+    pub claimed_at_ms: Option<i64>,
+    pub started_at_ms: Option<i64>,
+    pub finished_at_ms: Option<i64>,
 }
 
 /// Appends one activity-feed row. Callers pass the transaction performing the
@@ -2432,6 +2442,49 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    /// The claim/start/finish instants of each named run, read back out of the
+    /// activity feed. The feed is written in the same transaction as the
+    /// transition it narrates, so these are the authoritative wall-clock
+    /// boundaries of a run — nothing extra is stored to render them.
+    ///
+    /// A run with no finish row is still in flight; callers render it
+    /// open-ended rather than inventing an end. `run_aborted` counts as a
+    /// finish because it is the terminal row for runs that never settled.
+    pub fn run_timelines(
+        &self,
+        run_ids: &[&str],
+    ) -> Result<HashMap<String, RunTimeline>, StoreError> {
+        if run_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", run_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT run_id,
+                    MIN(CASE WHEN kind = 'run_claimed' THEN occurred_at_ms END),
+                    MIN(CASE WHEN kind = 'run_started' THEN occurred_at_ms END),
+                    MAX(CASE WHEN kind IN ('run_finished', 'run_aborted')
+                             THEN occurred_at_ms END)
+             FROM events
+             WHERE run_id IN ({placeholders})
+             GROUP BY run_id"
+        ))?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(run_ids), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    RunTimeline {
+                        claimed_at_ms: row.get(1)?,
+                        started_at_ms: row.get(2)?,
+                        finished_at_ms: row.get(3)?,
+                    },
+                ))
+            })?
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        Ok(rows)
     }
 
     pub fn latest_event_sequence(&self) -> Result<i64, StoreError> {

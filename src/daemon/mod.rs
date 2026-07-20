@@ -1,6 +1,7 @@
 mod aftercare;
 mod commands;
 mod dispatcher;
+mod history;
 mod recovery;
 mod scheduler;
 mod server;

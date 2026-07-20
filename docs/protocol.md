@@ -79,6 +79,26 @@ Patterns that fall out of the verbs:
   sequence them, `list` to observe why something is not running.
 - **Build a dashboard** — everything `status`, `list`, `show`, and `logs`
   return is structured JSON; render it however you like.
+- **Read a ticket's run history** — `show` on a ticket returns `value.runs`,
+  every run of the ticket newest attempt first. Each entry carries `id`,
+  `alias`, `attempt`, `state`, `terminal`, `started_at_ms`,
+  `finished_at_ms` (null while the run is in flight), the derived `reason`,
+  and `stages`: one `{stage, state}` pair per flow stage, where `state` is
+  `passed`, `failed`, `running`, or `pending`.
+- **Explain one run** — `show` on a run adds `attempt`, the timeline
+  (`claimed_at_ms`, `started_at_ms`, `finished_at_ms`), `agent_exit_code`,
+  and `stages`: per stage, its `state`, `attempts` (including `on_fail`
+  repair retries), `started_at_ms`, `finished_at_ms`, `duration_ms`,
+  `exit_code`, `verdict_source`, and `reason`. Stage names come from the
+  run's admitted flow snapshot, so a run reports the stages it actually had
+  even after the flow file changes.
+
+  `value.reason` on a run is now populated for every non-merged terminal
+  run. It is a classified vendor diagnostic where one exists, and otherwise
+  a sentence derived from the stored stage and evidence rows — never from
+  anything an agent reported about its own work. `exit_code` is unchanged
+  and has always been the *agent stage's* exit; `agent_exit_code` is the
+  same value under a name that cannot be misread as the run's outcome.
 - **Read or stream one run's output** — `logs` takes `{"run": <ref>}` plus
   optional `stage` (one flow stage name; an undefined one is
   `invalid_arguments`), `tail` (keep the last N matching entries), and
@@ -116,3 +136,14 @@ The envelope is versioned so clients can fail fast rather than misparse.
 Within version `1`, verbs and their response fields may gain data but are
 not repurposed. The daemon replies `unsupported_version` (listing what it
 supports) rather than guessing at unknown versions.
+
+That is the rule applied to `show`'s run and stage history: `value.runs`,
+`value.stages`, `value.attempt`, `value.agent_exit_code`, and the timeline
+fields are all *additive*, and no existing field changed meaning, so they
+carry no version break. `value.reason` on a run is the closest call — it was
+previously null unless a vendor error was classified, and is now also
+populated by a derived explanation — but it keeps its meaning ("why this run
+ended where it did"), only widening the set of runs that have one. A client
+that reads it as free text is unaffected; one that tested it for null as a
+proxy for "no vendor error" should read `value.classification` instead,
+which is unchanged.

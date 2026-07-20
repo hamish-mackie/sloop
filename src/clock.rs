@@ -104,6 +104,61 @@ pub fn next_local_minute_ms(clock: &dyn Clock, now_ms: i64, minute: u16) -> Opti
     None
 }
 
+/// A timestamp's local wall-clock fields. History views render times the way
+/// an operator reads a clock, so they need the local date as well as the
+/// local time: a span that crosses midnight has to widen from `HH:MM` to a
+/// dated form, and only the calendar day can tell them that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalTime {
+    pub year: i32,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+}
+
+impl LocalTime {
+    /// `HH:MM` — the default form, used whenever the surrounding context
+    /// already fixes the day.
+    pub fn clock(&self) -> String {
+        format!("{:02}:{:02}", self.hour, self.minute)
+    }
+
+    /// `MM-DD HH:MM` — the widened form for a timestamp whose day the reader
+    /// cannot infer. Year is omitted; `sloop` history is read in the small.
+    pub fn dated(&self) -> String {
+        format!(
+            "{:02}-{:02} {:02}:{:02}",
+            self.month, self.day, self.hour, self.minute
+        )
+    }
+
+    /// Whether two instants fall on the same local calendar day, which is what
+    /// decides between `clock` and `dated`.
+    pub fn same_day(&self, other: &Self) -> bool {
+        (self.year, self.month, self.day) == (other.year, other.month, other.day)
+    }
+}
+
+/// Breaks a millisecond timestamp into local wall-clock fields. Uses the same
+/// `localtime_r` path as `local_minute` so scheduling and rendering agree on
+/// what "local" means, including across DST.
+pub fn local_time(timestamp_ms: i64) -> Option<LocalTime> {
+    let seconds = timestamp_ms.div_euclid(1_000) as libc::time_t;
+    let mut local = unsafe { std::mem::zeroed::<libc::tm>() };
+    let result = unsafe { libc::localtime_r(&seconds, &mut local) };
+    if result.is_null() {
+        return None;
+    }
+    Some(LocalTime {
+        year: local.tm_year + 1900,
+        month: (local.tm_mon + 1) as u8,
+        day: local.tm_mday as u8,
+        hour: local.tm_hour as u8,
+        minute: local.tm_min as u8,
+    })
+}
+
 fn local_minute(timestamp_ms: i64) -> u16 {
     let seconds = timestamp_ms.div_euclid(1_000) as libc::time_t;
     let mut local = unsafe { std::mem::zeroed::<libc::tm>() };

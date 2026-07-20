@@ -411,12 +411,166 @@ fn render_ticket_show(data: &Value) -> String {
     if let Some(reason) = value["reason"].as_str() {
         let _ = writeln!(text, "reason: {reason}");
     }
+    text.push_str(&ticket_runs(&value["runs"]));
     if let Some(body) = value["body"]
         .as_str()
         .map(str::trim)
         .filter(|body| !body.is_empty())
     {
         let _ = write!(text, "\n{body}\n");
+    }
+    text
+}
+
+/// The ticket's runs, newest first, one line each: alias, outcome, wall-clock
+/// span, and a strip of stage markers. A ticket that has never run prints
+/// `runs: none` rather than nothing, so "no runs yet" is distinguishable from
+/// an older `sloop` that did not report runs at all.
+fn ticket_runs(runs: &Value) -> String {
+    let Some(runs) = runs.as_array() else {
+        return String::new();
+    };
+    if runs.is_empty() {
+        return "runs: none\n".to_owned();
+    }
+    // The alias and state columns are padded to the widest entry so the spans
+    // and stage strips line up down the section and can be read as columns.
+    let alias_width = column_width(runs, "alias");
+    let state_width = column_width(runs, "state");
+    let mut text = String::from("runs:\n");
+    for run in runs {
+        let _ = writeln!(
+            text,
+            "  {:alias_width$}  {:state_width$}  {}  {}",
+            run["alias"].as_str().unwrap_or("?"),
+            run["state"].as_str().unwrap_or("?"),
+            span(
+                run["started_at_ms"].as_i64(),
+                run["finished_at_ms"].as_i64()
+            ),
+            stage_strip(&run["stages"]),
+        );
+    }
+    text
+}
+
+fn column_width(runs: &[Value], key: &str) -> usize {
+    runs.iter()
+        .filter_map(|run| run[key].as_str())
+        .map(str::len)
+        .max()
+        .unwrap_or(1)
+}
+
+/// The per-stage markers on a run's summary line. Deliberately ASCII: the rest
+/// of this renderer is, and a stage strip is exactly the output most likely to
+/// be piped through something that mangles glyphs.
+fn stage_strip(stages: &Value) -> String {
+    stages
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|stage| {
+            format!(
+                "{}:{}",
+                stage["stage"].as_str().unwrap_or("?"),
+                stage_marker(stage["state"].as_str().unwrap_or("")),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+fn stage_marker(state: &str) -> &'static str {
+    match state {
+        "passed" => "ok",
+        "failed" => "FAIL",
+        "running" => "..",
+        _ => "-",
+    }
+}
+
+/// A run or stage's wall-clock span. An unfinished one is open-ended rather
+/// than closed at the current instant — a running stage has no end yet, and
+/// printing one would be an invention.
+fn span(start_ms: Option<i64>, end_ms: Option<i64>) -> String {
+    let Some(start) = start_ms.and_then(crate::clock::local_time) else {
+        return "-".to_owned();
+    };
+    let end = end_ms.and_then(crate::clock::local_time);
+    // `HH:MM` alone is ambiguous for anything that did not happen today or
+    // that ran across midnight, so those two cases widen to include the date.
+    let today = crate::clock::local_time(now_ms());
+    let dated = today.is_some_and(|today| !start.same_day(&today))
+        || end.is_some_and(|end| !start.same_day(&end));
+    let opening = if dated { start.dated() } else { start.clock() };
+    match end {
+        None => format!("{opening}-..."),
+        Some(end) if start.same_day(&end) => format!("{opening}-{}", end.clock()),
+        Some(end) => format!("{opening}-{}", end.dated()),
+    }
+}
+
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// A duration in the coarsest unit that still says something useful. Stage
+/// durations range from milliseconds to hours, and `4m12s` is easier to
+/// compare at a glance than `252000ms`.
+fn duration(milliseconds: i64) -> String {
+    let seconds = milliseconds / 1_000;
+    match (seconds / 3_600, (seconds % 3_600) / 60, seconds % 60) {
+        (0, 0, seconds) => format!("{seconds}s"),
+        (0, minutes, seconds) => format!("{minutes}m{seconds}s"),
+        (hours, minutes, _) => format!("{hours}h{minutes}m"),
+    }
+}
+
+/// The run's stage table: how far the flow got, and on what evidence. This is
+/// the view that answers "how did this run fail" without opening the database.
+fn run_stages(stages: &Value) -> String {
+    let Some(stages) = stages.as_array().filter(|stages| !stages.is_empty()) else {
+        return String::new();
+    };
+    let name_width = stages
+        .iter()
+        .filter_map(|stage| stage["stage"].as_str())
+        .map(str::len)
+        .max()
+        .unwrap_or(5)
+        .max(5);
+    let mut text = String::from("stages:\n");
+    for stage in stages {
+        let state = stage["state"].as_str().unwrap_or("?");
+        let mut line = format!(
+            "  {:name_width$}  {state:7}  {}",
+            stage["stage"].as_str().unwrap_or("?"),
+            span(
+                stage["started_at_ms"].as_i64(),
+                stage["finished_at_ms"].as_i64()
+            ),
+        );
+        if let Some(elapsed) = stage["duration_ms"].as_i64() {
+            let _ = write!(line, "  {}", duration(elapsed));
+        }
+        if let Some(exit_code) = stage["exit_code"].as_i64() {
+            let _ = write!(line, "  exit {exit_code}");
+        }
+        // Attempts are only worth a column when a repair actually retried the
+        // stage; every other stage ran exactly once and saying so is noise.
+        if let Some(attempts) = stage["attempts"].as_u64().filter(|attempts| *attempts > 1) {
+            let _ = write!(line, "  {attempts} attempts");
+        }
+        if let Some(source) = stage["verdict_source"].as_str() {
+            let _ = write!(line, "  verdict from {source}");
+        }
+        let _ = writeln!(text, "{}", line.trim_end());
     }
     text
 }
@@ -449,12 +603,32 @@ fn render_run_show(data: &Value) -> String {
     if let Some(worktree) = value["worktree"].as_str() {
         let _ = writeln!(text, "worktree: {worktree}");
     }
+    // Claim, start, and finish bound the run; a run still in flight simply
+    // lacks the later fields rather than showing a guessed end.
+    let timeline = [
+        ("claimed", value["claimed_at_ms"].as_i64()),
+        ("started", value["started_at_ms"].as_i64()),
+        ("finished", value["finished_at_ms"].as_i64()),
+    ]
+    .into_iter()
+    .filter_map(|(label, at_ms)| {
+        let at = crate::clock::local_time(at_ms?)?;
+        Some(format!("{label} {}", at.clock()))
+    })
+    .collect::<Vec<_>>();
+    if !timeline.is_empty() {
+        let _ = writeln!(text, "timeline: {}", timeline.join("  "));
+    }
+    // `exit: 0` read as "the run passed" even when a later stage had failed,
+    // which is exactly how one smoke-test failure got misdiagnosed. The label
+    // now says whose exit it is.
     if let Some(exit_code) = value["exit_code"].as_i64() {
-        let _ = writeln!(text, "exit: {exit_code}");
+        let _ = writeln!(text, "agent exit: {exit_code}");
     }
     if let Some(reason) = value["reason"].as_str() {
         let _ = writeln!(text, "reason: {reason}");
     }
+    text.push_str(&run_stages(&value["stages"]));
     text
 }
 
@@ -807,9 +981,172 @@ mod tests {
                 "ticket: TICK-1  cooldown\n",
                 "branch: sloop/R14-TICK-1\n",
                 "worktree: /repo/.worktrees/R14\n",
-                "exit: 0\n",
+                "agent exit: 0\n",
             )
         );
+    }
+
+    /// An instant today, so the span renders as bare `HH:MM` and the assertion
+    /// does not depend on which day the suite runs.
+    fn today_at(offset_ms: i64) -> i64 {
+        let today = crate::clock::local_time(super::now_ms()).expect("local time");
+        // Noon plus the offset: far enough from either midnight that a few
+        // minutes either way cannot spill into another day.
+        super::now_ms() - i64::from(today.hour) * 3_600_000 - i64::from(today.minute) * 60_000
+            + 12 * 3_600_000
+            + offset_ms
+    }
+
+    fn clock_at(offset_ms: i64) -> String {
+        crate::clock::local_time(today_at(offset_ms))
+            .expect("local time")
+            .clock()
+    }
+
+    #[test]
+    fn ticket_show_lists_runs_newest_first_with_a_stage_strip() {
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "ref": "TICK-1",
+                "kind": "ticket",
+                "value": {
+                    "id": "TICK-1", "name": "cooldown", "state": "merged", "blocked_by": [],
+                    "runs": [
+                        {
+                            "alias": "TICK-1-r2", "state": "merged",
+                            "started_at_ms": today_at(0),
+                            "finished_at_ms": today_at(360_000),
+                            "stages": [
+                                {"stage": "build", "state": "passed"},
+                                {"stage": "test", "state": "passed"},
+                                {"stage": "merge", "state": "passed"},
+                            ],
+                        },
+                        {
+                            "alias": "TICK-1-r1", "state": "needs_review",
+                            "started_at_ms": today_at(-3_600_000),
+                            "finished_at_ms": today_at(-3_240_000),
+                            "stages": [
+                                {"stage": "build", "state": "passed"},
+                                {"stage": "test", "state": "failed"},
+                                {"stage": "merge", "state": "pending"},
+                            ],
+                        },
+                    ],
+                }
+            }),
+        );
+
+        assert_eq!(
+            render(Some("show"), &response),
+            format!(
+                concat!(
+                    "TICK-1  cooldown  (merged)\n",
+                    "runs:\n",
+                    "  TICK-1-r2  merged        {}-{}  build:ok  test:ok  merge:ok\n",
+                    "  TICK-1-r1  needs_review  {}-{}  build:ok  test:FAIL  merge:-\n",
+                ),
+                clock_at(0),
+                clock_at(360_000),
+                clock_at(-3_600_000),
+                clock_at(-3_240_000),
+            )
+        );
+    }
+
+    #[test]
+    fn ticket_show_says_so_when_a_ticket_has_never_run() {
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "ref": "T1",
+                "kind": "ticket",
+                "value": {"id": "T1", "name": "work", "state": "ready", "blocked_by": [],
+                          "runs": []}
+            }),
+        );
+
+        assert_eq!(
+            render(Some("show"), &response),
+            "T1  work  (ready)\nruns: none\n"
+        );
+    }
+
+    #[test]
+    fn run_show_renders_stages_and_the_derived_reason() {
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "ref": "TICK-1-r1",
+                "kind": "run",
+                "value": {
+                    "id": "R14", "alias": "TICK-1-r1", "ticket": "TICK-1",
+                    "state": "needs_review", "terminal": true, "exit_code": 0,
+                    "claimed_at_ms": today_at(0),
+                    "started_at_ms": today_at(1_000),
+                    "finished_at_ms": today_at(252_000),
+                    "reason": "stage `test` failed (exit 1) after agent completed with commits",
+                    "stages": [
+                        {
+                            "stage": "build", "state": "passed", "attempts": 1,
+                            "started_at_ms": today_at(1_000),
+                            "finished_at_ms": today_at(61_000),
+                            "duration_ms": 60_000, "exit_code": 0,
+                            "verdict_source": "exit_code",
+                        },
+                        {
+                            "stage": "test", "state": "failed", "attempts": 2,
+                            "started_at_ms": today_at(61_000),
+                            "finished_at_ms": today_at(252_000),
+                            "duration_ms": 191_000, "exit_code": 1,
+                            "verdict_source": "exit_code",
+                        },
+                        {"stage": "merge", "state": "pending", "attempts": 0},
+                    ],
+                }
+            }),
+        );
+
+        assert_eq!(
+            render(Some("show"), &response),
+            format!(
+                concat!(
+                    "TICK-1-r1  (needs_review)\n",
+                    "ticket: TICK-1\n",
+                    "timeline: claimed {}  started {}  finished {}\n",
+                    "agent exit: 0\n",
+                    "reason: stage `test` failed (exit 1) after agent completed with commits\n",
+                    "stages:\n",
+                    "  build  passed   {}-{}  1m0s  exit 0  verdict from exit_code\n",
+                    "  test   failed   {}-{}  3m11s  exit 1  2 attempts  verdict from exit_code\n",
+                    "  merge  pending  -\n",
+                ),
+                clock_at(0),
+                clock_at(1_000),
+                clock_at(252_000),
+                clock_at(1_000),
+                clock_at(61_000),
+                clock_at(61_000),
+                clock_at(252_000),
+            )
+        );
+    }
+
+    #[test]
+    fn a_running_stage_renders_an_open_ended_span() {
+        assert_eq!(
+            super::span(Some(today_at(0)), None),
+            format!("{}-...", clock_at(0))
+        );
+        assert_eq!(super::span(None, None), "-");
+    }
+
+    #[test]
+    fn durations_use_the_coarsest_useful_unit() {
+        assert_eq!(super::duration(9_400), "9s");
+        assert_eq!(super::duration(191_000), "3m11s");
+        assert_eq!(super::duration(3_900_000), "1h5m");
     }
 
     #[test]

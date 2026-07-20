@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `sloop show <TICKET>` now lists the ticket's runs, newest attempt first:
+  alias, outcome, wall-clock span, and a strip of the run's flow stages
+  marked `ok`, `FAIL`, `..` (running), or `-` (not reached). A ticket that
+  has never run prints `runs: none`.
+- `sloop show <RUN>` now shows the run's timeline, a per-stage table (state,
+  attempts including `on_fail` retries, duration, exit code, and verdict
+  source), and a derived `reason` for any non-merged terminal run — for
+  example ``stage `test` failed (exit 1) after agent completed with
+  commits``. The reason comes from the stored stage and evidence rows, never
+  from an agent's own claim about its work. Stage names come from the run's
+  admitted flow snapshot, so a run reports the stages it actually had even
+  after the flow file changes.
+- The `show` response gained `value.runs` on tickets and `value.stages`,
+  `value.attempt`, `value.agent_exit_code`, and the timeline fields on runs,
+  all additive within protocol version 1.
 - `sloop logs` gained `--stage <NAME>`, `--tail <N>`, and `--follow`.
   `--stage` selects one flow stage by the name the flow gives it, including
   the agent stage, and rejects a name the run's flow does not define instead
@@ -27,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `sloop show <RUN>` labels the agent stage's exit as `agent exit:` rather
+  than a bare `exit:`, which could read as "the whole run passed" on a run
+  whose later stage failed. The JSON `exit_code` field is unchanged.
 - `sloop post` now reports every problem with a ticket file in a single
   `invalid_arguments` error, one per line under the file path, instead of
   stopping at the first one. A file whose frontmatter cannot be parsed at

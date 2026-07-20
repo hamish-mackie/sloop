@@ -109,6 +109,17 @@ fn ticket_detail(
 ) -> Result<serde_json::Value, ErrorBody> {
     let vendor_error = current_ticket_vendor_error(state, ticket)?;
     let mut detail = ticket_show(reference, ticket, vendor_error.as_ref());
+    // Where the ticket got to, and how. The runs section sits between the
+    // summary and the body so `show` answers "what has happened to this?"
+    // without an operator having to guess run aliases to find out.
+    let runs = lookup(state, |store| store.runs_for_ticket(&ticket.id))?;
+    let histories = super::history::histories(state, &runs)?;
+    detail["value"]["runs"] = json!(
+        runs.iter()
+            .zip(&histories)
+            .map(|(run, history)| super::history::run_summary_json(run, history))
+            .collect::<Vec<_>>()
+    );
     let body = ticket
         .file_path
         .as_ref()
@@ -136,22 +147,22 @@ fn run_detail(
     let run = &resolved.run;
     let ticket = lookup(state, |store| store.ticket(&run.ticket_id))?;
     let vendor_error = lookup(state, |store| store.vendor_error_for_run(&run.id))?;
-    let terminal = matches!(
-        run.state.as_str(),
-        "merged"
-            | "failed"
-            | "needs_review"
-            | "cancelled"
-            | "rate_limited"
-            | "orphaned"
-            | "aborted"
-    );
-    Ok(json!({
+    let terminal = super::history::is_terminal(&run.state);
+    let history = super::history::history(state, run)?;
+    // A classified vendor rejection is the more specific account of the same
+    // ending, so it still wins the `reason` line; otherwise the reason is
+    // derived from the stage evidence rather than left empty.
+    let reason = vendor_error
+        .as_ref()
+        .map(|error| error.diagnostic.clone())
+        .or_else(|| history.derived_reason());
+    let mut detail = json!({
         "ref": reference,
         "kind": "run",
         "value": {
             "id": run.id,
             "alias": resolved.alias,
+            "attempt": run.attempt,
             "note": resolved.note(),
             "ticket": run.ticket_id,
             "ticket_name": ticket.as_ref().map(|ticket| ticket.name.as_str()),
@@ -160,10 +171,12 @@ fn run_detail(
             "branch": run.branch,
             "worktree": run.worktree_path,
             "exit_code": run.exit_code,
-            "reason": vendor_error.as_ref().map(|error| error.diagnostic.as_str()),
+            "reason": reason,
             "classification": vendor_error,
         },
-    }))
+    });
+    super::history::extend_run_detail(&mut detail["value"], &history);
+    Ok(detail)
 }
 
 /// A project's tickets with their runtime activity: recent notes and the Git
