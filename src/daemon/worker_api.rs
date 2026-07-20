@@ -36,7 +36,12 @@ pub(super) fn dispatch_worker(
 
     let data = match request {
         Request::Brief(_) => handle_brief(state, run_id),
-        Request::Show(args) => handle_show(state, run_id, &args.reference),
+        Request::Show(args) => match args.reference.as_deref() {
+            Some(reference) if args.limit.is_none() => handle_show(state, run_id, reference),
+            _ => Err(unauthorized(
+                "workers may only show their own run's ticket by exact id",
+            )),
+        },
         Request::Note(args) => handle_note(state, run_id, &args.text),
         Request::Verdict(args) => handle_verdict(state, run_id, &args),
         // The connection handler already rejected operator verbs.

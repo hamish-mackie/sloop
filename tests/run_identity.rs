@@ -110,10 +110,12 @@ fn status_and_list_name_runs_by_ticket_derived_alias() {
     assert_eq!(run["id"], json!(world.run_id(1)));
     assert_eq!(run["ticket"], json!(ticket));
 
-    // The human line is ticket-first and carries the ticket's name.
+    // The dashboard run line carries the stable alias and ticket name.
     let human = String::from_utf8_lossy(&world.sloop_plain(&["status"]).stdout).into_owned();
     assert!(
-        human.contains(&format!("{alias} running — alias")),
+        human
+            .lines()
+            .any(|line| line.contains(&alias) && line.ends_with("alias")),
         "{human}"
     );
     assert!(!human.contains(&world.run_id(1)), "{human}");
@@ -137,7 +139,7 @@ fn a_run_resolves_by_alias_and_the_json_envelope_carries_id_and_alias() {
     let (world, ticket) = world_with_one_settled_run("by-alias.md");
     let alias = format!("{ticket}-r1");
 
-    let data = World::json_stdout_or_stderr(&world.sloop(&["wait", &alias]))["data"].clone();
+    let data = world.wait_snapshot(&alias)["data"].clone();
     assert_eq!(data["alias"], json!(alias));
     assert_eq!(data["id"], json!(world.run_id(1)));
     assert_eq!(data["terminal"], json!(true));
@@ -164,7 +166,7 @@ fn a_bare_ticket_resolves_to_the_latest_attempt_and_names_earlier_ones() {
     wait_for_idle(&world);
 
     // A bare ticket id picks the newest attempt...
-    let data = World::json_stdout_or_stderr(&world.sloop(&["wait", &ticket]))["data"].clone();
+    let data = world.wait_snapshot(&ticket)["data"].clone();
     assert_eq!(data["alias"], json!(format!("{ticket}-r2")));
     assert_eq!(data["id"], json!(world.run_id(2)));
     assert_eq!(
@@ -173,15 +175,13 @@ fn a_bare_ticket_resolves_to_the_latest_attempt_and_names_earlier_ones() {
     );
 
     // ...and the earlier attempt stays reachable by its own alias.
-    let first =
-        World::json_stdout_or_stderr(&world.sloop(&["wait", &format!("{ticket}-r1")]))["data"]
-            .clone();
+    let first = world.wait_snapshot(&format!("{ticket}-r1"))["data"].clone();
     assert_eq!(first["id"], json!(world.run_id(1)));
     assert_eq!(first["note"], json!(null));
 
     // A ticket that never ran says so rather than reporting a missing run.
     let unrun = post(&world, "unrun.md");
-    let error = World::json_stdout_or_stderr(&world.sloop(&["wait", &unrun]));
+    let error = world.wait_snapshot(&unrun);
     assert_eq!(error["error"]["code"], json!("not_found"));
     assert!(
         error["error"]["message"]
@@ -197,7 +197,7 @@ fn a_unique_hex_prefix_resolves_and_an_ambiguous_one_lists_the_candidates() {
     let (world, ticket) = world_with_one_settled_run("prefix.md");
     let id = world.run_id(1);
 
-    let data = World::json_stdout_or_stderr(&world.sloop(&["wait", &id[..4]]))["data"].clone();
+    let data = world.wait_snapshot(&id[..4])["data"].clone();
     assert_eq!(data["id"], json!(id));
     assert_eq!(data["alias"], json!(format!("{ticket}-r1")));
 
@@ -216,7 +216,7 @@ fn a_unique_hex_prefix_resolves_and_an_ambiguous_one_lists_the_candidates() {
         .expect("insert a colliding run");
     drop(store);
 
-    let error = World::json_stdout_or_stderr(&world.sloop(&["wait", &id[..4]]));
+    let error = world.wait_snapshot(&id[..4]);
     let message = error["error"]["message"].as_str().unwrap().to_owned();
     assert!(message.contains("is ambiguous"), "{message}");
     assert!(message.contains(&id[..8]), "{message}");
@@ -229,7 +229,7 @@ fn a_unique_hex_prefix_resolves_and_an_ambiguous_one_lists_the_candidates() {
 fn an_unresolvable_reference_names_every_accepted_form() {
     let (world, _) = world_with_one_settled_run("unknown.md");
 
-    let error = World::json_stdout_or_stderr(&world.sloop(&["wait", "not-a-run"]));
+    let error = world.wait_snapshot("not-a-run");
     assert_eq!(error["error"]["code"], json!("not_found"));
     let message = error["error"]["message"].as_str().unwrap().to_owned();
     for expected in ["an alias like", "a ticket id or name", "4 characters"] {
@@ -255,7 +255,7 @@ fn legacy_ordinal_run_ids_keep_resolving_in_a_pre_existing_store() {
         .expect("rewrite the run id");
     drop(store);
 
-    let data = World::json_stdout_or_stderr(&world.sloop(&["wait", "R1"]))["data"].clone();
+    let data = world.wait_snapshot("R1")["data"].clone();
     assert_eq!(data["id"], json!("R1"));
     // The alias still derives from stored ticket and attempt columns.
     assert_eq!(data["alias"], json!(format!("{ticket}-r1")));
@@ -270,8 +270,6 @@ fn reindex_preserves_run_identity() {
     assert!(world.sloop(&["reindex"]).status.success());
 
     assert_eq!(world.run_ids(), before, "reindex re-minted a run id");
-    let data =
-        World::json_stdout_or_stderr(&world.sloop(&["wait", &format!("{ticket}-r1")]))["data"]
-            .clone();
+    let data = world.wait_snapshot(&format!("{ticket}-r1"))["data"].clone();
     assert_eq!(data["id"], json!(before[0]));
 }

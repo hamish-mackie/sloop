@@ -28,6 +28,42 @@ const TICKET_STATES_HELP: &str = "Ticket states:
   failed        Terminal: the agent exited unsuccessfully; requeue with `sloop retry`.
   needs_review  Terminal: aftercare could not merge the run; inspect manually.";
 
+const SHOW_LONG_ABOUT: &str =
+    "Show the daemon, tickets, runs, and projects - sloop's one read verb.
+
+REF_OR_PATTERN is resolved in this order; first match wins:
+
+  1. nothing       -> the dashboard: daemon state plus recent tickets
+  2. an exact ref  -> the full detail view for that thing
+  3. anything else -> a filter: matching tickets, newest first
+
+A ref is an exact ticket id (TICK-12), run alias (TICK-12-r1), run-id prefix
+(749048f4), ticket name, or project id. An exact match always wins over pattern
+interpretation.
+
+A pattern matches ticket ids and names case-insensitively. Plain text is a
+substring; regex metacharacters make it an unanchored regex, like grep. Quote
+regexes in your shell: 'log.*'. A pattern always renders the list view, even
+when it matches one ticket.
+
+--follow streams events for the shown scope. Ticket and run scopes exit when
+they settle; dashboard, pattern, and project scopes run until interrupted.
+--follow --quiet suppresses the stream and only returns the outcome.
+
+EXIT CODES:
+  0  shown successfully, or followed scope merged
+  1  followed scope reached any other terminal outcome, or daemon error
+  2  usage error, invalid pattern, or deprecated wait-alias timeout";
+
+const SHOW_EXAMPLES: &str = "Examples:
+  sloop show                      dashboard: daemon plus recent tickets
+  sloop show -5                   dashboard with the 5 newest tickets
+  sloop show TICK-12              everything about one ticket, including runs
+  sloop show verdict              tickets mentioning \"verdict\"
+  sloop show 'flow|merge' -5      5 newest tickets matching a regex
+  sloop show TICK-12 --follow     watch a ticket until it settles
+  sloop show TICK-12 -f -q        block silently; exit code is the outcome";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "sloop",
@@ -37,7 +73,7 @@ const TICKET_STATES_HELP: &str = "Ticket states:
 )]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
     /// Emit JSON envelopes instead of human-readable output.
     #[arg(long, global = true)]
     pub json: bool,
@@ -86,8 +122,10 @@ pub enum Command {
     /// Tickets are ordered by registration time, newest first, whatever their
     /// state. Pass `--limit <N>`, `-n <N>`, or the `tail`-style shorthand
     /// `-<N>` to see only the N newest.
+    #[command(hide = true)]
     List(ListCliArgs),
     /// Show daemon state.
+    #[command(hide = true)]
     Status,
     /// Stop spawning new agents.
     #[command(hide = true)]
@@ -108,8 +146,15 @@ pub enum Command {
         /// Run alias, ticket reference, or run-id prefix.
         run: String,
     },
+    /// Show daemon state, details, or filtered tickets; optionally follow live.
+    #[command(
+        about = "Show daemon state, details, or filtered tickets; optionally follow live",
+        long_about = SHOW_LONG_ABOUT,
+        after_help = SHOW_EXAMPLES
+    )]
+    Show(ShowCliArgs),
     /// Show output from a run.
-    #[command(hide = true)]
+    #[command(after_help = "See `sloop show --help` for derived state and live activity.")]
     Logs {
         /// Run alias, ticket reference, or run-id prefix.
         run: String,
@@ -131,6 +176,7 @@ pub enum Command {
     /// covers just that run. Repository-wide events, such as a daemon drain,
     /// belong to no scope and are streamed only by a bare `sloop watch`. An
     /// unknown reference fails immediately rather than streaming nothing.
+    #[command(hide = true)]
     Watch {
         /// Ticket id or name, run alias or id prefix, or project id to scope to.
         r#ref: Option<String>,
@@ -152,8 +198,6 @@ pub enum Command {
     Reindex,
     /// Show the current worker's assignment.
     Brief,
-    /// Show a ticket, run, or project by reference.
-    Show { r#ref: String },
     /// Append an advisory note to the current run.
     #[command(hide = true)]
     Note {
@@ -230,6 +274,22 @@ pub struct ListCliArgs {
     limit: Option<u32>,
 }
 
+#[derive(Debug, Default, Args)]
+pub struct ShowCliArgs {
+    /// Exact reference or ticket pattern; exact match wins.
+    #[arg(value_name = "REF_OR_PATTERN")]
+    reference: Option<String>,
+    /// Stream events; ticket and run scopes exit when settled.
+    #[arg(long, short = 'f')]
+    follow: bool,
+    /// With --follow, suppress output and return only the outcome code.
+    #[arg(long, short = 'q', requires = "follow")]
+    quiet: bool,
+    /// At most N rows in list-shaped output; `-<N>` is shorthand.
+    #[arg(long, short = 'n', value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    limit: Option<u32>,
+}
+
 #[derive(Debug, Args)]
 #[command(group(
     ArgGroup::new("activation")
@@ -258,7 +318,9 @@ pub struct RunCliArgs {
 
 impl Cli {
     pub fn into_request(self) -> Result<Request, RequestConstructionError> {
-        self.command.try_into()
+        self.command
+            .unwrap_or_else(|| Command::Show(ShowCliArgs::default()))
+            .try_into()
     }
 }
 
@@ -310,7 +372,10 @@ impl TryFrom<Command> for Request {
             Command::Wait { run, .. } => Self::Wait(RunReferenceArgs { run }),
             Command::Reindex => Self::Reindex(empty()),
             Command::Brief => Self::Brief(empty()),
-            Command::Show { r#ref } => Self::Show(ShowArgs { reference: r#ref }),
+            Command::Show(args) => Self::Show(ShowArgs {
+                reference: args.reference,
+                limit: args.limit,
+            }),
             Command::Note { text } => Self::Note(NoteArgs {
                 text: text.join(" "),
             }),
@@ -456,7 +521,7 @@ where
     if expanded_help {
         args.retain(|arg| arg != "--all");
     }
-    expand_list_limit_shorthand(&mut args);
+    expand_limit_shorthand(&mut args);
 
     let mut command = Cli::command();
     if expanded_help {
@@ -469,7 +534,9 @@ where
         }
         command = command.after_help(TICKET_STATES_HELP);
     } else {
-        command = command.after_help("Run `sloop --help --all` to see every command.");
+        command = command.after_help(
+            "Read state with `sloop show` and raw output with `sloop logs`.\nRun `sloop show --help` for the complete read model or `sloop --help --all` for every command.",
+        );
     }
 
     match command
@@ -482,7 +549,13 @@ where
             } else {
                 OutputMode::Human
             };
-            run_command(cli.command, mode, stdout, stderr)
+            run_command(
+                cli.command
+                    .unwrap_or_else(|| Command::Show(ShowCliArgs::default())),
+                mode,
+                stdout,
+                stderr,
+            )
         }
         // Parsing failed, so the flag is read from the raw arguments: an
         // agent asking for `--json --help` still gets an envelope.
@@ -521,19 +594,19 @@ where
     }
 }
 
-/// Rewrites `sloop list -10` into `sloop list --limit=10`. clap lexes a bare
+/// Rewrites `sloop show -10` into `sloop show --limit=10`. clap lexes a bare
 /// `-10` as the short flag `-1`, so the `head`/`tail` shorthand has to be
-/// translated before parsing. Only arguments after a leading `list` verb are
+/// translated before parsing. Only arguments after a leading `show` or `list`
 /// touched, so no other command can have a negative-looking value rewritten,
 /// and only all-digit runs are: `-abc` and `-n` reach clap untouched and earn
 /// its usage error. `-0` becomes `--limit=0`, which the parser's range rejects.
-fn expand_list_limit_shorthand(args: &mut [OsString]) {
+fn expand_limit_shorthand(args: &mut [OsString]) {
     let verb = args
         .iter()
         .skip(1)
         .position(|arg| arg != "--json")
         .map(|offset| offset + 1);
-    let Some(verb) = verb.filter(|index| args[*index] == "list") else {
+    let Some(verb) = verb.filter(|index| args[*index] == "show" || args[*index] == "list") else {
         return;
     };
     for argument in &mut args[verb + 1..] {
@@ -620,8 +693,18 @@ fn run_command(
             run_daemon_request(request, report_started, mode, stdout, stderr)
         }
         Command::Stop { force } => run_stop_request(force, mode, stdout, stderr),
-        Command::Wait { run, timeout } => run_wait(run, timeout, mode, stdout, stderr),
-        Command::Watch { r#ref, tail } => run_watch(r#ref, tail, mode, stdout, stderr),
+        Command::Wait { run, timeout } => {
+            if !write_deprecation(stderr, "wait", "show --follow --quiet") {
+                return ExitCode::FAILURE;
+            }
+            run_wait(run, timeout, mode, stdout, stderr)
+        }
+        Command::Watch { r#ref, tail } => {
+            if !write_deprecation(stderr, "watch", "show --follow") {
+                return ExitCode::FAILURE;
+            }
+            run_watch(r#ref, tail, mode, stdout, stderr)
+        }
         Command::Logs {
             run,
             stage,
@@ -639,27 +722,34 @@ fn run_command(
             stdout,
             stderr,
         ),
+        Command::List(args) => {
+            if !write_deprecation(stderr, "list", "show") {
+                return ExitCode::FAILURE;
+            }
+            run_daemon_request(
+                Request::List(ListArgs { limit: args.limit }),
+                false,
+                mode,
+                stdout,
+                stderr,
+            )
+        }
+        Command::Status => {
+            if !write_deprecation(stderr, "status", "show") {
+                return ExitCode::FAILURE;
+            }
+            run_show(ShowCliArgs::default(), mode, stdout, stderr)
+        }
+        Command::Show(args) => run_show(args, mode, stdout, stderr),
         command @ (Command::Post(_)
         | Command::Run(_)
         | Command::Retry { .. }
         | Command::Hold { .. }
         | Command::Ready { .. }
-        | Command::List(_)
-        | Command::Status
         | Command::Pause
         | Command::Resume
         | Command::Cancel { .. }
         | Command::Reindex) => match Request::try_from(command) {
-            Ok(request) => run_daemon_request(request, false, mode, stdout, stderr),
-            Err(error) => write_cli_error(mode, stderr, error.to_string()),
-        },
-        command @ Command::Show { .. } => match Request::try_from(command) {
-            Ok(request)
-                if std::env::var_os("SLOOP_SOCKET").is_some()
-                    || std::env::var_os("SLOOP_TOKEN").is_some() =>
-            {
-                run_worker_request(request, mode, stdout, stderr)
-            }
             Ok(request) => run_daemon_request(request, false, mode, stdout, stderr),
             Err(error) => write_cli_error(mode, stderr, error.to_string()),
         },
@@ -772,6 +862,68 @@ fn run_init(mode: OutputMode, stdout: &mut impl Write, stderr: &mut impl Write) 
     }
 }
 
+fn write_deprecation(stderr: &mut impl Write, old: &str, new: &str) -> bool {
+    writeln!(
+        stderr,
+        "note: 'sloop {old}' is now 'sloop {new}'; this alias will be removed in a future release"
+    )
+    .is_ok()
+}
+
+fn run_show(
+    args: ShowCliArgs,
+    mode: OutputMode,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> ExitCode {
+    let request_args = ShowArgs {
+        reference: args.reference,
+        limit: args.limit,
+    };
+    let worker_environment =
+        std::env::var_os("SLOOP_SOCKET").is_some() || std::env::var_os("SLOOP_TOKEN").is_some();
+    if worker_environment {
+        if args.follow {
+            return write_cli_error(
+                mode,
+                stderr,
+                "workers cannot follow operator activity; worker `show` only reads its own ticket"
+                    .into(),
+            );
+        }
+        return run_worker_request(Request::Show(request_args), mode, stdout, stderr);
+    }
+    if args.follow {
+        return follow_show(request_args, 20, None, args.quiet, mode, stdout, stderr);
+    }
+    match crate::daemon::request(Request::Show(request_args)) {
+        Ok(result) if result.response.ok => write_response(
+            mode,
+            Some("show"),
+            stdout,
+            &result.response,
+            ExitCode::SUCCESS,
+        ),
+        Ok(result) => {
+            let exit = if result.response.error.as_ref().map(|error| error.code)
+                == Some(ErrorCode::InvalidArguments)
+            {
+                ExitCode::from(2)
+            } else {
+                ExitCode::FAILURE
+            };
+            write_response(mode, Some("show"), stderr, &result.response, exit)
+        }
+        Err(error) => write_response(
+            mode,
+            Some("show"),
+            stderr,
+            &ResponseEnvelope::failure(None, error.error_body()),
+            ExitCode::FAILURE,
+        ),
+    }
+}
+
 /// Polls the daemon until the run is terminal. The exit code is the outcome
 /// (`0` only for `merged`), so scripts and CI can gate on a run directly.
 /// Client-side wall-clock polling; the daemon stays stateless.
@@ -782,56 +934,42 @@ fn run_wait(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> ExitCode {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    loop {
-        let result = crate::daemon::request(Request::Wait(RunReferenceArgs { run: run.clone() }));
-        match result {
-            Ok(result) if result.response.ok => {
-                let data = result.response.data.clone().unwrap_or_default();
-                if data["terminal"] == serde_json::Value::Bool(true) {
-                    return if data["state"] == "merged" {
-                        write_response(
-                            mode,
-                            Some("wait"),
-                            stdout,
-                            &result.response,
-                            ExitCode::SUCCESS,
-                        )
-                    } else {
-                        write_response(
-                            mode,
-                            Some("wait"),
-                            stderr,
-                            &result.response,
-                            ExitCode::FAILURE,
-                        )
-                    };
-                }
-            }
-            Ok(result) => {
-                return write_response(
-                    mode,
-                    Some("wait"),
-                    stderr,
-                    &result.response,
-                    ExitCode::FAILURE,
-                );
-            }
-            Err(error) => {
-                return write_response(
-                    mode,
-                    Some("wait"),
-                    stderr,
-                    &ResponseEnvelope::failure(None, error.error_body()),
-                    ExitCode::FAILURE,
-                );
-            }
+    // Validate with the legacy run resolver so unknown and unrun references
+    // still fail immediately, then follow the original scope exactly as the
+    // advertised replacement does.
+    match crate::daemon::request(Request::Wait(RunReferenceArgs { run: run.clone() })) {
+        Ok(result) if result.response.ok => {}
+        Ok(result) => {
+            return write_response(
+                mode,
+                Some("wait"),
+                stderr,
+                &result.response,
+                ExitCode::FAILURE,
+            );
         }
-        if std::time::Instant::now() >= deadline {
-            return write_cli_error(mode, stderr, format!("timed out waiting for run `{run}`"));
+        Err(error) => {
+            return write_response(
+                mode,
+                Some("wait"),
+                stderr,
+                &ResponseEnvelope::failure(None, error.error_body()),
+                ExitCode::FAILURE,
+            );
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
     }
+    follow_show(
+        ShowArgs {
+            reference: Some(run),
+            limit: None,
+        },
+        0,
+        Some(timeout_secs),
+        true,
+        mode,
+        stdout,
+        stderr,
+    )
 }
 
 /// Follows the activity feed until interrupted. Same client-side polling
@@ -851,20 +989,69 @@ fn run_watch(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> ExitCode {
+    follow_show(
+        ShowArgs {
+            reference: scope,
+            limit: None,
+        },
+        tail,
+        None,
+        false,
+        mode,
+        stdout,
+        stderr,
+    )
+}
+
+fn follow_show(
+    show: ShowArgs,
+    tail: u32,
+    timeout_secs: Option<u64>,
+    quiet: bool,
+    mode: OutputMode,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> ExitCode {
+    let initial = match crate::daemon::request(Request::Show(show.clone())) {
+        Ok(result) if result.response.ok => result.response.data.unwrap_or_default(),
+        Ok(result) => {
+            let exit = if result.response.error.as_ref().map(|error| error.code)
+                == Some(ErrorCode::InvalidArguments)
+            {
+                ExitCode::from(2)
+            } else {
+                ExitCode::FAILURE
+            };
+            return write_response(mode, Some("show"), stderr, &result.response, exit);
+        }
+        Err(error) => {
+            return write_response(
+                mode,
+                Some("show"),
+                stderr,
+                &ResponseEnvelope::failure(None, error.error_body()),
+                ExitCode::FAILURE,
+            );
+        }
+    };
+    let settling_kind = matches!(initial["kind"].as_str(), Some("ticket" | "run"));
+    let deadline = timeout_secs
+        .map(|seconds| std::time::Instant::now() + std::time::Duration::from_secs(seconds));
     let mut cursor: Option<i64> = None;
+    let mut settled_outcome: Option<bool> = None;
     loop {
         let args = match cursor {
             Some(after) => EventsArgs {
                 after: Some(after),
                 tail: None,
                 limit: None,
-                scope: scope.clone(),
+                scope: show.reference.clone(),
             },
             None => EventsArgs {
                 after: None,
                 tail: Some(tail),
                 limit: None,
-                scope: scope.clone(),
+                scope: show.reference.clone(),
             },
         };
         match crate::daemon::request(Request::Events(args)) {
@@ -872,6 +1059,9 @@ fn run_watch(
                 let data = result.response.data.unwrap_or_default();
                 let events = data["events"].as_array().cloned().unwrap_or_default();
                 for event in &events {
+                    if quiet {
+                        continue;
+                    }
                     let written = match mode {
                         OutputMode::Json => serde_json::to_writer(&mut *stdout, event)
                             .map_err(|_| ())
@@ -884,7 +1074,7 @@ fn run_watch(
                         return ExitCode::FAILURE;
                     }
                 }
-                if stdout.flush().is_err() {
+                if !quiet && stdout.flush().is_err() {
                     return ExitCode::FAILURE;
                 }
                 let next = data["next_cursor"].as_i64();
@@ -899,14 +1089,64 @@ fn run_watch(
                 // and still leave matching rows further along. Requiring the
                 // cursor to have moved keeps a daemon that returns no cursor
                 // from spinning.
-                if advanced && next != data["latest"].as_i64() {
+                let caught_up = next == data["latest"].as_i64();
+                if advanced && !caught_up {
                     continue;
+                }
+                // Settlement and its final event are committed together, but
+                // they can land after the events snapshot and before the show
+                // snapshot below. Once terminal state is observed, perform one
+                // more event poll before exiting so that event is never lost.
+                if caught_up && let Some(merged) = settled_outcome {
+                    return if merged {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    };
+                }
+                if settling_kind && caught_up {
+                    match crate::daemon::request(Request::Show(show.clone())) {
+                        Ok(result) if result.response.ok => {
+                            let shown = result.response.data.unwrap_or_default();
+                            let value = &shown["value"];
+                            let terminal = match shown["kind"].as_str() {
+                                Some("ticket") => matches!(
+                                    value["state"].as_str(),
+                                    Some("merged" | "failed" | "needs_review")
+                                ),
+                                Some("run") => value["terminal"] == json!(true),
+                                _ => false,
+                            };
+                            if terminal {
+                                settled_outcome = Some(value["state"] == "merged");
+                                continue;
+                            }
+                        }
+                        Ok(result) => {
+                            return write_response(
+                                mode,
+                                Some("show"),
+                                stderr,
+                                &result.response,
+                                ExitCode::FAILURE,
+                            );
+                        }
+                        Err(error) => {
+                            return write_response(
+                                mode,
+                                Some("show"),
+                                stderr,
+                                &ResponseEnvelope::failure(None, error.error_body()),
+                                ExitCode::FAILURE,
+                            );
+                        }
+                    }
                 }
             }
             Ok(result) => {
                 return write_response(
                     mode,
-                    Some("events"),
+                    Some("show"),
                     stderr,
                     &result.response,
                     ExitCode::FAILURE,
@@ -915,12 +1155,16 @@ fn run_watch(
             Err(error) => {
                 return write_response(
                     mode,
-                    Some("events"),
+                    Some("show"),
                     stderr,
                     &ResponseEnvelope::failure(None, error.error_body()),
                     ExitCode::FAILURE,
                 );
             }
+        }
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            let reference = show.reference.as_deref().unwrap_or("dashboard");
+            return write_cli_error(mode, stderr, format!("timed out following `{reference}`"));
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
@@ -1273,7 +1517,7 @@ mod tests {
     use clap::{Parser, ValueEnum};
     use serde_json::{Value, json};
 
-    use super::{Cli, expand_list_limit_shorthand, subcommand_synonym};
+    use super::{Cli, expand_limit_shorthand, subcommand_synonym};
     use crate::protocol::{Capability, Request};
 
     /// Drives the full CLI entry point and returns the error envelope written
@@ -1291,11 +1535,11 @@ mod tests {
     /// only all-digit ones. Everything else has to reach clap untouched, or a
     /// negative-looking value elsewhere would silently become a limit.
     #[test]
-    fn the_list_limit_shorthand_expands_only_for_list_arguments() {
+    fn the_limit_shorthand_expands_only_for_read_arguments() {
         let expanded = |argv: &[&str]| {
             let mut args: Vec<std::ffi::OsString> =
                 argv.iter().map(std::ffi::OsString::from).collect();
-            expand_list_limit_shorthand(&mut args);
+            expand_limit_shorthand(&mut args);
             args.iter()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
@@ -1311,6 +1555,10 @@ mod tests {
         );
         // `-0` is expanded so clap's range, not this function, refuses it.
         assert_eq!(expanded(&["sloop", "list", "-0"])[2], "--limit=0");
+        assert_eq!(
+            expanded(&["sloop", "show", "log", "-2"]),
+            ["sloop", "show", "log", "--limit=2"]
+        );
         for untouched in [
             ["sloop", "list", "-abc"].as_slice(),
             ["sloop", "list", "-n"].as_slice(),

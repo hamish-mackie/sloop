@@ -121,13 +121,15 @@ fn default_help_only_shows_common_commands() {
 
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).expect("help is UTF-8");
-    for verb in ["init", "daemon", "post", "list", "status", "brief"] {
+    for verb in ["init", "daemon", "post", "show", "logs", "brief"] {
         assert!(
             help.contains(&format!("  {verb}")),
             "help did not contain {verb:?}"
         );
     }
-    for verb in ["run", "retry", "pause", "cancel", "logs", "reindex", "note"] {
+    for verb in [
+        "run", "retry", "pause", "cancel", "list", "status", "watch", "wait", "reindex", "note",
+    ] {
         assert!(
             !help.contains(&format!("  {verb}")),
             "compact help unexpectedly contained {verb:?}"
@@ -141,6 +143,27 @@ fn default_help_only_shows_common_commands() {
         !help.contains("Ticket states:"),
         "compact help unexpectedly contained the ticket state glossary"
     );
+}
+
+#[test]
+fn show_help_teaches_the_read_model() {
+    let world = World::new();
+    let output = world.sloop_plain(&["show", "--help"]);
+
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).expect("help is UTF-8");
+    for phrase in [
+        "resolved in this order",
+        "exact match always wins",
+        "run-id prefix",
+        "case-insensitively",
+        "regex metacharacters",
+        "EXIT CODES",
+        "sloop show TICK-12 --follow",
+        "sloop show TICK-12 -f -q",
+    ] {
+        assert!(help.contains(phrase), "show help missed {phrase:?}: {help}");
+    }
 }
 
 #[test]

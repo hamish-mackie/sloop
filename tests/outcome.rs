@@ -1446,10 +1446,8 @@ fn cancel_stops_an_active_aftercare_process_and_releases_the_ticket() {
         let counts = tickets(&world);
         counts["ready"] == 1 && counts["claimed"] == 0
     });
-    let waited = world.sloop(&["wait", &world.run_id(1), "--timeout", "5"]);
-    assert!(!waited.status.success());
     assert_eq!(
-        World::json_stdout_or_stderr(&waited)["data"]["state"],
+        world.wait_snapshot(&world.run_id(1))["data"]["state"],
         "cancelled"
     );
     wait_for_processes_to_exit(process_ids);
@@ -1498,10 +1496,8 @@ fn cancellation_before_the_test_process_checkpoint_stops_aftercare() {
         let counts = tickets(&world);
         counts["ready"] == 1 && counts["claimed"] == 0
     });
-    let waited = world.sloop(&["wait", &world.run_id(1), "--timeout", "5"]);
-    assert!(!waited.status.success());
     assert_eq!(
-        World::json_stdout_or_stderr(&waited)["data"]["state"],
+        world.wait_snapshot(&world.run_id(1))["data"]["state"],
         "cancelled"
     );
     assert!(
@@ -1881,9 +1877,7 @@ fn retryable_and_unknown_rejections_release_under_a_target_cooldown() {
             let counts = tickets(&world);
             counts["ready"] == 1 && counts["claimed"] == 0
         });
-        let waited = world.sloop(&["wait", &world.run_id(1), "--timeout", "5"]);
-        assert!(!waited.status.success());
-        let response = World::json_stdout_or_stderr(&waited);
+        let response = world.wait_snapshot(&world.run_id(1));
         assert_eq!(response["data"]["state"], "rate_limited");
         assert_eq!(response["data"]["classification"]["class"], class);
 
@@ -1988,8 +1982,8 @@ fn a_recognized_rejection_with_commits_never_tests_or_merges_the_work() {
             .collect::<Vec<_>>(),
         [("build".into(), "failed".into())]
     );
-    let waited = world.sloop_plain(&["wait", &world.run_id(1), "--timeout", "5"]);
-    let text = String::from_utf8_lossy(&waited.stderr);
+    let shown = world.sloop_plain(&["show", &world.run_id(1)]);
+    let text = String::from_utf8_lossy(&shown.stdout);
     assert!(text.contains("OpenCode rejected the request"), "{text}");
 }
 
@@ -2076,9 +2070,8 @@ fn cancellation_after_rejection_checkpoint_wins_without_a_cooldown() {
     assert!(world.sloop(&["cancel", &world.run_id(1)]).status.success());
     world.release_test_hook(HOOK);
     wait_until("cancellation settles", || tickets(&world)["ready"] == 1);
-    let waited = world.sloop(&["wait", &world.run_id(1), "--timeout", "5"]);
     assert_eq!(
-        World::json_stdout_or_stderr(&waited)["data"]["state"],
+        world.wait_snapshot(&world.run_id(1))["data"]["state"],
         "cancelled"
     );
     let connection = rusqlite::Connection::open(world.db_path()).unwrap();

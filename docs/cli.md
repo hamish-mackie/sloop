@@ -8,8 +8,8 @@ envelope verbatim. Scripts and agents should always use `--json` — see
 The commands split into two sets, and the split is enforced by the daemon:
 
 - **Operator commands** decide what happens. They use the operator socket
-  and implicitly start the daemon if it is not running. They also include
-  read-only views — `list`, `status`, and `show`.
+  and implicitly start the daemon if it is not running. The operator read
+  surface is bare `sloop`, `show`, and `logs`.
 - **Worker commands** (`brief`, `show`, `note`, `verdict`) are for the process
   inside a run. They authenticate with a per-run token. Only `verdict`, when
   the current stage explicitly uses the `reported` policy, affects flow
@@ -23,10 +23,10 @@ run, or project, while a worker's `show` is scoped to its own ticket. The
 verb is read-only on either socket.
 
 A running daemon uses the configuration and flow definitions it validated at
-startup. Operational commands (`status`, `stop`, `pause`, `resume`, `cancel`,
-`logs`, `wait`, `list`, `hold`, and `ready`) and worker commands therefore keep
-working if a flow file on disk is later made invalid. Active runs continue from
-their admitted flow snapshots. Flow errors surface when `sloop post` reads and
+startup. Operational commands (`show`, `logs`, `stop`, `pause`, `resume`,
+`cancel`, `hold`, and `ready`) and worker commands therefore keep working if a
+flow file on disk is later made invalid. Active runs continue from their
+admitted flow snapshots. Flow errors surface when `sloop post` reads and
 snapshots the current definitions and when daemon startup validates them; fix
 the named flow file before posting work or starting a new daemon.
 
@@ -86,9 +86,10 @@ last run settles, the daemon releases its sockets and lock, then replaces
 itself with the binary currently installed at the path from which it started.
 Queued activations remain queued and resume automatically in the replacement.
 
-Use `sloop status` or `sloop wait` to follow the drain. `sloop resume` cancels
-a pending restart and continues dispatching in the current process. For an
-immediate teardown, use `sloop stop`; restart has no force mode.
+Use bare `sloop` to inspect the drain or `sloop show --follow` to stream its
+events. `sloop resume` cancels a pending restart and continues dispatching in
+the current process. For an immediate teardown, use `sloop stop`; restart has
+no force mode.
 
 ### sloop post <FILE> [--project P] [--flow F] [--auto | --at TIME | --manual | --hold]
 
@@ -138,38 +139,50 @@ Return a failed ticket to ready and reset its attempt counter.
 Hold a ready ticket so it cannot be dispatched; release it again. Held
 tickets are skipped by selection and rejected by named runs.
 
-### sloop list [-N | --limit N]
+### sloop show
 
-Every ticket's name and state, and for each ticket that is not running,
-the scheduler's current reason (paused, outside running hours, at capacity,
-blocked, held, target cooldown, ...). Failed and cooled-down tickets include
-the safe vendor diagnostic when a built-in rule recognized the rejection.
+```text
+sloop
+sloop show [REF_OR_PATTERN] [-N] [--follow] [--quiet]
+```
 
-Tickets are ordered by registration time, newest first, so the work you just
-posted and the work running now are at the top. State does not affect the
-order — it is purely chronological. Tickets registered in the same millisecond
-fall back to their id's numeric ordinal, newest first.
+Bare `sloop` is the same as `sloop show`: a dashboard with daemon and gate
+state, active runs, queued activations, ticket counts, the next wake time, and
+the 10 newest tickets. `sloop show -N` changes the number of recent tickets;
+`-n N` and `--limit N` are equivalent. A limit of zero or a non-numeric limit
+is a usage error.
 
-- `--limit 10`, `-n 10` — show only the 10 newest tickets.
-- `-10` — the same thing in `head -10` / `tail -10` shorthand.
-
-The limit applies after ordering, so `-10` always means "the 10 newest". With
-no limit every ticket is listed. A limit of zero or a non-numeric one is a
-usage error. `--json` reflects the same order and count.
-
-### sloop show <REF>
-
-Read-only lookup that resolves, in order, a ticket id, a run id, a ticket
-name, or a project id:
+With an argument, `show` first tries the exact reference forms: ticket IDs,
+run IDs and aliases, unique run-ID prefixes, ticket names, and project IDs. An
+exact reference always wins, even when the same text is also a valid pattern.
+Exact references render full detail:
 
 - **Ticket** (`TICK-5` or its name) — the frontmatter summary (id, name,
   state, project, worktree, and `blocked_by`/`target`/`model`/`effort` when
   set), then a `runs:` section, then the ticket body read from its committed
   file. A ticket that has never run prints `runs: none`.
-- **Run** (`R14`) — the run's ticket, state, branch, worktree, timeline,
+- **Run** (`TICK-5-r1`) — the run's ticket, state, branch, worktree, timeline,
   agent exit, derived reason, and per-stage table.
 - **Project** — its tickets with each ticket's recent notes (from runtime
   state) and commits (rendered from Git).
+
+If no exact reference matches, the argument becomes a case-insensitive ticket
+pattern over IDs and names. Text without regex metacharacters is a substring;
+text containing regex metacharacters is an unanchored regular expression, like
+`grep`. Quote regular expressions in the shell. Pattern results always use the
+ticket-list view, even for one or zero matches, ordered by registration time,
+newest first. `-N` limits these results after ordering.
+
+```sh
+sloop show verdict
+sloop show 'flow|merge' -5
+```
+
+Each ticket row includes its state and, when it is not running, the scheduler's
+current reason. Failed and cooled-down tickets include a safe vendor diagnostic
+when a built-in rule recognized the rejection. With `--json`, the dashboard
+adds `kind`, `recent`, `recent_total`, and `recent_limit` to the existing status
+fields; a pattern response has top-level `kind`, `ref`, and `tickets` fields.
 
 The `runs:` section lists every run of the ticket, newest attempt first: run
 alias, outcome, wall-clock span, and a strip of the run's flow stages marked
@@ -209,17 +222,21 @@ the stages it actually had even if the flow file changed afterwards. A stage
 retried by an `on_fail` repair agent reports the total attempts it cost.
 
 Recognized vendor failures include their classification and safe
-diagnostic. An unresolvable reference returns `not_found`, naming the
-reference kinds `show` accepts and pointing at `sloop list`. Never writes
-generated activity into committed files.
+diagnostic. `show` never writes generated activity into committed files.
 
-### sloop status
+`--follow` streams the shown scope through the existing `events` protocol:
+a ticket includes all of its runs, a run includes only itself, a project or
+pattern includes its matching tickets and runs, and the dashboard includes
+repository-wide activity. Ticket and run followers exit when the subject
+settles; dashboard, project, and pattern followers continue until interrupted.
+`--quiet` requires `--follow`, suppresses the event stream, and returns only
+the outcome.
 
-Snapshot of daemon state: active runs, ready and queued work, gate state,
-active target cooldowns, and the next wake time. The gate state includes
-database writability; a full database blocks new dispatch until a write
-probe succeeds. A pending restart is shown as `draining for restart` with the
-number of active runs remaining.
+Exit codes are stable for scripting:
+
+- `0`: the read succeeded, or the followed ticket/run merged successfully.
+- `1`: another terminal outcome or a daemon error.
+- `2`: usage error, invalid regular expression, or deprecated `wait` alias timeout.
 
 ### sloop pause / sloop resume
 
@@ -239,18 +256,12 @@ desired state already holds, so it reports "not running" and exits 0.
 Kill the run's whole process group (including any children the agent
 spawned), release its ticket, and preserve the worktree for inspection.
 
-### sloop wait <RUN> [--timeout SECS]
-
-Block until the run reaches a terminal state. The exit code is the
-outcome: `0` only for `merged`, `1` for any other terminal state, `2` on
-timeout (default 3600 seconds). Lets scripts and CI gate on a run directly.
-Recognized vendor failures include their classification and safe diagnostic
-in the response.
-
 ### sloop logs <RUN> [--stage NAME] [--tail N] [--follow]
 
 Show a run's captured output — both stdout and stderr, in order. The
 underlying file is `runs/<run-id>/output.ndjson` in the state directory.
+Use [`sloop show`](#sloop-show) first for the run's derived outcome, timeline,
+and stage summary; use `logs` for the captured output behind that evidence.
 
 `--stage NAME` narrows the output to one flow stage, named exactly as the
 flow names it: `--stage build` is the agent's own output, `--stage test` is
@@ -270,39 +281,19 @@ streams only that stage.
 Filtering happens in the daemon, so any client of the socket gets it: this is
 the `logs` verb with `stage`, `tail`, and `after` arguments, returning a page
 plus `next_cursor`, `complete`, and `terminal`. `--follow` is a client-side
-loop over that cursor, the same shape as `sloop watch`.
+loop over that cursor, like `show --follow` over `events`.
 
-### sloop watch [REF] [--tail N]
+### Deprecated read aliases
 
-Follow ticket and run activity as it happens: claims, starts, and settled
-outcomes, one line per event. Prints the `--tail` most recent events
-(default 20), then streams new ones until interrupted. With `--json`, each
-event is written as one NDJSON object, ready to pipe into other tools.
+`status`, `list`, `watch`, and `wait` remain accepted as hidden deprecated
+aliases. They do not appear in normal help, and each invocation, including
+`--json`, writes a note to stderr naming its replacement and warning that the
+alias will be removed in a future release:
 
-With no reference every event in the repository is streamed. Passing one
-narrows the stream, using the same references `show` accepts:
-
-| Reference | What is streamed |
-| --- | --- |
-| Ticket id or name | That ticket and every run of it |
-| Run alias, run id, or id prefix | Just that run |
-| Project id | Its tickets and their runs |
-
-Repository-wide events, such as a daemon draining for restart, belong to no
-ticket or run and so appear only under a bare `sloop watch`. A reference that
-resolves to nothing exits nonzero with the same `not_found` error `show`
-gives, before anything streams — a typo never looks like a quiet queue.
-
-```sh
-sloop watch TICK-12          # one ticket and all of its attempts
-sloop watch TICK-12-r2       # one attempt
-sloop watch --json TICK-12 | jq -r 'select(.kind == "run_finished")'
-```
-
-Under the hood this is the `events` verb: a cursor-paginated read of the
-daemon's activity feed, with the reference passed as its `scope` argument so
-the daemon resolves and filters. Any client — a dashboard, a websocket
-bridge — gets the same scoping by polling with the returned cursor.
+- `status` and `list` name `sloop show` as the replacement. `list` keeps its
+  old all-ticket and limit behavior while the alias remains.
+- `watch` names `sloop show --follow`; its optional scope and tail still work.
+- `wait` names `sloop show --follow --quiet`; its run and timeout still work.
 
 ### sloop reindex
 

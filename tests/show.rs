@@ -11,7 +11,7 @@ mod support;
 use std::fs;
 
 use serde_json::Value;
-use support::{World, wait_until_slow};
+use support::{FakeAgent, World, wait_until, wait_until_slow};
 
 /// build -> test -> merge, where `test` is an `exec` stage that always passes.
 const FLOW_PASSING_TEST: &str = "stages:
@@ -264,4 +264,126 @@ fn project_show_is_unchanged() {
     let project = show(&world, "default");
     assert!(project["tickets"].is_array(), "{project}");
     assert_eq!(project["runs"], Value::Null);
+}
+
+#[test]
+fn bare_show_is_a_dashboard_and_patterns_filter_before_limiting() {
+    let world = World::configured();
+    configure(&world, FLOW_AGENT_ONLY, "exit 0\n");
+    world.commit_all("initial");
+    world.start_daemon();
+    let first = post(&world, "audit.md");
+    let second = post(&world, "audit-helper.md");
+    let third = post(&world, "other-audit.md");
+
+    let bare = world.sloop(&[]);
+    let shown = world.sloop(&["show"]);
+    assert!(bare.status.success());
+    assert!(shown.status.success());
+    let bare_data = &World::json_stdout(&bare)["data"];
+    let shown_data = &World::json_stdout(&shown)["data"];
+    assert_eq!(bare_data, shown_data);
+    assert_eq!(shown_data["kind"], "dashboard");
+    assert_eq!(shown_data["recent"][0]["id"], third);
+
+    let status_alias = world.sloop_plain(&["status"]);
+    let status_new = world.sloop_plain(&["show"]);
+    assert_eq!(status_alias.stdout, status_new.stdout);
+    assert_eq!(
+        String::from_utf8_lossy(&status_alias.stderr),
+        "note: 'sloop status' is now 'sloop show'; this alias will be removed in a future release\n"
+    );
+    let list_alias = world.sloop_plain(&["list", "-2"]);
+    let list_new = world.sloop_plain(&["show", ".*", "-2"]);
+    assert_eq!(list_alias.stdout, list_new.stdout);
+    assert_eq!(
+        String::from_utf8_lossy(&list_alias.stderr),
+        "note: 'sloop list' is now 'sloop show'; this alias will be removed in a future release\n"
+    );
+
+    // The exact ticket name wins even though the same text is regex-safe and
+    // could also be interpreted as a substring pattern.
+    let exact = World::json_stdout(&world.sloop(&["show", "audit"]));
+    assert_eq!(exact["data"]["kind"], "ticket");
+    assert_eq!(exact["data"]["value"]["id"], first);
+
+    let partial = World::json_stdout(&world.sloop(&["show", "udi"]));
+    assert_eq!(partial["data"]["kind"], "matches");
+    assert_eq!(partial["data"]["tickets"].as_array().unwrap().len(), 3);
+
+    let limited = World::json_stdout(&world.sloop(&["show", "audit", "-2"]));
+    // Exact matching still wins when a list limit is present.
+    assert_eq!(limited["data"]["kind"], "ticket");
+    let limited = World::json_stdout(&world.sloop(&["show", "udi", "-2"]));
+    let ids = limited["data"]["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|ticket| ticket["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, [third.as_str(), second.as_str()]);
+
+    let invalid = world.sloop(&["show", "["]);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&invalid.stderr).contains("invalid ticket pattern `[`"),
+        "{}",
+        String::from_utf8_lossy(&invalid.stderr)
+    );
+}
+
+#[test]
+fn show_follow_streams_a_ticket_until_it_settles_and_quiet_is_silent() {
+    let world = World::configured();
+    world.configure_fake_agent(
+        FakeAgent::new()
+            .block_until_released("follow")
+            .commit("work")
+            .exit(0),
+    );
+    world.commit_all("initial");
+    world.start_daemon();
+    let ticket = post(&world, "follow-ticket.md");
+    assert!(world.sloop(&["run", &ticket]).status.success());
+    wait_until("the followed run starts", || {
+        world.fake_agent_reached("follow")
+    });
+
+    let streaming = world.spawn_sloop(&["show", &ticket, "--follow"]);
+    let quiet = world.spawn_sloop(&["show", &ticket, "--follow", "--quiet"]);
+    world.release("follow");
+
+    let streaming = streaming
+        .wait_with_output()
+        .expect("wait for streaming show");
+    let quiet = quiet.wait_with_output().expect("wait for quiet show");
+    assert!(streaming.status.success(), "{:?}", streaming.status);
+    assert!(quiet.status.success(), "{:?}", quiet.status);
+    assert!(quiet.stdout.is_empty(), "quiet output: {:?}", quiet.stdout);
+    let events = String::from_utf8_lossy(&streaming.stdout);
+    assert!(
+        events.lines().any(|line| {
+            serde_json::from_str::<Value>(line)
+                .is_ok_and(|event| event["kind"] == "run_finished" && event["ticket"] == ticket)
+        }),
+        "streamed events: {events}"
+    );
+
+    let watch_alias = world.sloop(&["watch", &ticket]);
+    let watch_new = world.sloop(&["show", &ticket, "--follow"]);
+    assert_eq!(watch_alias.status.code(), watch_new.status.code());
+    assert_eq!(watch_alias.stdout, watch_new.stdout);
+    assert!(
+        String::from_utf8_lossy(&watch_alias.stderr)
+            .starts_with("note: 'sloop watch' is now 'sloop show --follow'")
+    );
+
+    let wait_alias = world.sloop(&["wait", &ticket, "--timeout", "5"]);
+    let wait_new = world.sloop(&["show", &ticket, "--follow", "--quiet"]);
+    assert_eq!(wait_alias.status.code(), wait_new.status.code());
+    assert_eq!(wait_alias.stdout, wait_new.stdout);
+    assert!(
+        String::from_utf8_lossy(&wait_alias.stderr)
+            .starts_with("note: 'sloop wait' is now 'sloop show --follow --quiet'")
+    );
 }

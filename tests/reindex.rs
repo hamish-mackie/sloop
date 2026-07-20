@@ -568,11 +568,10 @@ fn reindex_drops_history_for_tickets_removed_from_files() {
     assert_eq!(database_count(&world, "runs"), 1);
     assert_eq!(database_count(&world, "notes"), 1);
     let shown = world.sloop(&["show", "T1"]);
-    assert!(!shown.status.success());
-    assert_eq!(
-        World::json_stdout_or_stderr(&shown)["error"]["code"],
-        "not_found"
-    );
+    assert!(shown.status.success());
+    let shown = World::json_stdout(&shown);
+    assert_eq!(shown["data"]["kind"], "matches");
+    assert_eq!(shown["data"]["tickets"], serde_json::json!([]));
     let project = World::json_stdout(&world.sloop(&["show", "default"]))["data"].clone();
     let kept = project["value"]["tickets"]
         .as_array()
@@ -699,11 +698,10 @@ fn reindex_preserves_project_scoped_run_history_when_a_ticket_moves() {
         1
     );
     let old = world.sloop(&["show", "old"]);
-    assert!(!old.status.success());
-    assert_eq!(
-        World::json_stdout_or_stderr(&old)["error"]["code"],
-        "not_found"
-    );
+    assert!(old.status.success());
+    let old = World::json_stdout(&old);
+    assert_eq!(old["data"]["kind"], "matches");
+    assert_eq!(old["data"]["tickets"], serde_json::json!([]));
 }
 
 #[test]
