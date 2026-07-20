@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail" in one command. Filtering happens in the daemon: the `logs` verb
   gained `stage`, `tail`, and `after` arguments and a `terminal` response
   field, all additive within protocol version 1.
+- `sloop watch` now takes an optional ticket, run, or project reference and
+  streams only that scope's events, resolved exactly as `sloop show`
+  resolves a reference. A reference that resolves to nothing fails with
+  `not_found` before anything streams. Bare `sloop watch` is unchanged. The
+  `events` verb gained a matching optional `scope` argument, so any protocol
+  client scopes the feed the same way.
 
 ### Changed
 

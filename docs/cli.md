@@ -222,16 +222,37 @@ the `logs` verb with `stage`, `tail`, and `after` arguments, returning a page
 plus `next_cursor`, `complete`, and `terminal`. `--follow` is a client-side
 loop over that cursor, the same shape as `sloop watch`.
 
-### sloop watch [--tail N]
+### sloop watch [REF] [--tail N]
 
 Follow ticket and run activity as it happens: claims, starts, and settled
 outcomes, one line per event. Prints the `--tail` most recent events
 (default 20), then streams new ones until interrupted. With `--json`, each
 event is written as one NDJSON object, ready to pipe into other tools.
 
+With no reference every event in the repository is streamed. Passing one
+narrows the stream, using the same references `show` accepts:
+
+| Reference | What is streamed |
+| --- | --- |
+| Ticket id or name | That ticket and every run of it |
+| Run alias, run id, or id prefix | Just that run |
+| Project id | Its tickets and their runs |
+
+Repository-wide events, such as a daemon draining for restart, belong to no
+ticket or run and so appear only under a bare `sloop watch`. A reference that
+resolves to nothing exits nonzero with the same `not_found` error `show`
+gives, before anything streams — a typo never looks like a quiet queue.
+
+```sh
+sloop watch TICK-12          # one ticket and all of its attempts
+sloop watch TICK-12-r2       # one attempt
+sloop watch --json TICK-12 | jq -r 'select(.kind == "run_finished")'
+```
+
 Under the hood this is the `events` verb: a cursor-paginated read of the
-daemon's activity feed. Any client — a dashboard, a websocket bridge — can
-stream the same feed by polling with the returned cursor.
+daemon's activity feed, with the reference passed as its `scope` argument so
+the daemon resolves and filters. Any client — a dashboard, a websocket
+bridge — gets the same scoping by polling with the returned cursor.
 
 ### sloop reindex
 
