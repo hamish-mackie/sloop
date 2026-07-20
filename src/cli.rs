@@ -13,9 +13,9 @@ use clap::{
 use serde_json::json;
 
 use crate::protocol::{
-    EmptyArgs, ErrorBody, ErrorCode, EventsArgs, NoteArgs, PostActivation, PostArgs, Request,
-    RequestEnvelope, RequestId, ResponseEnvelope, RunActivation, RunArgs, RunReferenceArgs,
-    ShowArgs, StopArgs, TicketReferenceArgs, VerdictArgs, VerdictValue,
+    EmptyArgs, ErrorBody, ErrorCode, EventsArgs, ListArgs, NoteArgs, PostActivation, PostArgs,
+    Request, RequestEnvelope, RequestId, ResponseEnvelope, RunActivation, RunArgs,
+    RunReferenceArgs, ShowArgs, StopArgs, TicketReferenceArgs, VerdictArgs, VerdictValue,
 };
 use crate::templates::TemplateKind;
 
@@ -82,7 +82,11 @@ pub enum Command {
     #[command(hide = true)]
     Ready { ticket: String },
     /// List ticket names, states, and why they are not running.
-    List,
+    ///
+    /// Tickets are ordered by registration time, newest first, whatever their
+    /// state. Pass `--limit <N>`, `-n <N>`, or the `tail`-style shorthand
+    /// `-<N>` to see only the N newest.
+    List(ListCliArgs),
     /// Show daemon state.
     Status,
     /// Stop spawning new agents.
@@ -211,6 +215,13 @@ pub struct PostCliArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ListCliArgs {
+    /// Show only the N newest tickets; `-<N>` is shorthand, as in `tail -10`.
+    #[arg(long, short = 'n', value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Args)]
 #[command(group(
     ArgGroup::new("activation")
         .args(["at", "every", "overnight"])
@@ -265,7 +276,7 @@ impl TryFrom<Command> for Request {
             Command::Retry { ticket } => Self::Retry(TicketReferenceArgs { ticket }),
             Command::Hold { ticket } => Self::Hold(TicketReferenceArgs { ticket }),
             Command::Ready { ticket } => Self::Ready(TicketReferenceArgs { ticket }),
-            Command::List => Self::List(empty()),
+            Command::List(args) => Self::List(ListArgs { limit: args.limit }),
             Command::Status => Self::Status(empty()),
             Command::Pause => Self::Pause(empty()),
             Command::Resume => Self::Resume(empty()),
@@ -427,6 +438,7 @@ where
     if expanded_help {
         args.retain(|arg| arg != "--all");
     }
+    expand_list_limit_shorthand(&mut args);
 
     let mut command = Cli::command();
     if expanded_help {
@@ -487,6 +499,31 @@ where
                     augment_unknown_subcommand(&error, error.to_string().trim_end().to_owned()),
                 ),
             }
+        }
+    }
+}
+
+/// Rewrites `sloop list -10` into `sloop list --limit=10`. clap lexes a bare
+/// `-10` as the short flag `-1`, so the `head`/`tail` shorthand has to be
+/// translated before parsing. Only arguments after a leading `list` verb are
+/// touched, so no other command can have a negative-looking value rewritten,
+/// and only all-digit runs are: `-abc` and `-n` reach clap untouched and earn
+/// its usage error. `-0` becomes `--limit=0`, which the parser's range rejects.
+fn expand_list_limit_shorthand(args: &mut [OsString]) {
+    let verb = args
+        .iter()
+        .skip(1)
+        .position(|arg| arg != "--json")
+        .map(|offset| offset + 1);
+    let Some(verb) = verb.filter(|index| args[*index] == "list") else {
+        return;
+    };
+    for argument in &mut args[verb + 1..] {
+        let Some(digits) = argument.to_str().and_then(|arg| arg.strip_prefix('-')) else {
+            continue;
+        };
+        if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            *argument = OsString::from(format!("--limit={digits}"));
         }
     }
 }
@@ -572,7 +609,7 @@ fn run_command(
         | Command::Retry { .. }
         | Command::Hold { .. }
         | Command::Ready { .. }
-        | Command::List
+        | Command::List(_)
         | Command::Status
         | Command::Pause
         | Command::Resume
@@ -1102,7 +1139,7 @@ mod tests {
     use clap::{Parser, ValueEnum};
     use serde_json::{Value, json};
 
-    use super::{Cli, subcommand_synonym};
+    use super::{Cli, expand_list_limit_shorthand, subcommand_synonym};
     use crate::protocol::{Capability, Request};
 
     /// Drives the full CLI entry point and returns the error envelope written
@@ -1114,6 +1151,41 @@ mod tests {
         argv.extend_from_slice(args);
         super::run(argv, &mut stdout, &mut stderr);
         serde_json::from_slice(&stderr).expect("stderr carries a JSON envelope")
+    }
+
+    /// The rewrite is deliberately narrow: only `list`'s own arguments, and
+    /// only all-digit ones. Everything else has to reach clap untouched, or a
+    /// negative-looking value elsewhere would silently become a limit.
+    #[test]
+    fn the_list_limit_shorthand_expands_only_for_list_arguments() {
+        let expanded = |argv: &[&str]| {
+            let mut args: Vec<std::ffi::OsString> =
+                argv.iter().map(std::ffi::OsString::from).collect();
+            expand_list_limit_shorthand(&mut args);
+            args.iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            expanded(&["sloop", "list", "-2"]),
+            ["sloop", "list", "--limit=2"]
+        );
+        assert_eq!(
+            expanded(&["sloop", "--json", "list", "-2"]),
+            ["sloop", "--json", "list", "--limit=2"]
+        );
+        // `-0` is expanded so clap's range, not this function, refuses it.
+        assert_eq!(expanded(&["sloop", "list", "-0"])[2], "--limit=0");
+        for untouched in [
+            ["sloop", "list", "-abc"].as_slice(),
+            ["sloop", "list", "-n"].as_slice(),
+            // Another verb's arguments, and the verb token itself, are safe.
+            ["sloop", "post", "list", "-2"].as_slice(),
+            ["sloop", "watch", "-2"].as_slice(),
+        ] {
+            assert_eq!(expanded(untouched), untouched, "{untouched:?}");
+        }
     }
 
     #[test]
