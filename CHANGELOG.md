@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-20
+
+### Fixed
+
+- Keep worker socket paths within the 104-byte macOS socket path limit by
+  placing them directly in the runtime directory under the short run id.
+  On macOS the previous layout exceeded the limit, every agent spawn failed
+  at socket bind, and no run could start.
+
 ## [0.2.0] - 2026-07-20
 
 ### Fixed

@@ -231,9 +231,10 @@ impl World {
     }
 
     pub fn worker_socket(&self, run: &str) -> PathBuf {
-        self.runtime_dir()
-            .join("workers")
-            .join(format!("{run}.sock"))
+        // Mirrors `worker_socket_path`: short id, directly in the runtime
+        // directory, so the path fits the 104-byte macOS socket cap.
+        let short = run.get(..8).unwrap_or(run);
+        self.runtime_dir().join(format!("w{short}.sock"))
     }
 
     pub fn now_ms(&self) -> i64 {
