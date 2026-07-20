@@ -448,7 +448,11 @@ pub fn run_output_path(state_dir: &Path, run_id: &str) -> PathBuf {
 }
 
 pub fn worker_socket_path(runtime_dir: &Path, run_id: &str) -> PathBuf {
-    runtime_dir.join("workers").join(format!("{run_id}.sock"))
+    // macOS caps Unix socket paths at 104 bytes, and the runtime root under
+    // `$TMPDIR` is long there, so worker sockets sit directly in the runtime
+    // directory and use the short run id. The full 32-hex id pushed a macOS
+    // path past the cap and every agent spawn failed at bind.
+    runtime_dir.join(format!("w{}.sock", crate::run_ref::short(run_id)))
 }
 
 pub fn process_start_time(pid: u32) -> Option<i64> {
@@ -691,6 +695,24 @@ mod tests {
         assert_eq!(
             compose_worker_prompt(root.path()).unwrap(),
             format!("{WORKER_BOOTSTRAP_PROMPT}\n\nUse repository conventions.\n")
+        );
+    }
+
+    #[test]
+    fn worker_socket_paths_fit_the_macos_socket_length_cap() {
+        // A representative macOS runtime directory: `$TMPDIR` on macOS is
+        // `/var/folders/<2>/<30>/T/`, followed by the sloop runtime key. The
+        // tightest real layout adds a `tempdir` test prefix on top.
+        let runtime_dir = std::path::Path::new(
+            "/var/folders/24/8k48jl6d249_n_qfxwsl6xvm0000gn/T/.tmpAbC123/sloop/0123456789abcdef",
+        );
+        let socket = super::worker_socket_path(runtime_dir, &"ab".repeat(16));
+
+        assert!(
+            socket.as_os_str().len() <= 104,
+            "worker socket path is {} bytes, over the 104-byte macOS cap: {}",
+            socket.as_os_str().len(),
+            socket.display()
         );
     }
 }
