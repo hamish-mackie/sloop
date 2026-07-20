@@ -35,6 +35,12 @@ This scaffolds committed configuration under `.agents/sloop/`:
 `init` never edits `.gitignore`; whether worktrees and tickets are committed
 is your repository's policy.
 
+`init` gives you a working scaffold, not a reference. When you need to write
+one of these files by hand, `sloop template ticket|flow|project|config`
+prints a fully commented canonical version to stdout — the authoring
+documentation lives in the binary, so it is available offline and always
+matches the version you have installed.
+
 Then start the daemon:
 
 ```sh
@@ -59,7 +65,14 @@ work waits without changing state, and dispatch resumes under the replacement.
 ## Write a ticket
 
 A ticket is a Markdown file: YAML frontmatter for the metadata Sloop needs,
-then a body that becomes the agent's assignment.
+then a body that becomes the agent's assignment. To start from a template
+that documents every field, redirect one out of the binary:
+
+```sh
+sloop template ticket > .agents/sloop/tickets/add-request-logging.md
+```
+
+The minimum is short:
 
 ```markdown
 ---

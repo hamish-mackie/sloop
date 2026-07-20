@@ -17,6 +17,7 @@ use crate::protocol::{
     RequestEnvelope, RequestId, ResponseEnvelope, RunActivation, RunArgs, RunReferenceArgs,
     ShowArgs, StopArgs, TicketReferenceArgs, VerdictArgs, VerdictValue,
 };
+use crate::templates::TemplateKind;
 
 const TICKET_STATES_HELP: &str = "Ticket states:
   ready         Eligible for dispatch once a run is queued and gates are open.
@@ -54,6 +55,16 @@ enum OutputMode {
 pub enum Command {
     /// Scaffold a Sloop project.
     Init,
+    /// Print a commented canonical template for a file you author.
+    ///
+    /// Static compiled-in content: no daemon is contacted or started, and
+    /// nothing is written. Redirect it where you want the file, for example
+    /// `sloop template ticket > .agents/sloop/tickets/my-ticket.md`.
+    Template {
+        /// The file kind to print.
+        #[arg(value_name = "KIND")]
+        kind: TemplateKind,
+    },
     /// Ensure the daemon is running.
     Daemon(DaemonCliArgs),
     /// Register a ticket file.
@@ -157,11 +168,16 @@ enum DaemonAction {
 }
 
 #[derive(Debug, Args)]
-#[command(group(
-    ArgGroup::new("activation")
-        .args(["auto", "at", "manual", "hold"])
-        .multiple(false)
-))]
+#[command(
+    after_help = "Ticket files need `name`, `blocked_by`, and a non-empty body. Run \
+`sloop template ticket` for a commented example of every frontmatter field, or \
+`sloop template flow` for the flow grammar that `--flow` selects.",
+    group(
+        ArgGroup::new("activation")
+            .args(["auto", "at", "manual", "hold"])
+            .multiple(false)
+    )
+)]
 pub struct PostCliArgs {
     /// Markdown ticket to register.
     file: PathBuf,
@@ -224,6 +240,13 @@ impl TryFrom<Command> for Request {
         let empty = EmptyArgs::default;
         Ok(match command {
             Command::Init => Self::Init(empty()),
+            // `template` is answered entirely from compiled-in content, so it
+            // has no protocol verb and must never reach the daemon path.
+            Command::Template { .. } => {
+                return Err(RequestConstructionError(
+                    "template is printed locally and has no daemon request".into(),
+                ));
+            }
             Command::Daemon(args) => match args.action {
                 Some(DaemonAction::Restart) => Self::Restart(empty()),
                 None => Self::Daemon(empty()),
@@ -517,6 +540,7 @@ fn run_command(
 ) -> ExitCode {
     match command {
         Command::Init => run_init(mode, stdout, stderr),
+        Command::Template { kind } => run_template(kind, mode, stdout),
         Command::Daemon(args) if args.foreground && args.action.is_none() => {
             match crate::daemon::serve_current_repository() {
                 Ok(()) | Err(crate::daemon::DaemonError::AlreadyRunning) => ExitCode::SUCCESS,
@@ -579,6 +603,29 @@ fn write_plain_or(
         OutputMode::Json => write_response(mode, None, output, envelope, ExitCode::SUCCESS),
         OutputMode::Human => {
             if writeln!(output, "{text}").is_err() {
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+/// Prints a compiled-in template. Like `stop`, this verb never resurrects a
+/// daemon — unlike `stop`, it never contacts one at all, because the answer
+/// is static content baked into the binary. Plain mode writes the template
+/// verbatim so it can be redirected straight into a file.
+fn run_template(kind: TemplateKind, mode: OutputMode, stdout: &mut impl Write) -> ExitCode {
+    let text = kind.text();
+    match mode {
+        OutputMode::Json => write_response(
+            mode,
+            Some("template"),
+            stdout,
+            &ResponseEnvelope::success(None, json!({"kind": kind.as_str(), "template": text})),
+            ExitCode::SUCCESS,
+        ),
+        OutputMode::Human => {
+            if stdout.write_all(text.as_bytes()).is_err() {
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
@@ -1027,7 +1074,7 @@ fn write_response(
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use clap::{Parser, ValueEnum};
     use serde_json::{Value, json};
 
     use super::{Cli, subcommand_synonym};
@@ -1095,6 +1142,10 @@ mod tests {
     fn parses_every_documented_verb() {
         let commands: &[&[&str]] = &[
             &["sloop", "init"],
+            &["sloop", "template", "ticket"],
+            &["sloop", "template", "flow"],
+            &["sloop", "template", "project"],
+            &["sloop", "template", "config"],
             &["sloop", "daemon"],
             &["sloop", "post", "ticket.md", "--auto"],
             &["sloop", "post", "ticket.md", "--at", "03:00"],
@@ -1240,6 +1291,89 @@ mod tests {
 
         assert_eq!(request.capability(), Capability::Operator);
         assert!(matches!(request, Request::Status(_)));
+    }
+
+    /// Drives the full entry point and returns stdout, so these tests prove
+    /// the verb answers without a daemon: the test process has no repository,
+    /// no socket, and no `SLOOP_TOKEN`, and any daemon path would fail.
+    fn stdout_of(args: &[&str]) -> String {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut argv = vec!["sloop"];
+        argv.extend_from_slice(args);
+        let code = super::run(argv, &mut stdout, &mut stderr);
+
+        assert_eq!(
+            format!("{code:?}"),
+            format!("{:?}", std::process::ExitCode::SUCCESS),
+            "stderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        String::from_utf8(stdout).expect("stdout is UTF-8")
+    }
+
+    #[test]
+    fn every_template_kind_prints_verbatim_without_a_daemon() {
+        for kind in ["ticket", "flow", "project", "config"] {
+            let printed = stdout_of(&["template", kind]);
+            let expected = super::TemplateKind::from_str(kind, false)
+                .expect("kind is accepted")
+                .text();
+            assert_eq!(printed, expected, "`sloop template {kind}` was rewritten");
+        }
+    }
+
+    #[test]
+    fn template_json_mode_wraps_the_text_in_an_envelope() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        super::run(
+            ["sloop", "--json", "template", "flow"],
+            &mut stdout,
+            &mut stderr,
+        );
+
+        let envelope: Value = serde_json::from_slice(&stdout).expect("stdout carries an envelope");
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["data"]["kind"], "flow");
+        assert_eq!(
+            envelope["data"]["template"].as_str(),
+            Some(super::TemplateKind::Flow.text())
+        );
+    }
+
+    #[test]
+    fn an_unknown_template_kind_lists_the_valid_kinds() {
+        let envelope = error_envelope(&["template", "readme"]);
+
+        assert_eq!(envelope["error"]["code"], "invalid_arguments");
+        let message = envelope["error"]["message"]
+            .as_str()
+            .expect("error message");
+        for kind in ["ticket", "flow", "project", "config"] {
+            assert!(message.contains(kind), "`{kind}` missing from: {message}");
+        }
+    }
+
+    /// `template` answers from compiled-in content, so it deliberately has no
+    /// protocol verb. Constructing a request must fail rather than silently
+    /// routing it at the daemon.
+    #[test]
+    fn template_never_becomes_a_daemon_request() {
+        let error = Cli::try_parse_from(["sloop", "template", "ticket"])
+            .unwrap()
+            .into_request()
+            .expect_err("template has no daemon request");
+
+        assert!(error.to_string().contains("printed locally"), "{error}");
+    }
+
+    #[test]
+    fn post_help_points_at_the_ticket_template() {
+        let help = stdout_of(&["post", "--help"]);
+
+        assert!(help.contains("sloop template ticket"), "{help}");
+        assert!(help.contains("sloop template flow"), "{help}");
     }
 
     #[test]

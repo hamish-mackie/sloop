@@ -5,9 +5,24 @@ Sloop schedules. Commands find it by walking up from the current directory
 to the nearest `.agents/sloop/config.yaml`; the repository containing that
 file is the unit of configuration and scheduling.
 
+Every file described on this page has a commented canonical template built
+into the binary, so you do not need this page (or network access) to author
+one:
+
+```sh
+sloop template config   # the annotated config.yaml below
+sloop template ticket   # every frontmatter field
+sloop template flow     # the full flow schema
+sloop template project  # the project file shape
+```
+
+Those templates are round-tripped through Sloop's own parsers in the test
+suite, so they always match the grammar the binary you are running enforces.
+
 ## config.yaml
 
-`sloop init` generates a working file. A fuller example:
+`sloop init` generates a working file, and `sloop template config` prints an
+annotated one. A fuller example:
 
 ```yaml
 version: 1
@@ -143,6 +158,8 @@ repository-scoped.
 
 ## Ticket frontmatter
 
+`sloop template ticket` prints this with a comment on every field:
+
 ```markdown
 ---
 name: Add request logging      # required, non-empty
@@ -178,15 +195,19 @@ creates `projects/default.md`, and tickets posted without `--project` (or a
 `project` frontmatter field) land there.
 
 A project file is Markdown with `id` and `title` frontmatter and a
-free-form description. Project files never list their tickets — membership
-lives in ticket frontmatter.
+free-form description; `sloop template project` prints an annotated one.
+Project files never list their tickets — membership lives in ticket
+frontmatter.
 
 `sloop run --project <id>` restricts selection to that project's ready
 tickets. It never bypasses gates or jumps the queue.
 
 ## Flows
 
-`sloop init` scaffolds `.agents/sloop/flows/default.yaml`:
+`sloop template flow` prints a template exercising every stage kind, every
+verdict policy, and `on_fail`, with the structural rules spelled out in
+comments. `sloop init` scaffolds a smaller working
+`.agents/sloop/flows/default.yaml`:
 
 ```yaml
 stages:

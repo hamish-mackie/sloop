@@ -15,6 +15,9 @@ The commands split into two sets, and the split is enforced by the daemon:
   the current stage explicitly uses the `reported` policy, affects flow
   evidence.
 
+Two verbs answer without a socket at all: `init` writes files, and `template`
+prints compiled-in text. Neither starts a daemon.
+
 `show` is available on both sockets: an operator can inspect any ticket,
 run, or project, while a worker's `show` is scoped to its own ticket. The
 verb is read-only on either socket.
@@ -34,6 +37,38 @@ the named flow file before posting work or starting a new daemon.
 Scaffold `.agents/sloop/` in the current repository: `config.yaml`, the
 default project, the tickets directory, the default flow, and the review
 prompt. Never modifies `.gitignore` or other repository policy.
+
+### sloop template <KIND>
+
+Print a fully commented canonical template for a file you author, where
+`<KIND>` is `ticket`, `flow`, `project`, or `config`. An unknown kind fails
+with the list of valid ones.
+
+The templates are static content compiled into the binary, so this verb
+writes nothing, contacts no daemon, and never starts one — it works in a
+directory that is not a Sloop repository at all. Each one is a working
+example whose comments document every field, and each is parsed by Sloop's
+own loaders in the test suite, so a template cannot drift from the grammar
+it describes.
+
+Output goes to stdout so it composes; redirect it where you want the file:
+
+```sh
+sloop template ticket > .agents/sloop/tickets/add-request-logging.md
+sloop template flow    > .agents/sloop/flows/release.yaml
+sloop template project > .agents/sloop/projects/web.md
+sloop template config  > .agents/sloop/config.yaml
+```
+
+Nothing is written into `.agents/sloop/` for you: the ticket directory is a
+live queue, and an example file left there is one `sloop post` away from
+becoming real work.
+
+With `--json`, the template text is returned as `data.template` alongside
+`data.kind`; without it, the raw template is the entire output.
+
+`sloop template flow` is the only complete description of the flow schema
+available from an installed binary.
 
 ### sloop daemon
 

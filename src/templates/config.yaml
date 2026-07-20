@@ -1,0 +1,140 @@
+# The repository's committed Sloop configuration, at
+# .agents/sloop/config.yaml. Commands find it by walking up from the
+# current directory, and the repository containing it is the unit of
+# configuration and scheduling.
+#
+# Every key below is optional except `version`; the values shown are the
+# defaults unless noted. Commented blocks are off by default.
+
+# Schema version. The only accepted value is 1; anything else is refused
+# at load rather than guessed at.
+version: 1
+
+# ---- directories -------------------------------------------------------
+# All three must stay inside the repository: absolute paths and paths that
+# escape the root with `..` are rejected before the daemon starts. They are
+# repository policy and are never inherited from user configuration.
+
+# Where run worktrees are created.
+worktree_dir: .worktrees
+# Project files.
+project_dir: .agents/sloop/projects
+# Ticket files. `sloop post` refuses a file outside this directory.
+ticket_dir: .agents/sloop/tickets
+
+# ---- retention ---------------------------------------------------------
+# How long a settled run's worktree and run branch remain available before
+# periodic cleanup. Durations are a positive integer with an `s`, `m`, `h`,
+# `d`, or `w` suffix; `never` disables cleanup entirely. Merged runs are
+# eligible immediately, while failed and needs_review runs are kept as
+# evidence until the ticket is resolved by retry, external merge, or
+# reindex, and only then start their retention clock.
+worktree_retention: 7d
+
+# How long a ticket row stays stamped missing after its committed file
+# disappears before reconciliation deletes it. Same duration grammar.
+delete_missing_after: 30d
+
+# ---- scheduler ---------------------------------------------------------
+scheduler:
+  # How many agents may be alive at once. A hard spawn gate: queued work
+  # waits for a free slot. Must be greater than zero.
+  max_parallel_tasks: 1
+  # A local-time window in which agents may be spawned. Both values are
+  # HH:MM, must differ, and may cross midnight (22:00-06:00 is overnight).
+  # The start is inclusive and the end exclusive. Work queued outside the
+  # window waits for the next opening; agents already running when it
+  # closes are allowed to finish. Omit the key to run at any time.
+  # running_hours:
+  #   start: "22:00"
+  #   end: "06:00"
+
+# ---- agent targets -----------------------------------------------------
+# Named exec-shaped adapters, one per agent CLI. Adding a vendor is a
+# config block, not a code change. These are repository-scoped: they are
+# never read from user-level defaults.
+#
+# Each `cmd` is an argv template, run without a shell. `{prompt}` must
+# appear exactly once and is replaced with the composed worker
+# instructions at launch. `{model}` and `{effort}` are filled from the
+# ticket, falling back to the target's own `model:` and `effort:`; if a
+# template uses one and neither source supplies a value, the post is
+# rejected before anything is registered. Keep API keys in the
+# environment — the agent inherits the daemon's.
+agent:
+  # The target used by tickets that do not name one. Must name an entry
+  # in `targets` below.
+  default_target: claude
+  targets:
+    claude:
+      model: opus
+      effort: high
+      cmd:
+        - claude
+        - --print
+        - --model
+        - "{model}"
+        - --effort
+        - "{effort}"
+        - "{prompt}"
+    codex:
+      model: gpt-5.6-sol
+      effort: high
+      cmd:
+        - codex
+        - exec
+        - --model
+        - "{model}"
+        - --config
+        - 'model_reasoning_effort="{effort}"'
+        - --sandbox
+        - workspace-write
+        - --ephemeral
+        - "{prompt}"
+    # OpenCode model names are provider-qualified (for example
+    # anthropic/claude-opus-4-8), so pick yours here or per ticket.
+    opencode:
+      cmd:
+        - opencode
+        - run
+        - --model
+        - "{model}"
+        - --variant
+        - "{effort}"
+        - "{prompt}"
+
+# ---- id prefixes -------------------------------------------------------
+# Prefixes for the durable IDs stamped into committed files (TICK-7,
+# PROJ-2). A new ID is one greater than the largest existing numeric
+# suffix. Explicit IDs in frontmatter are always preserved. Each prefix
+# must be non-empty ASCII letters, digits, `-`, or `_`, with a letter or
+# digit at each end.
+ids:
+  ticket_prefix: TICK
+  project_prefix: PROJ
+
+# ---- aftercare ---------------------------------------------------------
+# An argv run inside the worktree after the agent exits and before its
+# work can merge. A failure keeps the work out of your branch and leaves
+# the ticket for review. It is inserted as an implicit `exit` stage named
+# `test` immediately after the agent stage, so it cannot be combined with
+# a flow that already has a stage named `test` — prefer an explicit stage
+# in the flow file (`sloop template flow`) when you need one.
+# aftercare:
+#   test_cmd: [cargo, test, --all-targets]
+
+# ---- ticket sources ----------------------------------------------------
+# Tickets normally come from Markdown files under `ticket_dir`. Setting
+# `sources.tickets.exec` replaces that source for `sloop reindex` rather
+# than merging with it. The command runs from the repository root and
+# receives one JSON request on stdin. Repository-scoped, like `agent`.
+# sources:
+#   tickets:
+#     exec: ["./scripts/ticket-source.sh"]
+
+# ---- user defaults -----------------------------------------------------
+# Optional defaults may live at ~/.config/sloop/config.yaml under a
+# `defaults:` key, and repository values override them. Only `scheduler`
+# and `aftercare` may be defaulted that way; `agent`, `sources`, `ids`,
+# and the directory keys are always repository-scoped and are rejected in
+# user configuration.

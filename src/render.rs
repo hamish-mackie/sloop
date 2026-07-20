@@ -86,6 +86,13 @@ fn render_init(data: &Value) -> String {
             let _ = writeln!(text, "  {label}: {path}");
         }
     }
+    // The scaffold shows the shape but not the grammar; point at the verb
+    // that documents every field, since nothing else in an installed binary
+    // does.
+    text.push_str(
+        "\nwrite a ticket with `sloop template ticket > .agents/sloop/tickets/<name>.md`\n\
+         see also `sloop template flow|project|config`\n",
+    );
     text
 }
 
