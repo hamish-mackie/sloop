@@ -67,9 +67,15 @@ impl RunIdSource for FixedRunIds {
 }
 
 fn random_bytes(buffer: &mut [u8]) -> Result<(), String> {
-    // `getentropy` is the portable entry point to the kernel CSPRNG on both
-    // Linux and macOS; `/dev/urandom` covers kernels that lack the syscall.
-    if unsafe { libc::getentropy(buffer.as_mut_ptr().cast(), buffer.len()) } == 0 {
+    // Both calls reach the kernel CSPRNG. Linux uses `getrandom` because musl
+    // libc does not export `getentropy`; `/dev/urandom` covers kernels that
+    // lack the syscall.
+    #[cfg(target_os = "linux")]
+    let filled = unsafe { libc::getrandom(buffer.as_mut_ptr().cast(), buffer.len(), 0) }
+        == buffer.len() as libc::ssize_t;
+    #[cfg(not(target_os = "linux"))]
+    let filled = unsafe { libc::getentropy(buffer.as_mut_ptr().cast(), buffer.len()) } == 0;
+    if filled {
         return Ok(());
     }
     File::open("/dev/urandom")
