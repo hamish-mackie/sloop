@@ -83,6 +83,14 @@ Patterns that fall out of the verbs:
   id's numeric ordinal. Add `{"limit": N}` to keep only the N newest; omit
   it for all of them. `N` must be at least `1`, so a client cannot ask for
   an empty page by accident — `0` is `invalid_arguments`.
+- **Read or stream one run's output** — `logs` takes `{"run": <ref>}` plus
+  optional `stage` (one flow stage name; an undefined one is
+  `invalid_arguments`), `tail` (keep the last N matching entries), and
+  `after` (a cursor). It returns the page along with `next_cursor`,
+  `complete`, and `terminal`. Poll with `{"after": <cursor>}` to follow a
+  live run and stop once a response is both `complete` and `terminal`;
+  `sloop logs --follow` is exactly this loop. Filtering is server-side, so a
+  dashboard tailing one stage of a large log transfers only that stage.
 - **Stream activity** — `events` returns one page of the append-only
   activity feed (`run_claimed`, `run_started`, `run_finished`,
   `run_aborted`) plus a `next_cursor`. Poll with `{"after": <cursor>}` to

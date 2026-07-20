@@ -133,19 +133,22 @@ pub fn launch_agent<H: StageHooks>(
     let mut child = command
         .spawn()
         .map_err(|error| RunnerError::Execution(error.to_string()))?;
+    // The agent's own flow stage is recorded alongside its output so the
+    // stage an operator reads about in the flow is the stage they can filter
+    // `sloop logs` by.
     let readers = vec![
         spawn_output_reader(
             child.stdout.take().expect("stdout was piped"),
             output_log.clone(),
             OutputSource::Agent,
-            None,
+            Some(order.stage.clone()),
             OutputStream::Stdout,
         ),
         spawn_output_reader(
             child.stderr.take().expect("stderr was piped"),
             output_log,
             OutputSource::Agent,
-            None,
+            Some(order.stage.clone()),
             OutputStream::Stderr,
         ),
     ];

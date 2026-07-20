@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `sloop logs` gained `--stage <NAME>`, `--tail <N>`, and `--follow`.
+  `--stage` selects one flow stage by the name the flow gives it, including
+  the agent stage, and rejects a name the run's flow does not define instead
+  of returning an empty page. `--tail` keeps the last N entries; `--follow`
+  streams new entries until the run settles. The three combine, so
+  `sloop logs <RUN> --stage test --tail 50` answers "why did the test stage
+  fail" in one command. Filtering happens in the daemon: the `logs` verb
+  gained `stage`, `tail`, and `after` arguments and a `terminal` response
+  field, all additive within protocol version 1.
 - `sloop watch` now takes an optional ticket, run, or project reference and
   streams only that scope's events, resolved exactly as `sloop show`
   resolves a reference. A reference that resolves to nothing fails with

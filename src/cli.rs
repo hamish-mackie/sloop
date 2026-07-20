@@ -13,8 +13,8 @@ use clap::{
 use serde_json::json;
 
 use crate::protocol::{
-    EmptyArgs, ErrorBody, ErrorCode, EventsArgs, ListArgs, NoteArgs, PostActivation, PostArgs,
-    Request, RequestEnvelope, RequestId, ResponseEnvelope, RunActivation, RunArgs,
+    EmptyArgs, ErrorBody, ErrorCode, EventsArgs, ListArgs, LogsArgs, NoteArgs, PostActivation,
+    PostArgs, Request, RequestEnvelope, RequestId, ResponseEnvelope, RunActivation, RunArgs,
     RunReferenceArgs, ShowArgs, StopArgs, TicketReferenceArgs, VerdictArgs, VerdictValue,
 };
 use crate::templates::TemplateKind;
@@ -113,6 +113,15 @@ pub enum Command {
     Logs {
         /// Run alias, ticket reference, or run-id prefix.
         run: String,
+        /// Show only output captured by this flow stage.
+        #[arg(long, value_name = "NAME")]
+        stage: Option<String>,
+        /// Show only the last N matching entries.
+        #[arg(long, value_name = "N")]
+        tail: Option<u32>,
+        /// Stream new output until the run reaches a terminal state.
+        #[arg(long)]
+        follow: bool,
     },
     /// Follow ticket and run activity as it happens.
     ///
@@ -282,7 +291,16 @@ impl TryFrom<Command> for Request {
             Command::Resume => Self::Resume(empty()),
             Command::Stop { force } => Self::Stop(StopArgs { force }),
             Command::Cancel { run } => Self::Cancel(RunReferenceArgs { run }),
-            Command::Logs { run } => Self::Logs(RunReferenceArgs { run }),
+            // `--follow` is a client-side loop over this request, so it has
+            // no field in the args the daemon sees.
+            Command::Logs {
+                run, stage, tail, ..
+            } => Self::Logs(LogsArgs {
+                run,
+                stage,
+                tail,
+                after: None,
+            }),
             Command::Watch { r#ref, tail } => Self::Events(EventsArgs {
                 after: None,
                 tail: Some(tail),
@@ -604,6 +622,23 @@ fn run_command(
         Command::Stop { force } => run_stop_request(force, mode, stdout, stderr),
         Command::Wait { run, timeout } => run_wait(run, timeout, mode, stdout, stderr),
         Command::Watch { r#ref, tail } => run_watch(r#ref, tail, mode, stdout, stderr),
+        Command::Logs {
+            run,
+            stage,
+            tail,
+            follow,
+        } => run_logs(
+            LogsArgs {
+                run,
+                stage,
+                tail,
+                after: None,
+            },
+            follow,
+            mode,
+            stdout,
+            stderr,
+        ),
         command @ (Command::Post(_)
         | Command::Run(_)
         | Command::Retry { .. }
@@ -614,7 +649,6 @@ fn run_command(
         | Command::Pause
         | Command::Resume
         | Command::Cancel { .. }
-        | Command::Logs { .. }
         | Command::Reindex) => match Request::try_from(command) {
             Ok(request) => run_daemon_request(request, false, mode, stdout, stderr),
             Err(error) => write_cli_error(mode, stderr, error.to_string()),
@@ -892,6 +926,95 @@ fn run_watch(
     }
 }
 
+/// One page of captured output, or — with `--follow` — every page until the
+/// run settles. Filtering is the daemon's job; the client only chooses when
+/// to ask again.
+fn run_logs(
+    args: LogsArgs,
+    follow: bool,
+    mode: OutputMode,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> ExitCode {
+    if !follow {
+        return run_daemon_request(Request::Logs(args), false, mode, stdout, stderr);
+    }
+    follow_logs(args, mode, stdout, stderr)
+}
+
+/// Polls the daemon for pages past the cursor of the previous one, exactly
+/// like `watch` does over the event feed. The daemon keeps no per-follower
+/// state, so any other client can stream a run the same way.
+///
+/// A page is written when it carries entries, and once at the end so an empty
+/// run still reports itself. Streaming stops only when the run is terminal
+/// *and* the page reached the end of the log: a settled run can still have
+/// unread output behind the cursor.
+fn follow_logs(
+    mut args: LogsArgs,
+    mode: OutputMode,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> ExitCode {
+    let mut written = false;
+    loop {
+        match crate::daemon::request(Request::Logs(args.clone())) {
+            Ok(mut result) => {
+                if !result.response.ok {
+                    return write_response(
+                        mode,
+                        Some("logs"),
+                        stderr,
+                        &result.response,
+                        ExitCode::FAILURE,
+                    );
+                }
+                // The attempt-disambiguation note describes the run, not the
+                // page; repeating it on every page would be noise.
+                if written && let Some(data) = result.response.data.as_mut() {
+                    data["note"] = serde_json::Value::Null;
+                }
+                let data = result.response.data.clone().unwrap_or_default();
+                let complete = data["complete"] == json!(true);
+                let settled = complete && data["terminal"] == json!(true);
+                let entries = data["entries"].as_array().map_or(0, Vec::len);
+                if entries > 0 || (settled && !written) {
+                    if write_envelope(mode, Some("logs"), stdout, &result.response).is_err()
+                        || stdout.flush().is_err()
+                    {
+                        return ExitCode::FAILURE;
+                    }
+                    written = true;
+                }
+                if let Some(next) = data["next_cursor"].as_u64() {
+                    args.after = Some(next);
+                }
+                // `tail` selects a window of what already exists; every later
+                // page is whatever arrived after it.
+                args.tail = None;
+                if settled {
+                    return ExitCode::SUCCESS;
+                }
+                // A truncated page means more output is already on disk;
+                // drain it before pausing.
+                if !complete {
+                    continue;
+                }
+            }
+            Err(error) => {
+                return write_response(
+                    mode,
+                    Some("logs"),
+                    stderr,
+                    &ResponseEnvelope::failure(None, error.error_body()),
+                    ExitCode::FAILURE,
+                );
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 /// Renders one activity event as a human `watch` line.
 fn format_event(event: &serde_json::Value) -> String {
     let time = event["occurred_at_ms"]
@@ -1120,18 +1243,29 @@ fn write_response(
     response: &ResponseEnvelope,
     success: ExitCode,
 ) -> ExitCode {
-    let written = match mode {
+    if write_envelope(mode, verb, output, response).is_err() {
+        return ExitCode::FAILURE;
+    }
+    success
+}
+
+/// Writes one envelope in the caller's mode. Split out of `write_response`
+/// for the streaming verbs, which write many envelopes before choosing an
+/// exit code.
+fn write_envelope(
+    mode: OutputMode,
+    verb: Option<&str>,
+    output: &mut impl Write,
+    response: &ResponseEnvelope,
+) -> Result<(), ()> {
+    match mode {
         OutputMode::Json => serde_json::to_writer(&mut *output, response)
             .map_err(|_| ())
             .and_then(|()| output.write_all(b"\n").map_err(|_| ())),
         OutputMode::Human => output
             .write_all(crate::render::render(verb, response).as_bytes())
             .map_err(|_| ()),
-    };
-    if written.is_err() {
-        return ExitCode::FAILURE;
     }
-    success
 }
 
 #[cfg(test)]
@@ -1261,6 +1395,11 @@ mod tests {
             &["sloop", "resume"],
             &["sloop", "cancel", "R1"],
             &["sloop", "logs", "R1"],
+            &["sloop", "logs", "R1", "--stage", "test"],
+            &["sloop", "logs", "R1", "--tail", "50"],
+            &[
+                "sloop", "logs", "R1", "--stage", "test", "--tail", "5", "--follow",
+            ],
             &["sloop", "watch"],
             &["sloop", "watch", "--tail", "50"],
             &["sloop", "watch", "T1"],
@@ -1295,6 +1434,7 @@ mod tests {
             &["sloop", "resume"],
             &["sloop", "cancel", "R1"],
             &["sloop", "logs", "R1"],
+            &["sloop", "logs", "R1", "--stage", "test", "--tail", "5"],
             &["sloop", "watch"],
             &["sloop", "watch", "T1"],
             &["sloop", "reindex"],
