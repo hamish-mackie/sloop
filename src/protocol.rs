@@ -88,7 +88,7 @@ pub enum Request {
     Retry(TicketReferenceArgs),
     Hold(TicketReferenceArgs),
     Ready(TicketReferenceArgs),
-    List(EmptyArgs),
+    List(ListArgs),
     Status(EmptyArgs),
     Pause(EmptyArgs),
     Resume(EmptyArgs),
@@ -269,6 +269,15 @@ pub struct EventsArgs {
     pub limit: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+}
+
+/// `limit` keeps only that many of the newest tickets. Absent means all of
+/// them, which is what a client that predates the field sends.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

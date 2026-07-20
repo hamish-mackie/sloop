@@ -40,11 +40,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `events` verb gained a matching optional `scope` argument, so any protocol
   client scopes the feed the same way.
 
+- `sloop list` accepts a row limit: `--limit N`, `-n N`, or the `head`/`tail`
+  shorthand `-N` shows only the N newest tickets. A zero or non-numeric limit
+  is a usage error. The `list` verb gained a matching optional `limit`
+  argument, so protocol clients page the same way.
+
 ### Changed
 
 - `sloop show <RUN>` labels the agent stage's exit as `agent exit:` rather
   than a bare `exit:`, which could read as "the whole run passed" on a run
   whose later stage failed. The JSON `exit_code` field is unchanged.
+- `sloop list` now orders tickets by registration time, newest first, instead
+  of oldest first, so recently posted and currently running work leads the
+  output. State does not affect the order. Tickets registered in the same
+  millisecond fall back to their id's numeric ordinal, newest first.
 - `sloop post` now reports every problem with a ticket file in a single
   `invalid_arguments` error, one per line under the file path, instead of
   stopping at the first one. A file whose frontmatter cannot be parsed at

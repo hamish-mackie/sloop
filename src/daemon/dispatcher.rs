@@ -552,7 +552,7 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
                 }
             }
         }
-        Request::List(_) => match handle_list(state) {
+        Request::List(args) => match handle_list(state, &args) {
             Ok(data) => data,
             Err(error) => return ResponseEnvelope::failure(Some(id), error),
         },

@@ -546,6 +546,11 @@ const RUN_RECORD_SELECT: &str = "SELECT id, ticket_id, attempt, state, branch, w
             flow_json, ticket_json
      FROM runs";
 
+const TICKET_RECORD_SELECT: &str =
+    "SELECT id, project_id, file_path, source, source_ref, state, name, worktree,
+            target, model, effort, flow, attempts, body, held_reason, created_at_ms
+     FROM tickets";
+
 fn run_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
     Ok(RunRecord {
         id: row.get(0)?,
@@ -652,6 +657,8 @@ pub struct TicketRecord {
     pub attempts: i64,
     pub body: Option<String>,
     pub held_reason: Option<String>,
+    /// When the ticket was registered. `sloop list` orders on this.
+    pub created_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -704,6 +711,7 @@ fn ticket_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TicketRecord> {
         attempts: row.get(12)?,
         body: row.get(13)?,
         held_reason: row.get(14)?,
+        created_at_ms: row.get(15)?,
     })
 }
 
@@ -1382,9 +1390,7 @@ impl Store {
         let mut ticket = self
             .connection
             .query_row(
-                "SELECT id, project_id, file_path, source, source_ref, state, name, worktree,
-                        target, model, effort, flow, attempts, body, held_reason
-                 FROM tickets WHERE id = ?1",
+                &format!("{TICKET_RECORD_SELECT} WHERE id = ?1"),
                 params![id],
                 ticket_record,
             )
@@ -1402,9 +1408,7 @@ impl Store {
         let mut ticket = self
             .connection
             .query_row(
-                "SELECT id, project_id, file_path, source, source_ref, state, name, worktree,
-                        target, model, effort, flow, attempts, body, held_reason
-                  FROM tickets WHERE name = ?1 ORDER BY id LIMIT 1",
+                &format!("{TICKET_RECORD_SELECT} WHERE name = ?1 ORDER BY id LIMIT 1"),
                 params![name],
                 ticket_record,
             )
@@ -1419,9 +1423,7 @@ impl Store {
         let mut ticket = self
             .connection
             .query_row(
-                "SELECT id, project_id, file_path, source, source_ref, state, name, worktree,
-                        target, model, effort, flow, attempts, body, held_reason
-                 FROM tickets WHERE file_path = ?1",
+                &format!("{TICKET_RECORD_SELECT} WHERE file_path = ?1"),
                 params![file_path],
                 ticket_record,
             )
@@ -1440,9 +1442,7 @@ impl Store {
         let mut ticket = self
             .connection
             .query_row(
-                "SELECT id, project_id, file_path, source, source_ref, state, name, worktree,
-                        target, model, effort, flow, attempts, body, held_reason
-                 FROM tickets WHERE source = ?1 AND source_ref = ?2",
+                &format!("{TICKET_RECORD_SELECT} WHERE source = ?1 AND source_ref = ?2"),
                 params![source, source_ref],
                 ticket_record,
             )
@@ -1453,15 +1453,24 @@ impl Store {
         Ok(ticket)
     }
 
+    /// Every ticket, newest registration first. `sloop list` answers "what is
+    /// going on right now?", so recency leads; SQL settles the coarse order and
+    /// a stable pass re-breaks ties on the id's numeric ordinal, which string
+    /// comparison gets wrong (`TICK-9` sorts above `TICK-38`). Ids with no
+    /// ordinal keep the deterministic `id DESC` order SQL gave them.
     pub fn tickets(&self) -> Result<Vec<TicketRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT id, project_id, file_path, source, source_ref, state, name, worktree,
-                    target, model, effort, flow, attempts, body, held_reason
-             FROM tickets ORDER BY project_id, id",
-        )?;
+        let mut statement = self.connection.prepare(&format!(
+            "{TICKET_RECORD_SELECT} ORDER BY created_at_ms DESC, id DESC"
+        ))?;
         let mut tickets = statement
             .query_map([], ticket_record)?
             .collect::<Result<Vec<_>, _>>()?;
+        tickets.sort_by_key(|ticket| {
+            (
+                std::cmp::Reverse(ticket.created_at_ms),
+                std::cmp::Reverse(crate::ids::ordinal(&ticket.id).unwrap_or(0)),
+            )
+        });
         let mut blockers = self.all_ticket_blockers()?;
         for ticket in &mut tickets {
             ticket.blocked_by = blockers.remove(&ticket.id).unwrap_or_default();
@@ -1470,11 +1479,9 @@ impl Store {
     }
 
     pub fn tickets_for_project(&self, project_id: &str) -> Result<Vec<TicketRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT id, project_id, file_path, source, source_ref, state, name, worktree,
-                    target, model, effort, flow, attempts, body, held_reason
-             FROM tickets WHERE project_id = ?1 ORDER BY id",
-        )?;
+        let mut statement = self.connection.prepare(&format!(
+            "{TICKET_RECORD_SELECT} WHERE project_id = ?1 ORDER BY id"
+        ))?;
         let mut tickets = statement
             .query_map(params![project_id], ticket_record)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -3789,7 +3796,7 @@ mod tests {
     }
 
     #[test]
-    fn tickets_are_ordered_by_project_and_id_and_include_attempts() {
+    fn tickets_are_ordered_newest_first_and_include_attempts() {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
         store
@@ -3808,7 +3815,7 @@ mod tests {
                 None,
                 "default",
                 TicketState::Held,
-                1_000,
+                3_000,
             )
             .unwrap();
         store
@@ -3830,16 +3837,18 @@ mod tests {
         store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
 
         let tickets = store.tickets().unwrap();
+        // T0 registered last, so it leads despite the lowest ordinal and a
+        // different project; T2 and T1 tie on time and fall back to ordinal.
         assert_eq!(
             tickets
                 .iter()
                 .map(|ticket| ticket.id.as_str())
                 .collect::<Vec<_>>(),
-            ["T0", "T1", "T2"]
+            ["T0", "T2", "T1"]
         );
         assert_eq!(tickets[0].attempts, 0);
-        assert_eq!(tickets[1].attempts, 1);
-        assert_eq!(tickets[2].attempts, 0);
+        assert_eq!(tickets[1].attempts, 0);
+        assert_eq!(tickets[2].attempts, 1);
     }
 
     #[test]

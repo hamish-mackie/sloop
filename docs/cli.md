@@ -138,12 +138,24 @@ Return a failed ticket to ready and reset its attempt counter.
 Hold a ready ticket so it cannot be dispatched; release it again. Held
 tickets are skipped by selection and rejected by named runs.
 
-### sloop list
+### sloop list [-N | --limit N]
 
 Every ticket's name and state, and for each ticket that is not running,
 the scheduler's current reason (paused, outside running hours, at capacity,
 blocked, held, target cooldown, ...). Failed and cooled-down tickets include
 the safe vendor diagnostic when a built-in rule recognized the rejection.
+
+Tickets are ordered by registration time, newest first, so the work you just
+posted and the work running now are at the top. State does not affect the
+order — it is purely chronological. Tickets registered in the same millisecond
+fall back to their id's numeric ordinal, newest first.
+
+- `--limit 10`, `-n 10` — show only the 10 newest tickets.
+- `-10` — the same thing in `head -10` / `tail -10` shorthand.
+
+The limit applies after ordering, so `-10` always means "the 10 newest". With
+no limit every ticket is listed. A limit of zero or a non-numeric one is a
+usage error. `--json` reflects the same order and count.
 
 ### sloop show <REF>
 

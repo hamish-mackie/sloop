@@ -30,6 +30,18 @@ pub fn next_id<'a>(
     Ok(format!("{prefix}-{ordinal}"))
 }
 
+/// The numeric ordinal an id ends in, whatever its prefix: `TICK-38` is 38.
+/// Allocation makes this a monotonic proxy for registration order, so it is
+/// what recency ordering falls back to when timestamps tie. Ids that do not
+/// end in `-<digits>` have none.
+pub fn ordinal(id: &str) -> Option<u64> {
+    let (_, suffix) = id.rsplit_once('-')?;
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse().ok()
+}
+
 /// Worktree slugs are what a ticket file stem must look like to name a
 /// branch: lowercase alphanumeric segments separated by single hyphens,
 /// `abc-def`.
@@ -83,7 +95,17 @@ impl std::error::Error for IdError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{default_worktree, next_id, valid_prefix, valid_slug};
+    use super::{default_worktree, next_id, ordinal, valid_prefix, valid_slug};
+
+    #[test]
+    fn ordinals_compare_numerically_across_prefixes() {
+        assert_eq!(ordinal("TICK-38"), Some(38));
+        assert_eq!(ordinal("MY-WORK-9"), Some(9));
+        assert!(ordinal("TICK-38") > ordinal("TICK-9"));
+        for id in ["TICK", "TICK-", "TICK-abc", "TICK-1a"] {
+            assert_eq!(ordinal(id), None, "{id}");
+        }
+    }
 
     #[test]
     fn allocation_uses_the_greatest_matching_numeric_suffix() {

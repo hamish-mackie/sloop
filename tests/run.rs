@@ -433,6 +433,72 @@ fn list_explains_paused_failed_held_and_claimed_tickets() {
 }
 
 #[test]
+fn list_orders_tickets_newest_first_and_honours_a_row_limit() {
+    let world = World::configured();
+    configure_fake_agent(&world, 1, false);
+    world.commit_all("initial");
+    world.start_daemon();
+
+    // Registered oldest to newest, so `list` must return them reversed.
+    let first = post_manual(&world, "first.md", "# First\n");
+    let second = post_manual(&world, "second.md", "# Second\n");
+    let third = post_manual(&world, "third.md", "# Third\n");
+
+    let listed_ids = |args: &[&str]| -> Vec<String> {
+        let output = world.sloop(args);
+        assert!(
+            output.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        World::json_stdout(&output)["data"]["tickets"]
+            .as_array()
+            .expect("tickets array")
+            .iter()
+            .map(|ticket| ticket["id"].as_str().expect("ticket id").to_owned())
+            .collect()
+    };
+
+    assert_eq!(
+        listed_ids(&["list"]),
+        [third.clone(), second.clone(), first.clone()]
+    );
+    // Every spelling of the limit keeps the same newest-first prefix.
+    for limited in [
+        listed_ids(&["list", "-2"]),
+        listed_ids(&["list", "--limit", "2"]),
+        listed_ids(&["list", "-n", "2"]),
+    ] {
+        assert_eq!(limited, [third.clone(), second.clone()]);
+    }
+    assert_eq!(listed_ids(&["list", "-99"]).len(), 3);
+
+    // Human output carries the same order and count as `--json`.
+    let human = world.sloop_plain(&["list", "-2"]);
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    let lines: Vec<&str> = human.lines().collect();
+    assert_eq!(lines.len(), 2, "{human}");
+    assert!(lines[0].starts_with(&third), "{human}");
+    assert!(lines[1].starts_with(&second), "{human}");
+
+    // A zero or non-numeric limit is a usage error, not an empty list.
+    for arguments in [
+        ["list", "-0"].as_slice(),
+        ["list", "-abc"].as_slice(),
+        ["list", "--limit", "abc"].as_slice(),
+    ] {
+        let output = world.sloop_plain(arguments);
+        assert!(!output.status.success(), "{arguments:?} should have failed");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("For more information, try '--help'"),
+            "{arguments:?} did not fail with a clap usage error: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn blocked_dependencies_are_reported_and_release_after_every_blocker_merges() {
     let world = World::configured();
     configure_fake_agent(&world, 1, false);

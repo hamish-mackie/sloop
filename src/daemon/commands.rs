@@ -10,7 +10,7 @@ use crate::config::parse_local_time;
 use crate::domain::ticket::TicketState;
 use crate::frontmatter;
 use crate::logging::LogLevel;
-use crate::protocol::ErrorBody;
+use crate::protocol::{ErrorBody, ListArgs};
 use crate::runner::local::{process_identity_matches, run_output_path};
 use crate::store::{ActivationKind, NewActivation, Store, StoreError};
 
@@ -296,7 +296,10 @@ fn git_commit(root: &Path, oid: &str) -> Result<(String, String), ErrorBody> {
     Ok((hash.to_owned(), message.to_owned()))
 }
 
-pub(super) fn handle_list(state: &DispatcherState) -> Result<serde_json::Value, ErrorBody> {
+pub(super) fn handle_list(
+    state: &DispatcherState,
+    args: &ListArgs,
+) -> Result<serde_json::Value, ErrorBody> {
     let now_ms = state.clock.now_ms();
     let at_capacity = lookup(state, Store::active_runs)?.len() >= state.max_agents;
     let gates = crate::eligibility::Gates {
@@ -308,8 +311,16 @@ pub(super) fn handle_list(state: &DispatcherState) -> Result<serde_json::Value, 
         at_capacity,
         has_queued_activation: !lookup(state, Store::queued_activations)?.is_empty(),
     };
+    // `tickets` already arrives newest first, so truncating here keeps the
+    // newest N and spares the per-ticket lookups below for the rest.
+    let mut tickets = lookup(state, Store::tickets)?;
+    match args.limit {
+        Some(0) => return Err(invalid_arguments("limit must be greater than zero")),
+        Some(limit) => tickets.truncate(limit as usize),
+        None => {}
+    }
     let mut rows = Vec::new();
-    for ticket in lookup(state, Store::tickets)? {
+    for ticket in tickets {
         let active_run = lookup(state, |store| store.active_run_for_ticket(&ticket.id))?;
         // Every ineligibility reason and list row names the run by alias; the
         // internal id rides alongside for machine consumers.
