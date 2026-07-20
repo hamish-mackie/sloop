@@ -506,6 +506,23 @@ impl World {
         Self::socket_exchange(&self.operator_socket(), request)
     }
 
+    pub fn wait_snapshot(&self, run: &str) -> Value {
+        self.operator_exchange(
+            &serde_json::json!({
+                "v": 1,
+                "id": "req-wait-snapshot",
+                "verb": "wait",
+                "args": {"run": run},
+                "token": null,
+            })
+            .to_string(),
+        )
+    }
+
+    pub fn show_snapshot(&self, reference: &str) -> Value {
+        World::json_stdout(&self.sloop(&["show", reference]))["data"]["value"].clone()
+    }
+
     /// Sends one raw envelope line over a Unix socket and returns the reply.
     /// Lets tests speak to per-run worker sockets directly.
     pub fn socket_exchange(socket: &Path, request: &str) -> Value {

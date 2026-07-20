@@ -101,7 +101,10 @@ fn status_uses_the_real_socket_and_dispatcher() {
     let output = world.sloop_in(&nested, &["status"]);
 
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .starts_with("note: 'sloop status' is now 'sloop show'")
+    );
     let response = World::json_stdout(&output);
     assert!(response["id"].as_str().unwrap().starts_with("req-"));
     assert_eq!(response["data"]["daemon"]["pid"], daemon["data"]["pid"]);
@@ -228,7 +231,7 @@ fn restart_drains_active_aftercare_before_resuming_the_queue() {
     assert_eq!(draining["queued_activations"].as_array().unwrap().len(), 1);
     assert!(!world.run_worktree(2).exists());
     let human = world.sloop_plain(&["status"]);
-    assert!(String::from_utf8_lossy(&human.stdout).contains("draining for restart (1 run active)"));
+    assert!(String::from_utf8_lossy(&human.stdout).contains("draining - 1/1 agents active"));
 
     world.release("drain");
     wait_until_slow("the daemon restarts and drains the queue", || {
@@ -718,26 +721,17 @@ fn status_renders_a_human_summary_without_the_json_flag() {
 }
 
 #[test]
-fn show_names_the_reference_kinds_it_accepts() {
+fn show_treats_unknown_text_as_a_ticket_pattern() {
     let world = World::configured();
 
-    // A reference matching no ticket, run, or project fails with a remedy that
-    // names every kind `show` resolves and points at `sloop list`.
+    // Once every exact reference form misses, the final resolution rung is a
+    // ticket pattern. A valid pattern that matches nothing is still a list.
     let output = world.sloop(&["show", "nonexistent"]);
 
-    assert!(!output.status.success());
-    let response = World::json_stdout_or_stderr(&output);
-    assert_eq!(response["error"]["code"], "not_found");
-    let message = response["error"]["message"]
-        .as_str()
-        .expect("error message");
-    assert!(
-        message.contains("ticket")
-            && message.contains("run")
-            && message.contains("project")
-            && message.contains("sloop list"),
-        "remedy does not name the accepted references: {message}"
-    );
+    assert!(output.status.success());
+    let response = World::json_stdout(&output);
+    assert_eq!(response["data"]["kind"], "matches");
+    assert_eq!(response["data"]["tickets"], serde_json::json!([]));
 }
 
 #[test]

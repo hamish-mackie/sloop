@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use serde_json::json;
 use sloop::clock::{Clock, SystemClock};
 use support::{FakeAgent, World, process_alive, wait_until, wait_until_slow};
 
@@ -1114,12 +1115,7 @@ fn restart_readopts_a_matching_live_process_until_it_exits() {
     });
     assert_eq!(world.run_note_count(&world.run_id(1)), 1);
     let run_id = world.run_id(1);
-    let waited = world.sloop(&["wait", &run_id, "--timeout", "5"]);
-    assert!(!waited.status.success());
-    assert_eq!(
-        World::json_stdout_or_stderr(&waited)["data"]["state"],
-        "orphaned"
-    );
+    assert_eq!(world.show_snapshot(&run_id)["state"], "orphaned");
 }
 
 #[test]
@@ -1195,12 +1191,7 @@ fn restart_orphans_a_dead_process_without_using_commits_as_a_verdict() {
         snapshot["gate"]["active_agents"] == 0 && snapshot["tickets"]["ready"] == 1
     });
     let run_id = world.run_id(1);
-    let waited = world.sloop(&["wait", &run_id, "--timeout", "5"]);
-    assert!(!waited.status.success());
-    assert_eq!(
-        World::json_stdout_or_stderr(&waited)["data"]["state"],
-        "orphaned"
-    );
+    assert_eq!(world.show_snapshot(&run_id)["state"], "orphaned");
 }
 
 #[test]
@@ -1720,12 +1711,7 @@ fn assert_periodic_dead_agent_is_orphaned(world: &World, ticket_name: &str, mark
 
     world.release_test_hook("before-agent-exit-checkpoint");
     let run_id = world.run_id(1);
-    let waited = world.sloop(&["wait", &run_id, "--timeout", "5"]);
-    assert!(!waited.status.success());
-    assert_eq!(
-        World::json_stdout_or_stderr(&waited)["data"]["state"],
-        "orphaned"
-    );
+    assert_eq!(world.show_snapshot(&run_id)["state"], "orphaned");
 }
 
 #[test]
@@ -1803,14 +1789,16 @@ fn wait_blocks_until_a_run_finishes_and_reports_the_outcome() {
             || status(&world)["tickets"]["needs_review"].as_u64() == Some(1)
     });
 
-    // The fake agent exits nonzero, so the derived outcome is `failed`; wait
-    // must return nonzero with the terminal state in the envelope.
+    // The fake agent exits nonzero, so the derived outcome is `failed`; the
+    // deprecated wait alias is the quiet show form and returns only its code.
     let run_id = world.run_id(1);
     let output = world.sloop(&["wait", &run_id, "--timeout", "30"]);
     assert!(!output.status.success());
-    let response = World::json_stdout_or_stderr(&output);
-    assert_eq!(response["data"]["terminal"], true);
-    assert_eq!(response["data"]["state"], "failed");
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .starts_with("note: 'sloop wait' is now 'sloop show --follow --quiet'")
+    );
 }
 
 #[test]
@@ -1820,10 +1808,9 @@ fn wait_rejects_unknown_runs() {
     world.start_daemon();
     let output = world.sloop(&["wait", "R99", "--timeout", "5"]);
     assert!(!output.status.success());
-    assert_eq!(
-        World::json_stdout_or_stderr(&output)["error"]["code"],
-        "not_found"
-    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("'sloop wait' is now 'sloop show --follow --quiet'"));
+    assert!(error.contains(r#""code":"not_found""#), "{error}");
 }
 
 #[test]
@@ -2009,25 +1996,20 @@ fn watch_scopes_its_stream_to_the_given_reference() {
     );
 }
 
-/// A reference that resolves to nothing is a typo, not an empty scope, so it
-/// fails with `show`'s error before a single event is written.
+/// A non-reference is a ticket pattern, including when it currently matches
+/// nothing. Pattern output keeps the list shape rather than becoming detail.
 #[test]
-fn watch_rejects_an_unknown_reference_before_streaming() {
+fn show_unknown_text_as_an_empty_ticket_pattern() {
     let world = World::configured();
     configure_fake_agent(&world, 1, false);
     world.commit_all("initial");
     world.start_daemon();
 
-    let output = world.sloop(&["watch", "NOPE-404"]);
-    assert!(!output.status.success(), "unknown ref should exit nonzero");
-    assert!(
-        output.stdout.is_empty(),
-        "nothing should stream before the ref resolves: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    let envelope = World::json_stdout_or_stderr(&output);
-    assert_eq!(envelope["ok"], false);
-    assert_eq!(envelope["error"]["code"], "not_found");
+    let output = world.sloop(&["show", "NOPE-404"]);
+    assert!(output.status.success());
+    let envelope = World::json_stdout(&output);
+    assert_eq!(envelope["data"]["kind"], "matches");
+    assert_eq!(envelope["data"]["tickets"], json!([]));
 }
 
 /// Run and project references scope the same feed the CLI streams, exercised
@@ -2090,6 +2072,6 @@ fn events_scope_accepts_run_and_project_references() {
     let unknown = world.operator_exchange(
         r#"{"v":1,"id":"req-unknown","verb":"events","args":{"after":0,"scope":"NOPE-404"},"token":null}"#,
     );
-    assert_eq!(unknown["ok"], false);
-    assert_eq!(unknown["error"]["code"], "not_found");
+    assert_eq!(unknown["ok"], true);
+    assert_eq!(unknown["data"]["events"], json!([]));
 }

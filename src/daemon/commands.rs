@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use regex::{Regex, RegexBuilder};
 use serde_json::json;
 
 use crate::clock::{format_timestamp, next_local_minute_ms};
@@ -10,7 +11,7 @@ use crate::config::parse_local_time;
 use crate::domain::ticket::TicketState;
 use crate::frontmatter;
 use crate::logging::LogLevel;
-use crate::protocol::{ErrorBody, ListArgs};
+use crate::protocol::{ErrorBody, ListArgs, ShowArgs};
 use crate::runner::local::{process_identity_matches, run_output_path};
 use crate::store::{ActivationKind, NewActivation, Store, StoreError};
 
@@ -21,7 +22,7 @@ use super::dispatcher::{
 use super::recovery::{
     PersistedProcessStop, aftercare_process_identity, stop_persisted_process_group,
 };
-use super::scheduler::{index_projects, running_hours_open};
+use super::scheduler::{index_projects, next_dispatch_deadline, running_hours_open};
 use super::worker_api::{current_ticket_vendor_error, ticket_show};
 
 /// The operator read view for `show`: resolve the reference, then render
@@ -29,12 +30,21 @@ use super::worker_api::{current_ticket_vendor_error, ticket_show};
 /// handler and never gain these resolutions.
 pub(super) fn handle_operator_show(
     state: &DispatcherState,
-    reference: &str,
+    args: &ShowArgs,
 ) -> Result<serde_json::Value, ErrorBody> {
+    let Some(reference) = args.reference.as_deref() else {
+        return dashboard(state, args.limit);
+    };
     match resolve_operator_reference(state, reference)? {
         OperatorReference::Ticket(ticket) => ticket_detail(state, reference, &ticket),
         OperatorReference::Run(run) => run_detail(state, reference, &ResolvedRun::only(*run)),
         OperatorReference::Project(project) => project_activity(state, reference, &project),
+        OperatorReference::Matches(tickets) => {
+            let mut data = ticket_rows(state, tickets, args.limit)?;
+            data["kind"] = json!("matches");
+            data["ref"] = json!(reference);
+            Ok(data)
+        }
     }
 }
 
@@ -49,12 +59,14 @@ pub(super) enum OperatorReference {
     Ticket(Box<crate::store::TicketRecord>),
     Run(Box<crate::store::RunRecord>),
     Project(crate::store::ProjectRecord),
+    Matches(Vec<crate::store::TicketRecord>),
 }
 
 /// The resolution ladder behind `show` and scoped `events`, ordered by how
 /// specific a reference is: an exact ticket id, then an exact run id, then a
-/// ticket name, then the alias and id-prefix run forms, and finally a project
-/// id. Every branch is read-only; nothing here transitions state.
+/// ticket name, then the alias and id-prefix run forms, then a project id, and
+/// finally a ticket pattern. Every branch is read-only; nothing here
+/// transitions state. Exact matches therefore always win over patterns.
 ///
 /// Tickets win over runs so that a bare ticket id still names the ticket; the
 /// alias, prefix, and legacy-id forms are what reach a run.
@@ -87,15 +99,31 @@ pub(super) fn resolve_operator_reference(
             return Err(ambiguous_run_prefix(reference, &candidates));
         }
     }
-    let Some(project) = lookup(state, |store| store.project(reference))? else {
-        return Err(not_found(&format!(
-            "reference `{reference}` is not a known ticket, run, or project; `show` accepts a \
-             ticket id or name, a project id, or a run named by {} — run `sloop list` to see \
-             tickets",
-            crate::run_ref::ACCEPTED_RUN_REFERENCES
-        )));
+    if let Some(project) = lookup(state, |store| store.project(reference))? {
+        return Ok(OperatorReference::Project(project));
+    }
+    let pattern = ticket_pattern(reference)?;
+    let tickets = lookup(state, Store::tickets)?
+        .into_iter()
+        .filter(|ticket| pattern.is_match(&ticket.id) || pattern.is_match(&ticket.name))
+        .collect();
+    Ok(OperatorReference::Matches(tickets))
+}
+
+fn ticket_pattern(pattern: &str) -> Result<Regex, ErrorBody> {
+    const METACHARACTERS: &str = r".^$*+?()[]{}|\";
+    let expression = if pattern
+        .chars()
+        .any(|character| METACHARACTERS.contains(character))
+    {
+        pattern.to_owned()
+    } else {
+        regex::escape(pattern)
     };
-    Ok(OperatorReference::Project(project))
+    RegexBuilder::new(&expression)
+        .case_insensitive(true)
+        .build()
+        .map_err(|error| invalid_arguments(&format!("invalid ticket pattern `{pattern}`: {error}")))
 }
 
 /// A ticket's frontmatter summary plus its committed Markdown body. The body is
@@ -296,9 +324,125 @@ fn git_commit(root: &Path, oid: &str) -> Result<(String, String), ErrorBody> {
     Ok((hash.to_owned(), message.to_owned()))
 }
 
+pub(super) fn handle_status(state: &DispatcherState) -> Result<serde_json::Value, ErrorBody> {
+    let tickets = lookup(state, Store::ticket_counts)?;
+    let active = lookup(state, Store::active_runs)?;
+    let mut active_runs = Vec::with_capacity(active.len());
+    for run in &active {
+        active_runs.push(
+            lookup(state, |store| store.run(&run.id))?
+                .ok_or_else(|| internal(&format!("active run `{}` no longer exists", run.id)))?,
+        );
+    }
+    let histories = super::history::histories(state, &active_runs)?;
+    let runs = active_runs
+        .iter()
+        .zip(&histories)
+        .zip(&active)
+        .map(|((run, history), active)| {
+            let mut value = super::history::run_summary_json(run, history);
+            value["project"] = json!(active.project_id);
+            value["ticket"] = json!(active.ticket_id);
+            value["ticket_name"] = json!(active.ticket_name);
+            value
+        })
+        .collect::<Vec<_>>();
+    let active_agents = runs.len();
+    let queued = lookup(state, Store::queued_activations)?
+        .into_iter()
+        .map(|activation| {
+            json!({
+                "id": activation.id,
+                "ticket": activation.ticket_id,
+                "project": activation.project_id,
+                "state": "queued",
+            })
+        })
+        .collect::<Vec<_>>();
+    let now_ms = state.clock.now_ms();
+    let mut gate = json!({
+        "active_agents": active_agents,
+        "max_agents": state.max_agents,
+        "capacity_reconciled": !state.reconciliation_blocked,
+        "storage": {
+            "writable": !state.storage_full.get(),
+            "reason": state.storage_full.get().then_some("database_full"),
+        },
+    });
+    if let Some(hours) = &state.running_hours {
+        gate["running_hours"] = json!({
+            "start": hours.start,
+            "end": hours.end,
+            "open": hours.is_open(state.clock.local_minute(now_ms)),
+        });
+    }
+    gate["cooldowns"] = json!(
+        lookup(state, |store| store.active_cooldowns(now_ms))?
+            .into_iter()
+            .map(|cooldown| {
+                json!({
+                    "target": cooldown.target,
+                    "until_ms": cooldown.until_ms,
+                    "reason": cooldown.reason,
+                })
+            })
+            .collect::<Vec<_>>()
+    );
+    let mut snapshot = json!({
+        "daemon": {
+            "pid": state.pid,
+            "paused": state.paused,
+            "draining": state.draining,
+        },
+        "gate": gate,
+        "runs": runs,
+        "queued_activations": queued,
+        "tickets": {
+            "ready": tickets.ready,
+            "held": tickets.held,
+            "blocked": tickets.blocked,
+            "claimed": tickets.claimed,
+            "merged": tickets.merged,
+            "failed": tickets.failed,
+            "needs_review": tickets.needs_review,
+        },
+    });
+    if let Some(deadline) = next_dispatch_deadline(state)
+        && let Some(formatted) = format_timestamp(deadline)
+    {
+        snapshot["next_wake"] = json!(formatted);
+    }
+    Ok(snapshot)
+}
+
+fn dashboard(
+    state: &DispatcherState,
+    requested_limit: Option<u32>,
+) -> Result<serde_json::Value, ErrorBody> {
+    const DEFAULT_RECENT_LIMIT: u32 = 10;
+    let tickets = lookup(state, Store::tickets)?;
+    let total = tickets.len();
+    let limit = requested_limit.unwrap_or(DEFAULT_RECENT_LIMIT);
+    let recent = ticket_rows(state, tickets, Some(limit))?;
+    let mut dashboard = handle_status(state)?;
+    dashboard["kind"] = json!("dashboard");
+    dashboard["recent"] = recent["tickets"].clone();
+    dashboard["recent_total"] = json!(total);
+    dashboard["recent_limit"] = json!(limit);
+    Ok(dashboard)
+}
+
 pub(super) fn handle_list(
     state: &DispatcherState,
     args: &ListArgs,
+) -> Result<serde_json::Value, ErrorBody> {
+    ticket_rows(state, lookup(state, Store::tickets)?, args.limit)
+}
+
+fn ticket_rows(
+    state: &DispatcherState,
+    mut tickets: Vec<crate::store::TicketRecord>,
+    limit: Option<u32>,
 ) -> Result<serde_json::Value, ErrorBody> {
     let now_ms = state.clock.now_ms();
     let at_capacity = lookup(state, Store::active_runs)?.len() >= state.max_agents;
@@ -313,8 +457,7 @@ pub(super) fn handle_list(
     };
     // `tickets` already arrives newest first, so truncating here keeps the
     // newest N and spares the per-ticket lookups below for the rest.
-    let mut tickets = lookup(state, Store::tickets)?;
-    match args.limit {
+    match limit {
         Some(0) => return Err(invalid_arguments("limit must be greater than zero")),
         Some(limit) => tickets.truncate(limit as usize),
         None => {}
@@ -789,6 +932,7 @@ enum EventScope {
     Ticket(String),
     Run(String),
     Project(HashSet<String>),
+    Matches(HashSet<String>),
 }
 
 impl EventScope {
@@ -796,7 +940,7 @@ impl EventScope {
         match self {
             Self::Ticket(ticket_id) => event.ticket_id.as_deref() == Some(ticket_id),
             Self::Run(run_id) => event.run_id.as_deref() == Some(run_id),
-            Self::Project(ticket_ids) => event
+            Self::Project(ticket_ids) | Self::Matches(ticket_ids) => event
                 .ticket_id
                 .as_ref()
                 .is_some_and(|ticket_id| ticket_ids.contains(ticket_id)),
@@ -818,6 +962,9 @@ fn resolve_event_scope(state: &DispatcherState, reference: &str) -> Result<Event
                 .map(|ticket| ticket.id)
                 .collect(),
         ),
+        OperatorReference::Matches(tickets) => {
+            EventScope::Matches(tickets.into_iter().map(|ticket| ticket.id).collect())
+        }
     })
 }
 

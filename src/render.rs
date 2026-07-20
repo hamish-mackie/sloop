@@ -371,11 +371,89 @@ fn render_reindex(data: &Value) -> String {
 
 fn render_show(data: &Value) -> String {
     match data["kind"].as_str() {
+        Some("dashboard") => render_dashboard(data),
+        Some("matches") => render_list(data),
         Some("ticket") => render_ticket_show(data),
         Some("run") => render_run_show(data),
         Some("project") => render_project_show(data),
         _ => fallback(data),
     }
+}
+
+fn render_dashboard(data: &Value) -> String {
+    let daemon = &data["daemon"];
+    let gate = &data["gate"];
+    let state = if daemon["draining"] == Value::Bool(true) {
+        "draining"
+    } else if daemon["paused"] == Value::Bool(true) {
+        "paused"
+    } else {
+        "running"
+    };
+    let mut text = format!(
+        "daemon: pid {} {state} - {}/{} agents active",
+        daemon["pid"], gate["active_agents"], gate["max_agents"]
+    );
+    if let Some(next_wake) = data["next_wake"].as_str() {
+        let _ = write!(text, " - next wake {next_wake}");
+    }
+    text.push('\n');
+
+    let tickets = &data["tickets"];
+    let counts = [
+        "ready",
+        "held",
+        "blocked",
+        "claimed",
+        "merged",
+        "failed",
+        "needs_review",
+    ]
+    .iter()
+    .map(|state| format!("{} {state}", tickets[*state]))
+    .collect::<Vec<_>>();
+    let _ = writeln!(text, "tickets: {}", counts.join(", "));
+
+    let runs = data["runs"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if !runs.is_empty() {
+        text.push_str("\nruns:\n");
+        let alias_width = column_width(runs, "alias");
+        let state_width = column_width(runs, "state");
+        for run in runs {
+            let _ = writeln!(
+                text,
+                "  {:alias_width$}  {:state_width$}  {}  {}  {}",
+                run["alias"].as_str().unwrap_or("?"),
+                run["state"].as_str().unwrap_or("?"),
+                span(
+                    run["started_at_ms"].as_i64(),
+                    run["finished_at_ms"].as_i64()
+                ),
+                stage_strip(&run["stages"]),
+                run["ticket_name"].as_str().unwrap_or("?"),
+            );
+        }
+    }
+
+    text.push_str("\nrecent:\n");
+    text.push_str(&render_list(
+        &serde_json::json!({"tickets": data["recent"]}),
+    ));
+    let shown = data["recent"].as_array().map_or(0, Vec::len);
+    let total = data["recent_total"].as_u64().unwrap_or(shown as u64);
+    let more = total.saturating_sub(shown as u64);
+    if total == 0 {
+        text.push_str("\n`sloop show <ref>` for detail\n");
+    } else {
+        let _ = writeln!(
+            text,
+            "\n{more} more - `sloop show -{total}` for all - `sloop show <ref>` for detail"
+        );
+    }
+    text
 }
 
 /// A scannable frontmatter summary followed by the ticket body. The worker's

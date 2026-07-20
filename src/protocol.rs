@@ -286,11 +286,13 @@ pub struct TicketReferenceArgs {
     pub ticket: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShowArgs {
-    #[serde(rename = "ref")]
-    pub reference: String,
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -489,11 +491,22 @@ mod tests {
     #[test]
     fn known_verbs_reject_invalid_arguments() {
         let error = RequestEnvelope::decode(
-            r#"{"v":1,"id":"req-1","verb":"show","args":{},"token":"token"}"#,
+            r#"{"v":1,"id":"req-1","verb":"show","args":{"unknown":true},"token":"token"}"#,
         )
         .unwrap_err();
 
         assert_eq!(error.body.code, ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn show_accepts_additive_dashboard_pattern_and_limit_arguments() {
+        for args in [r#"{}"#, r#"{"ref":"log","limit":5}"#] {
+            let request = RequestEnvelope::decode(&format!(
+                r#"{{"v":1,"id":"req-1","verb":"show","args":{args},"token":null}}"#
+            ))
+            .expect("decode show request");
+            assert!(matches!(request.request, Request::Show(_)));
+        }
     }
 
     #[test]

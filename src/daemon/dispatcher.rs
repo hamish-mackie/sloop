@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::clock::{Clock, format_timestamp, next_local_minute_ms};
+use crate::clock::{Clock, next_local_minute_ms};
 use crate::config::{AgentConfig, RunningHours, parse_local_time};
 use crate::coordination::Coordination;
 use crate::flow::Flow;
@@ -24,7 +24,8 @@ use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
 
 use super::commands::{
     handle_cancel, handle_events, handle_hold, handle_list, handle_logs, handle_operator_show,
-    handle_ready, handle_reindex, handle_retry, handle_run, handle_stop, handle_wait,
+    handle_ready, handle_reindex, handle_retry, handle_run, handle_status, handle_stop,
+    handle_wait,
 };
 use super::recovery::{RecoveryClassification, reconcile_run_liveness};
 use super::scheduler::{next_dispatch_deadline, reconcile};
@@ -460,7 +461,7 @@ pub(super) fn recover_storage(state: &DispatcherState, now_ms: i64) -> bool {
 
 fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> ResponseEnvelope {
     let data = match request {
-        Request::Show(args) => match handle_operator_show(state, &args.reference) {
+        Request::Show(args) => match handle_operator_show(state, &args) {
             Ok(data) => data,
             Err(error) => return ResponseEnvelope::failure(Some(id), error),
         },
@@ -556,119 +557,10 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
             Ok(data) => data,
             Err(error) => return ResponseEnvelope::failure(Some(id), error),
         },
-        Request::Status(_) => {
-            let tickets = match state.store.ticket_counts() {
-                Ok(counts) => counts,
-                Err(error) => {
-                    return ResponseEnvelope::failure(
-                        Some(id),
-                        internal(&format!("cannot read ticket counts: {error}")),
-                    );
-                }
-            };
-            let runs: Vec<_> = match state.store.active_runs() {
-                Ok(runs) => runs
-                    .into_iter()
-                    .map(|run| {
-                        json!({
-                            "id": run.id,
-                            "alias": crate::run_ref::alias(&run.ticket_id, run.attempt),
-                            "project": run.project_id,
-                            "ticket": run.ticket_id,
-                            "ticket_name": run.ticket_name,
-                            "state": run.state,
-                        })
-                    })
-                    .collect(),
-                Err(error) => {
-                    return ResponseEnvelope::failure(
-                        Some(id),
-                        internal(&format!("cannot read active runs: {error}")),
-                    );
-                }
-            };
-            let active_agents = runs.len();
-            let queued: Vec<_> = match state.store.queued_activations() {
-                Ok(activations) => activations
-                    .into_iter()
-                    .map(|activation| {
-                        json!({
-                            "id": activation.id,
-                            "ticket": activation.ticket_id,
-                            "project": activation.project_id,
-                            "state": "queued",
-                        })
-                    })
-                    .collect(),
-                Err(error) => {
-                    return ResponseEnvelope::failure(
-                        Some(id),
-                        internal(&format!("cannot read queued activations: {error}")),
-                    );
-                }
-            };
-            let now_ms = state.clock.now_ms();
-            let mut gate = json!({
-                "active_agents": active_agents,
-                "max_agents": state.max_agents,
-                "capacity_reconciled": !state.reconciliation_blocked,
-                "storage": {
-                    "writable": !state.storage_full.get(),
-                    "reason": state.storage_full.get().then_some("database_full"),
-                },
-            });
-            if let Some(hours) = &state.running_hours {
-                gate["running_hours"] = json!({
-                    "start": hours.start,
-                    "end": hours.end,
-                    "open": hours.is_open(state.clock.local_minute(now_ms)),
-                });
-            }
-            let cooldowns = match state.store.active_cooldowns(now_ms) {
-                Ok(cooldowns) => cooldowns
-                    .into_iter()
-                    .map(|cooldown| {
-                        json!({
-                            "target": cooldown.target,
-                            "until_ms": cooldown.until_ms,
-                            "reason": cooldown.reason,
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-                Err(error) => {
-                    return ResponseEnvelope::failure(
-                        Some(id),
-                        internal(&format!("cannot read cooldowns: {error}")),
-                    );
-                }
-            };
-            gate["cooldowns"] = json!(cooldowns);
-            let mut snapshot = json!({
-                "daemon": {
-                    "pid": state.pid,
-                    "paused": state.paused,
-                    "draining": state.draining,
-                },
-                "gate": gate,
-                "runs": runs,
-                "queued_activations": queued,
-                "tickets": {
-                    "ready": tickets.ready,
-                    "held": tickets.held,
-                    "blocked": tickets.blocked,
-                    "claimed": tickets.claimed,
-                    "merged": tickets.merged,
-                    "failed": tickets.failed,
-                    "needs_review": tickets.needs_review
-                }
-            });
-            if let Some(deadline) = next_dispatch_deadline(state)
-                && let Some(formatted) = format_timestamp(deadline)
-            {
-                snapshot["next_wake"] = json!(formatted);
-            }
-            snapshot
-        }
+        Request::Status(_) => match handle_status(state) {
+            Ok(data) => data,
+            Err(error) => return ResponseEnvelope::failure(Some(id), error),
+        },
         Request::Pause(_) => {
             if let Err(error) = state.store.set_paused(true, state.clock.now_ms()) {
                 mark_storage_full(state, &error);
