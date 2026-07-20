@@ -2,6 +2,7 @@
 //! untrusted evidence: they are stored as ordered chunks, never parsed as
 //! lines and never routed through the dispatcher.
 
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
@@ -232,22 +233,74 @@ pub fn visit_agent_output(
     Ok(())
 }
 
+/// Selects the records belonging to one flow stage. Aftercare records carry
+/// their stage name; agent records captured before stages were tagged carry
+/// none, so `agent_fallback` lets the flow's agent stage claim them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageFilter {
+    pub stage: String,
+    pub agent_fallback: bool,
+}
+
+impl StageFilter {
+    fn accepts(&self, record: &OutputRecord) -> bool {
+        match record.stage.as_deref() {
+            Some(stage) => stage == self.stage,
+            None => self.agent_fallback && record.source == OutputSource::Agent,
+        }
+    }
+}
+
+/// One read of the captured log: everything after a cursor, optionally
+/// narrowed to a stage and trimmed to a trailing window.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PageQuery {
+    /// Only records with `sequence > after`.
+    pub after: u64,
+    /// Hard cap on returned entries; also the cap on `tail`.
+    pub limit: usize,
+    /// Only records this filter accepts.
+    pub stage: Option<StageFilter>,
+    /// Keep the last N accepted records instead of the first N. Reading runs
+    /// to the end of the file, so the page is always complete.
+    pub tail: Option<usize>,
+}
+
 /// Reads a finite page of records with `sequence > after`, in order. A
 /// missing file is an empty page: the run may exist before any output does.
 pub fn read_page(path: &Path, after: u64, limit: usize) -> io::Result<OutputPage> {
+    read_filtered_page(
+        path,
+        &PageQuery {
+            after,
+            limit,
+            ..PageQuery::default()
+        },
+    )
+}
+
+/// Reads one page under a filter. `next_cursor` advances past every record
+/// the read *consumed*, not just the ones it returned: a filtered-out record
+/// is still evidence that has been examined, so a follower resuming from the
+/// cursor neither replays it nor stalls behind it.
+pub fn read_filtered_page(path: &Path, query: &PageQuery) -> io::Result<OutputPage> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(OutputPage {
                 entries: Vec::new(),
-                next_cursor: after,
+                next_cursor: query.after,
                 complete: true,
             });
         }
         Err(error) => return Err(error),
     };
 
-    let mut entries = Vec::new();
+    // A tail keeps the newest accepted records, so it must read to the end;
+    // the trailing window is bounded by the caller's limit either way.
+    let window = query.tail.map_or(query.limit, |tail| tail.min(query.limit));
+    let mut entries = VecDeque::new();
+    let mut next_cursor = query.after;
     let mut complete = true;
     for line in BufReader::new(file).lines() {
         // An unparsable line is an incomplete tail, not corruption of the
@@ -255,18 +308,24 @@ pub fn read_page(path: &Path, after: u64, limit: usize) -> io::Result<OutputPage
         let Ok(record) = serde_json::from_str::<OutputRecord>(&line?) else {
             continue;
         };
-        if record.sequence <= after {
+        if record.sequence <= query.after {
             continue;
         }
-        if entries.len() == limit {
+        if query.tail.is_none() && entries.len() == query.limit {
             complete = false;
             break;
         }
-        entries.push(record);
+        next_cursor = record.sequence;
+        if query.stage.as_ref().is_some_and(|f| !f.accepts(&record)) {
+            continue;
+        }
+        entries.push_back(record);
+        if entries.len() > window {
+            entries.pop_front();
+        }
     }
-    let next_cursor = entries.last().map_or(after, |record| record.sequence);
     Ok(OutputPage {
-        entries,
+        entries: entries.into(),
         next_cursor,
         complete,
     })
@@ -278,8 +337,164 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        OutputChunk, OutputSource, OutputStream, RunLogWriter, read_agent_output, read_page,
+        OutputChunk, OutputSource, OutputStream, PageQuery, RunLogWriter, StageFilter,
+        read_agent_output, read_filtered_page, read_page,
     };
+
+    /// Writes one record per call, so a test controls entry boundaries the
+    /// way pipe reads do at runtime.
+    fn write_records(path: &std::path::Path, records: &[(OutputSource, Option<&str>, &str)]) {
+        let writer = RunLogWriter::open(path).unwrap();
+        for (source, stage, text) in records {
+            writer
+                .append(*source, *stage, OutputStream::Stdout, text.as_bytes())
+                .unwrap();
+        }
+    }
+
+    fn texts(page: &super::OutputPage) -> Vec<String> {
+        page.entries
+            .iter()
+            .map(|record| String::from_utf8(record.chunk.clone().into_bytes()).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_stage_filter_selects_that_stage_and_leaves_the_cursor_past_what_it_skipped() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("output.ndjson");
+        write_records(
+            &path,
+            &[
+                (OutputSource::Agent, Some("build"), "built"),
+                (OutputSource::Aftercare, Some("test"), "tested"),
+                (OutputSource::Aftercare, Some("merge"), "merged"),
+            ],
+        );
+
+        let page = read_filtered_page(
+            &path,
+            &PageQuery {
+                limit: 10,
+                stage: Some(StageFilter {
+                    stage: "test".into(),
+                    agent_fallback: false,
+                }),
+                ..PageQuery::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(texts(&page), ["tested"]);
+        // Records 3 was examined and rejected, so a follower resuming here
+        // neither replays it nor re-reads it on every poll.
+        assert_eq!(page.next_cursor, 3);
+        assert!(page.complete);
+    }
+
+    #[test]
+    fn the_agent_fallback_claims_records_captured_before_stages_were_tagged() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("output.ndjson");
+        write_records(
+            &path,
+            &[
+                (OutputSource::Agent, None, "legacy agent"),
+                (OutputSource::Aftercare, None, "legacy aftercare"),
+                (OutputSource::Agent, Some("build"), "tagged agent"),
+            ],
+        );
+        let filter = |agent_fallback| PageQuery {
+            limit: 10,
+            stage: Some(StageFilter {
+                stage: "build".into(),
+                agent_fallback,
+            }),
+            ..PageQuery::default()
+        };
+
+        let claimed = read_filtered_page(&path, &filter(true)).unwrap();
+        assert_eq!(texts(&claimed), ["legacy agent", "tagged agent"]);
+
+        // Without the fallback only the tagged record matches: an untagged
+        // record names no stage and must not be invented into one.
+        let literal = read_filtered_page(&path, &filter(false)).unwrap();
+        assert_eq!(texts(&literal), ["tagged agent"]);
+    }
+
+    #[test]
+    fn a_tail_keeps_the_newest_matching_records_and_still_reaches_the_end() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("output.ndjson");
+        let mut records = Vec::new();
+        for index in 0..6 {
+            records.push((OutputSource::Aftercare, Some("test"), format!("t{index}")));
+            records.push((OutputSource::Agent, Some("build"), format!("b{index}")));
+        }
+        write_records(
+            &path,
+            &records
+                .iter()
+                .map(|(source, stage, text)| (*source, *stage, text.as_str()))
+                .collect::<Vec<_>>(),
+        );
+
+        let page = read_filtered_page(
+            &path,
+            &PageQuery {
+                limit: 64,
+                stage: Some(StageFilter {
+                    stage: "test".into(),
+                    agent_fallback: false,
+                }),
+                tail: Some(2),
+                ..PageQuery::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(texts(&page), ["t4", "t5"]);
+        // A tail reads to the end of the file, so the page is complete and
+        // the cursor is past every record — including the ones it dropped.
+        assert!(page.complete);
+        assert_eq!(page.next_cursor, 12);
+    }
+
+    #[test]
+    fn a_tail_larger_than_the_log_returns_everything_and_never_exceeds_the_limit() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("output.ndjson");
+        write_records(
+            &path,
+            &[
+                (OutputSource::Agent, Some("build"), "one"),
+                (OutputSource::Agent, Some("build"), "two"),
+            ],
+        );
+
+        let all = read_filtered_page(
+            &path,
+            &PageQuery {
+                limit: 64,
+                tail: Some(50),
+                ..PageQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(texts(&all), ["one", "two"]);
+
+        // The limit outranks the tail; a caller cannot page past it.
+        let capped = read_filtered_page(
+            &path,
+            &PageQuery {
+                limit: 1,
+                tail: Some(50),
+                ..PageQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(texts(&capped), ["two"]);
+    }
 
     #[test]
     fn utf8_and_binary_chunks_serialize_to_the_documented_shapes() {

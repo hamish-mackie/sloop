@@ -15,8 +15,8 @@ use crate::runner::local::{process_identity_matches, run_output_path};
 use crate::store::{ActivationKind, NewActivation, Store, StoreError};
 
 use super::dispatcher::{
-    DispatcherState, LOGS_PAGE_LIMIT, conflict, internal, invalid_arguments, mark_storage_full,
-    not_found,
+    DispatcherState, LOGS_PAGE_LIMIT, LOGS_TAIL_LIMIT, conflict, internal, invalid_arguments,
+    mark_storage_full, not_found,
 };
 use super::recovery::{
     PersistedProcessStop, aftercare_process_identity, stop_persisted_process_group,
@@ -552,16 +552,7 @@ pub(super) fn handle_wait(
 ) -> Result<serde_json::Value, ErrorBody> {
     let resolved = resolve_run(state, &args.run)?;
     let run = &resolved.run;
-    let terminal = matches!(
-        run.state.as_str(),
-        "merged"
-            | "failed"
-            | "needs_review"
-            | "cancelled"
-            | "rate_limited"
-            | "orphaned"
-            | "aborted"
-    );
+    let terminal = is_terminal(&run.state);
     let vendor_error = lookup(state, |store| store.vendor_error_for_run(&run.id))?;
     Ok(json!({
         "id": run.id,
@@ -575,19 +566,55 @@ pub(super) fn handle_wait(
     }))
 }
 
+/// True for every run state from which no further output can be captured.
+pub(super) fn is_terminal(state: &str) -> bool {
+    matches!(
+        state,
+        "merged"
+            | "failed"
+            | "needs_review"
+            | "cancelled"
+            | "rate_limited"
+            | "orphaned"
+            | "aborted"
+    )
+}
+
 /// Returns one finite page of captured run output. Records are stored
 /// escaped inside the response; raw agent bytes never reach Sloop's stdout.
+/// Stage and tail selection happen here rather than in the CLI so every
+/// client of the socket gets them, and so a `--tail` of a large log ships one
+/// small page instead of the whole file.
 pub(super) fn handle_logs(
     state: &DispatcherState,
-    args: &crate::protocol::RunReferenceArgs,
+    args: &crate::protocol::LogsArgs,
 ) -> Result<serde_json::Value, ErrorBody> {
     let resolved = resolve_run(state, &args.run)?;
+    let stage = args
+        .stage
+        .as_deref()
+        .map(|stage| stage_filter(&resolved.run, stage))
+        .transpose()?;
+    let tail = match args.tail {
+        Some(0) => return Err(invalid_arguments("`tail` must be at least 1")),
+        Some(tail) => Some(tail as usize),
+        None => None,
+    };
+    // The run's state is sampled before its output is read. The other order
+    // could report a run terminal while a chunk written just after the read
+    // is still on disk, and a follower that exits on `terminal` would lose it.
+    let terminal = is_terminal(&resolved.run.state);
+    let query = crate::run_log::PageQuery {
+        after: args.after.unwrap_or(0),
+        limit: tail.map_or(LOGS_PAGE_LIMIT, |tail| tail.min(LOGS_TAIL_LIMIT)),
+        stage,
+        tail,
+    };
     // The log lives under the resolved run's own id, never under whatever
     // shorthand the caller happened to type.
-    let page = crate::run_log::read_page(
+    let page = crate::run_log::read_filtered_page(
         &run_output_path(&state.state_dir, &resolved.run.id),
-        0,
-        LOGS_PAGE_LIMIT,
+        &query,
     )
     .map_err(|error| internal(&format!("cannot read run log: {error}")))?;
     let entries = page
@@ -600,10 +627,56 @@ pub(super) fn handle_logs(
         "id": resolved.run.id,
         "alias": resolved.alias,
         "note": resolved.note(),
+        "stage": args.stage,
         "entries": entries,
         "next_cursor": page.next_cursor,
         "complete": page.complete,
+        "terminal": terminal,
     }))
+}
+
+/// Resolves a requested stage name against the run's own flow snapshot, so a
+/// typo is a named error rather than a silently empty page. A run recorded
+/// before flow snapshots existed has nothing to validate against; there the
+/// name is matched literally rather than refused.
+fn stage_filter(
+    run: &crate::store::RunRecord,
+    requested: &str,
+) -> Result<crate::run_log::StageFilter, ErrorBody> {
+    let literal = crate::run_log::StageFilter {
+        stage: requested.to_owned(),
+        agent_fallback: false,
+    };
+    let Some(flow) = run
+        .flow_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<crate::flow::Flow>(json).ok())
+    else {
+        return Ok(literal);
+    };
+    if !flow.stages.iter().any(|stage| stage.name == requested) {
+        let names = flow
+            .stages
+            .iter()
+            .map(|stage| format!("`{}`", stage.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(invalid_arguments(&format!(
+            "run `{}` has no stage `{requested}`; its flow `{}` defines {names}",
+            run.id, flow.name
+        )));
+    }
+    // Agent output captured before stages were tagged carries no stage name.
+    // The flow's first agent stage owns it: that is the only stage such a
+    // record could have come from in every flow that produced one.
+    let first_agent = flow
+        .stages
+        .iter()
+        .find(|stage| matches!(stage.kind, crate::flow::StageKind::Agent));
+    Ok(crate::run_log::StageFilter {
+        agent_fallback: first_agent.is_some_and(|stage| stage.name == requested),
+        ..literal
+    })
 }
 
 /// One page of the activity feed. Reads are cursor-based and stateless, so a

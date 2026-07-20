@@ -197,10 +197,30 @@ timeout (default 3600 seconds). Lets scripts and CI gate on a run directly.
 Recognized vendor failures include their classification and safe diagnostic
 in the response.
 
-### sloop logs <RUN>
+### sloop logs <RUN> [--stage NAME] [--tail N] [--follow]
 
 Show a run's captured output — both stdout and stderr, in order. The
 underlying file is `runs/<run-id>/output.ndjson` in the state directory.
+
+`--stage NAME` narrows the output to one flow stage, named exactly as the
+flow names it: `--stage build` is the agent's own output, `--stage test` is
+that exec stage's. A stage the run's flow does not define is an error listing
+the ones it does, not an empty page.
+
+`--tail N` keeps the last N matching entries instead of the first. An entry is
+one captured chunk, matching how the NDJSON file is stored, so `--tail 50` is
+"the last 50 records" rather than "the last 50 lines".
+
+`--follow` streams entries as they are appended and exits when the run reaches
+a terminal state. On a run that has already settled it prints what exists and
+exits. All three combine: `sloop logs <RUN> --stage test --tail 50` answers
+"why did the test stage fail" in one command, and `--stage test --follow`
+streams only that stage.
+
+Filtering happens in the daemon, so any client of the socket gets it: this is
+the `logs` verb with `stage`, `tail`, and `after` arguments, returning a page
+plus `next_cursor`, `complete`, and `terminal`. `--follow` is a client-side
+loop over that cursor, the same shape as `sloop watch`.
 
 ### sloop watch [--tail N]
 

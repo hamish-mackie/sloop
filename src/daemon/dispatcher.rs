@@ -32,6 +32,10 @@ use super::worker_api::dispatch_worker;
 
 pub(super) const LOGS_PAGE_LIMIT: usize = 64;
 
+/// An explicit `tail` may ask for more than one default page — that is the
+/// point of asking — but not for an unbounded slice of an untrusted log.
+pub(super) const LOGS_TAIL_LIMIT: usize = 1000;
+
 pub(super) enum DispatcherMessage {
     Request {
         id: RequestId,

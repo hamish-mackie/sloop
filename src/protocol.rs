@@ -94,7 +94,7 @@ pub enum Request {
     Resume(EmptyArgs),
     Stop(StopArgs),
     Cancel(RunReferenceArgs),
-    Logs(RunReferenceArgs),
+    Logs(LogsArgs),
     Wait(RunReferenceArgs),
     Events(EventsArgs),
     Reindex(EmptyArgs),
@@ -231,6 +231,22 @@ pub struct StopArgs {
 #[serde(deny_unknown_fields)]
 pub struct RunReferenceArgs {
     pub run: String,
+}
+
+/// A cursor-paginated read of one run's captured output. `stage` narrows the
+/// page to a single flow stage, `tail` keeps the last N matching entries
+/// instead of the first N, and `after` resumes from a previously returned
+/// cursor so a follower streams without replaying what it has seen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogsArgs {
+    pub run: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<u64>,
 }
 
 /// A cursor-paginated read of the activity feed. `after` resumes from a
