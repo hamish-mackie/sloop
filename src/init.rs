@@ -133,7 +133,7 @@ impl std::error::Error for InitError {}
 mod tests {
     use tempfile::tempdir;
 
-    use super::{DEFAULT_CONFIG, DEFAULT_FLOW, InitError, init};
+    use super::{DEFAULT_CONFIG, DEFAULT_FLOW, DEFAULT_REVIEW_PROMPT, InitError, init};
 
     #[test]
     fn embedded_default_flow_parses() {
@@ -144,6 +144,44 @@ mod tests {
             .map(|stage| stage.name.as_str())
             .collect();
         assert_eq!(names, ["build", "review", "merge"]);
+    }
+
+    /// The shipped review stage must be a real gate. Under the exec default
+    /// (`verdict: exit`) it would pass whenever the reviewer command exits 0,
+    /// which `claude --print` always does — approving every run silently.
+    #[test]
+    fn the_shipped_review_stage_is_a_reported_gate() {
+        let flow = crate::flow::parse("default", DEFAULT_FLOW).expect("default flow must parse");
+        let review = flow
+            .stages
+            .iter()
+            .find(|stage| stage.name == "review")
+            .expect("default flow has a review stage");
+
+        assert_eq!(review.verdict, crate::flow::VerdictPolicy::Reported);
+        let crate::flow::StageKind::Exec { cmd } = &review.kind else {
+            panic!("review stage must be an exec stage: {:?}", review.kind);
+        };
+        // Bare `claude --print` cannot run any command, so it could never call
+        // `sloop verdict`; the tool allowance is load-bearing, not decorative.
+        assert!(
+            cmd.windows(2)
+                .any(|pair| pair == ["--allowedTools", "Bash"]),
+            "review command must let the reviewer run commands: {cmd:?}"
+        );
+        assert!(
+            cmd.iter()
+                .any(|arg| arg.contains(crate::flow::REVIEW_PROMPT_PATH)),
+            "review command must point the reviewer at the shipped prompt: {cmd:?}"
+        );
+    }
+
+    /// The prompt, not the flow, is what tells the reviewer how to report.
+    #[test]
+    fn the_shipped_review_prompt_demands_an_explicit_verdict_call() {
+        assert!(DEFAULT_REVIEW_PROMPT.contains("sloop verdict pass --reason"));
+        assert!(DEFAULT_REVIEW_PROMPT.contains("sloop verdict fail --reason"));
+        assert!(DEFAULT_REVIEW_PROMPT.contains("exactly once"));
     }
 
     #[test]

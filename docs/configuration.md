@@ -194,10 +194,22 @@ stages:
     kind: agent
   - name: review
     kind: exec
-    cmd: [opencode, run, "Read .agents/sloop/prompts/review.md and follow its instructions."]
+    verdict: reported
+    cmd:
+      - claude
+      - --print
+      - --allowedTools
+      - Bash
+      - --
+      - "Read .agents/sloop/prompts/review.md and follow its instructions."
   - name: merge
     kind: merge
 ```
+
+The review stage ships as `verdict: reported`: the reviewer must call
+`sloop verdict pass|fail --reason <text>` exactly once, and a stage that ends
+without one fails with `no verdict reported`. Under the exec default,
+`verdict: exit`, a reviewer that always exits 0 would approve every run.
 
 The filename is the flow name. Tickets bind to a flow at post time with
 `flow: <name>` in frontmatter or `sloop post --flow <name>`; the binding is

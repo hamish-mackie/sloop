@@ -112,10 +112,22 @@ stages:
     kind: agent
   - name: review
     kind: exec
-    cmd: [opencode, run, "Read .agents/sloop/prompts/review.md and follow its instructions."]
+    verdict: reported
+    cmd:
+      - claude
+      - --print
+      - --allowedTools
+      - Bash
+      - --
+      - "Read .agents/sloop/prompts/review.md and follow its instructions."
   - name: merge
     kind: merge
 ```
+
+The review stage is `verdict: reported`, so the reviewer decides the stage by
+calling `sloop verdict pass|fail --reason <text>` — its exit code is not the
+verdict. `--allowedTools Bash` is what lets the reviewer run tests and make
+that call at all.
 
 The filename is the flow name. Select one with `flow: <name>` in the ticket or
 with `sloop post my-ticket.md --flow <name>`.

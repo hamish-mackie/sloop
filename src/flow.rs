@@ -10,7 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 pub const DEFAULT_FLOW_NAME: &str = "default";
 pub const REVIEW_PROMPT_PATH: &str = ".agents/sloop/prompts/review.md";
-pub const REVIEW_PROMPT_INSTRUCTION: &str = "Review the completed work for correctness and regressions. Run relevant tests, then report a pass or fail verdict with a concise reason.";
+pub const REVIEW_PROMPT_INSTRUCTION: &str = "Review the completed work for correctness and regressions. Run relevant tests, then report the verdict with `sloop verdict pass|fail --reason <text>` exactly once.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Flow {

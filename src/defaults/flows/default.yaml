@@ -3,6 +3,20 @@ stages:
     kind: agent
   - name: review
     kind: exec
-    cmd: [claude, --print, "Read .agents/sloop/prompts/review.md and follow its instructions."]
+    # `reported` keeps SLOOP_SOCKET/SLOOP_TOKEN in the reviewer's environment so
+    # it can call `sloop verdict`; without it the stage would pass whenever the
+    # command exits 0, which `claude --print` always does.
+    verdict: reported
+    # `--allowedTools Bash` lets the reviewer run tests and `sloop verdict`;
+    # without it `claude --print` cannot run any command. It deliberately omits
+    # Write/Edit, so the reviewer can read and run but not rewrite the work.
+    # `--` ends the variadic tool list so the prompt stays a positional.
+    cmd:
+      - claude
+      - --print
+      - --allowedTools
+      - Bash
+      - --
+      - "Read .agents/sloop/prompts/review.md and follow its instructions."
   - name: merge
     kind: merge

@@ -375,6 +375,73 @@ fn reported_stage_without_a_report_fails_with_a_reason() {
     assert_eq!(evidence["reason"], "no verdict reported");
 }
 
+/// The shipped default flow's shape: a reported review stage decides the run.
+/// A reported `fail` must hold the work back even though the reviewer command
+/// itself exits 0, and a reported `pass` must let the merge through.
+#[test]
+fn a_reported_review_gates_the_merge_in_both_directions() {
+    fn review_flow(world: &World, verdict: &str) {
+        let reviewer = world.root().join("reviewer.sh");
+        fs::write(
+            &reviewer,
+            format!(
+                "#!/bin/sh\n\"{sloop}\" verdict {verdict} --reason 'scripted {verdict}'\nexit 0\n",
+                sloop = env!("CARGO_BIN_EXE_sloop"),
+            ),
+        )
+        .expect("write reviewer script");
+        write_flow(
+            world,
+            &format!(
+                "stages:\n  - {{ name: build, kind: agent }}\n  - {{ name: review, kind: exec, cmd: ['sh', '{}'], verdict: reported }}\n  - {{ name: merge, kind: merge }}\n",
+                reviewer.display()
+            ),
+        );
+    }
+
+    let failing = World::configured();
+    configure(&failing, COMMITTING_AGENT, None);
+    review_flow(&failing, "fail");
+    failing.commit_all("initial");
+    failing.start_daemon();
+    post_and_run(&failing, "review-fail.md");
+
+    wait_until("the failed review needs review", || {
+        tickets(&failing)["needs_review"] == 1
+    });
+    assert_eq!(tickets(&failing)["merged"], 0);
+    assert!(!default_branch_has(&failing, "work.txt"));
+    let evidence = aftercare_stage_evidence(&failing, 1, "review");
+    assert_eq!(evidence["verdict_source"], "reported");
+    assert_eq!(evidence["reason"], "scripted fail");
+    assert_eq!(
+        aftercare_stages(&failing, 1)
+            .into_iter()
+            .map(|(_, name, state, _)| (name, state))
+            .collect::<Vec<_>>(),
+        [
+            ("build".into(), "passed".into()),
+            ("review".into(), "failed".into())
+        ]
+    );
+
+    let passing = World::configured();
+    configure(&passing, COMMITTING_AGENT, None);
+    review_flow(&passing, "pass");
+    passing.commit_all("initial");
+    passing.start_daemon();
+    post_and_run(&passing, "review-pass.md");
+
+    wait_until("the passed review merges", || {
+        tickets(&passing)["merged"] == 1
+    });
+    assert!(default_branch_has(&passing, "work.txt"));
+    assert_eq!(
+        aftercare_stage_evidence(&passing, 1, "review")["reason"],
+        "scripted pass"
+    );
+}
+
 #[test]
 fn unknown_bound_flow_never_falls_back_to_default() {
     let world = World::configured();
