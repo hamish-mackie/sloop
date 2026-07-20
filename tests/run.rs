@@ -1840,3 +1840,190 @@ fn events_feed_reports_the_run_lifecycle_in_order() {
     assert_eq!(empty["data"]["events"].as_array().unwrap().len(), 0);
     assert_eq!(empty["data"]["next_cursor"], cursor);
 }
+
+/// A live `sloop watch` process, with its NDJSON stdout drained on a
+/// background thread so a test can inspect what has streamed so far without
+/// blocking on a process that never exits on its own.
+struct Watcher {
+    child: std::process::Child,
+    events: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
+impl Watcher {
+    fn spawn(world: &World, args: &[&str]) -> Self {
+        let mut child = world.spawn_sloop(args);
+        let stdout = child.stdout.take().expect("watcher stdout");
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&events);
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                let event: serde_json::Value =
+                    serde_json::from_str(&line).expect("watch emits one JSON object per line");
+                sink.lock().expect("watcher sink").push(event);
+            }
+        });
+        Self { child, events }
+    }
+
+    fn events(&self) -> Vec<serde_json::Value> {
+        self.events.lock().expect("watcher sink").clone()
+    }
+
+    /// The tickets this watcher has seen a run settle for, in arrival order.
+    fn finished_tickets(&self) -> Vec<String> {
+        self.events()
+            .iter()
+            .filter(|event| event["kind"] == "run_finished")
+            .filter_map(|event| event["ticket"].as_str().map(str::to_owned))
+            .collect()
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A watcher scoped to a ticket streams that ticket's runs and nothing else,
+/// while a bare watcher on the same feed sees every ticket.
+///
+/// The two runs are settled in a known order so the absence assertion is
+/// airtight rather than a race: cursors only move forward, so once the scoped
+/// watcher has emitted an event from the *later* run it has already scanned
+/// past every event of the earlier one and chosen not to emit them.
+#[test]
+fn watch_scopes_its_stream_to_the_given_reference() {
+    let world = World::configured();
+    configure_fake_agent(&world, 1, false);
+    world.commit_all("initial");
+    world.start_daemon();
+    let other = post_manual(&world, "other.md", "# Other work\n");
+    let watched = post_manual(&world, "watched.md", "# Watched work\n");
+
+    let scoped = Watcher::spawn(&world, &["watch", &watched]);
+    let every = Watcher::spawn(&world, &["watch"]);
+
+    assert!(world.sloop(&["run", &other]).status.success());
+    wait_until("the unscoped run settles", || {
+        status(&world)["tickets"]["merged"] == 1
+    });
+    assert!(world.sloop(&["run", &watched]).status.success());
+    wait_until("the scoped run settles", || {
+        status(&world)["tickets"]["merged"] == 2
+    });
+
+    wait_until("the scoped watcher streams its ticket's outcome", || {
+        scoped.finished_tickets() == [watched.clone()]
+    });
+    wait_until("the bare watcher streams both outcomes", || {
+        every.finished_tickets() == [other.clone(), watched.clone()]
+    });
+
+    let scoped_events = scoped.events();
+    assert!(
+        scoped_events
+            .iter()
+            .all(|event| event["ticket"] == watched.as_str()),
+        "scoped watch leaked another ticket's events: {scoped_events:?}"
+    );
+    // Scoping narrows the feed; it does not reduce it to outcomes.
+    let kinds: Vec<&str> = scoped_events
+        .iter()
+        .filter_map(|event| event["kind"].as_str())
+        .collect();
+    assert!(
+        kinds.contains(&"run_claimed") && kinds.contains(&"run_started"),
+        "expected the full lifecycle within the scope, got {kinds:?}"
+    );
+}
+
+/// A reference that resolves to nothing is a typo, not an empty scope, so it
+/// fails with `show`'s error before a single event is written.
+#[test]
+fn watch_rejects_an_unknown_reference_before_streaming() {
+    let world = World::configured();
+    configure_fake_agent(&world, 1, false);
+    world.commit_all("initial");
+    world.start_daemon();
+
+    let output = world.sloop(&["watch", "NOPE-404"]);
+    assert!(!output.status.success(), "unknown ref should exit nonzero");
+    assert!(
+        output.stdout.is_empty(),
+        "nothing should stream before the ref resolves: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let envelope = World::json_stdout_or_stderr(&output);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "not_found");
+}
+
+/// Run and project references scope the same feed the CLI streams, exercised
+/// over the socket because that envelope, not the CLI, is the public API.
+#[test]
+fn events_scope_accepts_run_and_project_references() {
+    let world = World::configured();
+    configure_fake_agent(&world, 1, false);
+    world.commit_all("initial");
+    world.start_daemon();
+    let ticket = post_manual(&world, "scoped.md", "# Scoped work\n");
+    assert!(world.sloop(&["run", &ticket]).status.success());
+    wait_until("the scoped run settles", || {
+        status(&world)["tickets"]["merged"] == 1
+    });
+    // A second run gives every scope something it must exclude, so a filter
+    // that silently matched everything would not pass here.
+    let unscoped = post_manual(&world, "unscoped.md", "# Unscoped work\n");
+    assert!(world.sloop(&["run", &unscoped]).status.success());
+    wait_until("the unscoped run settles", || {
+        status(&world)["tickets"]["merged"] == 2
+    });
+
+    let run_id = world.run_id(1);
+    let alias = world.run_alias(1);
+    for scope in [run_id.as_str(), alias.as_str(), ticket.as_str()] {
+        let response = world.operator_exchange(&format!(
+            r#"{{"v":1,"id":"req-scope","verb":"events","args":{{"after":0,"scope":"{scope}"}},"token":null}}"#,
+        ));
+        assert_eq!(response["ok"], true, "scope `{scope}` failed: {response}");
+        let events = response["data"]["events"].as_array().expect("events array");
+        assert!(!events.is_empty(), "scope `{scope}` matched nothing");
+        assert!(
+            events.iter().all(|event| event["run"] == run_id.as_str()),
+            "scope `{scope}` leaked events: {events:?}"
+        );
+        // The cursor tracks rows scanned, not rows emitted, so a watcher
+        // polling with it never rescans the feed.
+        assert_eq!(response["data"]["next_cursor"], response["data"]["latest"]);
+    }
+
+    // A project reaches both of its tickets, and nothing without a ticket:
+    // the daemon-wide rows an operator sees on a bare `watch` stay out.
+    let project = world.operator_exchange(
+        r#"{"v":1,"id":"req-project","verb":"events","args":{"after":0,"scope":"default"},"token":null}"#,
+    );
+    assert_eq!(project["ok"], true, "project scope failed: {project}");
+    let mut scoped_tickets: Vec<&str> = project["data"]["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter_map(|event| event["ticket"].as_str())
+        .collect();
+    scoped_tickets.sort_unstable();
+    scoped_tickets.dedup();
+    let mut expected = [ticket.as_str(), unscoped.as_str()];
+    expected.sort_unstable();
+    assert_eq!(scoped_tickets, expected);
+
+    let unknown = world.operator_exchange(
+        r#"{"v":1,"id":"req-unknown","verb":"events","args":{"after":0,"scope":"NOPE-404"},"token":null}"#,
+    );
+    assert_eq!(unknown["ok"], false);
+    assert_eq!(unknown["error"]["code"], "not_found");
+}

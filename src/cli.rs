@@ -111,7 +111,16 @@ pub enum Command {
         run: String,
     },
     /// Follow ticket and run activity as it happens.
+    ///
+    /// With no reference every event in the repository is streamed. With one,
+    /// only events belonging to that scope are: a ticket covers the ticket and
+    /// all of its runs, a project covers its tickets and their runs, and a run
+    /// covers just that run. Repository-wide events, such as a daemon drain,
+    /// belong to no scope and are streamed only by a bare `sloop watch`. An
+    /// unknown reference fails immediately rather than streaming nothing.
     Watch {
+        /// Ticket id or name, run alias or id prefix, or project id to scope to.
+        r#ref: Option<String>,
         /// Number of recent events to show before following.
         #[arg(long, default_value_t = 20)]
         tail: u32,
@@ -263,10 +272,11 @@ impl TryFrom<Command> for Request {
             Command::Stop { force } => Self::Stop(StopArgs { force }),
             Command::Cancel { run } => Self::Cancel(RunReferenceArgs { run }),
             Command::Logs { run } => Self::Logs(RunReferenceArgs { run }),
-            Command::Watch { tail } => Self::Events(EventsArgs {
+            Command::Watch { r#ref, tail } => Self::Events(EventsArgs {
                 after: None,
                 tail: Some(tail),
                 limit: None,
+                scope: r#ref,
             }),
             Command::Wait { run, .. } => Self::Wait(RunReferenceArgs { run }),
             Command::Reindex => Self::Reindex(empty()),
@@ -556,7 +566,7 @@ fn run_command(
         }
         Command::Stop { force } => run_stop_request(force, mode, stdout, stderr),
         Command::Wait { run, timeout } => run_wait(run, timeout, mode, stdout, stderr),
-        Command::Watch { tail } => run_watch(tail, mode, stdout, stderr),
+        Command::Watch { r#ref, tail } => run_watch(r#ref, tail, mode, stdout, stderr),
         command @ (Command::Post(_)
         | Command::Run(_)
         | Command::Retry { .. }
@@ -758,7 +768,13 @@ fn run_wait(
 /// cursor from the previous page, so the daemon stays stateless and any
 /// other client (a dashboard, a websocket bridge) can stream the same way.
 /// In `--json` mode each event is written as one NDJSON line.
+///
+/// A `scope` reference rides along on every request and the daemon resolves
+/// and applies it, so the filter stays part of the public protocol instead of
+/// a CLI-only convenience. An unresolvable reference comes back as a
+/// `not_found` failure on the very first request, before anything streams.
 fn run_watch(
+    scope: Option<String>,
     tail: u32,
     mode: OutputMode,
     stdout: &mut impl Write,
@@ -771,11 +787,13 @@ fn run_watch(
                 after: Some(after),
                 tail: None,
                 limit: None,
+                scope: scope.clone(),
             },
             None => EventsArgs {
                 after: None,
                 tail: Some(tail),
                 limit: None,
+                scope: scope.clone(),
             },
         };
         match crate::daemon::request(Request::Events(args)) {
@@ -798,12 +816,19 @@ fn run_watch(
                 if stdout.flush().is_err() {
                     return ExitCode::FAILURE;
                 }
-                if let Some(next) = data["next_cursor"].as_i64() {
+                let next = data["next_cursor"].as_i64();
+                let advanced = next.is_some() && next != cursor;
+                if let Some(next) = next {
                     cursor = Some(next);
                 }
-                // A full page means more events are already waiting; skip the
-                // sleep and drain them before pausing.
-                if !events.is_empty() && data["next_cursor"] != data["latest"] {
+                // A cursor short of the newest sequence means more rows are
+                // already waiting; skip the sleep and drain them. The test is
+                // on the cursor rather than on this page being non-empty
+                // because a scoped page can filter out every row it scanned
+                // and still leave matching rows further along. Requiring the
+                // cursor to have moved keeps a daemon that returns no cursor
+                // from spinning.
+                if advanced && next != data["latest"].as_i64() {
                     continue;
                 }
             }
@@ -1166,6 +1191,8 @@ mod tests {
             &["sloop", "logs", "R1"],
             &["sloop", "watch"],
             &["sloop", "watch", "--tail", "50"],
+            &["sloop", "watch", "T1"],
+            &["sloop", "watch", "T1-r2", "--tail", "50"],
             &["sloop", "reindex"],
             &["sloop", "brief"],
             &["sloop", "show", "T1"],
@@ -1197,6 +1224,7 @@ mod tests {
             &["sloop", "cancel", "R1"],
             &["sloop", "logs", "R1"],
             &["sloop", "watch"],
+            &["sloop", "watch", "T1"],
             &["sloop", "reindex"],
             &["sloop", "brief"],
             &["sloop", "show", "T1"],

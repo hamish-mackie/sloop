@@ -237,6 +237,11 @@ pub struct RunReferenceArgs {
 /// previously returned cursor; `tail` starts that many events before the
 /// newest one and wins when both are given. One page per request — clients
 /// stream by polling with the returned cursor.
+///
+/// `scope` narrows the feed to one reference, resolved by the daemon exactly
+/// as `show` resolves it, so thin clients never reimplement that ladder. The
+/// returned `next_cursor` still advances across filtered-out rows, so a scoped
+/// watcher does not rescan the feed when its scope matches nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventsArgs {
@@ -246,6 +251,8 @@ pub struct EventsArgs {
     pub tail: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

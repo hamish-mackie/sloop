@@ -86,6 +86,17 @@ Patterns that fall out of the verbs:
   keeps no per-client state, so a websocket bridge or UI can fan the same
   feed out however it likes. `sloop watch` is exactly this loop.
 
+  Add `{"scope": "<ref>"}` to narrow the page to one reference. The daemon
+  resolves it exactly as `show` does — a ticket id or name covers the ticket
+  and every run of it, a project id covers its tickets and their runs, and a
+  run alias, id, or id prefix covers that run alone — so a thin client never
+  reimplements that ladder. A reference that resolves to nothing is
+  `not_found` on the first request rather than a silently empty stream, and
+  events belonging to no ticket or run are repository-wide and so match no
+  scope. `next_cursor` still advances across rows the scope filtered out, so
+  a scoped poller never rescans the feed. `sloop watch <ref>` is this
+  argument.
+
 A worker token can read its run-scoped brief and ticket, leave advisory notes,
 and report the verdict of a stage explicitly configured to accept one. It
 cannot claim, schedule, merge, or otherwise move operator-owned state. If your

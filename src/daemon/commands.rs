@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -24,39 +24,64 @@ use super::recovery::{
 use super::scheduler::{index_projects, running_hours_open};
 use super::worker_api::{current_ticket_vendor_error, ticket_show};
 
-/// The operator read view for `show`. Resolution is ordered by how specific a
-/// reference is: an exact ticket id, then any run reference, then a ticket
-/// name, and finally a project id. Every branch is read-only; nothing here
-/// transitions state. Workers reach `show` through a separate, run-scoped
+/// The operator read view for `show`: resolve the reference, then render
+/// whatever it named. Workers reach `show` through a separate, run-scoped
 /// handler and never gain these resolutions.
-///
-/// Tickets win over runs so that a bare ticket id still shows the ticket; the
-/// shared run resolver is consulted for the alias, prefix, and legacy-id forms.
 pub(super) fn handle_operator_show(
     state: &DispatcherState,
     reference: &str,
 ) -> Result<serde_json::Value, ErrorBody> {
+    match resolve_operator_reference(state, reference)? {
+        OperatorReference::Ticket(ticket) => ticket_detail(state, reference, &ticket),
+        OperatorReference::Run(run) => run_detail(state, reference, &ResolvedRun::only(*run)),
+        OperatorReference::Project(project) => project_activity(state, reference, &project),
+    }
+}
+
+/// What an operator reference names once resolved. `show` renders one of
+/// these; a scoped `events` read turns one into a filter. Both go through
+/// `resolve_operator_reference`, so anything that shows can also be watched
+/// and a dead end reports the same `not_found` either way.
+///
+/// The ticket and run records dwarf the project one, so both are boxed to keep
+/// the enum cheap to move through the resolution ladder.
+pub(super) enum OperatorReference {
+    Ticket(Box<crate::store::TicketRecord>),
+    Run(Box<crate::store::RunRecord>),
+    Project(crate::store::ProjectRecord),
+}
+
+/// The resolution ladder behind `show` and scoped `events`, ordered by how
+/// specific a reference is: an exact ticket id, then an exact run id, then a
+/// ticket name, then the alias and id-prefix run forms, and finally a project
+/// id. Every branch is read-only; nothing here transitions state.
+///
+/// Tickets win over runs so that a bare ticket id still names the ticket; the
+/// alias, prefix, and legacy-id forms are what reach a run.
+pub(super) fn resolve_operator_reference(
+    state: &DispatcherState,
+    reference: &str,
+) -> Result<OperatorReference, ErrorBody> {
     if let Some(ticket) = lookup(state, |store| store.ticket(reference))? {
-        return ticket_detail(state, reference, &ticket);
+        return Ok(OperatorReference::Ticket(Box::new(ticket)));
     }
     if let Some(run) = lookup(state, |store| store.run(reference))? {
-        return run_detail(state, reference, &ResolvedRun::only(run));
+        return Ok(OperatorReference::Run(Box::new(run)));
     }
     if let Some(ticket) = lookup(state, |store| store.ticket_by_name(reference))? {
-        return ticket_detail(state, reference, &ticket);
+        return Ok(OperatorReference::Ticket(Box::new(ticket)));
     }
     if let Some((ticket_id, attempt)) = crate::run_ref::parse_alias(reference)
         && let Some(run) = lookup(state, |store| {
             store.run_for_ticket_attempt(ticket_id, attempt)
         })?
     {
-        return run_detail(state, reference, &ResolvedRun::only(run));
+        return Ok(OperatorReference::Run(Box::new(run)));
     }
     if let Some(prefix) = crate::run_ref::as_id_prefix(reference) {
         let mut candidates = lookup(state, |store| store.runs_with_id_prefix(&prefix))?;
         if candidates.len() == 1 {
-            let resolved = ResolvedRun::only(candidates.remove(0));
-            return run_detail(state, reference, &resolved);
+            return Ok(OperatorReference::Run(Box::new(candidates.remove(0))));
         }
         if candidates.len() > 1 {
             return Err(ambiguous_run_prefix(reference, &candidates));
@@ -70,7 +95,7 @@ pub(super) fn handle_operator_show(
             crate::run_ref::ACCEPTED_RUN_REFERENCES
         )));
     };
-    project_activity(state, reference, &project)
+    Ok(OperatorReference::Project(project))
 }
 
 /// A ticket's frontmatter summary plus its committed Markdown body. The body is
@@ -609,6 +634,11 @@ pub(super) fn handle_logs(
 /// One page of the activity feed. Reads are cursor-based and stateless, so a
 /// watcher streams by polling with the cursor from the previous response and
 /// the daemon keeps no per-client state.
+///
+/// A `scope` narrows the page to one reference. Resolution happens here, not
+/// in the client, because the daemon owns the index that turns `TICK-1-r1`
+/// into a run id — filtering client-side would make every non-CLI client
+/// reimplement that ladder, and would still ship it the rows it discards.
 pub(super) fn handle_events(
     state: &DispatcherState,
     args: &crate::protocol::EventsArgs,
@@ -616,16 +646,24 @@ pub(super) fn handle_events(
     const DEFAULT_LIMIT: u32 = 64;
     const MAX_LIMIT: u32 = 256;
     let limit = args.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
+    let scope = match args.scope.as_deref() {
+        Some(reference) => Some(resolve_event_scope(state, reference)?),
+        None => None,
+    };
     let latest = lookup(state, |store| store.latest_event_sequence())?;
     let after = match (args.after, args.tail) {
         (Some(after), _) => after,
         (None, Some(tail)) => latest.saturating_sub(i64::from(tail)),
         (None, None) => 0,
     };
-    let events = lookup(state, |store| store.events_after(after, limit))?;
-    let next_cursor = events.last().map_or(after.max(0), |event| event.sequence);
-    let events = events
+    let scanned = lookup(state, |store| store.events_after(after, limit))?;
+    // The cursor tracks rows *scanned*, not rows emitted. A scoped watcher
+    // whose page matches nothing must still advance, or every poll would
+    // rescan the feed from the same cursor forever.
+    let next_cursor = scanned.last().map_or(after.max(0), |event| event.sequence);
+    let events = scanned
         .iter()
+        .filter(|event| scope.as_ref().is_none_or(|scope| scope.matches(event)))
         .map(|event| {
             json!({
                 "sequence": event.sequence,
@@ -643,6 +681,47 @@ pub(super) fn handle_events(
         "next_cursor": next_cursor,
         "latest": latest,
     }))
+}
+
+/// The activity-feed rows a scoped read may see. A ticket covers the ticket
+/// and every run of it, because run events carry their ticket id; a project
+/// covers its tickets and, transitively, their runs; a run covers only itself.
+/// Feed rows belonging to no ticket or run — a daemon restart, say — are
+/// repository-wide and so belong to no scope.
+enum EventScope {
+    Ticket(String),
+    Run(String),
+    Project(HashSet<String>),
+}
+
+impl EventScope {
+    fn matches(&self, event: &crate::store::EventRecord) -> bool {
+        match self {
+            Self::Ticket(ticket_id) => event.ticket_id.as_deref() == Some(ticket_id),
+            Self::Run(run_id) => event.run_id.as_deref() == Some(run_id),
+            Self::Project(ticket_ids) => event
+                .ticket_id
+                .as_ref()
+                .is_some_and(|ticket_id| ticket_ids.contains(ticket_id)),
+        }
+    }
+}
+
+/// Turns a `show`-style reference into a feed filter. An unresolvable
+/// reference fails here, before a single event is written, so a watcher that
+/// typos a ticket id sees the same `not_found` `show` would give it rather
+/// than an eternally silent stream.
+fn resolve_event_scope(state: &DispatcherState, reference: &str) -> Result<EventScope, ErrorBody> {
+    Ok(match resolve_operator_reference(state, reference)? {
+        OperatorReference::Ticket(ticket) => EventScope::Ticket(ticket.id),
+        OperatorReference::Run(run) => EventScope::Run(run.id),
+        OperatorReference::Project(project) => EventScope::Project(
+            lookup(state, |store| store.tickets_for_project(&project.id))?
+                .into_iter()
+                .map(|ticket| ticket.id)
+                .collect(),
+        ),
+    })
 }
 
 /// Records cancellation intent durably, then kills the run's whole process
