@@ -144,7 +144,7 @@ A lock file guarantees at most one daemon per repository; a second
 
 If SQLite reports that its storage is full, the daemon keeps active and
 finished runs reserved, blocks new dispatch, and reports the storage gate in
-`sloop status` and `sloop list`. It periodically attempts a small committed
+`sloop show`. It periodically attempts a small committed
 write; after space becomes available, pending outcomes settle and dispatch
 resumes automatically. If the pre-aftercare checkpoint could not be written,
 Sloop skips side-effecting aftercare and preserves the run branch for review.

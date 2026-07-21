@@ -120,10 +120,9 @@ refreshed name, blockers, and worktree — without queuing a duplicate run.
 ## Watch it run
 
 ```sh
-sloop list            # every ticket's name, state, and scheduling reason
-sloop status          # what is running now, queue depth, next wake
-sloop logs <run-id>   # a run's captured output
-sloop wait <run-id>   # block until the run finishes; exit 0 only on merge
+sloop                                    # dashboard: running work, queue depth, next wake
+sloop logs <run-id>                      # a run's captured output
+sloop show <run-id> --follow --quiet     # block until the run finishes; exit 0 only on merge
 ```
 
 When the agent exits, Sloop evaluates its stage verdict, runs the bound flow's
