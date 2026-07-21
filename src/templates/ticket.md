@@ -4,7 +4,7 @@
 # required; everything it can derive is optional.
 #
 # ---- required ----------------------------------------------------------
-# A non-empty human-readable name. `sloop list` and `sloop show` use it,
+# A non-empty human-readable name. Bare `sloop` and `sloop show` use it,
 # and it can be passed anywhere a ticket reference is accepted.
 name: Add request logging
 # Ticket IDs that must merge before this one may run. A YAML list of

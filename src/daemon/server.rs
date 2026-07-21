@@ -448,7 +448,7 @@ async fn handle_connection(
                 Some(envelope.id),
                 unauthorized(
                     "worker verbs are not available on the operator socket; \
-                     run `sloop list` or `sloop show <ticket>` to inspect tickets from here",
+                     run `sloop` or `sloop show <ticket>` to inspect tickets from here",
                 ),
             )
         }

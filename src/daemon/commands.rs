@@ -549,7 +549,7 @@ pub(super) fn handle_run(
     if let Some(ticket_id) = &args.ticket {
         let Some(ticket) = lookup(state, |store| store.ticket(ticket_id))? else {
             return Err(not_found(&format!(
-                "ticket `{ticket_id}` is not registered; run `sloop list` to see registered ticket ids"
+                "ticket `{ticket_id}` is not registered; run `sloop show` to see registered ticket ids"
             )));
         };
         if ticket.state == TicketState::Held.as_str() {
@@ -566,7 +566,7 @@ pub(super) fn handle_run(
     for only in &args.only {
         let Some(ticket) = lookup(state, |store| store.ticket(only))? else {
             return Err(not_found(&format!(
-                "ticket `{only}` is not registered; run `sloop list` to see registered ticket ids"
+                "ticket `{only}` is not registered; run `sloop show` to see registered ticket ids"
             )));
         };
         if let Some(project) = &args.project
@@ -1242,7 +1242,7 @@ fn ambiguous_run_prefix(reference: &str, candidates: &[crate::store::RunRecord])
 /// dead end here names every accepted form so the caller has a next move.
 fn run_not_found(run: &str) -> ErrorBody {
     not_found(&format!(
-        "run `{run}` does not exist; pass {} — run `sloop list` to see each ticket's runs",
+        "run `{run}` does not exist; pass {} — run `sloop show <ticket>` to see a ticket's runs",
         crate::run_ref::ACCEPTED_RUN_REFERENCES
     ))
 }

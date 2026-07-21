@@ -61,7 +61,7 @@ Log each HTTP request with its method, path, status, and duration.
 
 ```sh
 sloop post my-ticket.md
-sloop list                # Ticket status, and why pending ones aren't running
+sloop                     # Ticket status, and why pending ones aren't running
 sloop logs <run-id>       # Follow a run's output
 ```
 

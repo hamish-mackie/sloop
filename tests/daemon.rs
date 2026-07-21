@@ -747,7 +747,7 @@ fn worker_verbs_on_the_operator_socket_point_at_an_alternative() {
         .as_str()
         .expect("error message");
     assert!(
-        message.contains("sloop list"),
+        message.contains("sloop show"),
         "remedy does not name an operator alternative: {message}"
     );
 }

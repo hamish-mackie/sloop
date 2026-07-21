@@ -125,7 +125,7 @@ fn logs_for_a_missing_run_names_the_run_id_shape() {
         .as_str()
         .expect("error message");
     assert!(
-        message.contains("`TICK-20-r1`") && message.contains("sloop list"),
+        message.contains("`TICK-20-r1`") && message.contains("sloop show"),
         "remedy does not name the run id shape: {message}"
     );
 }
