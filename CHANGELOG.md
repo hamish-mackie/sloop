@@ -7,8 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-21
+
 ### Added
 
+- The read surface is now one verb. Bare `sloop` or `sloop show` prints a
+  dashboard: daemon status, scheduler state, and recent activity.
+  `sloop show <REF>` resolves ticket IDs, ticket names, run IDs and aliases,
+  unique run-id prefixes, and project IDs; an exact reference always wins.
+  Anything else becomes a case-insensitive ticket pattern over IDs and
+  names — a substring by default, an unanchored regular expression when the
+  text contains regex metacharacters — rendered as a ticket list.
+  `-n`/`--limit N` or the shorthand `-N` caps list rows. `--follow` streams
+  the shown scope's events; ticket and run followers exit when the subject
+  settles, and `--follow --quiet` returns only the outcome for scripting.
+  Exit codes are stable: `0` for success or a merged subject, `1` for
+  another terminal outcome or a daemon error, `2` for usage errors.
+  `sloop show --help` documents the whole resolution ladder. Pattern
+  resolution happens in the daemon: the `show` verb accepts patterns, the
+  `events` verb gained an optional `scope`, and the `list` verb gained an
+  optional `limit`, all additive within protocol version 1.
+- `sloop template <kind>` prints fully commented canonical templates for
+  the config, flow, project, and ticket files, so a working example is
+  always one command away.
 - `sloop show <TICKET>` now lists the ticket's runs, newest attempt first:
   alias, outcome, wall-clock span, and a strip of the run's flow stages
   marked `ok`, `FAIL`, `..` (running), or `-` (not reached). A ticket that
@@ -33,25 +54,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail" in one command. Filtering happens in the daemon: the `logs` verb
   gained `stage`, `tail`, and `after` arguments and a `terminal` response
   field, all additive within protocol version 1.
-- `sloop watch` now takes an optional ticket, run, or project reference and
-  streams only that scope's events, resolved exactly as `sloop show`
-  resolves a reference. A reference that resolves to nothing fails with
-  `not_found` before anything streams. Bare `sloop watch` is unchanged. The
-  `events` verb gained a matching optional `scope` argument, so any protocol
-  client scopes the feed the same way.
-
-- `sloop list` accepts a row limit: `--limit N`, `-n N`, or the `head`/`tail`
-  shorthand `-N` shows only the N newest tickets. A zero or non-numeric limit
-  is a usage error. The `list` verb gained a matching optional `limit`
-  argument, so protocol clients page the same way.
-
 ### Changed
 
+- The default flow's review stage is now a real gate. It previously
+  inherited `verdict: exit` and passed whenever the reviewer process exited
+  zero, so every fresh `sloop init` deployment silently approved all work.
+  The shipped stage now uses `verdict: reported`, and the review prompt
+  requires the reviewer to call `sloop verdict pass|fail --reason` exactly
+  once; the command, not the prose, decides the stage.
+- Compact `sloop --help` now lists only the everyday operator commands
+  (`init`, `template`, `daemon`, `post`, `show`, `logs`). Everything else,
+  including the worker verb `brief`, remains available and documented under
+  `sloop --help --all`.
 - `sloop show <RUN>` labels the agent stage's exit as `agent exit:` rather
   than a bare `exit:`, which could read as "the whole run passed" on a run
   whose later stage failed. The JSON `exit_code` field is unchanged.
-- `sloop list` now orders tickets by registration time, newest first, instead
-  of oldest first, so recently posted and currently running work leads the
+- Ticket lists — the dashboard, pattern results, and the deprecated `list`
+  alias — order tickets by registration time, newest first, instead of
+  oldest first, so recently posted and currently running work leads the
   output. State does not affect the order. Tickets registered in the same
   millisecond fall back to their id's numeric ordinal, newest first.
 - `sloop post` now reports every problem with a ticket file in a single
@@ -59,6 +79,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stopping at the first one. A file whose frontmatter cannot be parsed at
   all still fails fast with the parse error, and a file with exactly one
   problem reads as it always has.
+
+### Deprecated
+
+- `status`, `list`, `watch`, and `wait` remain accepted as hidden
+  deprecated aliases of `sloop show`. They no longer appear in normal help,
+  and each invocation writes a note to stderr naming its replacement:
+  `status` and `list` point to `sloop show`, `watch` to `sloop show
+  --follow` (its optional scope and tail still work), and `wait` to
+  `sloop show --follow --quiet` (its run and timeout still work). The
+  aliases will be removed in a future release.
+
+### Fixed
+
+- `sloop reindex` now recognizes patch-equivalent merges. A run branch
+  whose commits were squashed or rebased onto the default branch is
+  detected with `git cherry` and indexed as merged; previously only true
+  ancestor merges counted, and reindex flipped squash-merged tickets to
+  `needs_review`.
 
 ## [0.2.1] - 2026-07-20
 
