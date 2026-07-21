@@ -197,6 +197,7 @@ pub enum Command {
     #[command(hide = true)]
     Reindex,
     /// Show the current worker's assignment.
+    #[command(hide = true)]
     Brief,
     /// Append an advisory note to the current run.
     #[command(hide = true)]

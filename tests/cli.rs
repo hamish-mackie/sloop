@@ -121,14 +121,15 @@ fn default_help_only_shows_common_commands() {
 
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).expect("help is UTF-8");
-    for verb in ["init", "daemon", "post", "show", "logs", "brief"] {
+    for verb in ["init", "daemon", "post", "show", "logs"] {
         assert!(
             help.contains(&format!("  {verb}")),
             "help did not contain {verb:?}"
         );
     }
     for verb in [
-        "run", "retry", "pause", "cancel", "list", "status", "watch", "wait", "reindex", "note",
+        "run", "retry", "pause", "cancel", "list", "status", "watch", "wait", "reindex", "brief",
+        "note",
     ] {
         assert!(
             !help.contains(&format!("  {verb}")),
