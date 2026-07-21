@@ -1,6 +1,9 @@
 version: 1
 worktree_dir: .worktrees
 
+scheduler:
+  max_parallel_tasks: 2
+
 agent:
   default_target: opencode
   targets:
