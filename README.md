@@ -1,6 +1,7 @@
-# Sloop
-
-A job scheduler for background coding agents.
+<p align="center">
+  <img src="docs/assets/banner-light.svg#gh-light-mode-only" alt="sloop — a job scheduler for background coding agents" width="100%">
+  <img src="docs/assets/banner-dark.svg#gh-dark-mode-only" alt="" width="100%">
+</p>
 
 Sloop runs agentic coding work autonomously: each ticket gets its own Git
 worktree and agent (Claude Code, Codex, or OpenCode), and Sloop reviews the

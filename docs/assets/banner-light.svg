@@ -1,0 +1,12 @@
+<svg width="1280" height="290" viewBox="0 0 1280 290" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="sloop — a job scheduler for background coding agents">
+  <g transform="translate(532, 6)" stroke="#111111" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round">
+    <line x1="100" y1="12" x2="100" y2="120"/>
+    <path d="M106 22 C 146 52, 164 90, 170 118 L 106 118 Z"/>
+    <path d="M94 40 C 72 68, 56 96, 48 118 L 94 118 Z"/>
+    <path d="M34 130 C 58 150, 156 150, 182 130"/>
+    <line x1="14" y1="144" x2="70" y2="144" stroke-width="3" stroke-dasharray="1 14"/>
+    <line x1="146" y1="144" x2="202" y2="144" stroke-width="3" stroke-dasharray="1 14"/>
+  </g>
+  <text x="644" y="226" text-anchor="middle" font-family="ui-monospace, 'SF Mono', 'Cascadia Mono', 'Roboto Mono', Menlo, Consolas, monospace" font-size="58" font-weight="600" letter-spacing="10" fill="#111111">sloop</text>
+  <text x="642" y="266" text-anchor="middle" font-family="ui-monospace, 'SF Mono', 'Cascadia Mono', 'Roboto Mono', Menlo, Consolas, monospace" font-size="15" font-weight="400" letter-spacing="3" fill="#666666">A JOB SCHEDULER FOR BACKGROUND CODING AGENTS</text>
+</svg>
