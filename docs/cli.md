@@ -9,7 +9,7 @@ The commands split into two sets, and the split is enforced by the daemon:
 
 - **Operator commands** decide what happens. They use the operator socket
   and implicitly start the daemon if it is not running. The operator read
-  surface is bare `sloop`, `show`, and `logs`.
+  surface is `show` and `logs`; bare `sloop` prints help.
 - **Worker commands** (`brief`, `show`, `note`, `verdict`) are for the process
   inside a run. They authenticate with a per-run token. Only `verdict`, when
   the current stage explicitly uses the `reported` policy, affects flow
@@ -86,7 +86,7 @@ last run settles, the daemon releases its sockets and lock, then replaces
 itself with the binary currently installed at the path from which it started.
 Queued activations remain queued and resume automatically in the replacement.
 
-Use bare `sloop` to inspect the drain or `sloop show --follow` to stream its
+Use `sloop show` to inspect the drain or `sloop show --follow` to stream its
 events. `sloop resume` cancels a pending restart and continues dispatching in
 the current process. For an immediate teardown, use `sloop stop`; restart has
 no force mode.
@@ -142,11 +142,10 @@ tickets are skipped by selection and rejected by named runs.
 ### sloop show
 
 ```text
-sloop
 sloop show [REF_OR_PATTERN] [-N] [--follow] [--quiet]
 ```
 
-Bare `sloop` is the same as `sloop show`: a dashboard with daemon and gate
+Without an argument, `sloop show` is a dashboard with daemon and gate
 state, active runs, queued activations, ticket counts, the next wake time, and
 the 10 newest tickets. `sloop show -N` changes the number of recent tickets;
 `-n N` and `--limit N` are equivalent. A limit of zero or a non-numeric limit

@@ -320,7 +320,11 @@ pub struct RunCliArgs {
 impl Cli {
     pub fn into_request(self) -> Result<Request, RequestConstructionError> {
         self.command
-            .unwrap_or_else(|| Command::Show(ShowCliArgs::default()))
+            .ok_or_else(|| {
+                RequestConstructionError(
+                    "bare `sloop` prints help and has no daemon request".into(),
+                )
+            })?
             .try_into()
     }
 }
@@ -541,6 +545,7 @@ where
     }
 
     match command
+        .clone()
         .try_get_matches_from(&args)
         .and_then(|matches| Cli::from_arg_matches(&matches))
     {
@@ -550,13 +555,21 @@ where
             } else {
                 OutputMode::Human
             };
-            run_command(
-                cli.command
-                    .unwrap_or_else(|| Command::Show(ShowCliArgs::default())),
-                mode,
-                stdout,
-                stderr,
-            )
+            match cli.command {
+                Some(subcommand) => run_command(subcommand, mode, stdout, stderr),
+                // Bare `sloop` orients rather than acts: print the same help
+                // as `sloop --help` instead of defaulting to a verb.
+                None => {
+                    let help = command.render_help().to_string();
+                    let help = help.trim_end();
+                    write_plain_or(
+                        mode,
+                        stdout,
+                        help,
+                        &ResponseEnvelope::success(None, json!({"kind": "help", "text": help})),
+                    )
+                }
+            }
         }
         // Parsing failed, so the flag is read from the raw arguments: an
         // agent asking for `--json --help` still gets an envelope.

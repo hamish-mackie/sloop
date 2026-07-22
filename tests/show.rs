@@ -267,7 +267,7 @@ fn project_show_is_unchanged() {
 }
 
 #[test]
-fn bare_show_is_a_dashboard_and_patterns_filter_before_limiting() {
+fn bare_sloop_prints_help_and_patterns_filter_before_limiting() {
     let world = World::configured();
     configure(&world, FLOW_AGENT_ONLY, "exit 0\n");
     world.commit_all("initial");
@@ -276,13 +276,27 @@ fn bare_show_is_a_dashboard_and_patterns_filter_before_limiting() {
     let second = post(&world, "audit-helper.md");
     let third = post(&world, "other-audit.md");
 
+    // Bare `sloop` orients rather than acts: it prints the same help as
+    // `sloop --help` and never contacts the daemon.
     let bare = world.sloop(&[]);
-    let shown = world.sloop(&["show"]);
     assert!(bare.status.success());
-    assert!(shown.status.success());
     let bare_data = &World::json_stdout(&bare)["data"];
+    assert_eq!(bare_data["kind"], "help");
+    assert!(
+        bare_data["text"].as_str().unwrap().contains("Usage: sloop"),
+        "{bare_data}"
+    );
+    let bare_plain = world.sloop_plain(&[]);
+    assert!(bare_plain.status.success());
+    assert!(
+        String::from_utf8_lossy(&bare_plain.stdout).contains("Usage: sloop"),
+        "{}",
+        String::from_utf8_lossy(&bare_plain.stdout)
+    );
+
+    let shown = world.sloop(&["show"]);
+    assert!(shown.status.success());
     let shown_data = &World::json_stdout(&shown)["data"];
-    assert_eq!(bare_data, shown_data);
     assert_eq!(shown_data["kind"], "dashboard");
     assert_eq!(shown_data["recent"][0]["id"], third);
 
