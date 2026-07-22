@@ -8,10 +8,16 @@ use crate::domain::ticket::TicketState;
 
 pub const SCHEMA_VERSION: u32 = 13;
 
+// `synchronous = NORMAL` is the standard WAL pairing: commits skip the
+// per-transaction fsync (durability moves to checkpoints), which keeps the
+// write lock short under contention. The busy timeout is generous because
+// SQLite's busy handler has no fairness queue: under sustained multi-writer
+// load a waiter can starve well past a "reasonable" wait before winning.
 const CONNECTION_PRAGMAS: &str = "
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
-PRAGMA busy_timeout = 5000;
+PRAGMA synchronous = NORMAL;
+PRAGMA busy_timeout = 30000;
 ";
 
 const SCHEMA_V1: &str = "
