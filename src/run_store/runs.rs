@@ -1206,7 +1206,7 @@ mod tests {
     #[test]
     fn active_run_for_ticket_tracks_claimed_and_running_runs_only() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        let store = open_seeded(&directory.path().join("sloop.db"));
         assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
 
         claim_run(&store, &claim_t1("R1"), 2_000);
@@ -1233,8 +1233,8 @@ mod tests {
             Some(("R1".into(), 1))
         );
 
-        store
-            .finish_run("R1", "T1", Some(1), Outcome::Failed, &[], None, 2_200)
+        Coordination::from_shared(&store)
+            .settle("R1", "T1", Some(1), Outcome::Failed, &[], None, 2_200)
             .unwrap();
         assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
     }
@@ -1303,8 +1303,8 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
         running_r1(&mut store);
-        store
-            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, 2_300)
+        Coordination::from_shared(&store)
+            .settle("R1", "T1", Some(0), Outcome::Merged, &[], None, 2_300)
             .unwrap();
 
         let events = store.events_after(0, 10).unwrap();
@@ -1317,8 +1317,8 @@ mod tests {
         assert_eq!(finished["outcome"], "merged");
         assert_eq!(finished["ticket_state"], "merged");
 
-        store
-            .finish_run("R1", "T1", Some(1), Outcome::Failed, &[], None, 2_400)
+        Coordination::from_shared(&store)
+            .settle("R1", "T1", Some(1), Outcome::Failed, &[], None, 2_400)
             .unwrap();
         assert_eq!(store.latest_event_sequence().unwrap(), events[2].sequence);
 
@@ -1335,9 +1335,11 @@ mod tests {
     #[test]
     fn abandoned_claims_append_an_abort_event() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        let store = open_seeded(&directory.path().join("sloop.db"));
         claim_run(&store, &claim_t1("R1"), 2_000);
-        store.abort_claim("R1", "T1", 2_100).unwrap();
+        Coordination::from_shared(&store)
+            .abandon("R1", "T1", 2_100)
+            .unwrap();
 
         let kinds: Vec<String> = store
             .events_after(0, 10)

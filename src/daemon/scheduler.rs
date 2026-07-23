@@ -784,7 +784,7 @@ fn reconcile_external_merges(state: &mut DispatcherState, log: &OperationalLog) 
             continue;
         }
         let now_ms = state.clock.now_ms();
-        match state.store.settle_external_merge(
+        match Coordination::new(&mut state.store).settle_external_merge(
             &branch.run_id,
             &branch.ticket_id,
             &branch.branch,

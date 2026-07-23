@@ -238,7 +238,7 @@ fn replace_ticket_blockers(
 pub(crate) mod tx {
     use rusqlite::{OptionalExtension, Transaction, params};
 
-    use super::{ClaimRequest, StoreError};
+    use super::{ClaimRequest, StoreError, TicketState};
 
     pub(crate) fn claim_ticket(
         transaction: &Transaction<'_>,
@@ -326,6 +326,61 @@ pub(crate) mod tx {
             ],
         )?;
         Ok(expires_at_ms)
+    }
+
+    pub(crate) fn delete_lease(
+        transaction: &Transaction<'_>,
+        run_id: &str,
+    ) -> rusqlite::Result<usize> {
+        transaction.execute("DELETE FROM leases WHERE run_id = ?1", params![run_id])
+    }
+
+    pub(crate) fn settle_ticket(
+        transaction: &Transaction<'_>,
+        ticket_id: &str,
+        ticket_state: TicketState,
+        now_ms: i64,
+    ) -> rusqlite::Result<usize> {
+        transaction.execute(
+            "UPDATE tickets SET state = ?2, held_reason = NULL, updated_at_ms = ?3
+             WHERE id = ?1 AND state = 'claimed'",
+            params![ticket_id, ticket_state.as_str(), now_ms],
+        )
+    }
+
+    pub(crate) fn requeue_activation(
+        transaction: &Transaction<'_>,
+        activation_id: &str,
+        now_ms: i64,
+    ) -> rusqlite::Result<usize> {
+        transaction.execute(
+            "UPDATE activations SET state = 'queued', updated_at_ms = ?2 WHERE id = ?1",
+            params![activation_id, now_ms],
+        )
+    }
+
+    pub(crate) fn abort_ticket(
+        transaction: &Transaction<'_>,
+        ticket_id: &str,
+        now_ms: i64,
+    ) -> rusqlite::Result<usize> {
+        transaction.execute(
+            "UPDATE tickets SET state = 'ready', held_reason = NULL, updated_at_ms = ?2
+             WHERE id = ?1 AND state = 'claimed'",
+            params![ticket_id, now_ms],
+        )
+    }
+
+    pub(crate) fn settle_external_merge(
+        transaction: &Transaction<'_>,
+        ticket_id: &str,
+        now_ms: i64,
+    ) -> rusqlite::Result<usize> {
+        transaction.execute(
+            "UPDATE tickets SET state = 'merged', held_reason = NULL, updated_at_ms = ?2
+             WHERE id = ?1 AND state = 'needs_review'",
+            params![ticket_id, now_ms],
+        )
     }
 }
 
@@ -1199,86 +1254,6 @@ impl Store {
             .map_err(StoreError::from)
     }
 
-    /// Terminates a run in one transaction: the raw exit and derived outcome
-    /// land on the run, evidence is appended, the lease is
-    /// freed, and the ticket moves to its terminal state or back to `ready`
-    /// when cancellation or recovery releases it.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn finish_run(
-        &mut self,
-        run_id: &str,
-        ticket_id: &str,
-        exit_code: Option<i32>,
-        outcome: crate::outcome::Outcome,
-        evidence: &[EvidenceRecord],
-        cooldown: Option<&CooldownUpdate<'_>>,
-        now_ms: i64,
-    ) -> Result<bool, StoreError> {
-        use crate::outcome::Outcome;
-
-        let mut connection = self.db.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let run_state = RunState::from(outcome);
-        let changed = runs::tx::finish(&transaction, run_id, run_state, exit_code, now_ms)?;
-        if changed == 0 {
-            let existing = runs::tx::state_and_exit(&transaction, run_id)?;
-            match existing {
-                Some((_, Some(_))) => {
-                    transaction.commit()?;
-                    return Ok(false);
-                }
-                Some((state, None)) => {
-                    return Err(StoreError::RunStateConflict {
-                        run_id: run_id.into(),
-                        state: Some(state),
-                        requested: run_state.as_str().into(),
-                    });
-                }
-                None => {
-                    return Err(StoreError::RunNotFound {
-                        run_id: run_id.into(),
-                    });
-                }
-            }
-        }
-        transaction.execute("DELETE FROM leases WHERE run_id = ?1", params![run_id])?;
-
-        let ticket_state = TicketState::after_outcome(outcome);
-        transaction.execute(
-            "UPDATE tickets SET state = ?2, held_reason = NULL, updated_at_ms = ?3
-             WHERE id = ?1 AND state = 'claimed'",
-            params![ticket_id, ticket_state.as_str(), now_ms],
-        )?;
-        if outcome == Outcome::RateLimited {
-            let activation_id = runs::tx::activation_id(&transaction, run_id)?;
-            transaction.execute(
-                "UPDATE activations SET state = 'queued', updated_at_ms = ?2 WHERE id = ?1",
-                params![activation_id, now_ms],
-            )?;
-        }
-
-        if let Some(cooldown) = cooldown {
-            limits::tx::upsert_cooldown(&transaction, run_id, cooldown, now_ms)?;
-        }
-
-        evidence::tx::record_settlement(&transaction, run_id, evidence, now_ms)?;
-        runs::tx::record_event(
-            &transaction,
-            now_ms,
-            "run_finished",
-            Some(run_id),
-            Some(ticket_id),
-            &serde_json::json!({
-                "outcome": outcome.as_str(),
-                "exit_code": exit_code,
-                "ticket_state": ticket_state.as_str(),
-            })
-            .to_string(),
-        )?;
-        transaction.commit()?;
-        Ok(true)
-    }
-
     /// Records one completed flow stage. The flow index is the idempotency
     /// key, so recovery can re-derive the first stage still lacking a verdict.
     pub(crate) fn record_aftercare_stage(
@@ -1460,36 +1435,6 @@ impl Store {
         Ok(data.and_then(|data| serde_json::from_str(&data).ok()))
     }
 
-    /// Rolls back a claim whose launch failed before a process existed: the
-    /// lease is released, the run is closed, and the ticket returns to
-    /// `ready`. The consumed attempt is kept as evidence of the try.
-    pub(crate) fn abort_claim(
-        &mut self,
-        run_id: &str,
-        ticket_id: &str,
-        now_ms: i64,
-    ) -> Result<(), StoreError> {
-        let mut connection = self.db.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute("DELETE FROM leases WHERE run_id = ?1", params![run_id])?;
-        runs::tx::abort(&transaction, run_id, now_ms)?;
-        transaction.execute(
-            "UPDATE tickets SET state = 'ready', held_reason = NULL, updated_at_ms = ?2
-             WHERE id = ?1 AND state = 'claimed'",
-            params![ticket_id, now_ms],
-        )?;
-        runs::tx::record_event(
-            &transaction,
-            now_ms,
-            "run_aborted",
-            Some(run_id),
-            Some(ticket_id),
-            "{}",
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-
     /// Reads activity-feed rows with `sequence > after`, oldest first. The
     /// last row's sequence is the caller's next cursor.
     pub fn events_after(&self, after: i64, limit: usize) -> Result<Vec<EventRecord>, StoreError> {
@@ -1597,52 +1542,6 @@ impl Store {
         self.run_store()
             .mark_run_worktree_cleaned(candidate, now_ms)
             .map_err(StoreError::from)
-    }
-
-    /// Settles a `needs_review` ticket whose run branch an operator merged by
-    /// hand: the ticket becomes `merged`, releasing its `blocked_by` dependents
-    /// exactly as a flow merge would, and the observation is recorded as
-    /// evidence. The ticket-state gate makes a repeated pass a no-op and the
-    /// `dedupe_key` UNIQUE gate keeps the evidence row unique across restarts.
-    /// Returns whether this call performed the transition.
-    pub(crate) fn settle_external_merge(
-        &mut self,
-        run_id: &str,
-        ticket_id: &str,
-        branch: &str,
-        branch_tip: &str,
-        observed_default_tip: &str,
-        now_ms: i64,
-    ) -> Result<bool, StoreError> {
-        let mut connection = self.db.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "UPDATE tickets SET state = 'merged', held_reason = NULL, updated_at_ms = ?2
-             WHERE id = ?1 AND state = 'needs_review'",
-            params![ticket_id, now_ms],
-        )?;
-        if changed == 0 {
-            transaction.commit()?;
-            return Ok(false);
-        }
-        runs::tx::mark_cleanup_eligible(&transaction, run_id, now_ms)?;
-        let data_json = serde_json::json!({
-            "branch": branch,
-            "branch_tip": branch_tip,
-            "observed_default_tip": observed_default_tip,
-        })
-        .to_string();
-        evidence::tx::record_external_merge(&transaction, run_id, &data_json, now_ms)?;
-        runs::tx::record_event(
-            &transaction,
-            now_ms,
-            "external_merge_reconciled",
-            Some(run_id),
-            Some(ticket_id),
-            &data_json,
-        )?;
-        transaction.commit()?;
-        Ok(true)
     }
 
     /// The ticket's live run as `(id, attempt)`. The attempt travels with the
@@ -2353,19 +2252,6 @@ mod tests {
     }
 
     #[test]
-    fn aborted_claims_are_closed_and_no_longer_active() {
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        granted_claim(&store, &claim_t1("R1"), 2_000);
-
-        store.abort_claim("R1", "T1", 2_100).unwrap();
-
-        assert_eq!(store.run("R1").unwrap().unwrap().state, "aborted");
-        assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
-        assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("ready"));
-    }
-
-    #[test]
     fn operator_hold_transitions_are_narrow_and_idempotent() {
         let directory = tempdir().unwrap();
         let store = open_seeded(&directory.path().join("sloop.db"));
@@ -2462,12 +2348,12 @@ mod tests {
         use crate::outcome::Outcome;
 
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        let store = open_seeded(&directory.path().join("sloop.db"));
 
         let first = granted_claim(&store, &claim_t1("R1"), 2_000);
         assert_eq!(first.attempt, 1);
-        store
-            .finish_run("R1", "T1", Some(0), Outcome::Failed, &[], None, 2_100)
+        Coordination::from_shared(&store)
+            .settle("R1", "T1", Some(0), Outcome::Failed, &[], None, 2_100)
             .unwrap();
 
         assert_eq!(store.retry_ticket("T1", 2_200).unwrap(), "failed");
@@ -2564,8 +2450,8 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
         granted_claim(&store, &claim_t1("R1"), 2_000);
-        store
-            .finish_run(
+        Coordination::from_shared(&store)
+            .settle(
                 "R1",
                 "T1",
                 Some(0),
@@ -2671,7 +2557,7 @@ mod tests {
     fn tickets_with_unmerged_blockers_are_never_selected() {
         use crate::outcome::Outcome;
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        let store = open_seeded(&directory.path().join("sloop.db"));
         store
             .insert_local_ticket(
                 "T2",
@@ -2701,8 +2587,8 @@ mod tests {
         // T1 is claimed and T2's blocker has not merged: nothing is ready.
         assert_eq!(store.select_ready_ticket(&activation, 2_000).unwrap(), None);
 
-        store
-            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, 3_000)
+        Coordination::from_shared(&store)
+            .settle("R1", "T1", Some(0), Outcome::Merged, &[], None, 3_000)
             .unwrap();
         assert_eq!(
             store
@@ -2711,20 +2597,5 @@ mod tests {
                 .as_deref(),
             Some("T2")
         );
-    }
-
-    #[test]
-    fn orphaning_a_run_releases_the_ticket_without_failing_it() {
-        use crate::outcome::Outcome;
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        granted_claim(&store, &claim_t1("R1"), 2_000);
-
-        store
-            .finish_run("R1", "T1", None, Outcome::Orphaned, &[], None, 3_000)
-            .unwrap();
-
-        assert_eq!(store.run("R1").unwrap().unwrap().state, "orphaned");
-        assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("ready"));
     }
 }

@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn cooldowns_extend_without_shortening_and_gate_ready_work() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        let store = open_seeded(&directory.path().join("sloop.db"));
         let activation = QueuedActivation {
             id: "A1".into(),
             kind: "immediate".into(),
@@ -261,8 +261,8 @@ mod tests {
         };
 
         claim_run(&store, "R1", 2_000);
-        store
-            .finish_run(
+        Coordination::from_shared(&store)
+            .settle(
                 "R1",
                 "T1",
                 Some(1),
@@ -282,8 +282,8 @@ mod tests {
         assert_eq!(store.active_cooldowns(5_000).unwrap()[0].target, "claude");
 
         claim_run(&store, "R2", 5_000);
-        store
-            .finish_run(
+        Coordination::from_shared(&store)
+            .settle(
                 "R2",
                 "T1",
                 Some(1),
@@ -316,10 +316,10 @@ mod tests {
     #[test]
     fn reindex_detaches_cooldowns_and_deletes_budget_reservations() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        let store = open_seeded(&directory.path().join("sloop.db"));
         claim_run(&store, "R1", 2_000);
-        store
-            .finish_run(
+        Coordination::from_shared(&store)
+            .settle(
                 "R1",
                 "T1",
                 Some(1),

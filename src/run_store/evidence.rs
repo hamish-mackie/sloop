@@ -455,7 +455,6 @@ impl RunStore {
 mod tests {
     use tempfile::tempdir;
 
-    use super::{EvidenceRecord, StageRecord};
     use crate::coordination::{Claim, Coordination, RunStart, Start};
     use crate::domain::ticket::TicketState;
     use crate::outcome::Outcome;
@@ -643,8 +642,8 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
         running_r1(&mut store);
-        store
-            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, 2_200)
+        Coordination::from_shared(&store)
+            .settle("R1", "T1", Some(0), Outcome::Merged, &[], None, 2_200)
             .unwrap();
 
         let claim = store
@@ -676,134 +675,5 @@ mod tests {
             2_300,
         );
         assert!(matches!(missing, Err(StoreError::RunNotFound { .. })));
-    }
-
-    #[test]
-    fn finish_run_settles_exactly_once() {
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        running_r1(&mut store);
-        store
-            .record_agent_exit(
-                "R1",
-                Some(0),
-                true,
-                r#"{"count":1,"oids":["abc"]}"#,
-                None,
-                None,
-                2_200,
-            )
-            .unwrap();
-
-        store
-            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, 2_300)
-            .unwrap();
-        assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("merged"));
-        assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
-        let evidence = store.run_evidence("R1").unwrap();
-
-        store
-            .finish_run("R1", "T1", Some(1), Outcome::Failed, &[], None, 2_400)
-            .unwrap();
-        let run = store.run("R1").unwrap().unwrap();
-        assert_eq!(run.state, "merged");
-        assert_eq!(run.exit_code, Some(0));
-        assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("merged"));
-        assert_eq!(store.run_evidence("R1").unwrap(), evidence);
-    }
-
-    #[test]
-    fn finishing_a_run_settles_ticket_lease_and_evidence_atomically() {
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        claim_run(&store, &claim_t1("R1"), 2_000);
-        store
-            .record_aftercare_stage(
-                "R1",
-                &StageRecord {
-                    stage_index: 0,
-                    stage: "test".into(),
-                    state: "passed".into(),
-                    started_at_ms: 2_500,
-                    finished_at_ms: 2_900,
-                    exit_code: Some(0),
-                    output_ref: "runs/R1/output.ndjson".into(),
-                    verdict_source: "exit_code".into(),
-                    reason: None,
-                },
-            )
-            .unwrap();
-
-        store
-            .finish_run(
-                "R1",
-                "T1",
-                Some(0),
-                Outcome::Merged,
-                &[EvidenceRecord {
-                    kind: "commits_observed",
-                    data_json: "{\"oids\":[\"abc\",\"def\"]}".into(),
-                }],
-                None,
-                3_000,
-            )
-            .unwrap();
-
-        assert_eq!(store.ticket_state("T1").unwrap().unwrap(), "merged");
-        let run = store.run("R1").unwrap().unwrap();
-        assert_eq!(run.state, "merged");
-        assert_eq!(run.exit_code, Some(0));
-        assert_eq!(run.exited_at_ms, Some(3_000));
-        let evidence = store.run_evidence("R1").unwrap();
-        assert_eq!(evidence[0].0, "commits_observed");
-        assert_eq!(store.aftercare_stages("R1").unwrap()[0].stage, "test");
-        assert!(store.renew_lease("T1", "R1", 60_000, 3_100).is_err());
-    }
-
-    #[test]
-    fn finishing_a_run_is_idempotent() {
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        claim_run(&store, &claim_t1("R1"), 2_000);
-        let evidence = [EvidenceRecord {
-            kind: "exit_classified",
-            data_json: "{\"exit_code\":1}".into(),
-        }];
-
-        store
-            .finish_run("R1", "T1", Some(1), Outcome::Failed, &evidence, None, 3_000)
-            .unwrap();
-        store
-            .finish_run("R1", "T1", Some(1), Outcome::Failed, &evidence, None, 3_100)
-            .unwrap();
-
-        assert_eq!(store.run_evidence("R1").unwrap().len(), 1);
-        assert_eq!(store.run("R1").unwrap().unwrap().exited_at_ms, Some(3_000));
-    }
-
-    #[test]
-    fn a_cancelled_outcome_returns_the_ticket_to_ready() {
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        claim_run(&store, &claim_t1("R1"), 2_000);
-
-        assert!(!store.cancellation_requested("R1").unwrap());
-        store.record_cancel_requested("R1", 2_500).unwrap();
-        store.record_cancel_requested("R1", 2_600).unwrap();
-        assert!(store.cancellation_requested("R1").unwrap());
-
-        store
-            .finish_run("R1", "T1", None, Outcome::Cancelled, &[], None, 3_000)
-            .unwrap();
-        assert_eq!(store.ticket_state("T1").unwrap().unwrap(), "ready");
-        assert_eq!(store.ticket_counts().unwrap().ready, 1);
-
-        let cancels = store
-            .run_evidence("R1")
-            .unwrap()
-            .into_iter()
-            .filter(|(kind, _)| kind == "cancel_requested")
-            .count();
-        assert_eq!(cancels, 1);
     }
 }
