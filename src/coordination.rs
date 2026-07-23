@@ -12,7 +12,7 @@
 //! KEY and `run_id` is UNIQUE, so the database engine enforces at most one
 //! lease per ticket and per run. That is the durable guard against
 //! double-spawn, backstopping the conditional `UPDATE ... WHERE state='ready'`
-//! inside `claim_ticket`.
+//! inside [`Coordination::claim`].
 //!
 //! Leases are held only by the daemon. `owner_id` records which daemon process
 //! took the claim. Workers never hold, renew, or observe leases: a worker's
@@ -38,9 +38,11 @@
 //! [`Coordination::readopt`] instead.
 
 use crate::outcome::Outcome;
+use crate::run_store::runs;
 use crate::store::{
-    ClaimRequest, ClaimedRun, CooldownUpdate, EvidenceRecord, ExitClaim, Store, StoreError,
+    self, ClaimRequest, ClaimedRun, CooldownUpdate, EvidenceRecord, ExitClaim, Store, StoreError,
 };
+use rusqlite::TransactionBehavior;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claim {
@@ -117,15 +119,21 @@ pub struct RunExit<'a> {
     pub cooldown_until_ms: Option<i64>,
 }
 
-pub struct Coordination<'a>(&'a mut Store);
+pub struct Coordination(Store);
 
-impl<'a> Coordination<'a> {
-    pub fn new(store: &'a mut Store) -> Self {
-        Self(store)
+impl Coordination {
+    pub fn new(store: &mut Store) -> Self {
+        Self(Store::from_db(store.db()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_shared(store: &Store) -> Self {
+        Self(Store::from_db(store.db()))
     }
 
     pub fn claim(&mut self, claim: &ClaimRequest<'_>, now_ms: i64) -> Result<Claim, StoreError> {
-        match self.0.claim_ticket(claim, now_ms) {
+        let result = self.claim_transaction(claim, now_ms);
+        match result {
             Ok(claimed) => Ok(Claim::Granted(claimed)),
             Err(StoreError::TicketNotReady { .. }) => Ok(Claim::Denied(ClaimDenial::NotReady)),
             Err(StoreError::ActivationNotQueued { .. }) => {
@@ -133,6 +141,53 @@ impl<'a> Coordination<'a> {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn claim_transaction(
+        &self,
+        claim: &ClaimRequest<'_>,
+        now_ms: i64,
+    ) -> Result<ClaimedRun, StoreError> {
+        let db = self.0.db();
+        let mut connection = db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        store::tx::claim_ticket(&transaction, claim, now_ms)?;
+        store::tx::advance_activation(&transaction, claim, now_ms)?;
+
+        // The run's attempt counts runs, not the ticket's retry budget:
+        // `retry` resets `tickets.attempts`, and a reused number would make two
+        // runs answer to the same alias. Allocating inside the claim
+        // transaction keeps the sequence gap-free under concurrent claims.
+        let attempt = runs::tx::next_attempt(&transaction, claim.ticket_id)?;
+
+        runs::tx::insert_claimed(
+            &transaction,
+            claim.run_id,
+            claim.activation_id,
+            claim.ticket_id,
+            attempt,
+            claim.flow_json,
+            claim.ticket_json,
+            now_ms,
+        )?;
+
+        let expires_at_ms = store::tx::insert_lease(&transaction, claim, now_ms)?;
+        runs::tx::record_event(
+            &transaction,
+            now_ms,
+            "run_claimed",
+            Some(claim.run_id),
+            Some(claim.ticket_id),
+            &serde_json::json!({"attempt": attempt}).to_string(),
+        )?;
+
+        transaction.commit()?;
+        Ok(ClaimedRun {
+            run_id: claim.run_id.into(),
+            attempt,
+            lease_expires_at_ms: expires_at_ms,
+        })
     }
 
     pub fn renew(
@@ -172,12 +227,14 @@ impl<'a> Coordination<'a> {
 
     /// Turns a claimed run `running` once its agent process exists.
     ///
-    /// Takes the store by shared reference: the transition needs no exclusive
-    /// connection state, and the runner's stage hooks that call it hold only a
-    /// shared borrow. It is an associated function for that reason alone —
-    /// the coordination boundary is the same.
+    /// Takes the store by shared reference because the runner's stage hooks
+    /// that call it hold only a shared borrow.
     pub fn start(store: &Store, start: &RunStart<'_>, now_ms: i64) -> Result<Start, StoreError> {
-        match store.mark_run_running(
+        let db = store.db();
+        let mut connection = db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = runs::tx::mark_running(
+            &transaction,
             start.run_id,
             start.branch,
             start.worktree_path,
@@ -187,13 +244,22 @@ impl<'a> Coordination<'a> {
             start.worker_token,
             start.worker_socket_path,
             now_ms,
-        ) {
-            Ok(()) => Ok(Start::Granted),
-            Err(StoreError::RunStateConflict { state, .. }) => {
-                Ok(Start::Denied(StartDenial::NotClaimed { state }))
-            }
-            Err(error) => Err(error),
+        )?;
+        if changed != 1 {
+            let state = runs::tx::state(&transaction, start.run_id)?;
+            return Ok(Start::Denied(StartDenial::NotClaimed { state }));
         }
+        let ticket_id = runs::tx::ticket_id(&transaction, start.run_id)?;
+        runs::tx::record_event(
+            &transaction,
+            now_ms,
+            "run_started",
+            Some(start.run_id),
+            Some(&ticket_id),
+            "{}",
+        )?;
+        transaction.commit()?;
+        Ok(Start::Granted)
     }
 
     /// Checkpoints an agent's exit, granting the caller ownership of aftercare.
@@ -253,7 +319,7 @@ mod tests {
         RunStart, Start, StartDenial,
     };
     use crate::domain::ticket::TicketState;
-    use crate::store::{ActivationKind, ClaimRequest, NewActivation, Store};
+    use crate::store::{ActivationKind, ClaimRequest, NewActivation, Store, StoreError};
 
     fn claim_t1(run_id: &str) -> ClaimRequest<'_> {
         ClaimRequest {
@@ -311,14 +377,118 @@ mod tests {
         let mut store = seeded_store(&directory);
         let mut coordination = Coordination::new(&mut store);
 
-        assert!(matches!(
-            coordination.claim(&claim_t1("R1"), 2_000).unwrap(),
-            Claim::Granted(_)
-        ));
+        let Claim::Granted(claimed) = coordination.claim(&claim_t1("R1"), 2_000).unwrap() else {
+            panic!("first claim was denied");
+        };
+        assert_eq!(claimed.attempt, 1);
+        assert_eq!(claimed.lease_expires_at_ms, 62_000);
         assert_eq!(
             coordination.claim(&claim_t1("R2"), 2_100).unwrap(),
             Claim::Denied(ClaimDenial::NotReady)
         );
+        assert!(matches!(
+            coordination.claim_transaction(&claim_t1("R3"), 2_200),
+            Err(StoreError::TicketNotReady { state: Some(state), .. }) if state == "claimed"
+        ));
+    }
+
+    #[test]
+    fn claiming_an_unknown_ticket_reports_it_not_ready() {
+        let directory = tempdir().unwrap();
+        let store = seeded_store(&directory);
+        let mut coordination = Coordination::from_shared(&store);
+
+        let request = ClaimRequest {
+            ticket_id: "missing",
+            ..claim_t1("R1")
+        };
+        assert_eq!(
+            coordination.claim(&request, 2_000).unwrap(),
+            Claim::Denied(ClaimDenial::NotReady)
+        );
+        assert!(matches!(
+            coordination.claim_transaction(&request, 2_000),
+            Err(StoreError::TicketNotReady { state: None, .. })
+        ));
+    }
+
+    #[test]
+    fn missing_and_blocked_ticket_diagnostics_are_preserved() {
+        let directory = tempdir().unwrap();
+        let store = seeded_store(&directory);
+        store.mark_ticket_missing("T1", 2_000).unwrap();
+        let coordination = Coordination::from_shared(&store);
+
+        assert!(matches!(
+            coordination.claim_transaction(&claim_t1("R1"), 2_000),
+            Err(StoreError::TicketNotReady { state: Some(state), .. }) if state == "missing"
+        ));
+
+        store.clear_ticket_missing("T1", 2_100).unwrap();
+        store
+            .insert_local_ticket(
+                "T2",
+                "default",
+                "tickets/T2.md",
+                "Ticket two",
+                &["T1".into()],
+                "sloop/T2",
+                Some("opencode"),
+                None,
+                None,
+                "default",
+                TicketState::Ready,
+                2_100,
+            )
+            .unwrap();
+        store
+            .db()
+            .lock()
+            .execute("UPDATE tickets SET state = 'failed' WHERE id = 'T1'", [])
+            .unwrap();
+        let request = ClaimRequest {
+            ticket_id: "T2",
+            run_id: "R2",
+            ..claim_t1("R1")
+        };
+        assert!(matches!(
+            coordination.claim_transaction(&request, 2_200),
+            Err(StoreError::TicketNotReady { state: Some(state), .. }) if state == "blocked"
+        ));
+        assert_eq!(store.ticket("T2").unwrap().unwrap().attempts, 0);
+    }
+
+    #[test]
+    fn concurrent_connections_cannot_both_claim_one_ticket() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("sloop.db");
+        drop(seeded_store(&directory));
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let claims: Vec<_> = ["R1", "R2"]
+            .into_iter()
+            .map(|run_id| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let store = Store::open(&path, 2_000).unwrap();
+                    barrier.wait();
+                    matches!(
+                        Coordination::from_shared(&store)
+                            .claim(&claim_t1(run_id), 2_000)
+                            .unwrap(),
+                        Claim::Granted(_)
+                    )
+                })
+            })
+            .collect();
+
+        let successes = claims
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|claimed| *claimed)
+            .count();
+        assert_eq!(successes, 1);
     }
 
     #[test]

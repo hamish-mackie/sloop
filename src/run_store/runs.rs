@@ -1010,6 +1010,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::RunState;
+    use crate::coordination::{Claim, Coordination, RunStart, Start};
     use crate::db::SCHEMA_VERSION;
     use crate::domain::ticket::{TicketSnapshot, TicketState};
     use crate::flow::{Flow, Stage, StageKind, VerdictPolicy};
@@ -1071,21 +1072,38 @@ mod tests {
         }
     }
 
+    fn claim_run(store: &Store, claim: &ClaimRequest<'_>, now_ms: i64) {
+        assert!(matches!(
+            Coordination::from_shared(store)
+                .claim(claim, now_ms)
+                .unwrap(),
+            Claim::Granted(_)
+        ));
+    }
+
+    fn start_run(store: &Store, start: &RunStart<'_>, now_ms: i64) {
+        assert_eq!(
+            Coordination::start(store, start, now_ms).unwrap(),
+            Start::Granted
+        );
+    }
+
     fn running_r1(store: &mut Store) {
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
-        store
-            .mark_run_running(
-                "R1",
-                "branch",
-                "/worktree",
-                123,
-                Some(456),
-                123,
-                "token",
-                "/runtime/R1.sock",
-                2_100,
-            )
-            .unwrap();
+        claim_run(store, &claim_t1("R1"), 2_000);
+        start_run(
+            store,
+            &RunStart {
+                run_id: "R1",
+                branch: "branch",
+                worktree_path: "/worktree",
+                pid: 123,
+                pid_start_time: Some(456),
+                process_group_id: 123,
+                worker_token: "token",
+                worker_socket_path: "/runtime/R1.sock",
+            },
+            2_100,
+        );
     }
 
     #[test]
@@ -1131,7 +1149,7 @@ mod tests {
     #[test]
     fn claims_persist_flow_and_ticket_snapshots() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        let store = open_seeded(&directory.path().join("sloop.db"));
         let flow = Flow {
             name: "default".into(),
             stages: vec![
@@ -1164,16 +1182,15 @@ mod tests {
         let flow_json = serde_json::to_string(&flow).unwrap();
         let ticket_json = serde_json::to_string(&ticket).unwrap();
 
-        store
-            .claim_ticket(
-                &ClaimRequest {
-                    flow_json: &flow_json,
-                    ticket_json: &ticket_json,
-                    ..claim_t1("R1")
-                },
-                2_000,
-            )
-            .unwrap();
+        claim_run(
+            &store,
+            &ClaimRequest {
+                flow_json: &flow_json,
+                ticket_json: &ticket_json,
+                ..claim_t1("R1")
+            },
+            2_000,
+        );
 
         let run = store.run("R1").unwrap().unwrap();
         assert_eq!(
@@ -1192,24 +1209,25 @@ mod tests {
         let mut store = open_seeded(&directory.path().join("sloop.db"));
         assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
 
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        claim_run(&store, &claim_t1("R1"), 2_000);
         assert_eq!(
             store.active_run_for_ticket("T1").unwrap(),
             Some(("R1".into(), 1))
         );
-        store
-            .mark_run_running(
-                "R1",
-                "branch",
-                "/tmp/worktree",
-                1,
-                Some(1),
-                1,
-                "token",
-                "/runtime/R1.sock",
-                2_100,
-            )
-            .unwrap();
+        start_run(
+            &store,
+            &RunStart {
+                run_id: "R1",
+                branch: "branch",
+                worktree_path: "/tmp/worktree",
+                pid: 1,
+                pid_start_time: Some(1),
+                process_group_id: 1,
+                worker_token: "token",
+                worker_socket_path: "/runtime/R1.sock",
+            },
+            2_100,
+        );
         assert_eq!(
             store.active_run_for_ticket("T1").unwrap(),
             Some(("R1".into(), 1))
@@ -1225,21 +1243,22 @@ mod tests {
     fn recoverable_runs_round_trip_process_identity_and_lease() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("sloop.db");
-        let mut store = open_seeded(&path);
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
-        store
-            .mark_run_running(
-                "R1",
-                "sloop/T1-a1-R1",
-                "/worktrees/R1",
-                123,
-                Some(456),
-                123,
-                "worker-token",
-                "/runtime/R1.sock",
-                2_100,
-            )
-            .unwrap();
+        let store = open_seeded(&path);
+        claim_run(&store, &claim_t1("R1"), 2_000);
+        start_run(
+            &store,
+            &RunStart {
+                run_id: "R1",
+                branch: "sloop/T1-a1-R1",
+                worktree_path: "/worktrees/R1",
+                pid: 123,
+                pid_start_time: Some(456),
+                process_group_id: 123,
+                worker_token: "worker-token",
+                worker_socket_path: "/runtime/R1.sock",
+            },
+            2_100,
+        );
         drop(store);
 
         let store = Store::open(&path, 3_000).unwrap();
@@ -1317,7 +1336,7 @@ mod tests {
     fn abandoned_claims_append_an_abort_event() {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        claim_run(&store, &claim_t1("R1"), 2_000);
         store.abort_claim("R1", "T1", 2_100).unwrap();
 
         let kinds: Vec<String> = store
@@ -1332,8 +1351,8 @@ mod tests {
     #[test]
     fn notes_round_trip_in_arrival_order() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        let store = open_seeded(&directory.path().join("sloop.db"));
+        claim_run(&store, &claim_t1("R1"), 2_000);
 
         assert_eq!(store.next_note_ordinal().unwrap(), 1);
         store.insert_note("N1", "R1", "first", 3_000).unwrap();
@@ -1420,8 +1439,8 @@ mod tests {
     fn version_eight_migrates_existing_runs_with_null_snapshots() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("sloop.db");
-        let mut store = open_seeded(&path);
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        let store = open_seeded(&path);
+        claim_run(&store, &claim_t1("R1"), 2_000);
         drop(store);
 
         let connection = Connection::open(&path).unwrap();

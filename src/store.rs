@@ -235,6 +235,100 @@ fn replace_ticket_blockers(
     Ok(())
 }
 
+pub(crate) mod tx {
+    use rusqlite::{OptionalExtension, Transaction, params};
+
+    use super::{ClaimRequest, StoreError};
+
+    pub(crate) fn claim_ticket(
+        transaction: &Transaction<'_>,
+        claim: &ClaimRequest<'_>,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let changed = transaction.execute(
+            "UPDATE tickets
+             SET state = 'claimed', held_reason = NULL, attempts = attempts + 1, updated_at_ms = ?2
+             WHERE id = ?1 AND state = 'ready' AND missing_at_ms IS NULL
+               AND NOT EXISTS (SELECT 1 FROM ticket_blockers b
+                               JOIN tickets bt ON bt.id = b.blocker_id
+                               WHERE b.ticket_id = tickets.id
+                                 AND bt.state != 'merged')",
+            params![claim.ticket_id, now_ms],
+        )?;
+        if changed != 1 {
+            let state: Option<String> = transaction
+                .query_row(
+                    "SELECT CASE
+                              WHEN missing_at_ms IS NOT NULL THEN 'missing'
+                              WHEN state = 'ready' AND EXISTS (
+                                  SELECT 1 FROM ticket_blockers b
+                                  JOIN tickets bt ON bt.id = b.blocker_id
+                                  WHERE b.ticket_id = tickets.id
+                                    AND bt.state != 'merged'
+                              ) THEN 'blocked'
+                              ELSE state
+                            END
+                     FROM tickets WHERE id = ?1",
+                    params![claim.ticket_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            return Err(StoreError::TicketNotReady {
+                ticket_id: claim.ticket_id.into(),
+                state,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn advance_activation(
+        transaction: &Transaction<'_>,
+        claim: &ClaimRequest<'_>,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let activation_changed = match claim.next_activation_eligible_at_ms {
+            Some(eligible_at_ms) => transaction.execute(
+                "UPDATE activations
+                 SET eligible_at_ms = ?2, updated_at_ms = ?3
+                 WHERE id = ?1 AND state = 'queued' AND kind = 'every'",
+                params![claim.activation_id, eligible_at_ms, now_ms],
+            )?,
+            None => transaction.execute(
+                "UPDATE activations SET state = 'completed', updated_at_ms = ?2
+                 WHERE id = ?1 AND state = 'queued' AND kind != 'every'",
+                params![claim.activation_id, now_ms],
+            )?,
+        };
+        if activation_changed != 1 {
+            return Err(StoreError::ActivationNotQueued {
+                activation_id: claim.activation_id.into(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn insert_lease(
+        transaction: &Transaction<'_>,
+        claim: &ClaimRequest<'_>,
+        now_ms: i64,
+    ) -> Result<i64, StoreError> {
+        let expires_at_ms = now_ms + claim.lease_ms;
+        transaction.execute(
+            "INSERT INTO leases
+                 (ticket_id, run_id, owner_id, acquired_at_ms, renewed_at_ms, expires_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+            params![
+                claim.ticket_id,
+                claim.run_id,
+                claim.owner_id,
+                now_ms,
+                expires_at_ms,
+            ],
+        )?;
+        Ok(expires_at_ms)
+    }
+}
+
 pub struct Store {
     db: Db,
 }
@@ -1105,56 +1199,6 @@ impl Store {
             .map_err(StoreError::from)
     }
 
-    /// Records a successful launch: the run turns `running` and carries the
-    /// worktree, branch, and durable process identity.
-    #[allow(clippy::too_many_arguments)]
-    pub fn mark_run_running(
-        &self,
-        run_id: &str,
-        branch: &str,
-        worktree_path: &str,
-        pid: u32,
-        pid_start_time: Option<i64>,
-        process_group_id: u32,
-        worker_token: &str,
-        worker_socket_path: &str,
-        now_ms: i64,
-    ) -> Result<(), StoreError> {
-        let mut connection = self.db.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = runs::tx::mark_running(
-            &transaction,
-            run_id,
-            branch,
-            worktree_path,
-            pid,
-            pid_start_time,
-            process_group_id,
-            worker_token,
-            worker_socket_path,
-            now_ms,
-        )?;
-        if changed != 1 {
-            let state = runs::tx::state(&transaction, run_id)?;
-            return Err(StoreError::RunStateConflict {
-                run_id: run_id.into(),
-                state,
-                requested: RunState::Running.as_str().into(),
-            });
-        }
-        let ticket_id = runs::tx::ticket_id(&transaction, run_id)?;
-        runs::tx::record_event(
-            &transaction,
-            now_ms,
-            "run_started",
-            Some(run_id),
-            Some(&ticket_id),
-            "{}",
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-
     /// Terminates a run in one transaction: the raw exit and derived outcome
     /// land on the run, evidence is appended, the lease is
     /// freed, and the ticket moves to its terminal state or back to `ready`
@@ -1672,117 +1716,6 @@ impl Store {
             .map_err(StoreError::from)
     }
 
-    /// Claims a ready ticket for one run in a single transaction. The
-    /// conditional update plus the primary key on `leases.ticket_id` are the
-    /// durable guards against a double claim.
-    pub(crate) fn claim_ticket(
-        &mut self,
-        claim: &ClaimRequest<'_>,
-        now_ms: i64,
-    ) -> Result<ClaimedRun, StoreError> {
-        let mut connection = self.db.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-        let changed = transaction.execute(
-            "UPDATE tickets
-             SET state = 'claimed', held_reason = NULL, attempts = attempts + 1, updated_at_ms = ?2
-             WHERE id = ?1 AND state = 'ready' AND missing_at_ms IS NULL
-               AND NOT EXISTS (SELECT 1 FROM ticket_blockers b
-                               JOIN tickets bt ON bt.id = b.blocker_id
-                               WHERE b.ticket_id = tickets.id
-                                 AND bt.state != 'merged')",
-            params![claim.ticket_id, now_ms],
-        )?;
-        if changed != 1 {
-            let state: Option<String> = transaction
-                .query_row(
-                    "SELECT CASE
-                              WHEN missing_at_ms IS NOT NULL THEN 'missing'
-                              WHEN state = 'ready' AND EXISTS (
-                                  SELECT 1 FROM ticket_blockers b
-                                  JOIN tickets bt ON bt.id = b.blocker_id
-                                  WHERE b.ticket_id = tickets.id
-                                    AND bt.state != 'merged'
-                              ) THEN 'blocked'
-                              ELSE state
-                            END
-                     FROM tickets WHERE id = ?1",
-                    params![claim.ticket_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            return Err(StoreError::TicketNotReady {
-                ticket_id: claim.ticket_id.into(),
-                state,
-            });
-        }
-
-        let activation_changed = match claim.next_activation_eligible_at_ms {
-            Some(eligible_at_ms) => transaction.execute(
-                "UPDATE activations
-                 SET eligible_at_ms = ?2, updated_at_ms = ?3
-                 WHERE id = ?1 AND state = 'queued' AND kind = 'every'",
-                params![claim.activation_id, eligible_at_ms, now_ms],
-            )?,
-            None => transaction.execute(
-                "UPDATE activations SET state = 'completed', updated_at_ms = ?2
-                 WHERE id = ?1 AND state = 'queued' AND kind != 'every'",
-                params![claim.activation_id, now_ms],
-            )?,
-        };
-        if activation_changed != 1 {
-            return Err(StoreError::ActivationNotQueued {
-                activation_id: claim.activation_id.into(),
-            });
-        }
-
-        // The run's attempt counts runs, not the ticket's retry budget:
-        // `retry` resets `tickets.attempts`, and a reused number would make two
-        // runs answer to the same alias. Allocating inside the claim
-        // transaction keeps the sequence gap-free under concurrent claims.
-        let attempt = runs::tx::next_attempt(&transaction, claim.ticket_id)?;
-
-        runs::tx::insert_claimed(
-            &transaction,
-            claim.run_id,
-            claim.activation_id,
-            claim.ticket_id,
-            attempt,
-            claim.flow_json,
-            claim.ticket_json,
-            now_ms,
-        )?;
-
-        let expires_at_ms = now_ms + claim.lease_ms;
-        transaction.execute(
-            "INSERT INTO leases
-                 (ticket_id, run_id, owner_id, acquired_at_ms, renewed_at_ms, expires_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
-            params![
-                claim.ticket_id,
-                claim.run_id,
-                claim.owner_id,
-                now_ms,
-                expires_at_ms,
-            ],
-        )?;
-        runs::tx::record_event(
-            &transaction,
-            now_ms,
-            "run_claimed",
-            Some(claim.run_id),
-            Some(claim.ticket_id),
-            &serde_json::json!({"attempt": attempt}).to_string(),
-        )?;
-
-        transaction.commit()?;
-        Ok(ClaimedRun {
-            run_id: claim.run_id.into(),
-            attempt,
-            lease_expires_at_ms: expires_at_ms,
-        })
-    }
-
     /// Re-arms the lease of a run this daemon has just adopted, returning the
     /// new expiry. Unlike [`Store::renew_lease`] this accepts an already
     /// expired lease: a daemon down longer than the TTL comes back to leases
@@ -2107,6 +2040,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{ActivationKind, ClaimRequest, NewActivation, ReindexTicket, Store, StoreError};
+    use crate::coordination::{Claim, ClaimDenial, Coordination};
     use crate::domain::ticket::TicketState;
 
     fn open_seeded(path: &std::path::Path) -> Store {
@@ -2179,10 +2113,20 @@ mod tests {
         }
     }
 
+    fn granted_claim(store: &Store, claim: &ClaimRequest<'_>, now_ms: i64) -> super::ClaimedRun {
+        match Coordination::from_shared(store)
+            .claim(claim, now_ms)
+            .unwrap()
+        {
+            Claim::Granted(claimed) => claimed,
+            Claim::Denied(denial) => panic!("claim denied: {denial:?}"),
+        }
+    }
+
     #[test]
     fn missing_tickets_are_not_selected_and_cannot_be_claimed() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        let store = open_seeded(&directory.path().join("sloop.db"));
         store.mark_ticket_missing("T1", 2_000).unwrap();
 
         let activation = super::QueuedActivation {
@@ -2194,12 +2138,12 @@ mod tests {
             interval_ms: None,
         };
         assert_eq!(store.select_ready_ticket(&activation, 2_000).unwrap(), None);
-        match store.claim_ticket(&claim_t1("R1"), 2_000).unwrap_err() {
-            StoreError::TicketNotReady { state, .. } => {
-                assert_eq!(state.as_deref(), Some("missing"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert_eq!(
+            Coordination::from_shared(&store)
+                .claim(&claim_t1("R1"), 2_000)
+                .unwrap(),
+            Claim::Denied(ClaimDenial::NotReady)
+        );
 
         // A second stamp must not restart the deletion clock.
         store.mark_ticket_missing("T1", 5_000).unwrap();
@@ -2221,7 +2165,7 @@ mod tests {
     #[test]
     fn blockers_gate_selection_claims_and_derived_counts_until_merged() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        let store = open_seeded(&directory.path().join("sloop.db"));
         store
             .insert_local_ticket(
                 "T2",
@@ -2263,27 +2207,24 @@ mod tests {
             .execute("UPDATE tickets SET state = 'failed' WHERE id = 'T1'", [])
             .unwrap();
         assert_eq!(store.select_ready_ticket(&activation, 2_000).unwrap(), None);
-        match store
-            .claim_ticket(
-                &ClaimRequest {
-                    ticket_id: "T2",
-                    run_id: "R2",
-                    activation_id: "A1",
-                    owner_id: "daemon-1",
-                    lease_ms: 60_000,
-                    next_activation_eligible_at_ms: None,
-                    flow_json: "{}",
-                    ticket_json: "{}",
-                },
-                2_000,
-            )
-            .unwrap_err()
-        {
-            StoreError::TicketNotReady { state, .. } => {
-                assert_eq!(state.as_deref(), Some("blocked"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert_eq!(
+            Coordination::from_shared(&store)
+                .claim(
+                    &ClaimRequest {
+                        ticket_id: "T2",
+                        run_id: "R2",
+                        activation_id: "A1",
+                        owner_id: "daemon-1",
+                        lease_ms: 60_000,
+                        next_activation_eligible_at_ms: None,
+                        flow_json: "{}",
+                        ticket_json: "{}",
+                    },
+                    2_000,
+                )
+                .unwrap(),
+            Claim::Denied(ClaimDenial::NotReady)
+        );
         assert_eq!(store.ticket("T2").unwrap().unwrap().attempts, 0);
 
         store
@@ -2309,8 +2250,8 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("sloop.db");
 
-        let mut store = open_seeded(&path);
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        let store = open_seeded(&path);
+        granted_claim(&store, &claim_t1("R1"), 2_000);
         drop(store);
 
         let store = Store::open(&path, 3_000).unwrap();
@@ -2356,25 +2297,9 @@ mod tests {
     }
 
     #[test]
-    fn a_claimed_ticket_cannot_be_claimed_again() {
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-
-        let claimed = store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
-        assert_eq!(claimed.attempt, 1);
-        assert_eq!(claimed.lease_expires_at_ms, 62_000);
-
-        let error = store.claim_ticket(&claim_t1("R2"), 2_100).unwrap_err();
-        assert!(matches!(
-            error,
-            StoreError::TicketNotReady { state: Some(ref state), .. } if state == "claimed"
-        ));
-    }
-
-    #[test]
     fn tickets_are_ordered_newest_first_and_include_attempts() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        let store = open_seeded(&directory.path().join("sloop.db"));
         store
             .insert_local_project("alpha", ".agents/sloop/projects/alpha.md", "Alpha", 1_000)
             .unwrap();
@@ -2410,7 +2335,7 @@ mod tests {
                 1_000,
             )
             .unwrap();
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        granted_claim(&store, &claim_t1("R1"), 2_000);
 
         let tickets = store.tickets().unwrap();
         // T0 registered last, so it leads despite the lowest ordinal and a
@@ -2431,7 +2356,7 @@ mod tests {
     fn aborted_claims_are_closed_and_no_longer_active() {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        granted_claim(&store, &claim_t1("R1"), 2_000);
 
         store.abort_claim("R1", "T1", 2_100).unwrap();
 
@@ -2523,8 +2448,8 @@ mod tests {
     #[test]
     fn operator_hold_cannot_steal_a_claim() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        let store = open_seeded(&directory.path().join("sloop.db"));
+        granted_claim(&store, &claim_t1("R1"), 2_000);
 
         assert!(matches!(
             store.set_ticket_hold("T1", TicketState::Held, 2_100),
@@ -2539,7 +2464,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
 
-        let first = store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        let first = granted_claim(&store, &claim_t1("R1"), 2_000);
         assert_eq!(first.attempt, 1);
         store
             .finish_run("R1", "T1", Some(0), Outcome::Failed, &[], None, 2_100)
@@ -2560,15 +2485,14 @@ mod tests {
                 2_300,
             )
             .unwrap();
-        let retried = store
-            .claim_ticket(
-                &ClaimRequest {
-                    activation_id: "A2",
-                    ..claim_t1("R2")
-                },
-                2_300,
-            )
-            .unwrap();
+        let retried = granted_claim(
+            &store,
+            &ClaimRequest {
+                activation_id: "A2",
+                ..claim_t1("R2")
+            },
+            2_300,
+        );
         // `retry` resets the ticket's attempt budget, but a run's attempt
         // counts runs of that ticket: it must keep climbing, or two runs would
         // answer to the same `T1-r1` alias.
@@ -2586,58 +2510,10 @@ mod tests {
     }
 
     #[test]
-    fn claiming_an_unknown_ticket_reports_it_missing() {
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-
-        let error = store
-            .claim_ticket(
-                &ClaimRequest {
-                    ticket_id: "missing",
-                    ..claim_t1("R1")
-                },
-                2_000,
-            )
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            StoreError::TicketNotReady { state: None, .. }
-        ));
-    }
-
-    #[test]
-    fn concurrent_connections_cannot_both_claim_one_ticket() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("sloop.db");
-        open_seeded(&path);
-
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let claims: Vec<_> = ["R1", "R2"]
-            .into_iter()
-            .map(|run_id| {
-                let path = path.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    let mut store = Store::open(&path, 2_000).unwrap();
-                    barrier.wait();
-                    store.claim_ticket(&claim_t1(run_id), 2_000).is_ok()
-                })
-            })
-            .collect();
-
-        let successes = claims
-            .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .filter(|claimed| *claimed)
-            .count();
-        assert_eq!(successes, 1);
-    }
-
-    #[test]
     fn renewing_a_held_lease_extends_its_expiry() {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        granted_claim(&store, &claim_t1("R1"), 2_000);
 
         let expires = store.renew_lease("T1", "R1", 60_000, 10_000).unwrap();
         assert_eq!(expires, 70_000);
@@ -2647,7 +2523,7 @@ mod tests {
     fn a_run_cannot_renew_a_lease_it_does_not_hold() {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        granted_claim(&store, &claim_t1("R1"), 2_000);
 
         let error = store.renew_lease("T1", "R2", 60_000, 10_000).unwrap_err();
         assert!(matches!(error, StoreError::LeaseNotHeld { .. }));
@@ -2657,7 +2533,7 @@ mod tests {
     fn an_expired_lease_cannot_be_renewed() {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        granted_claim(&store, &claim_t1("R1"), 2_000);
 
         // The lease expires at 62_000; renewal at or after that must fail.
         let error = store.renew_lease("T1", "R1", 60_000, 62_000).unwrap_err();
@@ -2668,7 +2544,7 @@ mod tests {
     fn a_readopted_lease_is_re_armed_even_after_it_expired() {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        granted_claim(&store, &claim_t1("R1"), 2_000);
 
         // The lease expired at 62_000, so ordinary renewal is refused...
         assert!(store.renew_lease("T1", "R1", 60_000, 90_000).is_err());
@@ -2687,7 +2563,7 @@ mod tests {
     fn a_settled_run_cannot_be_readopted() {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        granted_claim(&store, &claim_t1("R1"), 2_000);
         store
             .finish_run(
                 "R1",
@@ -2812,7 +2688,7 @@ mod tests {
                 1_500,
             )
             .unwrap();
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        granted_claim(&store, &claim_t1("R1"), 2_000);
 
         let activation = super::QueuedActivation {
             id: "A1".into(),
@@ -2842,7 +2718,7 @@ mod tests {
         use crate::outcome::Outcome;
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        granted_claim(&store, &claim_t1("R1"), 2_000);
 
         store
             .finish_run("R1", "T1", None, Outcome::Orphaned, &[], None, 3_000)

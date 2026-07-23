@@ -178,6 +178,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::CooldownUpdate;
+    use crate::coordination::{Claim, Coordination};
     use crate::domain::ticket::TicketState;
     use crate::outcome::Outcome;
     use crate::store::{ActivationKind, ClaimRequest, NewActivation, QueuedActivation, Store};
@@ -237,6 +238,15 @@ mod tests {
         }
     }
 
+    fn claim_run(store: &Store, run_id: &str, now_ms: i64) {
+        assert!(matches!(
+            Coordination::from_shared(store)
+                .claim(&claim(run_id), now_ms)
+                .unwrap(),
+            Claim::Granted(_)
+        ));
+    }
+
     #[test]
     fn cooldowns_extend_without_shortening_and_gate_ready_work() {
         let directory = tempdir().unwrap();
@@ -250,7 +260,7 @@ mod tests {
             interval_ms: None,
         };
 
-        store.claim_ticket(&claim("R1"), 2_000).unwrap();
+        claim_run(&store, "R1", 2_000);
         store
             .finish_run(
                 "R1",
@@ -271,7 +281,7 @@ mod tests {
         assert_eq!(store.next_active_cooldown(5_000).unwrap(), Some(10_000));
         assert_eq!(store.active_cooldowns(5_000).unwrap()[0].target, "claude");
 
-        store.claim_ticket(&claim("R2"), 5_000).unwrap();
+        claim_run(&store, "R2", 5_000);
         store
             .finish_run(
                 "R2",
@@ -307,7 +317,7 @@ mod tests {
     fn reindex_detaches_cooldowns_and_deletes_budget_reservations() {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim("R1"), 2_000).unwrap();
+        claim_run(&store, "R1", 2_000);
         store
             .finish_run(
                 "R1",

@@ -456,6 +456,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{EvidenceRecord, StageRecord};
+    use crate::coordination::{Claim, Coordination, RunStart, Start};
     use crate::domain::ticket::TicketState;
     use crate::outcome::Outcome;
     use crate::store::{
@@ -517,21 +518,35 @@ mod tests {
         }
     }
 
+    fn claim_run(store: &Store, claim: &ClaimRequest<'_>, now_ms: i64) {
+        assert!(matches!(
+            Coordination::from_shared(store)
+                .claim(claim, now_ms)
+                .unwrap(),
+            Claim::Granted(_)
+        ));
+    }
+
     fn running_r1(store: &mut Store) {
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
-        store
-            .mark_run_running(
-                "R1",
-                "branch",
-                "/worktree",
-                123,
-                Some(456),
-                123,
-                "token",
-                "/runtime/R1.sock",
+        claim_run(store, &claim_t1("R1"), 2_000);
+        assert_eq!(
+            Coordination::start(
+                store,
+                &RunStart {
+                    run_id: "R1",
+                    branch: "branch",
+                    worktree_path: "/worktree",
+                    pid: 123,
+                    pid_start_time: Some(456),
+                    process_group_id: 123,
+                    worker_token: "token",
+                    worker_socket_path: "/runtime/R1.sock",
+                },
                 2_100,
             )
-            .unwrap();
+            .unwrap(),
+            Start::Granted
+        );
     }
 
     #[test]
@@ -701,7 +716,7 @@ mod tests {
     fn finishing_a_run_settles_ticket_lease_and_evidence_atomically() {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        claim_run(&store, &claim_t1("R1"), 2_000);
         store
             .record_aftercare_stage(
                 "R1",
@@ -749,7 +764,7 @@ mod tests {
     fn finishing_a_run_is_idempotent() {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        claim_run(&store, &claim_t1("R1"), 2_000);
         let evidence = [EvidenceRecord {
             kind: "exit_classified",
             data_json: "{\"exit_code\":1}".into(),
@@ -770,7 +785,7 @@ mod tests {
     fn a_cancelled_outcome_returns_the_ticket_to_ready() {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
+        claim_run(&store, &claim_t1("R1"), 2_000);
 
         assert!(!store.cancellation_requested("R1").unwrap());
         store.record_cancel_requested("R1", 2_500).unwrap();
