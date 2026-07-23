@@ -29,9 +29,10 @@ use crate::run_ref::{RandomRunIds, RunIdSource};
 use crate::runner::local::{process_identity_matches, process_start_time};
 use crate::sources::TicketSource;
 use crate::sources::exec::ExecTicketSource;
-use crate::sources::markdown::MarkdownTicketSource;
 use crate::store::{Store, StoreError};
 use crate::vendor_error::{CatalogError, VendorErrorClassifier};
+use crate::work_state::local::LocalSqlite;
+use crate::work_state::markdown::MarkdownTicketSource;
 
 use super::dispatcher::{
     DaemonControl, DispatcherMessage, DispatcherState, RequestOrigin, internal, protocol_error,
@@ -301,6 +302,7 @@ async fn serve(
     log.emit(LogLevel::Info, "sloop::daemon", "daemon_started");
 
     let paused = store.paused().map_err(DaemonError::Store)?;
+    let work_state = LocalSqlite::from_db(store.db());
     let (dispatcher_tx, dispatcher_rx) = mpsc::channel(DISPATCH_CHANNEL_CAPACITY);
     let (events_tx, events_rx) = mpsc::channel(DISPATCH_CHANNEL_CAPACITY);
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<DaemonControl>(1);
@@ -339,6 +341,7 @@ async fn serve(
         socket: repository.operator_socket.clone(),
         daemon_log: repository.daemon_log.clone(),
         store,
+        work_state,
         storage_full: Cell::new(false),
         reconciliation_blocked: false,
         active: HashSet::new(),

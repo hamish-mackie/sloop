@@ -1111,19 +1111,22 @@ pub(super) fn handle_reindex(state: &mut DispatcherState) -> Result<serde_json::
         &state.project_prefix,
     )
     .map_err(|error| internal(&format!("cannot reindex projects: {error}")))?;
-    crate::reindex::run(
-        &state.root,
-        state.ticket_source.as_ref(),
-        &state.worktree_dir,
-        &state.store,
-        now_ms,
-        &state.ticket_prefix,
-        &project_ids,
-        state.agent.as_ref(),
-        &state.flows,
-        &state.default_flow,
-    )
-    .map_err(|error| internal(&format!("cannot reindex tickets: {error}")))
+    state
+        .work_state
+        .sync_from_source(
+            &state.root,
+            state.ticket_source.as_ref(),
+            &state.worktree_dir,
+            now_ms,
+            &state.ticket_prefix,
+            &project_ids,
+            state.agent.as_ref(),
+            &state.flows,
+            &state.default_flow,
+            crate::coordination::drop_reindex_runs,
+            crate::coordination::mark_reindex_runs_cleanup_eligible,
+        )
+        .map_err(|error| internal(&format!("cannot reindex tickets: {error}")))
 }
 
 /// A run named by a reference, together with the alias every human-facing

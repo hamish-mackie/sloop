@@ -439,31 +439,43 @@ pub(crate) fn apply_reindex(
         project_ids,
         tickets,
         now_ms,
-        |transaction, stale_tickets, doomed_activations| {
-            let mut doomed_runs = BTreeSet::new();
-            for ticket_id in stale_tickets {
-                doomed_runs.extend(runs::tx::ids_for_ticket(transaction, ticket_id)?);
-            }
-            for activation_id in doomed_activations {
-                doomed_runs.extend(runs::tx::ids_for_activation(transaction, activation_id)?);
-            }
-
-            let mut rows_dropped = 0;
-            for run_id in &doomed_runs {
-                limits::tx::detach_cooldowns_from_run(transaction, run_id)?;
-                rows_dropped += local::tx::delete_lease(transaction, run_id)?;
-                rows_dropped += evidence::tx::delete_for_run(transaction, run_id)?;
-                rows_dropped += limits::tx::delete_budget_reservation_for_run(transaction, run_id)?;
-                rows_dropped += runs::tx::delete_notes_for_run(transaction, run_id)?;
-                rows_dropped += runs::tx::delete(transaction, run_id)?;
-            }
-            Ok(rows_dropped)
-        },
-        |transaction, ticket_id, now_ms| {
-            runs::tx::mark_failed_or_review_runs_cleanup_eligible(transaction, ticket_id, now_ms)?;
-            Ok(())
-        },
+        drop_reindex_runs,
+        mark_reindex_runs_cleanup_eligible,
     )
+}
+
+pub(crate) fn drop_reindex_runs(
+    transaction: &rusqlite::Transaction<'_>,
+    stale_tickets: &[String],
+    doomed_activations: &BTreeSet<String>,
+) -> Result<usize, StoreError> {
+    let mut doomed_runs = BTreeSet::new();
+    for ticket_id in stale_tickets {
+        doomed_runs.extend(runs::tx::ids_for_ticket(transaction, ticket_id)?);
+    }
+    for activation_id in doomed_activations {
+        doomed_runs.extend(runs::tx::ids_for_activation(transaction, activation_id)?);
+    }
+
+    let mut rows_dropped = 0;
+    for run_id in &doomed_runs {
+        limits::tx::detach_cooldowns_from_run(transaction, run_id)?;
+        rows_dropped += local::tx::delete_lease(transaction, run_id)?;
+        rows_dropped += evidence::tx::delete_for_run(transaction, run_id)?;
+        rows_dropped += limits::tx::delete_budget_reservation_for_run(transaction, run_id)?;
+        rows_dropped += runs::tx::delete_notes_for_run(transaction, run_id)?;
+        rows_dropped += runs::tx::delete(transaction, run_id)?;
+    }
+    Ok(rows_dropped)
+}
+
+pub(crate) fn mark_reindex_runs_cleanup_eligible(
+    transaction: &rusqlite::Transaction<'_>,
+    ticket_id: &str,
+    now_ms: i64,
+) -> Result<(), StoreError> {
+    runs::tx::mark_failed_or_review_runs_cleanup_eligible(transaction, ticket_id, now_ms)?;
+    Ok(())
 }
 
 pub(crate) fn retry_ticket(db: Db, id: &str, now_ms: i64) -> Result<String, StoreError> {
