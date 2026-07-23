@@ -83,6 +83,7 @@ pub(super) struct DispatcherState {
     pub(super) project_dir: PathBuf,
     pub(super) ticket_dir: PathBuf,
     pub(super) ticket_source: Arc<dyn TicketSource>,
+    pub(super) work_state_author_enabled: bool,
     pub(super) worktree_dir: PathBuf,
     pub(super) worktree_retention_ms: Option<i64>,
     pub(super) state_dir: PathBuf,
@@ -178,7 +179,7 @@ pub(super) async fn run_dispatcher(
                 match message {
                     DispatcherMessage::Request { id, request, origin, reply } => {
                         let response = match origin {
-                            RequestOrigin::Operator => dispatch(&mut state, id, request),
+                            RequestOrigin::Operator => dispatch(&mut state, id, request).await,
                             RequestOrigin::Worker { run_id, token } => dispatch_worker(
                                 &mut state,
                                 id,
@@ -461,7 +462,11 @@ pub(super) fn recover_storage(state: &DispatcherState, now_ms: i64) -> bool {
     }
 }
 
-fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> ResponseEnvelope {
+async fn dispatch(
+    state: &mut DispatcherState,
+    id: RequestId,
+    request: Request,
+) -> ResponseEnvelope {
     let data = match request {
         Request::Show(args) => match handle_operator_show(state, &args) {
             Ok(data) => data,
@@ -511,6 +516,12 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
             })
         }
         Request::Post(args) => {
+            if !state.work_state_author_enabled {
+                return ResponseEnvelope::failure(
+                    Some(id),
+                    conflict("the configured ticket source does not support authoring"),
+                );
+            }
             let now_ms = state.clock.now_ms();
             let at_eligible_ms = match &args.activation {
                 crate::protocol::PostActivation::At { time } => {
@@ -545,11 +556,26 @@ fn dispatch(state: &mut DispatcherState, id: RequestId, request: Request) -> Res
                 state.agent.as_ref(),
                 &state.flows,
                 &state.default_flow,
-            ) {
+            )
+            .await
+            {
                 Ok(data) => data,
                 Err(error) => {
                     if let crate::post::PostError::Store(store_error) = &error {
                         mark_storage_full(state, store_error);
+                    } else if matches!(
+                        &error,
+                        crate::post::PostError::Source(
+                            crate::work_state::SourceError::Unavailable { .. }
+                        )
+                    ) && !state.storage_full.replace(true)
+                    {
+                        state.log.emit_with_fields(
+                            LogLevel::Error,
+                            "sloop::dispatcher",
+                            "storage_full",
+                            json!({"error": error.to_string()}),
+                        );
                     }
                     return ResponseEnvelope::failure(Some(id), post_error_body(&error));
                 }
@@ -687,10 +713,12 @@ fn post_error_body(error: &crate::post::PostError) -> ErrorBody {
         PostError::ProjectConflict { .. }
         | PostError::FlowConflict { .. }
         | PostError::TicketIdTaken { .. }
-        | PostError::DependencyCycle(_) => ErrorCode::Conflict,
-        PostError::Io { .. } | PostError::Store(_) | PostError::IdAllocation(_) => {
-            ErrorCode::Internal
-        }
+        | PostError::DependencyCycle(_)
+        | PostError::Source(crate::work_state::SourceError::Rejected { .. }) => ErrorCode::Conflict,
+        PostError::Io { .. }
+        | PostError::Source(_)
+        | PostError::Store(_)
+        | PostError::IdAllocation(_) => ErrorCode::Internal,
     };
     ErrorBody {
         code,

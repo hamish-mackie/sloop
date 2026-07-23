@@ -1,3 +1,4 @@
+use std::fmt;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -29,6 +30,24 @@ pub enum SourceError {
     Rejected { message: String },
     Corrupt { message: String },
 }
+
+impl fmt::Display for SourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable { retry_after } => match retry_after {
+                Some(retry_after) => write!(
+                    formatter,
+                    "work source is unavailable; retry after {} seconds",
+                    retry_after.as_secs()
+                ),
+                None => formatter.write_str("work source is unavailable"),
+            },
+            Self::Rejected { message } | Self::Corrupt { message } => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for SourceError {}
 
 /// The daemon-facing contract for reading and claiming work.
 ///

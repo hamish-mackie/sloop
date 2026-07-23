@@ -307,15 +307,20 @@ async fn serve(
     let (events_tx, events_rx) = mpsc::channel(DISPATCH_CHANNEL_CAPACITY);
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<DaemonControl>(1);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let ticket_source: Arc<dyn TicketSource> = match &config.ticket_source {
-        TicketSourceConfig::Markdown => Arc::new(MarkdownTicketSource::new(
-            &repository.root,
-            &config.ticket_dir,
-        )),
-        TicketSourceConfig::Exec(argv) => {
-            Arc::new(ExecTicketSource::new(&repository.root, argv.clone()))
-        }
-    };
+    let (ticket_source, work_state_author_enabled): (Arc<dyn TicketSource>, bool) =
+        match &config.ticket_source {
+            TicketSourceConfig::Markdown => (
+                Arc::new(MarkdownTicketSource::new(
+                    &repository.root,
+                    &config.ticket_dir,
+                )),
+                true,
+            ),
+            TicketSourceConfig::Exec(argv) => (
+                Arc::new(ExecTicketSource::new(&repository.root, argv.clone())),
+                false,
+            ),
+        };
     let mut state = DispatcherState {
         pid: std::process::id(),
         paused,
@@ -334,6 +339,7 @@ async fn serve(
         project_dir: config.project_dir.clone(),
         ticket_dir: config.ticket_dir.clone(),
         ticket_source,
+        work_state_author_enabled,
         worktree_dir: repository.root.join(&config.worktree_dir),
         worktree_retention_ms: config.worktree_retention_ms,
         state_dir: repository.state_dir.clone(),
