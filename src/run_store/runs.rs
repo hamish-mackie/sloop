@@ -642,11 +642,7 @@ pub(crate) fn ticket_is_referenced(
     ticket_id: &str,
 ) -> rusqlite::Result<bool> {
     connection.query_row(
-        "SELECT EXISTS (SELECT 1 FROM runs WHERE ticket_id = ?1)
-             OR EXISTS (SELECT 1 FROM leases WHERE ticket_id = ?1)
-             OR EXISTS (SELECT 1 FROM activations WHERE ticket_id = ?1)
-             OR EXISTS (SELECT 1 FROM activation_filters WHERE ticket_id = ?1)
-             OR EXISTS (SELECT 1 FROM ticket_blockers WHERE blocker_id = ?1)",
+        "SELECT EXISTS (SELECT 1 FROM runs WHERE ticket_id = ?1)",
         params![ticket_id],
         |row| row.get(0),
     )
@@ -924,10 +920,6 @@ impl RunStore {
         self.write(TransactionBehavior::Deferred, |transaction| {
             tx::trim_events(transaction, keep)
         })
-    }
-
-    pub(crate) fn ticket_is_referenced(&self, ticket_id: &str) -> rusqlite::Result<bool> {
-        ticket_is_referenced(&self.db.lock(), ticket_id)
     }
 
     pub(crate) fn readopt_lease(

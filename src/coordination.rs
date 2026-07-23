@@ -37,12 +37,16 @@
 //! that was down past the TTL re-arms an adopted run's lapsed lease through
 //! [`Coordination::readopt`] instead.
 
+use std::collections::BTreeSet;
+
+use crate::db::Db;
 use crate::domain::ticket::TicketState;
 use crate::outcome::Outcome;
 use crate::run_store::{RunState, evidence, limits, runs};
 use crate::store::{
     self, ClaimRequest, ClaimedRun, CooldownUpdate, EvidenceRecord, ExitClaim, Store, StoreError,
 };
+use crate::work_state::local::{self, LocalSqlite, ReindexResult, ReindexTicket};
 use rusqlite::TransactionBehavior;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,7 +157,7 @@ impl Coordination {
         let mut connection = db.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        store::tx::claim_ticket(&transaction, claim, now_ms)?;
+        local::tx::claim_ticket(&transaction, claim, now_ms)?;
         store::tx::advance_activation(&transaction, claim, now_ms)?;
 
         // The run's attempt counts runs, not the ticket's retry budget:
@@ -298,7 +302,7 @@ impl Coordination {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         store::tx::delete_lease(&transaction, run_id)?;
         runs::tx::abort(&transaction, run_id, now_ms)?;
-        store::tx::abort_ticket(&transaction, ticket_id, now_ms)?;
+        local::tx::abort_ticket(&transaction, ticket_id, now_ms)?;
         runs::tx::record_event(
             &transaction,
             now_ms,
@@ -355,7 +359,7 @@ impl Coordination {
         store::tx::delete_lease(&transaction, run_id)?;
 
         let ticket_state = TicketState::after_outcome(outcome);
-        store::tx::settle_ticket(&transaction, ticket_id, ticket_state, now_ms)?;
+        local::tx::settle_ticket(&transaction, ticket_id, ticket_state, now_ms)?;
         if outcome == Outcome::RateLimited {
             let activation_id = runs::tx::activation_id(&transaction, run_id)?;
             store::tx::requeue_activation(&transaction, &activation_id, now_ms)?;
@@ -399,7 +403,7 @@ impl Coordination {
         let db = self.0.db();
         let mut connection = db.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = store::tx::settle_external_merge(&transaction, ticket_id, now_ms)?;
+        let changed = local::tx::settle_external_merge(&transaction, ticket_id, now_ms)?;
         if changed == 0 {
             transaction.commit()?;
             return Ok(false);
@@ -423,6 +427,56 @@ impl Coordination {
         transaction.commit()?;
         Ok(true)
     }
+}
+
+pub(crate) fn apply_reindex(
+    db: Db,
+    project_ids: &[String],
+    tickets: &[ReindexTicket],
+    now_ms: i64,
+) -> Result<ReindexResult, StoreError> {
+    LocalSqlite::from_db(db).apply_reindex(
+        project_ids,
+        tickets,
+        now_ms,
+        |transaction, stale_tickets, doomed_activations| {
+            let mut doomed_runs = BTreeSet::new();
+            for ticket_id in stale_tickets {
+                doomed_runs.extend(runs::tx::ids_for_ticket(transaction, ticket_id)?);
+            }
+            for activation_id in doomed_activations {
+                doomed_runs.extend(runs::tx::ids_for_activation(transaction, activation_id)?);
+            }
+
+            let mut rows_dropped = 0;
+            for run_id in &doomed_runs {
+                limits::tx::detach_cooldowns_from_run(transaction, run_id)?;
+                rows_dropped += store::tx::delete_lease(transaction, run_id)?;
+                rows_dropped += evidence::tx::delete_for_run(transaction, run_id)?;
+                rows_dropped += limits::tx::delete_budget_reservation_for_run(transaction, run_id)?;
+                rows_dropped += runs::tx::delete_notes_for_run(transaction, run_id)?;
+                rows_dropped += runs::tx::delete(transaction, run_id)?;
+            }
+            Ok(rows_dropped)
+        },
+        |transaction, ticket_id, now_ms| {
+            runs::tx::mark_failed_or_review_runs_cleanup_eligible(transaction, ticket_id, now_ms)?;
+            Ok(())
+        },
+    )
+}
+
+pub(crate) fn retry_ticket(db: Db, id: &str, now_ms: i64) -> Result<String, StoreError> {
+    LocalSqlite::from_db(db).retry_ticket(id, now_ms, |transaction, id, now_ms| {
+        runs::tx::mark_ticket_runs_cleanup_eligible(transaction, id, RunState::Failed, now_ms)?;
+        Ok(())
+    })
+}
+
+pub(crate) fn ticket_is_referenced(db: Db, id: &str) -> Result<bool, StoreError> {
+    let connection = db.lock();
+    Ok(runs::ticket_is_referenced(&connection, id)?
+        || LocalSqlite::ticket_has_work_references_on(&connection, id)?)
 }
 
 #[cfg(test)]

@@ -6,6 +6,8 @@ use crate::domain::work::{
     Disposition, OwnerId, SourceVersion, TicketRef, WorkOutcome, WorkTicket,
 };
 
+pub mod local;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimStrength {
     Atomic,
