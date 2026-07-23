@@ -11,6 +11,64 @@ const TICKET_RECORD_SELECT: &str =
             target, model, effort, flow, attempts, body, held_reason, created_at_ms
      FROM tickets";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationKind {
+    Immediate,
+    Auto,
+    At,
+    Every,
+    Overnight,
+}
+
+impl ActivationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::Auto => "auto",
+            Self::At => "at",
+            Self::Every => "every",
+            Self::Overnight => "overnight",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationState {
+    Queued,
+    Completed,
+    Cancelled,
+}
+
+impl ActivationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewActivation<'a> {
+    pub id: &'a str,
+    pub kind: ActivationKind,
+    pub ticket_id: Option<&'a str>,
+    pub project_id: Option<&'a str>,
+    pub eligible_at_ms: Option<i64>,
+    pub interval_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedActivation {
+    pub id: String,
+    pub kind: String,
+    pub ticket_id: Option<String>,
+    pub project_id: Option<String>,
+    pub eligible_at_ms: Option<i64>,
+    pub interval_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TicketCounts {
     pub ready: u64,
@@ -115,6 +173,71 @@ fn ticket_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TicketRecord> {
 
 pub(crate) mod tx {
     use super::*;
+
+    pub(crate) fn advance_activation(
+        transaction: &Transaction<'_>,
+        claim: &ClaimRequest<'_>,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let activation_changed = match claim.next_activation_eligible_at_ms {
+            Some(eligible_at_ms) => transaction.execute(
+                "UPDATE activations
+                 SET eligible_at_ms = ?2, updated_at_ms = ?3
+                 WHERE id = ?1 AND state = 'queued' AND kind = 'every'",
+                params![claim.activation_id, eligible_at_ms, now_ms],
+            )?,
+            None => transaction.execute(
+                "UPDATE activations SET state = 'completed', updated_at_ms = ?2
+                 WHERE id = ?1 AND state = 'queued' AND kind != 'every'",
+                params![claim.activation_id, now_ms],
+            )?,
+        };
+        if activation_changed != 1 {
+            return Err(StoreError::ActivationNotQueued {
+                activation_id: claim.activation_id.into(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn insert_lease(
+        transaction: &Transaction<'_>,
+        claim: &ClaimRequest<'_>,
+        now_ms: i64,
+    ) -> Result<i64, StoreError> {
+        let expires_at_ms = now_ms + claim.lease_ms;
+        transaction.execute(
+            "INSERT INTO leases
+                 (ticket_id, run_id, owner_id, acquired_at_ms, renewed_at_ms, expires_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+            params![
+                claim.ticket_id,
+                claim.run_id,
+                claim.owner_id,
+                now_ms,
+                expires_at_ms,
+            ],
+        )?;
+        Ok(expires_at_ms)
+    }
+
+    pub(crate) fn delete_lease(
+        transaction: &Transaction<'_>,
+        run_id: &str,
+    ) -> rusqlite::Result<usize> {
+        transaction.execute("DELETE FROM leases WHERE run_id = ?1", params![run_id])
+    }
+
+    pub(crate) fn requeue_activation(
+        transaction: &Transaction<'_>,
+        activation_id: &str,
+        now_ms: i64,
+    ) -> rusqlite::Result<usize> {
+        transaction.execute(
+            "UPDATE activations SET state = 'queued', updated_at_ms = ?2 WHERE id = ?1",
+            params![activation_id, now_ms],
+        )
+    }
 
     pub(crate) fn replace_ticket_blockers(
         transaction: &Transaction<'_>,
@@ -233,6 +356,158 @@ pub struct LocalSqlite {
 impl LocalSqlite {
     pub(crate) fn from_db(db: Db) -> Self {
         Self { db }
+    }
+
+    pub fn insert_activation(
+        &self,
+        activation: &NewActivation<'_>,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        self.db.lock().execute(
+            "INSERT INTO activations
+                 (id, kind, state, ticket_id, project_id, eligible_at_ms, interval_ms,
+                  created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            params![
+                activation.id,
+                activation.kind.as_str(),
+                ActivationState::Queued.as_str(),
+                activation.ticket_id,
+                activation.project_id,
+                activation.eligible_at_ms,
+                activation.interval_ms,
+                now_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_activation_filter(
+        &self,
+        activation_id: &str,
+        ticket_id: &str,
+    ) -> Result<(), StoreError> {
+        self.db.lock().execute(
+            "INSERT OR IGNORE INTO activation_filters (activation_id, ticket_id) VALUES (?1, ?2)",
+            params![activation_id, ticket_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn queued_activations(&self) -> Result<Vec<QueuedActivation>, StoreError> {
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
+            "SELECT id, kind, ticket_id, project_id, eligible_at_ms, interval_ms
+             FROM activations WHERE state = 'queued'
+             ORDER BY created_at_ms, id",
+        )?;
+        let activations = statement
+            .query_map([], |row| {
+                Ok(QueuedActivation {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    ticket_id: row.get(2)?,
+                    project_id: row.get(3)?,
+                    eligible_at_ms: row.get(4)?,
+                    interval_ms: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(activations)
+    }
+
+    pub fn dispatchable_activations(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<QueuedActivation>, StoreError> {
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
+            "SELECT id, kind, ticket_id, project_id, eligible_at_ms, interval_ms
+             FROM activations
+             WHERE state = 'queued'
+               AND (kind IN ('immediate', 'auto') OR eligible_at_ms <= ?1)
+             ORDER BY created_at_ms, id",
+        )?;
+        let activations = statement
+            .query_map(params![now_ms], |row| {
+                Ok(QueuedActivation {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    ticket_id: row.get(2)?,
+                    project_id: row.get(3)?,
+                    eligible_at_ms: row.get(4)?,
+                    interval_ms: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(activations)
+    }
+
+    pub fn next_activation_eligible_at_ms(&self, now_ms: i64) -> Result<Option<i64>, StoreError> {
+        self.db
+            .lock()
+            .query_row(
+                "SELECT MIN(eligible_at_ms) FROM activations
+                 WHERE state = 'queued' AND eligible_at_ms > ?1",
+                params![now_ms],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn queued_ticket_activation(
+        &self,
+        ticket_id: &str,
+        kind: ActivationKind,
+    ) -> Result<Option<String>, StoreError> {
+        self.db
+            .lock()
+            .query_row(
+                "SELECT id FROM activations
+                 WHERE ticket_id = ?1 AND kind = ?2 AND state = 'queued'
+                 ORDER BY created_at_ms LIMIT 1",
+                params![ticket_id, kind.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn reschedule_activation(
+        &self,
+        id: &str,
+        eligible_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        self.db.lock().execute(
+            "UPDATE activations
+             SET eligible_at_ms = ?2, updated_at_ms = ?3
+             WHERE id = ?1 AND state = 'queued'",
+            params![id, eligible_at_ms, now_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn next_activation_ordinal(&self) -> Result<i64, StoreError> {
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let reserved: i64 = transaction.query_row(
+            "SELECT next_ordinal FROM id_counters WHERE kind = 'activation'",
+            [],
+            |row| row.get(0),
+        )?;
+        let existing: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) + 1 FROM activations",
+            [],
+            |row| row.get(0),
+        )?;
+        let ordinal = reserved.max(existing);
+        transaction.execute(
+            "UPDATE id_counters SET next_ordinal = ?1 WHERE kind = 'activation'",
+            params![ordinal + 1],
+        )?;
+        transaction.commit()?;
+        Ok(ordinal)
     }
 
     pub fn insert_local_project(
@@ -717,6 +992,39 @@ impl LocalSqlite {
         Ok(dependencies)
     }
 
+    pub fn select_ready_ticket(
+        &self,
+        project_id: Option<&str>,
+        activation_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<String>, StoreError> {
+        self.db
+            .lock()
+            .query_row(
+                "SELECT t.id FROM tickets t
+                 WHERE t.state = 'ready'
+                   AND t.missing_at_ms IS NULL
+                   AND (?1 IS NULL OR t.project_id = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM ticket_blockers b
+                                   JOIN tickets bt ON bt.id = b.blocker_id
+                                   WHERE b.ticket_id = t.id
+                                     AND bt.state != 'merged')
+                    AND (NOT EXISTS (SELECT 1 FROM activation_filters f
+                                    WHERE f.activation_id = ?2)
+                        OR EXISTS (SELECT 1 FROM activation_filters f
+                                    WHERE f.activation_id = ?2 AND f.ticket_id = t.id))
+                   AND NOT EXISTS (SELECT 1 FROM cooldowns c
+                                   WHERE c.key = 'agent_target:' || t.target
+                                     AND c.until_ms > ?3)
+                  ORDER BY t.created_at_ms, t.id
+                  LIMIT 1",
+                params![project_id, activation_id, now_ms],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     pub fn ticket_is_dispatchable(&self, ticket_id: &str) -> Result<bool, StoreError> {
         self.db
             .lock()
@@ -749,6 +1057,62 @@ impl LocalSqlite {
             .query_map(params![ticket_id], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    pub(crate) fn readopt_lease(
+        &self,
+        ticket_id: &str,
+        run_id: &str,
+        lease_ms: i64,
+        now_ms: i64,
+    ) -> Result<i64, StoreError> {
+        let expires_at_ms = now_ms + lease_ms;
+        let changed = self.db.lock().execute(
+            "UPDATE leases
+             SET renewed_at_ms = ?3, expires_at_ms = ?4
+             WHERE ticket_id = ?1 AND run_id = ?2
+               AND EXISTS (SELECT 1 FROM runs
+                           WHERE id = ?2 AND exited_at_ms IS NULL)",
+            params![ticket_id, run_id, now_ms, expires_at_ms],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::LeaseNotHeld {
+                ticket_id: ticket_id.into(),
+                run_id: run_id.into(),
+            });
+        }
+        Ok(expires_at_ms)
+    }
+
+    pub(crate) fn renew_lease(
+        &self,
+        ticket_id: &str,
+        run_id: &str,
+        lease_ms: i64,
+        now_ms: i64,
+    ) -> Result<i64, StoreError> {
+        let expires_at_ms = now_ms + lease_ms;
+        let changed = self.db.lock().execute(
+            "UPDATE leases
+             SET renewed_at_ms = ?3, expires_at_ms = ?4
+             WHERE ticket_id = ?1 AND run_id = ?2 AND expires_at_ms > ?3",
+            params![ticket_id, run_id, now_ms, expires_at_ms],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::LeaseNotHeld {
+                ticket_id: ticket_id.into(),
+                run_id: run_id.into(),
+            });
+        }
+        Ok(expires_at_ms)
+    }
+
+    pub(crate) fn active_lease_count(&self) -> Result<usize, StoreError> {
+        let count: i64 = self
+            .db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM leases", [], |row| row.get(0))?;
+        Ok(count as usize)
     }
 
     fn all_ticket_blockers(
@@ -1038,6 +1402,181 @@ mod tests {
             Claim::Granted(claimed) => claimed,
             Claim::Denied(denial) => panic!("claim denied: {denial:?}"),
         }
+    }
+
+    #[test]
+    fn renewing_a_held_lease_extends_its_expiry() {
+        let directory = tempdir().unwrap();
+        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        granted_claim(&store, &claim_t1("R1"), 2_000);
+
+        let expires = store.renew_lease("T1", "R1", 60_000, 10_000).unwrap();
+        assert_eq!(expires, 70_000);
+    }
+
+    #[test]
+    fn a_run_cannot_renew_a_lease_it_does_not_hold() {
+        let directory = tempdir().unwrap();
+        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        granted_claim(&store, &claim_t1("R1"), 2_000);
+
+        let error = store.renew_lease("T1", "R2", 60_000, 10_000).unwrap_err();
+        assert!(matches!(error, StoreError::LeaseNotHeld { .. }));
+    }
+
+    #[test]
+    fn an_expired_lease_cannot_be_renewed() {
+        let directory = tempdir().unwrap();
+        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        granted_claim(&store, &claim_t1("R1"), 2_000);
+
+        // The lease expires at 62_000; renewal at or after that must fail.
+        let error = store.renew_lease("T1", "R1", 60_000, 62_000).unwrap_err();
+        assert!(matches!(error, StoreError::LeaseNotHeld { .. }));
+    }
+
+    #[test]
+    fn a_readopted_lease_is_re_armed_even_after_it_expired() {
+        let directory = tempdir().unwrap();
+        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        granted_claim(&store, &claim_t1("R1"), 2_000);
+
+        // The lease expired at 62_000, so ordinary renewal is refused...
+        assert!(store.renew_lease("T1", "R1", 60_000, 90_000).is_err());
+        // ...while adoption re-arms it, and renewal works again afterwards.
+        assert_eq!(
+            store.readopt_lease("T1", "R1", 60_000, 90_000).unwrap(),
+            150_000
+        );
+        assert_eq!(
+            store.renew_lease("T1", "R1", 60_000, 100_000).unwrap(),
+            160_000
+        );
+    }
+
+    #[test]
+    fn a_settled_run_cannot_be_readopted() {
+        let directory = tempdir().unwrap();
+        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        granted_claim(&store, &claim_t1("R1"), 2_000);
+        Coordination::from_shared(&store)
+            .settle("R1", "T1", Some(0), Outcome::Failed, &[], None, 3_000)
+            .unwrap();
+
+        let error = store.readopt_lease("T1", "R1", 60_000, 4_000).unwrap_err();
+        assert!(matches!(error, StoreError::LeaseNotHeld { .. }));
+    }
+
+    #[test]
+    fn ready_work_selection_is_deterministic_and_respects_filters() {
+        let directory = tempdir().unwrap();
+        let store = open_seeded(&directory.path().join("sloop.db"));
+        store
+            .insert_local_ticket(
+                "T0",
+                "default",
+                ".agents/sloop/tickets/t0.md",
+                "Ticket zero",
+                &[],
+                "sloop/T0",
+                None,
+                None,
+                None,
+                "default",
+                TicketState::Ready,
+                2_000,
+            )
+            .unwrap();
+        store
+            .insert_activation(
+                &NewActivation {
+                    id: "A2",
+                    kind: ActivationKind::Immediate,
+                    ticket_id: None,
+                    project_id: None,
+                    eligible_at_ms: None,
+                    interval_ms: None,
+                },
+                2_000,
+            )
+            .unwrap();
+        let activation = QueuedActivation {
+            id: "A2".into(),
+            kind: "immediate".into(),
+            ticket_id: None,
+            project_id: None,
+            eligible_at_ms: None,
+            interval_ms: None,
+        };
+
+        // T1 was registered first, so it wins despite T0 sorting lower.
+        assert_eq!(
+            store
+                .select_ready_ticket(&activation, 2_000)
+                .unwrap()
+                .as_deref(),
+            Some("T1")
+        );
+
+        store.insert_activation_filter("A2", "T0").unwrap();
+        assert_eq!(
+            store
+                .select_ready_ticket(&activation, 2_000)
+                .unwrap()
+                .as_deref(),
+            Some("T0")
+        );
+
+        let scoped = QueuedActivation {
+            project_id: Some("elsewhere".into()),
+            ..activation
+        };
+        assert_eq!(store.select_ready_ticket(&scoped, 2_000).unwrap(), None);
+    }
+
+    #[test]
+    fn tickets_with_unmerged_blockers_are_never_selected() {
+        let directory = tempdir().unwrap();
+        let store = open_seeded(&directory.path().join("sloop.db"));
+        store
+            .insert_local_ticket(
+                "T2",
+                "default",
+                ".agents/sloop/tickets/t2.md",
+                "Ticket two",
+                &["T1".into()],
+                "sloop/T2",
+                Some("claude"),
+                Some("sonnet"),
+                Some("medium"),
+                "default",
+                TicketState::Ready,
+                1_500,
+            )
+            .unwrap();
+        granted_claim(&store, &claim_t1("R1"), 2_000);
+
+        let activation = QueuedActivation {
+            id: "A1".into(),
+            kind: "immediate".into(),
+            ticket_id: None,
+            project_id: None,
+            eligible_at_ms: None,
+            interval_ms: None,
+        };
+        // T1 is claimed and T2's blocker has not merged: nothing is ready.
+        assert_eq!(store.select_ready_ticket(&activation, 2_000).unwrap(), None);
+
+        Coordination::from_shared(&store)
+            .settle("R1", "T1", Some(0), Outcome::Merged, &[], None, 3_000)
+            .unwrap();
+        assert_eq!(
+            store
+                .select_ready_ticket(&activation, 3_000)
+                .unwrap()
+                .as_deref(),
+            Some("T2")
+        );
     }
 
     #[test]

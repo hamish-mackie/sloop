@@ -648,23 +648,6 @@ pub(crate) fn ticket_is_referenced(
     )
 }
 
-pub(crate) fn readopt_lease(
-    connection: &Connection,
-    ticket_id: &str,
-    run_id: &str,
-    now_ms: i64,
-    expires_at_ms: i64,
-) -> rusqlite::Result<usize> {
-    connection.execute(
-        "UPDATE leases
-         SET renewed_at_ms = ?3, expires_at_ms = ?4
-         WHERE ticket_id = ?1 AND run_id = ?2
-           AND EXISTS (SELECT 1 FROM runs
-                       WHERE id = ?2 AND exited_at_ms IS NULL)",
-        params![ticket_id, run_id, now_ms, expires_at_ms],
-    )
-}
-
 pub(crate) fn run(connection: &Connection, id: &str) -> rusqlite::Result<Option<RunRecord>> {
     connection
         .query_row(
@@ -920,16 +903,6 @@ impl RunStore {
         self.write(TransactionBehavior::Deferred, |transaction| {
             tx::trim_events(transaction, keep)
         })
-    }
-
-    pub(crate) fn readopt_lease(
-        &self,
-        ticket_id: &str,
-        run_id: &str,
-        now_ms: i64,
-        expires_at_ms: i64,
-    ) -> rusqlite::Result<usize> {
-        readopt_lease(&self.db.lock(), ticket_id, run_id, now_ms, expires_at_ms)
     }
 
     pub(crate) fn run(&self, id: &str) -> rusqlite::Result<Option<RunRecord>> {

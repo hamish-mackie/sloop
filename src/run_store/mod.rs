@@ -43,10 +43,6 @@ impl RunStore {
         self.reserve_ordinal("note", "notes")
     }
 
-    pub(crate) fn next_activation_ordinal(&self) -> rusqlite::Result<i64> {
-        self.reserve_ordinal("activation", "activations")
-    }
-
     fn reserve_ordinal(&self, kind: &str, table: &str) -> rusqlite::Result<i64> {
         self.write(TransactionBehavior::Immediate, |transaction| {
             tx::reserve_ordinal(transaction, kind, table)

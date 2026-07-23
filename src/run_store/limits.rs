@@ -69,37 +69,6 @@ pub(crate) mod tx {
     }
 }
 
-fn select_ready_ticket(
-    connection: &Connection,
-    project_id: Option<&str>,
-    activation_id: &str,
-    now_ms: i64,
-) -> rusqlite::Result<Option<String>> {
-    connection
-        .query_row(
-            "SELECT t.id FROM tickets t
-             WHERE t.state = 'ready'
-               AND t.missing_at_ms IS NULL
-               AND (?1 IS NULL OR t.project_id = ?1)
-               AND NOT EXISTS (SELECT 1 FROM ticket_blockers b
-                               JOIN tickets bt ON bt.id = b.blocker_id
-                               WHERE b.ticket_id = t.id
-                                 AND bt.state != 'merged')
-                AND (NOT EXISTS (SELECT 1 FROM activation_filters f
-                                WHERE f.activation_id = ?2)
-                    OR EXISTS (SELECT 1 FROM activation_filters f
-                                WHERE f.activation_id = ?2 AND f.ticket_id = t.id))
-               AND NOT EXISTS (SELECT 1 FROM cooldowns c
-                               WHERE c.key = 'agent_target:' || t.target
-                                 AND c.until_ms > ?3)
-              ORDER BY t.created_at_ms, t.id
-              LIMIT 1",
-            params![project_id, activation_id, now_ms],
-            |row| row.get(0),
-        )
-        .optional()
-}
-
 fn active_cooldown_for_target(
     connection: &Connection,
     target: &str,
@@ -147,15 +116,6 @@ fn next_active_cooldown(connection: &Connection, now_ms: i64) -> rusqlite::Resul
 }
 
 impl RunStore {
-    pub(crate) fn select_ready_ticket(
-        &self,
-        project_id: Option<&str>,
-        activation_id: &str,
-        now_ms: i64,
-    ) -> rusqlite::Result<Option<String>> {
-        select_ready_ticket(&self.db.lock(), project_id, activation_id, now_ms)
-    }
-
     pub(crate) fn active_cooldown_for_target(
         &self,
         target: &str,
