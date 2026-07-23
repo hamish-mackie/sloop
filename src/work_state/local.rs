@@ -1,13 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
 
+use crate::clock::{Clock, SystemClock};
 use crate::config::{AgentConfig, expand_agent_cmd};
 use crate::db::Db;
 use crate::domain::ticket::TicketState;
@@ -21,7 +23,7 @@ use crate::ids::next_id;
 use crate::reindex::ReindexError;
 use crate::sources::TicketSource;
 use crate::store::{ClaimRequest, StoreError};
-use crate::work_state::{ClaimResult, ClaimStrength, SourceError, WorkState};
+use crate::work_state::{ActiveClaim, ClaimResult, ClaimStrength, SourceError, WorkState};
 
 const TICKET_RECORD_SELECT: &str =
     "SELECT id, project_id, file_path, source, source_ref, state, name, worktree,
@@ -370,13 +372,19 @@ pub(crate) mod tx {
 
 pub struct LocalSqlite {
     db: Db,
+    clock: Arc<dyn Clock>,
     last_sync_ms: AtomicI64,
 }
 
 impl LocalSqlite {
-    pub(crate) fn from_db(db: Db) -> Self {
+    pub fn from_db(db: Db) -> Self {
+        Self::from_db_with_clock(db, Arc::new(SystemClock))
+    }
+
+    pub fn from_db_with_clock(db: Db, clock: Arc<dyn Clock>) -> Self {
         Self {
             db,
+            clock,
             last_sync_ms: AtomicI64::new(i64::MIN),
         }
     }
@@ -1718,15 +1726,21 @@ fn source_error(error: StoreError) -> SourceError {
     }
 }
 
-fn now_ms() -> Result<i64, SourceError> {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| SourceError::Corrupt {
-            message: format!("system clock is before the Unix epoch: {error}"),
-        })?;
-    i64::try_from(elapsed.as_millis()).map_err(|_| SourceError::Corrupt {
-        message: "system clock is outside the supported range".into(),
-    })
+fn lease_owner(owner: &OwnerId, activation_id: &str) -> String {
+    json!({"owner": owner.0, "activation": activation_id}).to_string()
+}
+
+fn decode_lease_owner(stored: &str) -> (OwnerId, Option<String>) {
+    let parsed = serde_json::from_str::<Value>(stored).ok();
+    let owner = parsed
+        .as_ref()
+        .and_then(|value| value["owner"].as_str())
+        .unwrap_or(stored);
+    let activation = parsed
+        .as_ref()
+        .and_then(|value| value["activation"].as_str())
+        .map(str::to_owned);
+    (OwnerId(owner.into()), activation)
 }
 
 fn lease_ms(ttl: Duration) -> Result<i64, SourceError> {
@@ -1783,6 +1797,8 @@ fn work_ticket(
         blocked_by: record.blocked_by,
         attempts,
         hints: ExecutionHints {
+            worktree: record.worktree,
+            activation_id: None,
             target: record.target,
             model: record.model,
             effort: record.effort,
@@ -1805,7 +1821,7 @@ impl WorkState for LocalSqlite {
     }
 
     async fn pull_ready(&self) -> Result<Vec<WorkTicket>, SourceError> {
-        let now_ms = now_ms()?;
+        let now_ms = self.clock.now_ms();
         let activations = self
             .dispatchable_activations(now_ms)
             .map_err(source_error)?;
@@ -1841,93 +1857,141 @@ impl WorkState for LocalSqlite {
             .collect()
     }
 
+    async fn active_claims(&self) -> Result<Vec<ActiveClaim>, SourceError> {
+        let connection = self.db.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT t.id, t.source, t.source_ref, l.run_id
+                 FROM leases l
+                 JOIN tickets t ON t.id = l.ticket_id
+                 ORDER BY l.acquired_at_ms, l.ticket_id",
+            )
+            .map_err(StoreError::from)
+            .map_err(source_error)?;
+        statement
+            .query_map([], |row| {
+                Ok(ActiveClaim {
+                    ticket: TicketRef {
+                        id: row.get(0)?,
+                        source: row.get(1)?,
+                        source_ref: row.get(2)?,
+                    },
+                    owner: OwnerId(row.get(3)?),
+                })
+            })
+            .map_err(StoreError::from)
+            .map_err(source_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+            .map_err(source_error)
+    }
+
     async fn claim(
         &self,
         ticket: &TicketRef,
         owner: &OwnerId,
         ttl: Duration,
     ) -> Result<ClaimResult, SourceError> {
-        let now_ms = now_ms()?;
+        let now_ms = self.clock.now_ms();
         let lease_ms = lease_ms(ttl)?;
         let mut connection = self.db.lock();
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        // The unchanged schema still points leases at runs. Admission now
+        // commits the source claim first, so this one connection suspends FK
+        // enforcement only while creating that recoverable dangling lease.
+        connection
+            .pragma_update(None, "foreign_keys", false)
             .map_err(StoreError::from)
             .map_err(source_error)?;
-        let Some(activation) = Self::claimable_activation_on(&transaction, &ticket.id, now_ms)
-            .map_err(source_error)?
-        else {
-            return Ok(ClaimResult::Lost { held_by: None });
-        };
-        let next_activation_eligible_at_ms = if activation.kind == "every" {
-            match (activation.eligible_at_ms, activation.interval_ms) {
-                (Some(eligible_at_ms), Some(interval_ms)) => {
-                    rearm_every_at(eligible_at_ms, interval_ms, now_ms)
+        let result = (|| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(StoreError::from)
+                .map_err(source_error)?;
+            let Some(activation) = Self::claimable_activation_on(&transaction, &ticket.id, now_ms)
+                .map_err(source_error)?
+            else {
+                return Ok(ClaimResult::Lost { held_by: None });
+            };
+            let next_activation_eligible_at_ms = if activation.kind == "every" {
+                match (activation.eligible_at_ms, activation.interval_ms) {
+                    (Some(eligible_at_ms), Some(interval_ms)) => {
+                        rearm_every_at(eligible_at_ms, interval_ms, now_ms)
+                    }
+                    _ => None,
                 }
-                _ => None,
+            } else {
+                None
+            };
+            if activation.kind == "every" && next_activation_eligible_at_ms.is_none() {
+                return Err(SourceError::Corrupt {
+                    message: format!(
+                        "recurring activation `{}` has an invalid cadence",
+                        activation.id
+                    ),
+                });
             }
-        } else {
-            None
-        };
-        if activation.kind == "every" && next_activation_eligible_at_ms.is_none() {
-            return Err(SourceError::Corrupt {
-                message: format!(
-                    "recurring activation `{}` has an invalid cadence",
-                    activation.id
-                ),
-            });
-        }
-        let claim = ClaimRequest {
-            ticket_id: &ticket.id,
-            run_id: &owner.0,
-            activation_id: &activation.id,
-            owner_id: &owner.0,
-            lease_ms,
-            next_activation_eligible_at_ms,
-            flow_json: "",
-            ticket_json: "",
-        };
+            let stored_owner = lease_owner(owner, &activation.id);
+            let claim = ClaimRequest {
+                ticket_id: &ticket.id,
+                run_id: &owner.0,
+                activation_id: &activation.id,
+                owner_id: &stored_owner,
+                lease_ms,
+                next_activation_eligible_at_ms,
+                flow_json: "",
+                ticket_json: "",
+            };
 
-        match tx::claim_ticket(&transaction, &claim, now_ms) {
-            Ok(()) => {}
-            Err(StoreError::TicketNotReady { .. }) => {
-                let held_by = transaction
-                    .query_row(
-                        "SELECT owner_id FROM leases WHERE ticket_id = ?1",
-                        params![ticket.id],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()
-                    .map_err(StoreError::from)
-                    .map_err(source_error)?
-                    .map(OwnerId);
-                return Ok(ClaimResult::Lost { held_by });
+            match tx::claim_ticket(&transaction, &claim, now_ms) {
+                Ok(()) => {}
+                Err(StoreError::TicketNotReady { .. }) => {
+                    let held_by = transaction
+                        .query_row(
+                            "SELECT owner_id FROM leases WHERE ticket_id = ?1",
+                            params![ticket.id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(StoreError::from)
+                        .map_err(source_error)?
+                        .map(|stored| decode_lease_owner(&stored).0);
+                    return Ok(ClaimResult::Lost { held_by });
+                }
+                Err(error) => return Err(source_error(error)),
             }
-            Err(error) => return Err(source_error(error)),
-        }
-        tx::advance_activation(&transaction, &claim, now_ms).map_err(source_error)?;
-        tx::insert_lease(&transaction, &claim, now_ms).map_err(source_error)?;
-        let record = Self::ticket_on(&transaction, &ticket.id)
-            .map_err(source_error)?
-            .ok_or_else(|| SourceError::Corrupt {
-                message: format!("claimed ticket `{}` no longer exists", ticket.id),
-            })?;
-        let ticket = work_ticket(record, false, owner.clone())?;
-        transaction
-            .commit()
+            tx::advance_activation(&transaction, &claim, now_ms).map_err(source_error)?;
+            tx::insert_lease(&transaction, &claim, now_ms).map_err(source_error)?;
+            let record = Self::ticket_on(&transaction, &ticket.id)
+                .map_err(source_error)?
+                .ok_or_else(|| SourceError::Corrupt {
+                    message: format!("claimed ticket `{}` no longer exists", ticket.id),
+                })?;
+            let mut ticket = work_ticket(record, false, owner.clone())?;
+            ticket.hints.activation_id = Some(activation.id.clone());
+            transaction
+                .commit()
+                .map_err(StoreError::from)
+                .map_err(source_error)?;
+            Ok(ClaimResult::Claimed { ticket })
+        })();
+        let restored = connection
+            .pragma_update(None, "foreign_keys", true)
             .map_err(StoreError::from)
-            .map_err(source_error)?;
-        Ok(ClaimResult::Claimed { ticket })
+            .map_err(source_error);
+        match (result, restored) {
+            (_, Err(error)) => Err(error),
+            (result, Ok(())) => result,
+        }
     }
 
     async fn renew(&self, ticket: &TicketRef, owner: &OwnerId) -> Result<ClaimResult, SourceError> {
-        let now_ms = now_ms()?;
+        let now_ms = self.clock.now_ms();
         let lease_ms = self
             .db
             .lock()
             .query_row(
                 "SELECT expires_at_ms - renewed_at_ms FROM leases
-                 WHERE ticket_id = ?1 AND run_id = ?2 AND owner_id = ?2",
+                 WHERE ticket_id = ?1 AND run_id = ?2",
                 params![ticket.id, owner.0],
                 |row| row.get::<_, i64>(0),
             )
@@ -1961,37 +2025,41 @@ impl WorkState for LocalSqlite {
         owner: &OwnerId,
         disposition: Disposition,
     ) -> Result<(), SourceError> {
-        let now_ms = now_ms()?;
+        let now_ms = self.clock.now_ms();
         let mut connection = self.db.lock();
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::from)
             .map_err(source_error)?;
-        let holds_lease: bool = transaction
+        let stored_owner = transaction
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM leases
-                               WHERE ticket_id = ?1 AND run_id = ?2 AND owner_id = ?2)",
+                "SELECT owner_id FROM leases WHERE ticket_id = ?1 AND run_id = ?2",
                 params![ticket.id, owner.0],
-                |row| row.get(0),
+                |row| row.get::<_, String>(0),
             )
+            .optional()
             .map_err(StoreError::from)
             .map_err(source_error)?;
-        if !holds_lease {
+        let Some(stored_owner) = stored_owner else {
             return Err(SourceError::Rejected {
                 message: format!(
                     "owner `{}` does not hold the lease on ticket `{}`",
                     owner.0, ticket.id
                 ),
             });
-        }
+        };
+        let (_, claimed_activation_id) = decode_lease_owner(&stored_owner);
 
         let changed = match disposition {
             Disposition::Retry { not_before_ms } => {
-                let activation_id = Self::activation_for_release_on(&transaction, &ticket.id)
-                    .map_err(source_error)?
-                    .ok_or_else(|| SourceError::Corrupt {
-                        message: format!("ticket `{}` has no activation to retry", ticket.id),
-                    })?;
+                let activation_id = match claimed_activation_id {
+                    Some(activation_id) => activation_id,
+                    None => Self::activation_for_release_on(&transaction, &ticket.id)
+                        .map_err(source_error)?
+                        .ok_or_else(|| SourceError::Corrupt {
+                            message: format!("ticket `{}` has no activation to retry", ticket.id),
+                        })?,
+                };
                 let changed = tx::abort_ticket(&transaction, &ticket.id, now_ms)
                     .map_err(StoreError::from)
                     .map_err(source_error)?;
@@ -2059,10 +2127,9 @@ mod tests {
     use std::process::Command;
     use std::time::Duration;
 
-    use rusqlite::params;
     use tempfile::tempdir;
 
-    use crate::coordination::{Claim, ClaimDenial, Coordination};
+    use crate::coordination::Coordination;
     use crate::db::Db;
     use crate::domain::ticket::TicketState;
     use crate::domain::work::{Disposition, OwnerId, TicketRef, WorkTicket};
@@ -2070,7 +2137,7 @@ mod tests {
     use crate::sources::{AuthoredTicket, SourceError, TicketSource};
     use crate::store::{
         ActivationKind, ClaimRequest, ClaimedRun, NewActivation, QueuedActivation, ReindexTicket,
-        Store, StoreError,
+        Store, StoreError, claim_for_test,
     };
     use crate::work_state::{ClaimResult, WorkState};
 
@@ -2170,19 +2237,6 @@ mod tests {
         }
     }
 
-    fn seed_run(local: &LocalSqlite, run_id: &str) {
-        local
-            .db
-            .lock()
-            .execute(
-                "INSERT INTO runs
-                     (id, activation_id, ticket_id, state, attempt, created_at_ms, updated_at_ms)
-                 VALUES (?1, 'A1', 'T1', 'claimed', 1, 1000, 1000)",
-                params![run_id],
-            )
-            .unwrap();
-    }
-
     async fn claim_local(local: &LocalSqlite, run_id: &str) -> ClaimResult {
         local
             .claim(
@@ -2197,7 +2251,6 @@ mod tests {
     #[tokio::test]
     async fn local_work_state_claim_is_atomic() {
         let (_directory, local) = open_seeded_local();
-        seed_run(&local, "R1");
 
         assert!(matches!(
             claim_local(&local, "R1").await,
@@ -2205,6 +2258,57 @@ mod tests {
                 ticket: WorkTicket { attempts: 1, .. }
             }
         ));
+        {
+            let connection = local.db.lock();
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                connection
+                    .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                connection
+                    .prepare("PRAGMA foreign_key_check")
+                    .unwrap()
+                    .query_map([], |_| Ok(()))
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(local.active_claims().await.unwrap().len(), 1);
+        Store::from_db(local.db.clone())
+            .insert_claimed_run(
+                &ClaimRequest {
+                    ticket_id: "T1",
+                    run_id: "R1",
+                    activation_id: "A1",
+                    owner_id: "R1",
+                    lease_ms: 60_000,
+                    next_activation_eligible_at_ms: None,
+                    flow_json: "{}",
+                    ticket_json: "{}",
+                },
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(
+            local
+                .db
+                .lock()
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query_map([], |_| Ok(()))
+                .unwrap()
+                .count(),
+            0
+        );
         assert_eq!(
             claim_local(&local, "R1").await,
             ClaimResult::Lost { held_by: None }
@@ -2214,7 +2318,6 @@ mod tests {
     #[tokio::test]
     async fn local_work_state_retry_preserves_attempts_until_the_next_claim() {
         let (_directory, local) = open_seeded_local();
-        seed_run(&local, "R1");
         claim_local(&local, "R1").await;
 
         local
@@ -2239,7 +2342,6 @@ mod tests {
             Some(2_000)
         );
 
-        seed_run(&local, "R2");
         assert!(matches!(
             claim_local(&local, "R2").await,
             ClaimResult::Claimed {
@@ -2251,7 +2353,6 @@ mod tests {
     #[tokio::test]
     async fn local_work_state_park_and_abandon_apply_the_disposition() {
         let (_park_directory, parked) = open_seeded_local();
-        seed_run(&parked, "R1");
         claim_local(&parked, "R1").await;
         parked
             .release(
@@ -2268,7 +2369,6 @@ mod tests {
         assert_eq!(ticket.held_reason.as_deref(), Some("operator review"));
 
         let (_abandon_directory, abandoned) = open_seeded_local();
-        seed_run(&abandoned, "R1");
         claim_local(&abandoned, "R1").await;
         abandoned
             .release(&ticket_ref(), &OwnerId("R1".into()), Disposition::Abandon)
@@ -2280,7 +2380,6 @@ mod tests {
     #[tokio::test]
     async fn local_work_state_denies_renewal_of_an_expired_lease() {
         let (_directory, local) = open_seeded_local();
-        seed_run(&local, "R1");
         claim_local(&local, "R1").await;
         local
             .db
@@ -2395,13 +2494,7 @@ mod tests {
     }
 
     fn granted_claim(store: &Store, claim: &ClaimRequest<'_>, now_ms: i64) -> ClaimedRun {
-        match Coordination::from_shared(store)
-            .claim(claim, now_ms)
-            .unwrap()
-        {
-            Claim::Granted(claimed) => claimed,
-            Claim::Denied(denial) => panic!("claim denied: {denial:?}"),
-        }
+        claim_for_test(store, claim, now_ms)
     }
 
     #[test]
@@ -2593,12 +2686,7 @@ mod tests {
             interval_ms: None,
         };
         assert_eq!(store.select_ready_ticket(&activation, 2_000).unwrap(), None);
-        assert_eq!(
-            Coordination::from_shared(&store)
-                .claim(&claim_t1("R1"), 2_000)
-                .unwrap(),
-            Claim::Denied(ClaimDenial::NotReady)
-        );
+        assert_eq!(store.ticket("T1").unwrap().unwrap().attempts, 0);
 
         store.mark_ticket_missing("T1", 5_000).unwrap();
         assert_eq!(
@@ -2660,24 +2748,6 @@ mod tests {
             .execute("UPDATE tickets SET state = 'failed' WHERE id = 'T1'", [])
             .unwrap();
         assert_eq!(store.select_ready_ticket(&activation, 2_000).unwrap(), None);
-        assert_eq!(
-            Coordination::from_shared(&store)
-                .claim(
-                    &ClaimRequest {
-                        ticket_id: "T2",
-                        run_id: "R2",
-                        activation_id: "A1",
-                        owner_id: "daemon-1",
-                        lease_ms: 60_000,
-                        next_activation_eligible_at_ms: None,
-                        flow_json: "{}",
-                        ticket_json: "{}",
-                    },
-                    2_000,
-                )
-                .unwrap(),
-            Claim::Denied(ClaimDenial::NotReady)
-        );
         assert_eq!(store.ticket("T2").unwrap().unwrap().attempts, 0);
 
         store

@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::clock::Clock;
 use crate::coordination::{Coordination, Exit, ExitDenial, Renewal, RenewalDenial, RunExit};
+use crate::domain::work::Disposition;
 use crate::flow::Flow;
 use crate::logging::{LogLevel, OperationalLog};
 use crate::run_log::OutputStream;
@@ -38,11 +39,12 @@ pub(super) enum RecoveryClassification {
 /// Classifies every durable lease before normal dispatch. Processes that are
 /// live or cannot be disproved consume capacity and are monitored by identity;
 /// dead or reused PIDs are settled from the work preserved in their branches.
-pub(super) fn recover_inflight_runs(
+pub(super) async fn recover_inflight_runs(
     state: &mut DispatcherState,
     events: &mpsc::Sender<RunEvent>,
     log: &OperationalLog,
 ) -> Result<(), DaemonError> {
+    release_unrecorded_claims(state, log).await?;
     let runs = state.store.recoverable_runs().map_err(DaemonError::Store)?;
     for run in runs {
         // Every durable lease consumes capacity until adoption or settlement
@@ -99,6 +101,46 @@ pub(super) fn recover_inflight_runs(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+async fn release_unrecorded_claims(
+    state: &mut DispatcherState,
+    log: &OperationalLog,
+) -> Result<(), DaemonError> {
+    for claim in state
+        .work_state
+        .active_claims()
+        .await
+        .map_err(DaemonError::WorkState)?
+    {
+        if state
+            .run_store
+            .run(&claim.owner.0)
+            .map_err(crate::store::StoreError::from)
+            .map_err(DaemonError::Store)?
+            .is_some()
+        {
+            continue;
+        }
+        state
+            .work_state
+            .release(
+                &claim.ticket,
+                &claim.owner,
+                Disposition::Retry {
+                    not_before_ms: None,
+                },
+            )
+            .await
+            .map_err(DaemonError::WorkState)?;
+        log.emit_with_fields(
+            LogLevel::Info,
+            "sloop::recovery",
+            "unrecorded_claim_released",
+            json!({"run_id": claim.owner.0, "ticket_id": claim.ticket.id}),
+        );
     }
     Ok(())
 }
@@ -605,11 +647,21 @@ fn claim_recovered_exit(
 
 /// Repairs in-memory capacity from durable leases and recovers runs whose
 /// recorded process identity is provably gone or reused.
-pub(super) fn reconcile_run_liveness(
+pub(super) async fn reconcile_run_liveness(
     state: &mut DispatcherState,
     events: &mpsc::Sender<RunEvent>,
     log: &OperationalLog,
 ) {
+    if let Err(error) = release_unrecorded_claims(state, log).await {
+        state.reconciliation_blocked = true;
+        log.emit_with_fields(
+            LogLevel::Error,
+            "sloop::recovery",
+            "claim_reconciliation_failed",
+            json!({"error": error.to_string()}),
+        );
+        return;
+    }
     let runs = match state.store.recoverable_runs() {
         Ok(runs) => {
             state.reconciliation_blocked = false;

@@ -455,11 +455,12 @@ impl RunStore {
 mod tests {
     use tempfile::tempdir;
 
-    use crate::coordination::{Claim, Coordination, RunStart, Start};
+    use crate::coordination::{Coordination, RunStart, Start};
     use crate::domain::ticket::TicketState;
     use crate::outcome::Outcome;
     use crate::store::{
         ActivationKind, ClaimRequest, ExitClaim, NewActivation, RunState, Store, StoreError,
+        claim_for_test,
     };
 
     fn open_seeded(path: &std::path::Path) -> Store {
@@ -518,12 +519,7 @@ mod tests {
     }
 
     fn claim_run(store: &Store, claim: &ClaimRequest<'_>, now_ms: i64) {
-        assert!(matches!(
-            Coordination::from_shared(store)
-                .claim(claim, now_ms)
-                .unwrap(),
-            Claim::Granted(_)
-        ));
+        claim_for_test(store, claim, now_ms);
     }
 
     fn running_r1(store: &mut Store) {

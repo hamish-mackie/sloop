@@ -121,6 +121,19 @@ pub struct RunRecord {
     pub ticket_json: Option<String>,
 }
 
+pub(crate) struct RunAdmission<'a> {
+    pub(crate) run_id: &'a str,
+    pub(crate) activation_id: &'a str,
+    pub(crate) ticket_id: &'a str,
+    pub(crate) flow_json: &'a str,
+    pub(crate) ticket_json: &'a str,
+}
+
+pub(crate) struct AdmittedRun {
+    pub(crate) run_id: String,
+    pub(crate) attempt: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NeedsReviewBranch {
     pub(crate) ticket_id: String,
@@ -857,6 +870,38 @@ pub(crate) fn recoverable_runs(connection: &Connection) -> rusqlite::Result<Vec<
 }
 
 impl RunStore {
+    pub(crate) fn insert_claimed_run(
+        &self,
+        claim: &RunAdmission<'_>,
+        now_ms: i64,
+    ) -> rusqlite::Result<AdmittedRun> {
+        self.write(TransactionBehavior::Immediate, |transaction| {
+            let attempt = tx::next_attempt(transaction, claim.ticket_id)?;
+            tx::insert_claimed(
+                transaction,
+                claim.run_id,
+                claim.activation_id,
+                claim.ticket_id,
+                attempt,
+                claim.flow_json,
+                claim.ticket_json,
+                now_ms,
+            )?;
+            tx::record_event(
+                transaction,
+                now_ms,
+                "run_claimed",
+                Some(claim.run_id),
+                Some(claim.ticket_id),
+                &serde_json::json!({"attempt": attempt}).to_string(),
+            )?;
+            Ok(AdmittedRun {
+                run_id: claim.run_id.into(),
+                attempt,
+            })
+        })
+    }
+
     pub(crate) fn insert_note(
         &self,
         id: &str,
@@ -975,12 +1020,14 @@ mod tests {
     use tempfile::tempdir;
 
     use super::RunState;
-    use crate::coordination::{Claim, Coordination, RunStart, Start};
+    use crate::coordination::{Coordination, RunStart, Start};
     use crate::db::SCHEMA_VERSION;
     use crate::domain::ticket::{TicketSnapshot, TicketState};
     use crate::flow::{Flow, Stage, StageKind, VerdictPolicy};
     use crate::outcome::Outcome;
-    use crate::store::{ActivationKind, ClaimRequest, NewActivation, Store, StoreError};
+    use crate::store::{
+        ActivationKind, ClaimRequest, NewActivation, Store, StoreError, claim_for_test,
+    };
 
     fn open_seeded(path: &std::path::Path) -> Store {
         let store = Store::open(path, 1_000).unwrap();
@@ -1038,12 +1085,7 @@ mod tests {
     }
 
     fn claim_run(store: &Store, claim: &ClaimRequest<'_>, now_ms: i64) {
-        assert!(matches!(
-            Coordination::from_shared(store)
-                .claim(claim, now_ms)
-                .unwrap(),
-            Claim::Granted(_)
-        ));
+        claim_for_test(store, claim, now_ms);
     }
 
     fn start_run(store: &Store, start: &RunStart<'_>, now_ms: i64) {

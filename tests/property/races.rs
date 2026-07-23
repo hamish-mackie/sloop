@@ -17,7 +17,7 @@ use std::sync::Barrier;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use rusqlite::Connection;
-use sloop::coordination::{Claim, Coordination, Exit, RunExit, RunStart, Start};
+use sloop::coordination::{Coordination, Exit, RunExit, RunStart, Start};
 use sloop::domain::ticket::TicketState;
 use sloop::outcome::Outcome;
 use sloop::store::{ActivationKind, ClaimRequest, NewActivation, Store};
@@ -155,13 +155,15 @@ fn simultaneous_claims_grant_exactly_one_winner() {
                     let (arena, ticket, activation, barrier) =
                         (&arena, &ticket, &activation, &barrier);
                     scope.spawn(move || {
-                        let mut store = arena.open();
+                        let store = arena.open();
                         let run_id = format!("{ticket}-R{thread}");
                         barrier.wait();
-                        let claim = Coordination::new(&mut store)
-                            .claim(&claim_request(ticket, &run_id, activation), arena.now())
-                            .expect("claim must grant or deny, never fail");
-                        matches!(claim, Claim::Granted(_))
+                        crate::claim(
+                            &store,
+                            &claim_request(ticket, &run_id, activation),
+                            arena.now(),
+                        )
+                        .is_some()
                     })
                 })
                 .collect();
@@ -182,7 +184,7 @@ fn simultaneous_claims_grant_exactly_one_winner() {
 #[test]
 fn simultaneous_exit_checkpoints_grant_exactly_one_owner() {
     let arena = Arena::new();
-    let mut setup = arena.open();
+    let setup = arena.open();
 
     for round in 0..20 {
         let ticket = format!("T{round}");
@@ -190,10 +192,14 @@ fn simultaneous_exit_checkpoints_grant_exactly_one_owner() {
         let run_id = format!("{ticket}-R0");
         arena.add_ticket(&setup, &ticket);
         arena.add_activation(&setup, &activation, &ticket);
-        let claim = Coordination::new(&mut setup)
-            .claim(&claim_request(&ticket, &run_id, &activation), arena.now())
-            .expect("claim");
-        assert!(matches!(claim, Claim::Granted(_)));
+        assert!(
+            crate::claim(
+                &setup,
+                &claim_request(&ticket, &run_id, &activation),
+                arena.now()
+            )
+            .is_some()
+        );
         let started = Coordination::start(&setup, &run_start(&run_id), arena.now()).expect("start");
         assert_eq!(started, Start::Granted);
 
@@ -245,9 +251,12 @@ fn simultaneous_settlements_land_exactly_once() {
         let run_id = format!("{ticket}-R0");
         arena.add_ticket(&setup, &ticket);
         arena.add_activation(&setup, &activation, &ticket);
-        Coordination::new(&mut setup)
-            .claim(&claim_request(&ticket, &run_id, &activation), arena.now())
-            .expect("claim");
+        crate::claim(
+            &setup,
+            &claim_request(&ticket, &run_id, &activation),
+            arena.now(),
+        )
+        .expect("claim");
         Coordination::start(&setup, &run_start(&run_id), arena.now()).expect("start");
         Coordination::new(&mut setup)
             .record_exit(&run_exit(&run_id), arena.now())
@@ -333,10 +342,13 @@ fn uncoordinated_lifecycle_hammer_preserves_invariants() {
                         let run_id = format!("{ticket}-{thread}-{iteration}-run");
                         arena.add_activation(&store, &activation, ticket);
 
-                        let claim = Coordination::new(&mut store)
-                            .claim(&claim_request(ticket, &run_id, &activation), arena.now())
-                            .expect("claim must grant or deny");
-                        if !matches!(claim, Claim::Granted(_)) {
+                        if crate::claim(
+                            &store,
+                            &claim_request(ticket, &run_id, &activation),
+                            arena.now(),
+                        )
+                        .is_none()
+                        {
                             continue;
                         }
                         // Walk the whole lifecycle; every step must be

@@ -1,7 +1,5 @@
-//! Integration coverage for `on_fail` repair agents on `exec` and `merge`
-//! stages. Real daemon, real git, scripted fake agents that branch on their
-//! prompt: the build spawn and the repair spawn run the same script but do
-//! different work depending on whether the prompt carries the `REPAIR` marker.
+//! Integration coverage for repairing interrupted run state and for `on_fail`
+//! repair agents on `exec` and `merge` stages.
 
 mod support;
 
@@ -443,6 +441,120 @@ fn a_restart_mid_repair_resumes_without_double_spawning() {
     // lost nor repeated.
     assert_eq!(fs::read_to_string(&spawn_log).unwrap(), "x");
     assert_eq!(repair_attempts(&world, 1).len(), 1);
+}
+
+#[test]
+fn recovery_releases_a_claim_whose_run_commit_never_landed() {
+    let world = World::configured();
+    world.commit_all("initial");
+    let first = World::json_stdout(&world.sloop(&["daemon"]))["data"]["pid"]
+        .as_u64()
+        .unwrap() as u32;
+    let ticket = post(&world, "claim-window.md");
+    assert!(world.sloop(&["pause"]).status.success());
+    world.kill_daemon(first);
+
+    let now_ms = world.now_ms();
+    let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO activations
+                 (id, kind, state, ticket_id, created_at_ms, updated_at_ms)
+             VALUES ('A-window', 'immediate', 'completed', ?1, ?2, ?2)",
+            rusqlite::params![ticket, now_ms],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO activations
+                 (id, kind, state, ticket_id, created_at_ms, updated_at_ms)
+             VALUES ('A-other', 'immediate', 'completed', ?1, ?2, ?3)",
+            rusqlite::params![ticket, now_ms + 1, now_ms + 1],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE tickets
+             SET state = 'claimed', attempts = 1, updated_at_ms = ?2
+             WHERE id = ?1",
+            rusqlite::params![ticket, now_ms],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO leases
+                 (ticket_id, run_id, owner_id, acquired_at_ms, renewed_at_ms, expires_at_ms)
+             VALUES (?1, 'R-window', ?2, ?3, ?3, ?4)",
+            rusqlite::params![
+                ticket,
+                r#"{"activation":"A-window","owner":"R-window"}"#,
+                now_ms,
+                now_ms + 60_000
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    world.start_daemon();
+    wait_until("the unrecorded claim is released", || {
+        status(&world)["tickets"]["ready"] == 1
+    });
+
+    let connection = rusqlite::Connection::open(world.db_path()).expect("open recovered database");
+    let (state, attempts): (String, i64) = connection
+        .query_row(
+            "SELECT state, attempts FROM tickets WHERE id = ?1",
+            [&ticket],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "ready");
+    assert_eq!(attempts, 1);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT state FROM activations WHERE id = 'A-window'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "queued"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT state FROM activations WHERE id = 'A-other'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "completed"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM leases", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query_map([], |_| Ok(()))
+            .unwrap()
+            .count(),
+        0
+    );
 }
 
 fn git_root(world: &World, args: &[&str]) -> std::process::Output {

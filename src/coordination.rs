@@ -1,7 +1,7 @@
 //! Answers scheduling mutation intents with granted or denied decisions.
 //!
-//! This is the daemon's only path for mutating runtime scheduling state through
-//! claims, leases, and run settlement. Read-only queries are not coordination
+//! This is the daemon's path for composing remaining cross-boundary run
+//! settlement. Read-only queries are not coordination
 //! and remain on [`Store`]. Rust's sibling-module visibility cannot enforce the
 //! boundary, so daemon code must not call the wrapped store methods directly.
 //!
@@ -11,11 +11,11 @@
 //! atomically at claim time. In the `leases` table `ticket_id` is the PRIMARY
 //! KEY and `run_id` is UNIQUE, so the database engine enforces at most one
 //! lease per ticket and per run. That is the durable guard against
-//! double-spawn, backstopping the conditional `UPDATE ... WHERE state='ready'`
-//! inside [`Coordination::claim`].
+//! double-spawn, backstopping the conditional `UPDATE ... WHERE state='ready'`.
 //!
-//! Leases are held only by the daemon. `owner_id` records which daemon process
-//! took the claim. Workers never hold, renew, or observe leases: a worker's
+//! Leases are held only by the daemon. `owner_id` stores the source's ownership
+//! token, including the activation needed to recover an interrupted claim.
+//! Workers never hold, renew, or observe leases: a worker's
 //! only credential is a per-run capability token granting the worker verbs on
 //! its own run. The daemon-to-worker relationship is delegation of access to a
 //! run, never sub-leasing of ownership of a ticket.
@@ -43,23 +43,9 @@ use crate::db::Db;
 use crate::domain::ticket::TicketState;
 use crate::outcome::Outcome;
 use crate::run_store::{RunState, evidence, limits, runs};
-use crate::store::{
-    ClaimRequest, ClaimedRun, CooldownUpdate, EvidenceRecord, ExitClaim, Store, StoreError,
-};
+use crate::store::{CooldownUpdate, EvidenceRecord, ExitClaim, Store, StoreError};
 use crate::work_state::local::{self, LocalSqlite, ReindexResult, ReindexTicket};
 use rusqlite::TransactionBehavior;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Claim {
-    Granted(ClaimedRun),
-    Denied(ClaimDenial),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClaimDenial {
-    NotReady,
-    ActivationNotQueued,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Renewal {
@@ -134,65 +120,6 @@ impl Coordination {
     #[cfg(test)]
     pub(crate) fn from_shared(store: &Store) -> Self {
         Self(Store::from_db(store.db()))
-    }
-
-    pub fn claim(&mut self, claim: &ClaimRequest<'_>, now_ms: i64) -> Result<Claim, StoreError> {
-        let result = self.claim_transaction(claim, now_ms);
-        match result {
-            Ok(claimed) => Ok(Claim::Granted(claimed)),
-            Err(StoreError::TicketNotReady { .. }) => Ok(Claim::Denied(ClaimDenial::NotReady)),
-            Err(StoreError::ActivationNotQueued { .. }) => {
-                Ok(Claim::Denied(ClaimDenial::ActivationNotQueued))
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn claim_transaction(
-        &self,
-        claim: &ClaimRequest<'_>,
-        now_ms: i64,
-    ) -> Result<ClaimedRun, StoreError> {
-        let db = self.0.db();
-        let mut connection = db.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-        local::tx::claim_ticket(&transaction, claim, now_ms)?;
-        local::tx::advance_activation(&transaction, claim, now_ms)?;
-
-        // The run's attempt counts runs, not the ticket's retry budget:
-        // `retry` resets `tickets.attempts`, and a reused number would make two
-        // runs answer to the same alias. Allocating inside the claim
-        // transaction keeps the sequence gap-free under concurrent claims.
-        let attempt = runs::tx::next_attempt(&transaction, claim.ticket_id)?;
-
-        runs::tx::insert_claimed(
-            &transaction,
-            claim.run_id,
-            claim.activation_id,
-            claim.ticket_id,
-            attempt,
-            claim.flow_json,
-            claim.ticket_json,
-            now_ms,
-        )?;
-
-        let expires_at_ms = local::tx::insert_lease(&transaction, claim, now_ms)?;
-        runs::tx::record_event(
-            &transaction,
-            now_ms,
-            "run_claimed",
-            Some(claim.run_id),
-            Some(claim.ticket_id),
-            &serde_json::json!({"attempt": attempt}).to_string(),
-        )?;
-
-        transaction.commit()?;
-        Ok(ClaimedRun {
-            run_id: claim.run_id.into(),
-            attempt,
-            lease_expires_at_ms: expires_at_ms,
-        })
     }
 
     pub fn renew(
@@ -497,13 +424,14 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        Claim, ClaimDenial, Coordination, Exit, ExitDenial, Renewal, RenewalDenial, RunExit,
-        RunStart, Start, StartDenial,
+        Coordination, Exit, ExitDenial, Renewal, RenewalDenial, RunExit, RunStart, Start,
+        StartDenial,
     };
     use crate::domain::ticket::TicketState;
     use crate::outcome::Outcome;
     use crate::store::{
-        ActivationKind, ClaimRequest, EvidenceRecord, NewActivation, StageRecord, Store, StoreError,
+        ActivationKind, ClaimRequest, EvidenceRecord, NewActivation, StageRecord, Store,
+        claim_for_test,
     };
 
     fn claim_t1(run_id: &str) -> ClaimRequest<'_> {
@@ -557,131 +485,10 @@ mod tests {
     }
 
     #[test]
-    fn claiming_twice_is_denied_instead_of_failing() {
-        let directory = tempdir().unwrap();
-        let mut store = seeded_store(&directory);
-        let mut coordination = Coordination::new(&mut store);
-
-        let Claim::Granted(claimed) = coordination.claim(&claim_t1("R1"), 2_000).unwrap() else {
-            panic!("first claim was denied");
-        };
-        assert_eq!(claimed.attempt, 1);
-        assert_eq!(claimed.lease_expires_at_ms, 62_000);
-        assert_eq!(
-            coordination.claim(&claim_t1("R2"), 2_100).unwrap(),
-            Claim::Denied(ClaimDenial::NotReady)
-        );
-        assert!(matches!(
-            coordination.claim_transaction(&claim_t1("R3"), 2_200),
-            Err(StoreError::TicketNotReady { state: Some(state), .. }) if state == "claimed"
-        ));
-    }
-
-    #[test]
-    fn claiming_an_unknown_ticket_reports_it_not_ready() {
-        let directory = tempdir().unwrap();
-        let store = seeded_store(&directory);
-        let mut coordination = Coordination::from_shared(&store);
-
-        let request = ClaimRequest {
-            ticket_id: "missing",
-            ..claim_t1("R1")
-        };
-        assert_eq!(
-            coordination.claim(&request, 2_000).unwrap(),
-            Claim::Denied(ClaimDenial::NotReady)
-        );
-        assert!(matches!(
-            coordination.claim_transaction(&request, 2_000),
-            Err(StoreError::TicketNotReady { state: None, .. })
-        ));
-    }
-
-    #[test]
-    fn missing_and_blocked_ticket_diagnostics_are_preserved() {
-        let directory = tempdir().unwrap();
-        let store = seeded_store(&directory);
-        store.mark_ticket_missing("T1", 2_000).unwrap();
-        let coordination = Coordination::from_shared(&store);
-
-        assert!(matches!(
-            coordination.claim_transaction(&claim_t1("R1"), 2_000),
-            Err(StoreError::TicketNotReady { state: Some(state), .. }) if state == "missing"
-        ));
-
-        store.clear_ticket_missing("T1", 2_100).unwrap();
-        store
-            .insert_local_ticket(
-                "T2",
-                "default",
-                "tickets/T2.md",
-                "Ticket two",
-                &["T1".into()],
-                "sloop/T2",
-                Some("opencode"),
-                None,
-                None,
-                "default",
-                TicketState::Ready,
-                2_100,
-            )
-            .unwrap();
-        store
-            .db()
-            .lock()
-            .execute("UPDATE tickets SET state = 'failed' WHERE id = 'T1'", [])
-            .unwrap();
-        let request = ClaimRequest {
-            ticket_id: "T2",
-            run_id: "R2",
-            ..claim_t1("R1")
-        };
-        assert!(matches!(
-            coordination.claim_transaction(&request, 2_200),
-            Err(StoreError::TicketNotReady { state: Some(state), .. }) if state == "blocked"
-        ));
-        assert_eq!(store.ticket("T2").unwrap().unwrap().attempts, 0);
-    }
-
-    #[test]
-    fn concurrent_connections_cannot_both_claim_one_ticket() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("sloop.db");
-        drop(seeded_store(&directory));
-
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let claims: Vec<_> = ["R1", "R2"]
-            .into_iter()
-            .map(|run_id| {
-                let path = path.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    let store = Store::open(&path, 2_000).unwrap();
-                    barrier.wait();
-                    matches!(
-                        Coordination::from_shared(&store)
-                            .claim(&claim_t1(run_id), 2_000)
-                            .unwrap(),
-                        Claim::Granted(_)
-                    )
-                })
-            })
-            .collect();
-
-        let successes = claims
-            .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .filter(|claimed| *claimed)
-            .count();
-        assert_eq!(successes, 1);
-    }
-
-    #[test]
     fn only_one_caller_is_granted_a_runs_exit_checkpoint() {
         let directory = tempdir().unwrap();
         let mut store = seeded_store(&directory);
-        let mut coordination = Coordination::new(&mut store);
-        coordination.claim(&claim_t1("R1"), 2_000).unwrap();
+        claim_for_test(&store, &claim_t1("R1"), 2_000);
         let start = RunStart {
             run_id: "R1",
             branch: "sloop/T1",
@@ -724,8 +531,7 @@ mod tests {
     fn finish_run_settles_exactly_once() {
         let directory = tempdir().unwrap();
         let mut store = seeded_store(&directory);
-        let mut coordination = Coordination::new(&mut store);
-        coordination.claim(&claim_t1("R1"), 2_000).unwrap();
+        claim_for_test(&store, &claim_t1("R1"), 2_000);
         assert_eq!(
             Coordination::start(
                 &store,
@@ -777,9 +583,7 @@ mod tests {
     fn finishing_a_run_settles_ticket_lease_and_evidence_atomically() {
         let directory = tempdir().unwrap();
         let mut store = seeded_store(&directory);
-        Coordination::new(&mut store)
-            .claim(&claim_t1("R1"), 2_000)
-            .unwrap();
+        claim_for_test(&store, &claim_t1("R1"), 2_000);
         store
             .record_aftercare_stage(
                 "R1",
@@ -827,9 +631,7 @@ mod tests {
     fn finishing_a_run_is_idempotent() {
         let directory = tempdir().unwrap();
         let mut store = seeded_store(&directory);
-        Coordination::new(&mut store)
-            .claim(&claim_t1("R1"), 2_000)
-            .unwrap();
+        claim_for_test(&store, &claim_t1("R1"), 2_000);
         let evidence = [EvidenceRecord {
             kind: "exit_classified",
             data_json: "{\"exit_code\":1}".into(),
@@ -850,9 +652,7 @@ mod tests {
     fn a_cancelled_outcome_returns_the_ticket_to_ready() {
         let directory = tempdir().unwrap();
         let mut store = seeded_store(&directory);
-        Coordination::new(&mut store)
-            .claim(&claim_t1("R1"), 2_000)
-            .unwrap();
+        claim_for_test(&store, &claim_t1("R1"), 2_000);
 
         assert!(!store.cancellation_requested("R1").unwrap());
         store.record_cancel_requested("R1", 2_500).unwrap();
@@ -879,7 +679,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut store = seeded_store(&directory);
         let mut coordination = Coordination::new(&mut store);
-        coordination.claim(&claim_t1("R1"), 2_000).unwrap();
+        claim_for_test(&store, &claim_t1("R1"), 2_000);
 
         coordination.abandon("R1", "T1", 2_100).unwrap();
 
@@ -893,7 +693,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut store = seeded_store(&directory);
         let mut coordination = Coordination::new(&mut store);
-        coordination.claim(&claim_t1("R1"), 2_000).unwrap();
+        claim_for_test(&store, &claim_t1("R1"), 2_000);
 
         coordination
             .settle("R1", "T1", None, Outcome::Orphaned, &[], None, 3_000)
@@ -908,7 +708,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut store = seeded_store(&directory);
         let mut coordination = Coordination::new(&mut store);
-        coordination.claim(&claim_t1("R1"), 2_000).unwrap();
+        claim_for_test(&store, &claim_t1("R1"), 2_000);
         coordination
             .settle("R1", "T1", Some(0), Outcome::NeedsReview, &[], None, 3_000)
             .unwrap();
@@ -935,7 +735,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut store = seeded_store(&directory);
         let mut coordination = Coordination::new(&mut store);
-        coordination.claim(&claim_t1("R1"), 2_000).unwrap();
+        claim_for_test(&store, &claim_t1("R1"), 2_000);
         coordination.abandon("R1", "T1", 2_050).unwrap();
 
         let start = RunStart {
@@ -961,7 +761,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut store = seeded_store(&directory);
         let mut coordination = Coordination::new(&mut store);
-        coordination.claim(&claim_t1("R1"), 2_000).unwrap();
+        claim_for_test(&store, &claim_t1("R1"), 2_000);
 
         // The claim's lease expired at 62_000.
         assert_eq!(

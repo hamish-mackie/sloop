@@ -138,10 +138,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::CooldownUpdate;
-    use crate::coordination::{Claim, Coordination};
+    use crate::coordination::Coordination;
     use crate::domain::ticket::TicketState;
     use crate::outcome::Outcome;
-    use crate::store::{ActivationKind, ClaimRequest, NewActivation, QueuedActivation, Store};
+    use crate::store::{
+        ActivationKind, ClaimRequest, NewActivation, QueuedActivation, Store, claim_for_test,
+    };
 
     fn open_seeded(path: &std::path::Path) -> Store {
         let store = Store::open(path, 1_000).unwrap();
@@ -199,12 +201,7 @@ mod tests {
     }
 
     fn claim_run(store: &Store, run_id: &str, now_ms: i64) {
-        assert!(matches!(
-            Coordination::from_shared(store)
-                .claim(&claim(run_id), now_ms)
-                .unwrap(),
-            Claim::Granted(_)
-        ));
+        claim_for_test(store, &claim(run_id), now_ms);
     }
 
     #[test]

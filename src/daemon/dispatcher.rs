@@ -17,10 +17,12 @@ use crate::logging::{LogLevel, OperationalLog};
 use crate::outcome::{MergeOutcome, RunEvidence, classify_exit, derive_outcome};
 use crate::protocol::{ErrorBody, ErrorCode, Request, RequestId, ResponseEnvelope};
 use crate::run_ref::RunIdSource;
+use crate::run_store::RunStore;
 use crate::runner::local::worker_socket_path;
 use crate::sources::TicketSource;
 use crate::store::{CooldownUpdate, EvidenceRecord, Store, StoreError};
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
+use crate::work_state::WorkState;
 use crate::work_state::local::LocalSqlite;
 
 use super::commands::{
@@ -90,7 +92,9 @@ pub(super) struct DispatcherState {
     pub(super) socket: PathBuf,
     pub(super) daemon_log: PathBuf,
     pub(super) store: Store,
-    pub(super) work_state: LocalSqlite,
+    pub(super) local_work_state: LocalSqlite,
+    pub(super) work_state: Box<dyn WorkState>,
+    pub(super) run_store: RunStore,
     /// `SQLITE_FULL` is a dispatcher gate. The daemon retains active and
     /// pending run evidence in memory until a committed probe succeeds.
     pub(super) storage_full: Cell<bool>,
@@ -168,7 +172,7 @@ pub(super) async fn run_dispatcher(
     // Tokio intervals fire immediately once; consume that tick because startup
     // recovery already classified every durable lease.
     liveness_tick.tick().await;
-    reconcile(&mut state, &events_tx, &log);
+    reconcile(&mut state, &events_tx, &log).await;
     loop {
         let deadline = next_dispatch_deadline(&state);
         let clock = state.clock.clone();
@@ -210,10 +214,10 @@ pub(super) async fn run_dispatcher(
                     let _ = state.shutdown.send(DaemonControl::Stop).await;
                     break;
                 }
-                reconcile_run_liveness(&mut state, &events_tx, &log);
+                reconcile_run_liveness(&mut state, &events_tx, &log).await;
             }
         }
-        reconcile(&mut state, &events_tx, &log);
+        reconcile(&mut state, &events_tx, &log).await;
         if complete_restart_if_ready(&mut state).await {
             break;
         }

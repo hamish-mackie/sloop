@@ -364,6 +364,10 @@ fn a_worker_brief_uses_the_ticket_body_captured_at_claim() {
         "admission.md",
         "# Admission body\n\nOriginal instructions.\n",
     );
+    rusqlite::Connection::open(world.db_path())
+        .unwrap()
+        .execute("UPDATE tickets SET body = NULL WHERE id = ?1", [&ticket])
+        .unwrap();
 
     assert!(world.sloop(&["run", &ticket]).status.success());
     wait_until("the claimed run starts", || {

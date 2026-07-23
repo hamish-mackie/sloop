@@ -4,17 +4,20 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::config::expand_agent_cmd;
-use crate::coordination::{Claim, Coordination, Renewal, RenewalDenial};
+use crate::coordination::Coordination;
 use crate::domain::ticket::TicketSnapshot;
+use crate::domain::work::{Disposition, OwnerId, TicketRef, WorkTicket};
 use crate::flow::Flow;
 use crate::frontmatter::Frontmatter;
 use crate::ids::next_id;
 use crate::logging::{LogLevel, OperationalLog};
+use crate::run_store::RunAdmission;
 use crate::runner::local::{
     compose_worker_prompt, launch_agent, run_output_path, wait_for_test_hook, worker_socket_path,
 };
@@ -22,6 +25,7 @@ use crate::runner::{AgentLaunch, RunnerError, StageExecution, StageOrder};
 use crate::store::{
     ClaimRequest, QueuedActivation, RunState, Store, TicketRecord, WorktreeCleanupCandidate,
 };
+use crate::work_state::ClaimResult;
 
 use super::aftercare::{
     RepairContext, StoreStageHooks, gather_exit_evidence, git_is_ancestor, git_stdout,
@@ -40,7 +44,7 @@ pub(super) const VENDOR_COOLDOWN_MS: i64 = 5 * 60 * 1000;
 
 fn agent_stage_order(
     state: &DispatcherState,
-    ticket: &TicketRecord,
+    ticket: &WorkTicket,
     flow: &Flow,
     run_id: &str,
     attempt: i64,
@@ -50,7 +54,7 @@ fn agent_stage_order(
         .agent
         .as_ref()
         .ok_or_else(|| error("no agent targets configured".into()))?;
-    let target = ticket.target.as_deref().ok_or_else(|| {
+    let target = ticket.hints.target.as_deref().ok_or_else(|| {
         error(format!(
             "ticket `{}` does not specify an agent target",
             ticket.id
@@ -65,8 +69,8 @@ fn agent_stage_order(
     let prompt = compose_worker_prompt(&state.root).map_err(error)?;
     let argv = expand_agent_cmd(
         template,
-        ticket.model.as_deref(),
-        ticket.effort.as_deref(),
+        ticket.hints.model.as_deref(),
+        ticket.hints.effort.as_deref(),
         &prompt,
     )
     .map_err(|message| error(format!("ticket `{}` {message}", ticket.id)))?;
@@ -324,9 +328,39 @@ pub(super) fn renews_lease(
     identity != ProcessIdentity::GoneOrReused
 }
 
+async fn release_unrecorded_claim(
+    state: &mut DispatcherState,
+    ticket: &TicketRef,
+    owner: &OwnerId,
+    log: &OperationalLog,
+) {
+    if let Err(error) = state
+        .work_state
+        .release(
+            ticket,
+            owner,
+            Disposition::Retry {
+                not_before_ms: None,
+            },
+        )
+        .await
+    {
+        log.emit_with_fields(
+            LogLevel::Error,
+            "sloop::dispatcher",
+            "unrecorded_claim_release_failed",
+            json!({
+                "run_id": owner.0,
+                "ticket_id": ticket.id,
+                "error": format!("{error:?}"),
+            }),
+        );
+    }
+}
+
 /// Keeps `expires_at_ms` truthful for every run this daemon supervises, so a
 /// run outliving the initial TTL no longer executes on an expired lease.
-fn renew_supervised_leases(state: &mut DispatcherState, log: &OperationalLog, now_ms: i64) {
+async fn renew_supervised_leases(state: &mut DispatcherState, log: &OperationalLog) {
     let runs = match state.store.recoverable_runs() {
         Ok(runs) => runs,
         Err(error) => {
@@ -347,18 +381,33 @@ fn renew_supervised_leases(state: &mut DispatcherState, log: &OperationalLog, no
         if !renews_lease(run.state, supervised, recoverable_process_identity(&run)) {
             continue;
         }
-        let renewed = Coordination::new(&mut state.store).renew(
-            &run.ticket_id,
-            &run.id,
-            DEFAULT_LEASE_MS,
-            now_ms,
-        );
+        let ticket = match state.store.ticket(&run.ticket_id) {
+            Ok(Some(ticket)) => TicketRef {
+                id: ticket.id,
+                source: ticket.source,
+                source_ref: ticket.source_ref,
+            },
+            Ok(None) => continue,
+            Err(error) => {
+                log.emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::dispatcher",
+                    "lease_renewal_failed",
+                    json!({"run_id": run.id, "ticket_id": run.ticket_id, "error": error.to_string()}),
+                );
+                continue;
+            }
+        };
+        let renewed = state
+            .work_state
+            .renew(&ticket, &OwnerId(run.id.clone()))
+            .await;
         match renewed {
-            Ok(Renewal::Granted(_)) => {}
+            Ok(ClaimResult::Claimed { .. }) => {}
             // The daemon believes it supervises this run yet does not hold a
             // renewable lease on it. That is an anomaly worth surfacing, but
             // recovery keys off process identity, so nothing changes here.
-            Ok(Renewal::Denied(RenewalDenial::LeaseNotHeld)) => log.emit_with_fields(
+            Ok(ClaimResult::Lost { .. }) => log.emit_with_fields(
                 LogLevel::Warn,
                 "sloop::dispatcher",
                 "lease_renewal_denied",
@@ -368,7 +417,7 @@ fn renew_supervised_leases(state: &mut DispatcherState, log: &OperationalLog, no
                 LogLevel::Error,
                 "sloop::dispatcher",
                 "lease_renewal_failed",
-                json!({"run_id": run.id, "ticket_id": run.ticket_id, "error": error.to_string()}),
+                json!({"run_id": run.id, "ticket_id": run.ticket_id, "error": format!("{error:?}")}),
             ),
         }
     }
@@ -377,7 +426,7 @@ fn renew_supervised_leases(state: &mut DispatcherState, log: &OperationalLog, no
 /// The single spawn decision point: every queued activation passes the same
 /// pause and capacity gates, selects deterministically, claims conditionally,
 /// and only then touches Git and processes.
-pub(super) fn reconcile(
+pub(super) async fn reconcile(
     state: &mut DispatcherState,
     events: &mpsc::Sender<RunEvent>,
     log: &OperationalLog,
@@ -394,7 +443,7 @@ pub(super) fn reconcile(
     reconcile_worktree_cleanup(state, log);
     // Supervised runs keep their leases truthful regardless of the dispatch
     // gates: a run outliving the TTL while the daemon is paused is still alive.
-    renew_supervised_leases(state, log, now_ms);
+    renew_supervised_leases(state, log).await;
     if state.storage_full.get()
         || state.reconciliation_blocked
         || state.paused
@@ -423,7 +472,7 @@ pub(super) fn reconcile(
     // queued activation could otherwise spawn now.
     if !activations.is_empty() && state.active.len() < state.max_agents {
         wait_for_test_hook("before-spawn-capacity-reconciliation");
-        reconcile_run_liveness(state, events, log);
+        reconcile_run_liveness(state, events, log).await;
         if state.reconciliation_blocked {
             return;
         }
@@ -437,7 +486,7 @@ pub(super) fn reconcile(
             continue;
         };
 
-        let ticket = match state.store.ticket(&ticket_id) {
+        let ticket_record = match state.store.ticket(&ticket_id) {
             Ok(Some(ticket)) => ticket,
             Ok(None) => {
                 log.emit_with_fields(
@@ -458,38 +507,18 @@ pub(super) fn reconcile(
                 continue;
             }
         };
-        let flow = match bound_flow_for_ticket(&state.flows, &ticket) {
-            Ok(flow) => flow,
-            Err(error) => {
-                log.emit_with_fields(
-                    LogLevel::Error,
-                    "sloop::dispatcher",
-                    "bound_flow_resolution_failed",
-                    json!({"ticket_id": ticket_id, "error": error}),
-                );
-                continue;
-            }
-        };
-        let body = ticket.body.clone().unwrap_or_else(|| {
-            ticket
+        let fallback_body = ticket_record.body.clone().unwrap_or_else(|| {
+            ticket_record
                 .file_path
                 .as_ref()
                 .and_then(|file_path| fs::read_to_string(state.root.join(file_path)).ok())
                 .unwrap_or_default()
         });
-        let ticket_snapshot = TicketSnapshot {
-            id: ticket.id.clone(),
-            name: ticket.name.clone(),
-            blocked_by: ticket.blocked_by.clone(),
-            worktree: ticket.worktree.clone(),
-            target: ticket.target.clone(),
-            model: ticket.model.clone(),
-            effort: ticket.effort.clone(),
-            body,
+        let ticket_ref = TicketRef {
+            id: ticket_record.id,
+            source: ticket_record.source,
+            source_ref: ticket_record.source_ref,
         };
-        let flow_json = serde_json::to_string(&flow).expect("flow snapshots serialize to JSON");
-        let ticket_json =
-            serde_json::to_string(&ticket_snapshot).expect("ticket snapshots serialize to JSON");
 
         let now_ms = state.clock.now_ms();
         // Minting reads the OS CSPRNG, so it happens here at the effect
@@ -506,41 +535,99 @@ pub(super) fn reconcile(
                 continue;
             }
         };
-        let owner = format!("daemon-{}", state.pid);
-        let claim = ClaimRequest {
-            ticket_id: &ticket_id,
-            run_id: &run_id,
-            activation_id: &activation.id,
-            owner_id: &owner,
-            lease_ms: DEFAULT_LEASE_MS,
-            flow_json: &flow_json,
-            ticket_json: &ticket_json,
-            next_activation_eligible_at_ms: if activation.kind == "every" {
-                match (activation.eligible_at_ms, activation.interval_ms) {
-                    (Some(eligible_at_ms), Some(interval_ms)) => {
-                        rearm_every_at(eligible_at_ms, interval_ms, now_ms)
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            },
+        let owner = OwnerId(run_id.clone());
+        let ticket = match state
+            .work_state
+            .claim(
+                &ticket_ref,
+                &owner,
+                Duration::from_millis(DEFAULT_LEASE_MS as u64),
+            )
+            .await
+        {
+            Ok(ClaimResult::Claimed { ticket }) => ticket,
+            // Losing a conditional source claim is expected under contention.
+            Ok(ClaimResult::Lost { .. }) => continue,
+            Err(error) => {
+                log.emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::dispatcher",
+                    "claim_failed",
+                    json!({
+                        "activation_id": activation.id,
+                        "ticket_id": ticket_id,
+                        "run_id": run_id,
+                        "error": format!("{error:?}"),
+                    }),
+                );
+                continue;
+            }
         };
-        if activation.kind == "every" && claim.next_activation_eligible_at_ms.is_none() {
+        let flow = match bound_flow_for_work_ticket(&state.flows, &ticket) {
+            Ok(flow) => flow,
+            Err(error) => {
+                release_unrecorded_claim(state, &ticket_ref, &owner, log).await;
+                log.emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::dispatcher",
+                    "bound_flow_resolution_failed",
+                    json!({"ticket_id": ticket_id, "error": error}),
+                );
+                continue;
+            }
+        };
+        let Some(activation_id) = ticket.hints.activation_id.as_deref() else {
+            release_unrecorded_claim(state, &ticket_ref, &owner, log).await;
             log.emit_with_fields(
                 LogLevel::Error,
                 "sloop::dispatcher",
-                "invalid_recurring_activation",
-                json!({"activation_id": activation.id}),
+                "claim_missing_activation",
+                json!({"ticket_id": ticket_id, "run_id": run_id}),
             );
             continue;
-        }
-        let claimed = match Coordination::new(&mut state.store).claim(&claim, now_ms) {
-            Ok(Claim::Granted(claimed)) => claimed,
-            // Not ready right now; the activation stays queued for later.
-            Ok(Claim::Denied(_)) => continue,
+        };
+        let ticket_snapshot = TicketSnapshot {
+            id: ticket.id.clone(),
+            name: ticket.name.clone(),
+            blocked_by: ticket.blocked_by.clone(),
+            worktree: ticket.hints.worktree.clone(),
+            target: ticket.hints.target.clone(),
+            model: ticket.hints.model.clone(),
+            effort: ticket.hints.effort.clone(),
+            body: if ticket.body.is_empty() {
+                fallback_body
+            } else {
+                ticket.body.clone()
+            },
+        };
+        let flow_json = serde_json::to_string(&flow).expect("flow snapshots serialize to JSON");
+        let ticket_json =
+            serde_json::to_string(&ticket_snapshot).expect("ticket snapshots serialize to JSON");
+        let claim = ClaimRequest {
+            ticket_id: &ticket_id,
+            run_id: &run_id,
+            activation_id,
+            owner_id: &owner.0,
+            lease_ms: DEFAULT_LEASE_MS,
+            flow_json: &flow_json,
+            ticket_json: &ticket_json,
+            next_activation_eligible_at_ms: None,
+        };
+        let claimed = match state.run_store.insert_claimed_run(
+            &RunAdmission {
+                run_id: claim.run_id,
+                activation_id: claim.activation_id,
+                ticket_id: claim.ticket_id,
+                flow_json: claim.flow_json,
+                ticket_json: claim.ticket_json,
+            },
+            now_ms,
+        ) {
+            Ok(claimed) => claimed,
             Err(error) => {
+                let error = crate::store::StoreError::from(error);
                 mark_storage_full(state, &error);
+                release_unrecorded_claim(state, &ticket_ref, &owner, log).await;
                 log.emit_with_fields(
                     LogLevel::Error,
                     "sloop::dispatcher",
@@ -1003,18 +1090,6 @@ pub(super) fn next_dispatch_deadline(state: &DispatcherState) -> Option<i64> {
         .min()
 }
 
-/// Advances a recurring cadence to its first future slot. Missed slots are
-/// skipped deterministically so reopening a dispatch window cannot cause a
-/// burst of catch-up runs.
-fn rearm_every_at(eligible_at_ms: i64, interval_ms: i64, now_ms: i64) -> Option<i64> {
-    if interval_ms <= 0 || eligible_at_ms > now_ms {
-        return None;
-    }
-    let missed = now_ms.checked_sub(eligible_at_ms)?.div_euclid(interval_ms);
-    let steps = missed.checked_add(1)?;
-    eligible_at_ms.checked_add(interval_ms.checked_mul(steps)?)
-}
-
 fn eligible_ticket(store: &Store, activation: &QueuedActivation, now_ms: i64) -> Option<String> {
     match &activation.ticket_id {
         Some(ticket) if store.ticket_is_dispatchable(ticket).unwrap_or(false) => {
@@ -1060,6 +1135,23 @@ fn bound_flow_for_ticket(
     })
 }
 
+fn bound_flow_for_work_ticket(
+    flows: &BTreeMap<String, Flow>,
+    ticket: &WorkTicket,
+) -> Result<Flow, String> {
+    let flow_name = ticket
+        .hints
+        .flow
+        .as_ref()
+        .ok_or_else(|| format!("ticket `{}` has no bound flow", ticket.id))?;
+    flows.get(flow_name).cloned().ok_or_else(|| {
+        format!(
+            "ticket `{}` names unknown bound flow `{flow_name}`",
+            ticket.id
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1068,8 +1160,8 @@ mod tests {
 
     use super::{
         OrphanDisposition::{Delete, Keep, MarkMissing},
-        ProcessIdentity, RunState, index_projects, orphan_disposition, rearm_every_at,
-        reconcile_tickets, renews_lease, worktree_cleanup_due,
+        ProcessIdentity, RunState, index_projects, orphan_disposition, reconcile_tickets,
+        renews_lease, worktree_cleanup_due,
     };
     use crate::domain::ticket::TicketState;
     use crate::store::Store;
@@ -1120,14 +1212,6 @@ mod tests {
         assert!(worktree_cleanup_due(1_000, 500, 1_500, false));
         assert!(!worktree_cleanup_due(1_000, 500, 2_000, true));
         assert!(worktree_cleanup_due(i64::MIN, i64::MAX, 0, false));
-    }
-
-    #[test]
-    fn recurring_rearm_preserves_cadence_and_skips_missed_slots() {
-        assert_eq!(rearm_every_at(1_000, 500, 1_000), Some(1_500));
-        assert_eq!(rearm_every_at(1_000, 500, 2_200), Some(2_500));
-        assert_eq!(rearm_every_at(1_000, 0, 1_000), None);
-        assert_eq!(rearm_every_at(2_000, 500, 1_000), None);
     }
 
     #[test]

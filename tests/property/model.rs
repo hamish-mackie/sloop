@@ -18,9 +18,7 @@ use std::path::PathBuf;
 
 use proptest::prelude::*;
 use rusqlite::Connection;
-use sloop::coordination::{
-    Claim, ClaimDenial, Coordination, Exit, Renewal, RunExit, RunStart, Start,
-};
+use sloop::coordination::{Coordination, Exit, Renewal, RunExit, RunStart, Start};
 use sloop::domain::ticket::TicketState;
 use sloop::outcome::Outcome;
 use sloop::store::{ActivationKind, ClaimRequest, NewActivation, Store};
@@ -119,6 +117,7 @@ struct Model {
     leases: BTreeMap<String, ModelLease>,
     /// Ticket id → queued activation ids, oldest first.
     queued: BTreeMap<String, Vec<String>>,
+    activation_created_at: BTreeMap<String, i64>,
 }
 
 struct Harness {
@@ -238,10 +237,18 @@ impl Harness {
             )
             .expect("insert activation");
         self.model
-            .queued
-            .get_mut(ticket)
-            .expect("known ticket")
-            .push(id);
+            .activation_created_at
+            .insert(id.clone(), self.now_ms);
+        self.queue_activation(ticket, id);
+    }
+
+    fn queue_activation(&mut self, ticket: &str, activation: String) {
+        let created_at = &self.model.activation_created_at;
+        let queued = self.model.queued.get_mut(ticket).expect("known ticket");
+        queued.push(activation);
+        queued.sort_by(|left, right| {
+            (created_at[left], left.as_str()).cmp(&(created_at[right], right.as_str()))
+        });
     }
 
     fn claim(&mut self, ticket: &str) {
@@ -265,28 +272,20 @@ impl Harness {
             flow_json: "{}",
             ticket_json: "{}",
         };
-        let claim = Coordination::new(&mut self.store)
-            .claim(&request, self.now_ms)
-            .expect("claim never fails structurally");
+        let claim = crate::claim(&self.store, &request, self.now_ms);
 
         let ticket_ready = self.model.tickets[ticket] == "ready";
         match (ticket_ready, activation) {
-            (false, _) => assert_eq!(
-                claim,
-                Claim::Denied(ClaimDenial::NotReady),
-                "{op:?}",
-                op = ticket
-            ),
+            (false, _) => assert!(claim.is_none(), "{ticket}"),
             (true, None) => {
-                assert_eq!(claim, Claim::Denied(ClaimDenial::ActivationNotQueued));
+                assert!(claim.is_none());
                 // The denial happened mid-transaction; the ticket's move to
                 // `claimed` must have rolled back. The post-op state
                 // comparison verifies exactly that.
             }
             (true, Some(activation)) => {
-                let Claim::Granted(granted) = claim else {
-                    panic!("model expected a grant for {ticket}, got {claim:?}");
-                };
+                let granted =
+                    claim.unwrap_or_else(|| panic!("model expected a grant for {ticket}"));
                 assert_eq!(granted.run_id, run_id);
                 assert_eq!(granted.lease_expires_at_ms, self.now_ms + CLAIM_LEASE_MS);
                 self.run_counter += 1;
@@ -463,11 +462,7 @@ impl Harness {
         }
         if outcome == Outcome::RateLimited {
             // A rate-limited settlement re-queues the activation it consumed.
-            self.model
-                .queued
-                .get_mut(&ticket)
-                .expect("known ticket")
-                .push(activation);
+            self.queue_activation(&ticket, activation);
         }
     }
 
