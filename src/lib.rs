@@ -3,6 +3,7 @@ pub mod clock;
 pub mod config;
 pub mod coordination;
 pub mod daemon;
+pub mod db;
 pub mod domain;
 pub mod eligibility;
 pub mod flow;

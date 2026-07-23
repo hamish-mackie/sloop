@@ -4,253 +4,9 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+pub use crate::db::SCHEMA_VERSION;
+use crate::db::{Db, DbError};
 use crate::domain::ticket::TicketState;
-
-pub const SCHEMA_VERSION: u32 = 13;
-
-// `synchronous = NORMAL` is the standard WAL pairing: commits skip the
-// per-transaction fsync (durability moves to checkpoints), which keeps the
-// write lock short under contention. The busy timeout is generous because
-// SQLite's busy handler has no fairness queue: under sustained multi-writer
-// load a waiter can starve well past a "reasonable" wait before winning.
-const CONNECTION_PRAGMAS: &str = "
-PRAGMA foreign_keys = ON;
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-PRAGMA busy_timeout = 30000;
-";
-
-const SCHEMA_V1: &str = "
-CREATE TABLE projects (
-    id              TEXT PRIMARY KEY,
-    file_path       TEXT UNIQUE,
-    source          TEXT NOT NULL DEFAULT 'local',
-    source_ref      TEXT,
-    title           TEXT NOT NULL,
-    created_at_ms   INTEGER NOT NULL,
-    updated_at_ms   INTEGER NOT NULL,
-    UNIQUE (source, source_ref),
-    CHECK (file_path IS NOT NULL OR source_ref IS NOT NULL)
-);
-
-CREATE TABLE tickets (
-    id              TEXT PRIMARY KEY,
-    project_id      TEXT NOT NULL REFERENCES projects(id),
-    file_path       TEXT UNIQUE,
-    source          TEXT NOT NULL DEFAULT 'local',
-    source_ref      TEXT,
-    state           TEXT NOT NULL,
-    attempts        INTEGER NOT NULL DEFAULT 0,
-    content_hash    TEXT,
-    name            TEXT NOT NULL DEFAULT '',
-    worktree        TEXT,
-    target          TEXT,
-    model           TEXT,
-    effort          TEXT,
-    flow            TEXT,
-    body            TEXT,
-    held_reason     TEXT,
-    missing_at_ms   INTEGER,
-    created_at_ms   INTEGER NOT NULL,
-    updated_at_ms   INTEGER NOT NULL,
-    UNIQUE (source, source_ref),
-    CHECK (file_path IS NOT NULL OR source_ref IS NOT NULL)
-);
-
-CREATE INDEX tickets_by_project_state
-ON tickets(project_id, state);
-
--- Dependencies are normalized so references are foreign-key checked and
--- graph reads do not require decoding serialized ticket data.
-CREATE TABLE ticket_blockers (
-    ticket_id       TEXT NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
-    blocker_id      TEXT NOT NULL REFERENCES tickets(id),
-    position        INTEGER NOT NULL,
-    PRIMARY KEY (ticket_id, blocker_id)
-);
-
-CREATE TABLE activations (
-    id              TEXT PRIMARY KEY,
-    kind            TEXT NOT NULL,
-    state           TEXT NOT NULL,
-    ticket_id       TEXT REFERENCES tickets(id),
-    project_id      TEXT REFERENCES projects(id),
-    eligible_at_ms  INTEGER,
-    interval_ms     INTEGER,
-    created_at_ms   INTEGER NOT NULL,
-    updated_at_ms   INTEGER NOT NULL,
-    CHECK (ticket_id IS NULL OR project_id IS NULL)
-);
-
-CREATE TABLE activation_filters (
-    activation_id   TEXT NOT NULL REFERENCES activations(id) ON DELETE CASCADE,
-    ticket_id       TEXT NOT NULL REFERENCES tickets(id),
-    PRIMARY KEY (activation_id, ticket_id)
-);
-
-CREATE TABLE runs (
-    id                    TEXT PRIMARY KEY,
-    activation_id         TEXT NOT NULL REFERENCES activations(id),
-    ticket_id             TEXT NOT NULL REFERENCES tickets(id),
-    state                 TEXT NOT NULL,
-    attempt               INTEGER NOT NULL,
-    branch                TEXT,
-    worktree_path         TEXT,
-    pid                   INTEGER,
-    pid_start_time        INTEGER,
-    process_group_id      INTEGER,
-    worker_token          TEXT,
-    worker_socket_path    TEXT,
-    started_at_ms         INTEGER,
-    exited_at_ms          INTEGER,
-    exit_code             INTEGER,
-    cleanup_eligible_at_ms INTEGER,
-    cleaned_at_ms         INTEGER,
-    flow_json             TEXT,
-    ticket_json           TEXT,
-    created_at_ms         INTEGER NOT NULL,
-    updated_at_ms         INTEGER NOT NULL
-);
-
-CREATE INDEX runs_by_ticket ON runs(ticket_id, created_at_ms);
-CREATE INDEX runs_by_activation ON runs(activation_id, created_at_ms);
-
--- A lease is time-bounded ownership of a ticket by the daemon, taken
--- atomically at claim time. `ticket_id` is the PRIMARY KEY and `run_id` is
--- UNIQUE, so the engine itself enforces at most one lease per ticket and per
--- run: the durable guard against double-spawn, backstopping the conditional
--- `UPDATE ... WHERE state='ready'` in `claim_ticket`.
---
--- Leases are held only by the daemon; `owner_id` records which daemon process
--- took the claim. Workers never hold, renew, or observe leases — a worker's
--- only credential is a per-run capability token granting the worker verbs on
--- its own run.
---
--- `expires_at_ms` gates renewal only: an expired lease cannot be renewed, so a
--- revived process cannot resurrect a claim recovery has decided is lost.
--- Liveness of a run is determined by process identity (pid + pid start time +
--- process group id), never by lease expiry.
---
--- The daemon renews the lease of every run it supervises, so `expires_at_ms`
--- stays in the future for as long as a run is alive and an expired row means
--- nobody was there to renew it. Because renewal is strict, a daemon returning
--- after longer than the TTL re-arms a readopted run's lapsed lease through
--- `readopt_lease` rather than through renewal.
---
--- A lease is released by deleting its row: on settlement (`finish_run`) or on
--- claim rollback (`abort_claim`). An expired-but-present row is evidence of an
--- owner that died mid-work.
-CREATE TABLE leases (
-    ticket_id       TEXT PRIMARY KEY REFERENCES tickets(id),
-    run_id          TEXT NOT NULL UNIQUE REFERENCES runs(id),
-    owner_id        TEXT NOT NULL,
-    acquired_at_ms  INTEGER NOT NULL,
-    renewed_at_ms   INTEGER NOT NULL,
-    expires_at_ms   INTEGER NOT NULL
-);
-
-CREATE INDEX leases_by_expiry ON leases(expires_at_ms);
-
-CREATE TABLE run_evidence (
-    sequence        INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id          TEXT NOT NULL REFERENCES runs(id),
-    kind            TEXT NOT NULL,
-    observed_at_ms  INTEGER NOT NULL,
-    dedupe_key      TEXT UNIQUE,
-    data_json       TEXT NOT NULL
-);
-
-CREATE INDEX evidence_by_run ON run_evidence(run_id, sequence);
-
-CREATE TABLE aftercare_stages (
-    run_id          TEXT NOT NULL REFERENCES runs(id),
-    stage_index     INTEGER NOT NULL,
-    stage           TEXT NOT NULL,
-    state           TEXT NOT NULL,
-    attempt         INTEGER NOT NULL DEFAULT 1,
-    started_at_ms   INTEGER,
-    finished_at_ms  INTEGER,
-    exit_code       INTEGER,
-    evidence_json   TEXT,
-    PRIMARY KEY (run_id, stage_index, attempt)
-);
-
-CREATE TABLE cooldowns (
-    key             TEXT PRIMARY KEY,
-    until_ms        INTEGER NOT NULL,
-    reason          TEXT NOT NULL,
-    source_run_id   TEXT REFERENCES runs(id),
-    updated_at_ms   INTEGER NOT NULL
-);
-
-CREATE TABLE budget_reservations (
-    run_id              TEXT PRIMARY KEY REFERENCES runs(id),
-    reserved_tokens     INTEGER NOT NULL,
-    actual_tokens       INTEGER,
-    state               TEXT NOT NULL,
-    created_at_ms       INTEGER NOT NULL,
-    reconciled_at_ms    INTEGER
-);
-
-CREATE TABLE scheduler_state (
-    singleton       INTEGER PRIMARY KEY CHECK (singleton = 1),
-    paused          INTEGER NOT NULL CHECK (paused IN (0, 1)),
-    draining        INTEGER NOT NULL DEFAULT 0 CHECK (draining IN (0, 1)),
-    updated_at_ms   INTEGER NOT NULL
-);
-
-CREATE TABLE notes (
-    id              TEXT PRIMARY KEY,
-    run_id          TEXT NOT NULL REFERENCES runs(id),
-    text            TEXT NOT NULL,
-    recorded_at_ms  INTEGER NOT NULL
-);
-";
-
-const ID_COUNTER_SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS id_counters (
-    kind            TEXT PRIMARY KEY,
-    next_ordinal    INTEGER NOT NULL CHECK (next_ordinal > 0)
-);
-INSERT OR IGNORE INTO id_counters (kind, next_ordinal)
-SELECT 'activation', COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) + 1 FROM activations;
-INSERT OR IGNORE INTO id_counters (kind, next_ordinal)
-SELECT 'note', COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) + 1 FROM notes;
-";
-
-const RUN_SNAPSHOT_COLUMNS: &str = "
-ALTER TABLE runs ADD COLUMN flow_json TEXT;
-ALTER TABLE runs ADD COLUMN ticket_json TEXT;
-";
-
-// The activity feed read by `sloop watch`. Rows are written inside the same
-// transaction as the state transition they describe, so the feed can never
-// disagree with the tables it narrates.
-const EVENTS_SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS events (
-    sequence        INTEGER PRIMARY KEY AUTOINCREMENT,
-    occurred_at_ms  INTEGER NOT NULL,
-    kind            TEXT NOT NULL,
-    run_id          TEXT,
-    ticket_id       TEXT,
-    data_json       TEXT NOT NULL DEFAULT '{}'
-);
-";
-
-const TICKET_SOURCE_COLUMNS: &str = "
-ALTER TABLE tickets ADD COLUMN body TEXT;
-ALTER TABLE tickets ADD COLUMN held_reason TEXT;
-";
-
-const RESTART_DRAINING_COLUMN: &str = "
-ALTER TABLE scheduler_state ADD COLUMN draining INTEGER NOT NULL DEFAULT 0
-CHECK (draining IN (0, 1));
-";
-
-const WORKTREE_CLEANUP_COLUMNS: &str = "
-ALTER TABLE runs ADD COLUMN cleanup_eligible_at_ms INTEGER;
-ALTER TABLE runs ADD COLUMN cleaned_at_ms INTEGER;
-";
 
 /// Every value the `runs.state` column can hold. The ladder runs
 /// `claimed → running → aftercare` and then to one terminal state, either an
@@ -741,7 +497,7 @@ fn replace_ticket_blockers(
 }
 
 pub struct Store {
-    connection: Connection,
+    db: Db,
 }
 
 impl Store {
@@ -749,248 +505,25 @@ impl Store {
     /// schema version. The daemon is the only writer; `now_ms` is injected so
     /// decision-adjacent timestamps never read the wall clock here.
     pub fn open(path: &Path, now_ms: i64) -> Result<Self, StoreError> {
-        let connection = Connection::open(path).map_err(|source| StoreError::Open {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        connection.execute_batch(CONNECTION_PRAGMAS)?;
-
-        let mut store = Self { connection };
-        store.migrate(now_ms)?;
-        Ok(store)
+        Db::open(path, now_ms)
+            .map(Self::from_db)
+            .map_err(StoreError::from)
     }
 
-    fn migrate(&mut self, now_ms: i64) -> Result<(), StoreError> {
-        let version: u32 = self
-            .connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        match version {
-            0 => {
-                let transaction = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
-                transaction.execute_batch(SCHEMA_V1)?;
-                transaction.execute_batch(ID_COUNTER_SCHEMA)?;
-                transaction.execute_batch(EVENTS_SCHEMA)?;
-                transaction.execute(
-                    "INSERT INTO scheduler_state (singleton, paused, draining, updated_at_ms)
-                     VALUES (1, 0, 0, ?1)",
-                    params![now_ms],
-                )?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                transaction.commit()?;
-                Ok(())
-            }
-            1 => {
-                let transaction = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
-                transaction.execute_batch(
-                    "ALTER TABLE tickets ADD COLUMN model TEXT;
-                     ALTER TABLE tickets ADD COLUMN effort TEXT;
-                     ALTER TABLE tickets ADD COLUMN target TEXT;
-                     ALTER TABLE tickets ADD COLUMN name TEXT NOT NULL DEFAULT '';
-                     ALTER TABLE tickets ADD COLUMN worktree TEXT;
-                     ALTER TABLE tickets ADD COLUMN flow TEXT;
-                     ALTER TABLE tickets ADD COLUMN missing_at_ms INTEGER;
-                     ALTER TABLE runs ADD COLUMN worker_socket_path TEXT;
-                     CREATE TABLE ticket_blockers (
-                         ticket_id TEXT NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
-                         blocker_id TEXT NOT NULL REFERENCES tickets(id),
-                         position INTEGER NOT NULL,
-                         PRIMARY KEY (ticket_id, blocker_id)
-                     );",
-                )?;
-                transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
-                transaction.execute_batch(ID_COUNTER_SCHEMA)?;
-                transaction.execute_batch(EVENTS_SCHEMA)?;
-                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
-                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
-                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                transaction.commit()?;
-                Ok(())
-            }
-            2 => {
-                let transaction = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
-                transaction.execute_batch(
-                    "ALTER TABLE tickets ADD COLUMN target TEXT;
-                     ALTER TABLE tickets ADD COLUMN name TEXT NOT NULL DEFAULT '';
-                     ALTER TABLE tickets ADD COLUMN worktree TEXT;
-                     ALTER TABLE tickets ADD COLUMN flow TEXT;
-                     ALTER TABLE tickets ADD COLUMN missing_at_ms INTEGER;
-                     ALTER TABLE runs ADD COLUMN worker_socket_path TEXT;
-                     CREATE TABLE ticket_blockers (
-                         ticket_id TEXT NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
-                         blocker_id TEXT NOT NULL REFERENCES tickets(id),
-                         position INTEGER NOT NULL,
-                         PRIMARY KEY (ticket_id, blocker_id)
-                     );",
-                )?;
-                transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
-                transaction.execute_batch(ID_COUNTER_SCHEMA)?;
-                transaction.execute_batch(EVENTS_SCHEMA)?;
-                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
-                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
-                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                transaction.commit()?;
-                Ok(())
-            }
-            3 => {
-                let transaction = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
-                transaction.execute_batch(
-                    "ALTER TABLE tickets ADD COLUMN name TEXT NOT NULL DEFAULT '';
-                     ALTER TABLE tickets ADD COLUMN worktree TEXT;
-                     ALTER TABLE tickets ADD COLUMN flow TEXT;
-                     ALTER TABLE tickets ADD COLUMN missing_at_ms INTEGER;
-                     ALTER TABLE runs ADD COLUMN worker_socket_path TEXT;
-                     CREATE TABLE ticket_blockers (
-                         ticket_id TEXT NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
-                         blocker_id TEXT NOT NULL REFERENCES tickets(id),
-                         position INTEGER NOT NULL,
-                         PRIMARY KEY (ticket_id, blocker_id)
-                     );",
-                )?;
-                transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
-                transaction.execute_batch(ID_COUNTER_SCHEMA)?;
-                transaction.execute_batch(EVENTS_SCHEMA)?;
-                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
-                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
-                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                transaction.commit()?;
-                Ok(())
-            }
-            4 => {
-                let transaction = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
-                transaction.execute_batch(
-                    "ALTER TABLE tickets ADD COLUMN flow TEXT;
-                     ALTER TABLE tickets ADD COLUMN missing_at_ms INTEGER;
-                     ALTER TABLE runs ADD COLUMN worker_socket_path TEXT;",
-                )?;
-                transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
-                transaction.execute_batch(ID_COUNTER_SCHEMA)?;
-                transaction.execute_batch(EVENTS_SCHEMA)?;
-                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
-                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
-                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                transaction.commit()?;
-                Ok(())
-            }
-            5 => {
-                let transaction = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
-                transaction.execute_batch(
-                    "ALTER TABLE tickets ADD COLUMN missing_at_ms INTEGER;
-                         ALTER TABLE runs ADD COLUMN worker_socket_path TEXT;",
-                )?;
-                transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
-                transaction.execute_batch(ID_COUNTER_SCHEMA)?;
-                transaction.execute_batch(EVENTS_SCHEMA)?;
-                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
-                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
-                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                transaction.commit()?;
-                Ok(())
-            }
-            6 => {
-                let transaction = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
-                transaction
-                    .execute_batch("ALTER TABLE runs ADD COLUMN worker_socket_path TEXT;")?;
-                transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
-                transaction.execute_batch(ID_COUNTER_SCHEMA)?;
-                transaction.execute_batch(EVENTS_SCHEMA)?;
-                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
-                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
-                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                transaction.commit()?;
-                Ok(())
-            }
-            7 => {
-                let transaction = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
-                transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
-                transaction.execute_batch(ID_COUNTER_SCHEMA)?;
-                transaction.execute_batch(EVENTS_SCHEMA)?;
-                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
-                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
-                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                transaction.commit()?;
-                Ok(())
-            }
-            8 => {
-                let transaction = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
-                transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
-                transaction.execute_batch(EVENTS_SCHEMA)?;
-                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
-                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
-                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                transaction.commit()?;
-                Ok(())
-            }
-            9 => {
-                let transaction = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
-                transaction.execute_batch(EVENTS_SCHEMA)?;
-                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
-                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
-                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                transaction.commit()?;
-                Ok(())
-            }
-            10 => {
-                let transaction = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
-                transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
-                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
-                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                transaction.commit()?;
-                Ok(())
-            }
-            11 => {
-                let transaction = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
-                transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
-                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                transaction.commit()?;
-                Ok(())
-            }
-            12 => {
-                let transaction = self
-                    .connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
-                transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                transaction.commit()?;
-                Ok(())
-            }
-            SCHEMA_VERSION => Ok(()),
-            newer => Err(StoreError::UnsupportedSchemaVersion(newer)),
-        }
+    pub fn from_db(db: Db) -> Self {
+        Self { db }
+    }
+
+    pub fn db(&self) -> Db {
+        self.db.clone()
+    }
+
+    fn with_connection<T>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let mut connection = self.db.lock();
+        operation(&mut connection)
     }
 
     pub fn insert_local_project(
@@ -1000,12 +533,14 @@ impl Store {
         title: &str,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
-            "INSERT INTO projects (id, file_path, source, title, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, 'local', ?3, ?4, ?4)",
-            params![id, file_path, title, now_ms],
-        )?;
-        Ok(())
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO projects (id, file_path, source, title, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, 'local', ?3, ?4, ?4)",
+                params![id, file_path, title, now_ms],
+            )?;
+            Ok(())
+        })
     }
 
     /// Inserts or refreshes a project indexed from a committed file. Startup
@@ -1018,43 +553,48 @@ impl Store {
         title: &str,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
-            "INSERT INTO projects (id, file_path, source, title, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, 'local', ?3, ?4, ?4)
-             ON CONFLICT(id) DO UPDATE SET
-                 file_path = excluded.file_path,
-                 title = excluded.title,
-                 updated_at_ms = excluded.updated_at_ms",
-            params![id, file_path, title, now_ms],
-        )?;
-        Ok(())
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO projects (id, file_path, source, title, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, 'local', ?3, ?4, ?4)
+                 ON CONFLICT(id) DO UPDATE SET
+                     file_path = excluded.file_path,
+                     title = excluded.title,
+                     updated_at_ms = excluded.updated_at_ms",
+                params![id, file_path, title, now_ms],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn project_exists(&self, id: &str) -> Result<bool, StoreError> {
-        let found: Option<i64> = self
-            .connection
-            .query_row("SELECT 1 FROM projects WHERE id = ?1", params![id], |row| {
-                row.get(0)
-            })
-            .optional()?;
-        Ok(found.is_some())
+        self.with_connection(|connection| {
+            let found: Option<i64> = connection
+                .query_row("SELECT 1 FROM projects WHERE id = ?1", params![id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            Ok(found.is_some())
+        })
     }
 
     pub fn project(&self, id: &str) -> Result<Option<ProjectRecord>, StoreError> {
-        self.connection
-            .query_row(
-                "SELECT id, file_path, title FROM projects WHERE id = ?1",
-                params![id],
-                |row| {
-                    Ok(ProjectRecord {
-                        id: row.get(0)?,
-                        file_path: row.get(1)?,
-                        title: row.get(2)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(StoreError::from)
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT id, file_path, title FROM projects WHERE id = ?1",
+                    params![id],
+                    |row| {
+                        Ok(ProjectRecord {
+                            id: row.get(0)?,
+                            file_path: row.get(1)?,
+                            title: row.get(2)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(StoreError::from)
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1073,7 +613,8 @@ impl Store {
         state: TicketState,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        let transaction = self.immediate_transaction()?;
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO tickets
                  (id, project_id, file_path, source, state, name, worktree, target, model, effort,
@@ -1111,7 +652,8 @@ impl Store {
         flow: &str,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        let transaction = self.immediate_transaction()?;
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "UPDATE tickets
              SET name = ?2, worktree = ?3, target = ?4, model = ?5, effort = ?6, flow = ?7,
@@ -1134,15 +676,15 @@ impl Store {
         tickets: &[ReindexTicket],
         now_ms: i64,
     ) -> Result<ReindexResult, StoreError> {
-        let existing: BTreeMap<String, TicketRecord> = self
-            .tickets()?
+        let mut connection = self.db.lock();
+        let existing: BTreeMap<String, TicketRecord> = Self::tickets_on(&connection)?
             .into_iter()
             .map(|ticket| (ticket.id.clone(), ticket))
             .collect();
         let desired_ticket_ids: BTreeSet<&str> =
             tickets.iter().map(|ticket| ticket.id.as_str()).collect();
         let desired_project_ids: BTreeSet<&str> = project_ids.iter().map(String::as_str).collect();
-        let transaction = self.immediate_transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let stale_tickets = {
             let mut statement = transaction.prepare("SELECT id FROM tickets ORDER BY id")?;
@@ -1361,7 +903,7 @@ impl Store {
         effort: Option<&str>,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.db.lock().execute(
             "UPDATE tickets SET target = ?2, model = ?3, effort = ?4, updated_at_ms = ?5 WHERE id = ?1",
             params![id, target, model, effort, now_ms],
         )?;
@@ -1369,7 +911,7 @@ impl Store {
     }
 
     pub fn update_ticket_body(&self, id: &str, body: &str, now_ms: i64) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.db.lock().execute(
             "UPDATE tickets SET body = ?2, updated_at_ms = ?3 WHERE id = ?1",
             params![id, body, now_ms],
         )?;
@@ -1384,7 +926,8 @@ impl Store {
         default_target: &str,
         now_ms: i64,
     ) -> Result<usize, StoreError> {
-        self.connection
+        self.db
+            .lock()
             .execute(
                 "UPDATE tickets SET target = ?1, updated_at_ms = ?2 WHERE target IS NULL",
                 params![default_target, now_ms],
@@ -1393,8 +936,8 @@ impl Store {
     }
 
     pub fn ticket(&self, id: &str) -> Result<Option<TicketRecord>, StoreError> {
-        let mut ticket = self
-            .connection
+        let connection = self.db.lock();
+        let mut ticket = connection
             .query_row(
                 &format!("{TICKET_RECORD_SELECT} WHERE id = ?1"),
                 params![id],
@@ -1402,7 +945,7 @@ impl Store {
             )
             .optional()?;
         if let Some(ticket) = ticket.as_mut() {
-            ticket.blocked_by = self.ticket_blockers(&ticket.id)?;
+            ticket.blocked_by = Self::ticket_blockers(&connection, &ticket.id)?;
         }
         Ok(ticket)
     }
@@ -1411,8 +954,8 @@ impl Store {
     /// unique across projects, so the lowest id wins deterministically; `show`
     /// tries this only after an exact id match fails.
     pub fn ticket_by_name(&self, name: &str) -> Result<Option<TicketRecord>, StoreError> {
-        let mut ticket = self
-            .connection
+        let connection = self.db.lock();
+        let mut ticket = connection
             .query_row(
                 &format!("{TICKET_RECORD_SELECT} WHERE name = ?1 ORDER BY id LIMIT 1"),
                 params![name],
@@ -1420,14 +963,14 @@ impl Store {
             )
             .optional()?;
         if let Some(ticket) = ticket.as_mut() {
-            ticket.blocked_by = self.ticket_blockers(&ticket.id)?;
+            ticket.blocked_by = Self::ticket_blockers(&connection, &ticket.id)?;
         }
         Ok(ticket)
     }
 
     pub fn ticket_by_file(&self, file_path: &str) -> Result<Option<TicketRecord>, StoreError> {
-        let mut ticket = self
-            .connection
+        let connection = self.db.lock();
+        let mut ticket = connection
             .query_row(
                 &format!("{TICKET_RECORD_SELECT} WHERE file_path = ?1"),
                 params![file_path],
@@ -1435,7 +978,7 @@ impl Store {
             )
             .optional()?;
         if let Some(ticket) = ticket.as_mut() {
-            ticket.blocked_by = self.ticket_blockers(&ticket.id)?;
+            ticket.blocked_by = Self::ticket_blockers(&connection, &ticket.id)?;
         }
         Ok(ticket)
     }
@@ -1445,8 +988,8 @@ impl Store {
         source: &str,
         source_ref: &str,
     ) -> Result<Option<TicketRecord>, StoreError> {
-        let mut ticket = self
-            .connection
+        let connection = self.db.lock();
+        let mut ticket = connection
             .query_row(
                 &format!("{TICKET_RECORD_SELECT} WHERE source = ?1 AND source_ref = ?2"),
                 params![source, source_ref],
@@ -1454,7 +997,7 @@ impl Store {
             )
             .optional()?;
         if let Some(ticket) = ticket.as_mut() {
-            ticket.blocked_by = self.ticket_blockers(&ticket.id)?;
+            ticket.blocked_by = Self::ticket_blockers(&connection, &ticket.id)?;
         }
         Ok(ticket)
     }
@@ -1465,7 +1008,11 @@ impl Store {
     /// comparison gets wrong (`TICK-9` sorts above `TICK-38`). Ids with no
     /// ordinal keep the deterministic `id DESC` order SQL gave them.
     pub fn tickets(&self) -> Result<Vec<TicketRecord>, StoreError> {
-        let mut statement = self.connection.prepare(&format!(
+        self.with_connection(|connection| Self::tickets_on(connection))
+    }
+
+    fn tickets_on(connection: &Connection) -> Result<Vec<TicketRecord>, StoreError> {
+        let mut statement = connection.prepare(&format!(
             "{TICKET_RECORD_SELECT} ORDER BY created_at_ms DESC, id DESC"
         ))?;
         let mut tickets = statement
@@ -1477,7 +1024,7 @@ impl Store {
                 std::cmp::Reverse(crate::ids::ordinal(&ticket.id).unwrap_or(0)),
             )
         });
-        let mut blockers = self.all_ticket_blockers()?;
+        let mut blockers = Self::all_ticket_blockers(connection)?;
         for ticket in &mut tickets {
             ticket.blocked_by = blockers.remove(&ticket.id).unwrap_or_default();
         }
@@ -1485,13 +1032,14 @@ impl Store {
     }
 
     pub fn tickets_for_project(&self, project_id: &str) -> Result<Vec<TicketRecord>, StoreError> {
-        let mut statement = self.connection.prepare(&format!(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(&format!(
             "{TICKET_RECORD_SELECT} WHERE project_id = ?1 ORDER BY id"
         ))?;
         let mut tickets = statement
             .query_map(params![project_id], ticket_record)?
             .collect::<Result<Vec<_>, _>>()?;
-        let mut blockers = self.all_ticket_blockers()?;
+        let mut blockers = Self::all_ticket_blockers(&connection)?;
         for ticket in &mut tickets {
             ticket.blocked_by = blockers.remove(&ticket.id).unwrap_or_default();
         }
@@ -1502,12 +1050,13 @@ impl Store {
         &self,
     ) -> Result<std::collections::BTreeMap<String, Vec<String>>, StoreError> {
         let mut dependencies = std::collections::BTreeMap::new();
-        let mut statement = self.connection.prepare("SELECT id FROM tickets")?;
+        let connection = self.db.lock();
+        let mut statement = connection.prepare("SELECT id FROM tickets")?;
         let ids = statement.query_map([], |row| row.get::<_, String>(0))?;
         for id in ids {
             dependencies.insert(id?, Vec::new());
         }
-        for (ticket_id, blockers) in self.all_ticket_blockers()? {
+        for (ticket_id, blockers) in Self::all_ticket_blockers(&connection)? {
             if let Some(entry) = dependencies.get_mut(&ticket_id) {
                 *entry = blockers;
             }
@@ -1518,8 +1067,10 @@ impl Store {
     /// Every ticket's blockers in one pass, keeping each list in declared
     /// order. Loading these per ticket turns any all-tickets read into a
     /// query per row, which is what the post path pays cycle checks against.
-    fn all_ticket_blockers(&self) -> Result<BTreeMap<String, Vec<String>>, StoreError> {
-        let mut statement = self.connection.prepare(
+    fn all_ticket_blockers(
+        connection: &Connection,
+    ) -> Result<BTreeMap<String, Vec<String>>, StoreError> {
+        let mut statement = connection.prepare(
             "SELECT ticket_id, blocker_id FROM ticket_blockers
              ORDER BY ticket_id, position, blocker_id",
         )?;
@@ -1534,8 +1085,8 @@ impl Store {
         Ok(blockers)
     }
 
-    fn ticket_blockers(&self, id: &str) -> Result<Vec<String>, StoreError> {
-        let mut statement = self.connection.prepare(
+    fn ticket_blockers(connection: &Connection, id: &str) -> Result<Vec<String>, StoreError> {
+        let mut statement = connection.prepare(
             "SELECT blocker_id FROM ticket_blockers
              WHERE ticket_id = ?1 ORDER BY position, blocker_id",
         )?;
@@ -1546,14 +1097,16 @@ impl Store {
     }
 
     pub fn ticket_ids(&self) -> Result<Vec<String>, StoreError> {
-        let mut statement = self.connection.prepare("SELECT id FROM tickets")?;
+        let connection = self.db.lock();
+        let mut statement = connection.prepare("SELECT id FROM tickets")?;
         let rows = statement.query_map([], |row| row.get(0))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
 
     pub fn local_ticket_files(&self) -> Result<Vec<LocalTicketFile>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
             "SELECT id, file_path, state, missing_at_ms FROM tickets
              WHERE source = 'local' AND file_path IS NOT NULL
              ORDER BY id",
@@ -1574,7 +1127,7 @@ impl Store {
     /// blocker list still points at this row; deleting it would then violate
     /// a foreign key or orphan run evidence.
     pub fn ticket_is_referenced(&self, id: &str) -> Result<bool, StoreError> {
-        let referenced = self.connection.query_row(
+        let referenced = self.db.lock().query_row(
             "SELECT EXISTS (SELECT 1 FROM runs WHERE ticket_id = ?1)
                  OR EXISTS (SELECT 1 FROM leases WHERE ticket_id = ?1)
                  OR EXISTS (SELECT 1 FROM activations WHERE ticket_id = ?1)
@@ -1587,7 +1140,8 @@ impl Store {
     }
 
     pub fn delete_ticket(&self, id: &str) -> Result<(), StoreError> {
-        self.connection
+        self.db
+            .lock()
             .execute("DELETE FROM tickets WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -1596,7 +1150,7 @@ impl Store {
     /// the row out of selection without disturbing its state; an existing
     /// stamp is preserved so the deletion clock starts at the first pass.
     pub fn mark_ticket_missing(&self, id: &str, now_ms: i64) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.db.lock().execute(
             "UPDATE tickets SET missing_at_ms = ?2, updated_at_ms = ?2
              WHERE id = ?1 AND missing_at_ms IS NULL",
             params![id, now_ms],
@@ -1605,7 +1159,7 @@ impl Store {
     }
 
     pub fn clear_ticket_missing(&self, id: &str, now_ms: i64) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.db.lock().execute(
             "UPDATE tickets SET missing_at_ms = NULL, updated_at_ms = ?2
              WHERE id = ?1 AND missing_at_ms IS NOT NULL",
             params![id, now_ms],
@@ -1614,8 +1168,11 @@ impl Store {
     }
 
     pub fn ticket_state(&self, id: &str) -> Result<Option<String>, StoreError> {
-        let state = self
-            .connection
+        self.with_connection(|connection| Self::ticket_state_on(connection, id))
+    }
+
+    fn ticket_state_on(connection: &Connection, id: &str) -> Result<Option<String>, StoreError> {
+        let state = connection
             .query_row(
                 "SELECT state FROM tickets WHERE id = ?1",
                 params![id],
@@ -1635,10 +1192,10 @@ impl Store {
         now_ms: i64,
     ) -> Result<String, StoreError> {
         debug_assert!(matches!(state, TicketState::Ready | TicketState::Held));
+        let connection = self.db.lock();
         let requested = state.as_str();
-        let previous = self
-            .ticket_state(id)?
-            .ok_or_else(|| StoreError::TicketNotFound {
+        let previous =
+            Self::ticket_state_on(&connection, id)?.ok_or_else(|| StoreError::TicketNotFound {
                 ticket_id: id.into(),
             })?;
         if previous == requested {
@@ -1649,7 +1206,7 @@ impl Store {
             TicketState::Held => TicketState::Ready.as_str(),
             _ => unreachable!("hold transitions only use ready and held"),
         };
-        let changed = self.connection.execute(
+        let changed = connection.execute(
             "UPDATE tickets SET state = ?2, held_reason = NULL, updated_at_ms = ?3
              WHERE id = ?1 AND state = ?4",
             params![id, requested, now_ms, allowed_previous],
@@ -1667,12 +1224,12 @@ impl Store {
     /// Returns a failed ticket to the ready queue and starts its attempt
     /// counter over. Other states remain evidence-derived and immutable here.
     pub fn retry_ticket(&self, id: &str, now_ms: i64) -> Result<String, StoreError> {
-        let previous = self
-            .ticket_state(id)?
-            .ok_or_else(|| StoreError::TicketNotFound {
+        let mut connection = self.db.lock();
+        let previous =
+            Self::ticket_state_on(&connection, id)?.ok_or_else(|| StoreError::TicketNotFound {
                 ticket_id: id.into(),
             })?;
-        let transaction = self.immediate_transaction()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
             "UPDATE tickets SET state = 'ready', held_reason = NULL, attempts = 0, updated_at_ms = ?2
              WHERE id = ?1 AND state = 'failed'",
@@ -1700,7 +1257,7 @@ impl Store {
         activation: &NewActivation<'_>,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.db.lock().execute(
             "INSERT INTO activations
                  (id, kind, state, ticket_id, project_id, eligible_at_ms, interval_ms,
                   created_at_ms, updated_at_ms)
@@ -1724,7 +1281,7 @@ impl Store {
         activation_id: &str,
         ticket_id: &str,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.db.lock().execute(
             "INSERT OR IGNORE INTO activation_filters (activation_id, ticket_id) VALUES (?1, ?2)",
             params![activation_id, ticket_id],
         )?;
@@ -1732,7 +1289,8 @@ impl Store {
     }
 
     pub fn queued_activations(&self) -> Result<Vec<QueuedActivation>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
             "SELECT id, kind, ticket_id, project_id, eligible_at_ms, interval_ms
              FROM activations WHERE state = 'queued'
              ORDER BY created_at_ms, id",
@@ -1757,7 +1315,8 @@ impl Store {
         &self,
         now_ms: i64,
     ) -> Result<Vec<QueuedActivation>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
             "SELECT id, kind, ticket_id, project_id, eligible_at_ms, interval_ms
              FROM activations
              WHERE state = 'queued'
@@ -1780,7 +1339,8 @@ impl Store {
     }
 
     pub fn next_activation_eligible_at_ms(&self, now_ms: i64) -> Result<Option<i64>, StoreError> {
-        self.connection
+        self.db
+            .lock()
             .query_row(
                 "SELECT MIN(eligible_at_ms) FROM activations
                  WHERE state = 'queued' AND eligible_at_ms > ?1",
@@ -1799,7 +1359,8 @@ impl Store {
         now_ms: i64,
     ) -> Result<Option<String>, StoreError> {
         let ticket = self
-            .connection
+            .db
+            .lock()
             .query_row(
                 "SELECT t.id FROM tickets t
                  WHERE t.state = 'ready'
@@ -1826,7 +1387,8 @@ impl Store {
     }
 
     pub fn ticket_is_dispatchable(&self, ticket_id: &str) -> Result<bool, StoreError> {
-        self.connection
+        self.db
+            .lock()
             .query_row(
                 "SELECT EXISTS(
                      SELECT 1 FROM tickets t
@@ -1845,7 +1407,8 @@ impl Store {
     }
 
     pub fn unmerged_blockers(&self, ticket_id: &str) -> Result<Vec<String>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
             "SELECT b.blocker_id FROM ticket_blockers b
              JOIN tickets bt ON bt.id = b.blocker_id
              WHERE b.ticket_id = ?1 AND bt.state != 'merged'
@@ -1872,7 +1435,8 @@ impl Store {
         worker_socket_path: &str,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        let transaction = self.immediate_transaction()?;
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
             "UPDATE runs
              SET state = ?10, branch = ?2, worktree_path = ?3, pid = ?4,
@@ -1941,9 +1505,8 @@ impl Store {
     ) -> Result<bool, StoreError> {
         use crate::outcome::Outcome;
 
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let run_state = RunState::from(outcome);
         let changed = transaction.execute(
             "UPDATE runs
@@ -2043,7 +1606,7 @@ impl Store {
             "reason": stage.reason,
         })
         .to_string();
-        self.connection.execute(
+        self.db.lock().execute(
             "INSERT INTO aftercare_stages
                  (run_id, stage_index, stage, state, started_at_ms, finished_at_ms, exit_code,
                   evidence_json)
@@ -2070,7 +1633,8 @@ impl Store {
     }
 
     pub(crate) fn aftercare_stages(&self, run_id: &str) -> Result<Vec<StageRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
             "SELECT stage_index, stage, state, started_at_ms, finished_at_ms, exit_code,
                     evidence_json
              FROM aftercare_stages WHERE run_id = ?1 ORDER BY stage_index",
@@ -2124,9 +1688,8 @@ impl Store {
         cooldown_until_ms: Option<i64>,
         now_ms: i64,
     ) -> Result<ExitClaim, StoreError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
             "UPDATE runs
              SET state = ?4, exit_code = ?2, updated_at_ms = ?3
@@ -2201,7 +1764,7 @@ impl Store {
         data_json: &str,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.db.lock().execute(
             "INSERT INTO run_evidence
                  (run_id, kind, observed_at_ms, dedupe_key, data_json)
              VALUES (?1, ?2, ?3, 'settlement:' || ?1 || ':' || ?2, ?4)
@@ -2214,7 +1777,7 @@ impl Store {
     }
 
     pub(crate) fn clear_aftercare_process(&self, run_id: &str) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.db.lock().execute(
             "DELETE FROM run_evidence
              WHERE run_id = ?1 AND dedupe_key = 'settlement:' || ?1 || ':aftercare_process'",
             params![run_id],
@@ -2225,7 +1788,7 @@ impl Store {
     /// Durably records an operator's cancellation intent, idempotently: the
     /// dedupe key makes a repeated `cancel` a no-op rather than new evidence.
     pub fn record_cancel_requested(&self, run_id: &str, now_ms: i64) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.db.lock().execute(
             "INSERT OR IGNORE INTO run_evidence
                  (run_id, kind, observed_at_ms, dedupe_key, data_json)
              VALUES (?1, 'cancel_requested', ?2, 'cancel_requested:' || ?1, '{}')",
@@ -2238,7 +1801,8 @@ impl Store {
     /// racing the cancel still resolves to `Cancelled`.
     pub fn cancellation_requested(&self, run_id: &str) -> Result<bool, StoreError> {
         let found: Option<i64> = self
-            .connection
+            .db
+            .lock()
             .query_row(
                 "SELECT 1 FROM run_evidence
                  WHERE run_id = ?1 AND kind = 'cancel_requested'",
@@ -2258,7 +1822,7 @@ impl Store {
         text: &str,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.db.lock().execute(
             "INSERT INTO notes (id, run_id, text, recorded_at_ms)
              VALUES (?1, ?2, ?3, ?4)",
             params![id, run_id, text, now_ms],
@@ -2268,8 +1832,8 @@ impl Store {
 
     /// Notes recorded against one run, in the order they arrived.
     pub fn notes_for_run(&self, run_id: &str) -> Result<Vec<String>, StoreError> {
-        let mut statement = self
-            .connection
+        let connection = self.db.lock();
+        let mut statement = connection
             .prepare("SELECT text FROM notes WHERE run_id = ?1 ORDER BY recorded_at_ms, id")?;
         let rows = statement
             .query_map(params![run_id], |row| row.get(0))?
@@ -2290,7 +1854,7 @@ impl Store {
         let dedupe_key = format!("verdict:{run_id}:{stage}");
         let data_json =
             serde_json::json!({"stage": stage, "verdict": verdict, "reason": reason}).to_string();
-        let inserted = self.connection.execute(
+        let inserted = self.db.lock().execute(
             "INSERT OR IGNORE INTO run_evidence
                  (run_id, kind, observed_at_ms, dedupe_key, data_json)
              VALUES (?1, 'stage_verdict', ?2, ?3, ?4)",
@@ -2300,7 +1864,8 @@ impl Store {
     }
 
     pub fn notes_for_project(&self, project_id: &str) -> Result<Vec<ProjectNote>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
             "SELECT n.id, n.run_id, r.ticket_id, n.text, n.recorded_at_ms
              FROM notes n
              JOIN runs r ON r.id = n.run_id
@@ -2326,7 +1891,8 @@ impl Store {
         &self,
         project_id: &str,
     ) -> Result<Vec<ProjectCommitEvidence>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
             "SELECT r.id, r.ticket_id, e.data_json
              FROM run_evidence e
              JOIN runs r ON r.id = e.run_id
@@ -2352,7 +1918,8 @@ impl Store {
 
     /// Evidence rows for one run in observation order, as (kind, data_json).
     pub fn run_evidence(&self, run_id: &str) -> Result<Vec<(String, String)>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
             "SELECT kind, data_json FROM run_evidence WHERE run_id = ?1 ORDER BY sequence",
         )?;
         let rows = statement
@@ -2366,7 +1933,8 @@ impl Store {
         run_id: &str,
     ) -> Result<Option<crate::vendor_error::VendorErrorMatch>, StoreError> {
         let data: Option<String> = self
-            .connection
+            .db
+            .lock()
             .query_row(
                 "SELECT data_json FROM run_evidence
                  WHERE run_id = ?1 AND kind = 'vendor_error_classified'
@@ -2383,7 +1951,8 @@ impl Store {
         ticket_id: &str,
     ) -> Result<Option<crate::vendor_error::VendorErrorMatch>, StoreError> {
         let data: Option<String> = self
-            .connection
+            .db
+            .lock()
             .query_row(
                 "SELECT e.data_json FROM run_evidence e
                  JOIN runs r ON r.id = e.run_id
@@ -2408,9 +1977,8 @@ impl Store {
         ticket_id: &str,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute("DELETE FROM leases WHERE run_id = ?1", params![run_id])?;
         transaction.execute(
             "UPDATE runs
@@ -2438,7 +2006,8 @@ impl Store {
     /// Reads activity-feed rows with `sequence > after`, oldest first. The
     /// last row's sequence is the caller's next cursor.
     pub fn events_after(&self, after: i64, limit: usize) -> Result<Vec<EventRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
             "SELECT sequence, occurred_at_ms, kind, run_id, ticket_id, data_json
              FROM events WHERE sequence > ?1 ORDER BY sequence LIMIT ?2",
         )?;
@@ -2475,7 +2044,8 @@ impl Store {
         let placeholders = std::iter::repeat_n("?", run_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let mut statement = self.connection.prepare(&format!(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(&format!(
             "SELECT run_id,
                     MIN(CASE WHEN kind = 'run_claimed' THEN occurred_at_ms END),
                     MIN(CASE WHEN kind = 'run_started' THEN occurred_at_ms END),
@@ -2501,7 +2071,7 @@ impl Store {
     }
 
     pub fn latest_event_sequence(&self) -> Result<i64, StoreError> {
-        let latest = self.connection.query_row(
+        let latest = self.db.lock().query_row(
             "SELECT COALESCE(MAX(sequence), 0) FROM events",
             [],
             |row| row.get(0),
@@ -2512,7 +2082,7 @@ impl Store {
     /// Drops all but the newest `keep` activity-feed rows. Sequences are never
     /// reused after a trim, so cursors held by watchers stay valid.
     pub fn trim_events(&self, keep: i64) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.db.lock().execute(
             "DELETE FROM events
              WHERE sequence <= (SELECT COALESCE(MAX(sequence), 0) FROM events) - ?1",
             params![keep],
@@ -2522,7 +2092,8 @@ impl Store {
 
     pub fn run(&self, id: &str) -> Result<Option<RunRecord>, StoreError> {
         let run = self
-            .connection
+            .db
+            .lock()
             .query_row(
                 &format!("{RUN_RECORD_SELECT} WHERE id = ?1"),
                 params![id],
@@ -2540,7 +2111,8 @@ impl Store {
         attempt: i64,
     ) -> Result<Option<RunRecord>, StoreError> {
         let run = self
-            .connection
+            .db
+            .lock()
             .query_row(
                 &format!(
                     "{RUN_RECORD_SELECT} WHERE ticket_id = ?1 AND attempt = ?2
@@ -2556,7 +2128,8 @@ impl Store {
     /// Every run a ticket has produced, newest attempt first, so a bare ticket
     /// reference can name the latest run and still report the earlier ones.
     pub fn runs_for_ticket(&self, ticket_id: &str) -> Result<Vec<RunRecord>, StoreError> {
-        let mut statement = self.connection.prepare(&format!(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(&format!(
             "{RUN_RECORD_SELECT} WHERE ticket_id = ?1 ORDER BY attempt DESC, created_at_ms DESC"
         ))?;
         let runs = statement
@@ -2570,7 +2143,8 @@ impl Store {
     pub fn runs_with_id_prefix(&self, prefix: &str) -> Result<Vec<RunRecord>, StoreError> {
         // `LIKE` would treat `%` and `_` in a prefix as wildcards; run ids are
         // hexadecimal, but comparing on the substring keeps that beyond doubt.
-        let mut statement = self.connection.prepare(&format!(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(&format!(
             "{RUN_RECORD_SELECT} WHERE SUBSTR(id, 1, ?2) = ?1 ORDER BY created_at_ms, id"
         ))?;
         let runs = statement
@@ -2584,7 +2158,8 @@ impl Store {
     /// integration. Only the newest `needs_review` run with a branch is
     /// returned per ticket; the tip itself is never cached here.
     pub(crate) fn needs_review_branches(&self) -> Result<Vec<NeedsReviewBranch>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
             "SELECT t.id, r.id, r.branch
              FROM tickets t
              JOIN runs r ON r.id = (
@@ -2612,7 +2187,8 @@ impl Store {
     pub(crate) fn worktree_cleanup_candidates(
         &self,
     ) -> Result<Vec<WorktreeCleanupCandidate>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
             "SELECT r.id, r.ticket_id, r.branch, r.worktree_path, r.cleanup_eligible_at_ms
              FROM runs r
              WHERE r.cleanup_eligible_at_ms IS NOT NULL
@@ -2641,7 +2217,7 @@ impl Store {
         retention_ms: i64,
         now_ms: i64,
     ) -> Result<Option<i64>, StoreError> {
-        let eligible_at: Option<i64> = self.connection.query_row(
+        let eligible_at: Option<i64> = self.db.lock().query_row(
             "SELECT MIN(r.cleanup_eligible_at_ms)
              FROM runs r
              WHERE r.cleanup_eligible_at_ms IS NOT NULL
@@ -2663,7 +2239,8 @@ impl Store {
         candidate: &WorktreeCleanupCandidate,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
-        let transaction = self.immediate_transaction()?;
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
             "UPDATE runs SET cleaned_at_ms = ?2, updated_at_ms = ?2
              WHERE id = ?1 AND cleanup_eligible_at_ms IS NOT NULL
@@ -2704,9 +2281,8 @@ impl Store {
         observed_default_tip: &str,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
             "UPDATE tickets SET state = 'merged', held_reason = NULL, updated_at_ms = ?2
              WHERE id = ?1 AND state = 'needs_review'",
@@ -2752,7 +2328,8 @@ impl Store {
         ticket_id: &str,
     ) -> Result<Option<(String, i64)>, StoreError> {
         let run = self
-            .connection
+            .db
+            .lock()
             .query_row(
                 "SELECT r.id, r.attempt FROM runs r
                  JOIN leases l ON l.run_id = r.id
@@ -2774,7 +2351,8 @@ impl Store {
 
     /// Leased nonterminal runs that consume capacity, oldest first.
     pub fn active_runs(&self) -> Result<Vec<ActiveRun>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
             "SELECT r.id, r.ticket_id, r.attempt, t.name, t.project_id, r.state FROM runs r
              JOIN leases l ON l.run_id = r.id
              JOIN tickets t ON t.id = r.ticket_id
@@ -2800,7 +2378,8 @@ impl Store {
     /// Every nonterminal run that still owns a lease, oldest first. Startup
     /// must classify all of these before making another spawn decision.
     pub(crate) fn recoverable_runs(&self) -> Result<Vec<RecoverableRun>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
             "SELECT r.id, r.ticket_id, t.target, r.state, r.branch, r.worktree_path,
                     r.pid, r.pid_start_time, r.process_group_id, r.worker_token,
                     r.worker_socket_path, r.exit_code, l.expires_at_ms, r.flow_json,
@@ -2844,7 +2423,8 @@ impl Store {
         kind: ActivationKind,
     ) -> Result<Option<String>, StoreError> {
         let id = self
-            .connection
+            .db
+            .lock()
             .query_row(
                 "SELECT id FROM activations
                  WHERE ticket_id = ?1 AND kind = ?2 AND state = 'queued'
@@ -2865,7 +2445,7 @@ impl Store {
         eligible_at_ms: i64,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.db.lock().execute(
             "UPDATE activations
              SET eligible_at_ms = ?2, updated_at_ms = ?3
              WHERE id = ?1 AND state = 'queued'",
@@ -2880,17 +2460,9 @@ impl Store {
         self.reserve_ordinal("activation", "activations")
     }
 
-    /// Begins a write transaction that takes the write lock up front. A
-    /// deferred transaction that reads before its first write can hit an
-    /// immediate `SQLITE_BUSY` when a sibling connection commits in between:
-    /// its snapshot is stale, so SQLite fails fast instead of honoring
-    /// `busy_timeout`. Starting immediate makes contending writers queue.
-    fn immediate_transaction(&self) -> Result<rusqlite::Transaction<'_>, rusqlite::Error> {
-        rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
-    }
-
     fn reserve_ordinal(&self, kind: &str, table: &str) -> Result<i64, StoreError> {
-        let transaction = self.immediate_transaction()?;
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let reserved: i64 = transaction.query_row(
             "SELECT next_ordinal FROM id_counters WHERE kind = ?1",
             params![kind],
@@ -2918,9 +2490,8 @@ impl Store {
         claim: &ClaimRequest<'_>,
         now_ms: i64,
     ) -> Result<ClaimedRun, StoreError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let changed = transaction.execute(
             "UPDATE tickets
@@ -3048,7 +2619,7 @@ impl Store {
         now_ms: i64,
     ) -> Result<i64, StoreError> {
         let expires_at_ms = now_ms + lease_ms;
-        let changed = self.connection.execute(
+        let changed = self.db.lock().execute(
             "UPDATE leases
              SET renewed_at_ms = ?3, expires_at_ms = ?4
              WHERE ticket_id = ?1 AND run_id = ?2
@@ -3078,7 +2649,7 @@ impl Store {
         now_ms: i64,
     ) -> Result<i64, StoreError> {
         let expires_at_ms = now_ms + lease_ms;
-        let changed = self.connection.execute(
+        let changed = self.db.lock().execute(
             "UPDATE leases
              SET renewed_at_ms = ?3, expires_at_ms = ?4
              WHERE ticket_id = ?1 AND run_id = ?2 AND expires_at_ms > ?3",
@@ -3094,7 +2665,7 @@ impl Store {
     }
 
     pub fn paused(&self) -> Result<bool, StoreError> {
-        let paused: i64 = self.connection.query_row(
+        let paused: i64 = self.db.lock().query_row(
             "SELECT paused FROM scheduler_state WHERE singleton = 1",
             [],
             |row| row.get(0),
@@ -3103,7 +2674,7 @@ impl Store {
     }
 
     pub fn clear_restart_draining(&self, now_ms: i64) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.db.lock().execute(
             "UPDATE scheduler_state SET draining = 0, updated_at_ms = ?1 WHERE singleton = 1",
             params![now_ms],
         )?;
@@ -3111,7 +2682,7 @@ impl Store {
     }
 
     pub fn restart_draining(&self) -> Result<bool, StoreError> {
-        let draining: i64 = self.connection.query_row(
+        let draining: i64 = self.db.lock().query_row(
             "SELECT draining FROM scheduler_state WHERE singleton = 1",
             [],
             |row| row.get(0),
@@ -3124,7 +2695,8 @@ impl Store {
         target: &str,
         now_ms: i64,
     ) -> Result<Option<CooldownRecord>, StoreError> {
-        self.connection
+        self.db
+            .lock()
             .query_row(
                 "SELECT ?1, until_ms, reason FROM cooldowns
                  WHERE key = 'agent_target:' || ?1 AND until_ms > ?2",
@@ -3145,7 +2717,8 @@ impl Store {
     /// gate for repair spawns, which run inside an already-leased run.
     pub(crate) fn active_lease_count(&self) -> Result<usize, StoreError> {
         let count: i64 = self
-            .connection
+            .db
+            .lock()
             .query_row("SELECT COUNT(*) FROM leases", [], |row| row.get(0))?;
         Ok(count as usize)
     }
@@ -3162,7 +2735,7 @@ impl Store {
         data_json: &str,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.db.lock().execute(
             "INSERT INTO run_evidence
                  (run_id, kind, observed_at_ms, dedupe_key, data_json)
              VALUES (?1, 'repair_attempt', ?2,
@@ -3176,7 +2749,8 @@ impl Store {
     }
 
     pub fn active_cooldowns(&self, now_ms: i64) -> Result<Vec<CooldownRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
             "SELECT SUBSTR(key, 14), until_ms, reason FROM cooldowns
              WHERE key LIKE 'agent_target:%' AND until_ms > ?1
              ORDER BY key",
@@ -3194,7 +2768,8 @@ impl Store {
     }
 
     pub fn next_active_cooldown(&self, now_ms: i64) -> Result<Option<i64>, StoreError> {
-        self.connection
+        self.db
+            .lock()
             .query_row(
                 "SELECT MIN(until_ms) FROM cooldowns WHERE until_ms > ?1",
                 params![now_ms],
@@ -3204,7 +2779,7 @@ impl Store {
     }
 
     pub fn set_paused(&self, paused: bool, now_ms: i64) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.db.lock().execute(
             "UPDATE scheduler_state SET paused = ?1, updated_at_ms = ?2 WHERE singleton = 1",
             params![i64::from(paused), now_ms],
         )?;
@@ -3216,9 +2791,8 @@ impl Store {
         active_runs: usize,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
             "UPDATE scheduler_state SET draining = 1, updated_at_ms = ?1
              WHERE singleton = 1 AND draining = 0",
@@ -3240,9 +2814,8 @@ impl Store {
 
     /// Resuming cancels both scheduler holds in one durable transition.
     pub fn resume_scheduler(&mut self, now_ms: i64) -> Result<bool, StoreError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let was_draining: bool = transaction.query_row(
             "SELECT draining FROM scheduler_state WHERE singleton = 1",
             [],
@@ -3261,7 +2834,7 @@ impl Store {
     /// Performs a small committed write used to detect when SQLite can make
     /// progress again after returning `SQLITE_FULL`.
     pub(crate) fn probe_writable(&self, now_ms: i64) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.db.lock().execute(
             "UPDATE scheduler_state SET updated_at_ms = ?1 WHERE singleton = 1",
             params![now_ms],
         )?;
@@ -3269,7 +2842,8 @@ impl Store {
     }
 
     pub fn ticket_counts(&self) -> Result<TicketCounts, StoreError> {
-        let mut statement = self.connection.prepare(
+        let connection = self.db.lock();
+        let mut statement = connection.prepare(
             "SELECT CASE
                       WHEN t.state = 'ready' AND EXISTS (
                           SELECT 1 FROM ticket_blockers b
@@ -3394,6 +2968,16 @@ impl StoreError {
 impl From<rusqlite::Error> for StoreError {
     fn from(source: rusqlite::Error) -> Self {
         Self::Sqlite(source)
+    }
+}
+
+impl From<DbError> for StoreError {
+    fn from(source: DbError) -> Self {
+        match source {
+            DbError::Open { path, source } => Self::Open { path, source },
+            DbError::Sqlite(source) => Self::Sqlite(source),
+            DbError::UnsupportedSchemaVersion(version) => Self::UnsupportedSchemaVersion(version),
+        }
     }
 }
 
@@ -3530,7 +3114,8 @@ mod tests {
 
         assert!(!store.paused().unwrap());
         let updated_at_ms: i64 = store
-            .connection
+            .db
+            .lock()
             .query_row(
                 "SELECT updated_at_ms FROM scheduler_state WHERE singleton = 1",
                 [],
@@ -3690,7 +3275,8 @@ mod tests {
         assert_eq!(store.ticket_counts().unwrap().blocked, 1);
 
         store
-            .connection
+            .db
+            .lock()
             .execute("UPDATE tickets SET state = 'failed' WHERE id = 'T1'", [])
             .unwrap();
         assert_eq!(store.select_ready_ticket(&activation, 2_000).unwrap(), None);
@@ -3718,7 +3304,8 @@ mod tests {
         assert_eq!(store.ticket("T2").unwrap().unwrap().attempts, 0);
 
         store
-            .connection
+            .db
+            .lock()
             .execute("UPDATE tickets SET state = 'merged' WHERE id = 'T1'", [])
             .unwrap();
         assert!(store.unmerged_blockers("T2").unwrap().is_empty());
@@ -4683,7 +4270,8 @@ mod tests {
         let path = directory.path().join("sloop.db");
         let store = open_seeded(&path);
         store
-            .connection
+            .db
+            .lock()
             .execute(
                 "UPDATE tickets SET state = 'held', attempts = 3 WHERE id = 'T1'",
                 [],
@@ -4951,7 +4539,8 @@ mod tests {
         assert!(!store.restart_draining().unwrap());
         assert_eq!(
             store
-                .connection
+                .db
+                .lock()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
             SCHEMA_VERSION
