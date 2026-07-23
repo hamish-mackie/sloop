@@ -21,6 +21,16 @@ project says which work belongs together.
 - **Repeatable** — tickets are Markdown files in your repo, easy to share and
   re-run.
 
+<p align="center">
+  <img src="docs/assets/show.png" alt="sloop show — daemon status, active runs, and the ticket queue with blockers" width="100%">
+</p>
+
+<p align="center">
+  More: <a href="docs/assets/show-ticket.png">ticket detail</a> ·
+  <a href="docs/assets/show-follow.png">live event feed</a> ·
+  <a href="docs/assets/help.png">CLI help</a>
+</p>
+
 Under the hood it's a small Rust daemon — an agent harness that supervises
 each run, enforces shared rate limits, and judges outcomes from process exit
 and tests rather than trusting the agent's word.
