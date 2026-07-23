@@ -7,107 +7,18 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 pub use crate::db::SCHEMA_VERSION;
 use crate::db::{Db, DbError};
 use crate::domain::ticket::TicketState;
-pub use crate::run_store::{EventRecord, ProjectNote, RunTimeline};
+pub use crate::run_store::{ActiveRun, EventRecord, ProjectNote, RunRecord, RunState, RunTimeline};
+pub(crate) use crate::run_store::{NeedsReviewBranch, RecoverableRun, WorktreeCleanupCandidate};
 use crate::run_store::{RunStore, runs};
 
-/// Every value the `runs.state` column can hold. The ladder runs
-/// `claimed → running → aftercare` and then to one terminal state, either an
-/// outcome written by [`Store::finish_run`] or `aborted` from a rolled-back
-/// claim. Values are the exact strings already stored; there is no migration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunState {
-    Claimed,
-    Running,
-    Aftercare,
-    /// A claim rolled back before a process existed.
-    Aborted,
-    Merged,
-    Failed,
-    NeedsReview,
-    Cancelled,
-    RateLimited,
-    Orphaned,
-}
-
-/// The nonterminal run states, in ladder order. A run in one of these still
-/// owns its lease and is a candidate for recovery.
-pub(crate) const NONTERMINAL_RUN_STATES: [RunState; 3] =
-    [RunState::Claimed, RunState::Running, RunState::Aftercare];
-
 impl RunState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Claimed => "claimed",
-            Self::Running => "running",
-            Self::Aftercare => "aftercare",
-            Self::Aborted => "aborted",
-            Self::Merged => "merged",
-            Self::Failed => "failed",
-            Self::NeedsReview => "needs_review",
-            Self::Cancelled => "cancelled",
-            Self::RateLimited => "rate_limited",
-            Self::Orphaned => "orphaned",
-        }
-    }
-
     /// Reads a state written by an older or newer binary. An unrecognized
     /// value is an error rather than a fallback: silently treating it as
     /// nonterminal would let the daemon act on a run it cannot classify.
     pub fn parse(value: &str) -> Result<Self, StoreError> {
-        match value {
-            "claimed" => Ok(Self::Claimed),
-            "running" => Ok(Self::Running),
-            "aftercare" => Ok(Self::Aftercare),
-            "aborted" => Ok(Self::Aborted),
-            "merged" => Ok(Self::Merged),
-            "failed" => Ok(Self::Failed),
-            "needs_review" => Ok(Self::NeedsReview),
-            "cancelled" => Ok(Self::Cancelled),
-            "rate_limited" => Ok(Self::RateLimited),
-            "orphaned" => Ok(Self::Orphaned),
-            other => Err(StoreError::UnknownRunState {
-                state: other.into(),
-            }),
-        }
-    }
-
-    /// Whether the run has stopped: no lease, no supervision, no renewal.
-    pub fn is_terminal(self) -> bool {
-        !NONTERMINAL_RUN_STATES.contains(&self)
-    }
-}
-
-/// Reads `runs.state` as a typed value. An unrecognized string fails the row
-/// rather than defaulting, so a state this binary does not understand can
-/// never be mistaken for a live or a settled run.
-impl rusqlite::types::FromSql for RunState {
-    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        let text = value.as_str()?;
-        Self::parse(text).map_err(|error| rusqlite::types::FromSqlError::Other(Box::new(error)))
-    }
-}
-
-/// Binds the nonterminal states as `?1, ?2, ?3` for the `IN` clauses that
-/// select live runs.
-fn nonterminal_state_params() -> [&'static str; 3] {
-    [
-        NONTERMINAL_RUN_STATES[0].as_str(),
-        NONTERMINAL_RUN_STATES[1].as_str(),
-        NONTERMINAL_RUN_STATES[2].as_str(),
-    ]
-}
-
-impl From<crate::outcome::Outcome> for RunState {
-    fn from(outcome: crate::outcome::Outcome) -> Self {
-        use crate::outcome::Outcome;
-        match outcome {
-            Outcome::Merged => Self::Merged,
-            Outcome::Failed => Self::Failed,
-            Outcome::NeedsReview => Self::NeedsReview,
-            Outcome::Cancelled => Self::Cancelled,
-            Outcome::RateLimited => Self::RateLimited,
-            Outcome::Orphaned => Self::Orphaned,
-        }
+        Self::from_stored(value).ok_or_else(|| StoreError::UnknownRunState {
+            state: value.into(),
+        })
     }
 }
 
@@ -234,104 +145,10 @@ pub struct QueuedActivation {
     pub interval_ms: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActiveRun {
-    pub id: String,
-    pub ticket_id: String,
-    /// Carried so callers can render the run's alias without a second lookup.
-    pub attempt: i64,
-    pub ticket_name: String,
-    pub project_id: String,
-    pub state: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunRecord {
-    pub id: String,
-    pub ticket_id: String,
-    /// The per-ticket attempt this run served. Frozen at claim, so it is the
-    /// second half of the run's alias.
-    pub attempt: i64,
-    pub state: String,
-    pub branch: Option<String>,
-    pub worktree_path: Option<String>,
-    pub pid: Option<i64>,
-    pub pid_start_time: Option<i64>,
-    pub process_group_id: Option<i64>,
-    pub exit_code: Option<i64>,
-    pub exited_at_ms: Option<i64>,
-    pub flow_json: Option<String>,
-    pub ticket_json: Option<String>,
-}
-
-/// Every `RunRecord` read uses this projection so the column order and the
-/// mapper below can never drift apart.
-const RUN_RECORD_SELECT: &str = "SELECT id, ticket_id, attempt, state, branch, worktree_path, pid,
-            pid_start_time, process_group_id, exit_code, exited_at_ms,
-            flow_json, ticket_json
-     FROM runs";
-
 const TICKET_RECORD_SELECT: &str =
     "SELECT id, project_id, file_path, source, source_ref, state, name, worktree,
             target, model, effort, flow, attempts, body, held_reason, created_at_ms
      FROM tickets";
-
-fn run_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
-    Ok(RunRecord {
-        id: row.get(0)?,
-        ticket_id: row.get(1)?,
-        attempt: row.get(2)?,
-        state: row.get(3)?,
-        branch: row.get(4)?,
-        worktree_path: row.get(5)?,
-        pid: row.get(6)?,
-        pid_start_time: row.get(7)?,
-        process_group_id: row.get(8)?,
-        exit_code: row.get(9)?,
-        exited_at_ms: row.get(10)?,
-        flow_json: row.get(11)?,
-        ticket_json: row.get(12)?,
-    })
-}
-
-/// A `needs_review` ticket paired with the preserved run branch whose tip the
-/// daemon can test for external integration against the default branch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NeedsReviewBranch {
-    pub(crate) ticket_id: String,
-    pub(crate) run_id: String,
-    pub(crate) branch: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorktreeCleanupCandidate {
-    pub(crate) run_id: String,
-    pub(crate) ticket_id: String,
-    pub(crate) branch: String,
-    pub(crate) worktree_path: String,
-    pub(crate) cleanup_eligible_at_ms: i64,
-}
-
-/// One lease that must be classified when a daemon starts. Process identity
-/// and worker credentials are returned only to the daemon recovery path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RecoverableRun {
-    pub(crate) id: String,
-    pub(crate) ticket_id: String,
-    pub(crate) target: String,
-    pub(crate) state: RunState,
-    pub(crate) branch: Option<String>,
-    pub(crate) worktree_path: Option<String>,
-    pub(crate) pid: Option<i64>,
-    pub(crate) pid_start_time: Option<i64>,
-    pub(crate) process_group_id: Option<i64>,
-    pub(crate) worker_token: Option<String>,
-    pub(crate) worker_socket_path: Option<String>,
-    pub(crate) exit_code: Option<i64>,
-    pub(crate) lease_expires_at_ms: i64,
-    pub(crate) flow_json: Option<String>,
-    pub(crate) ticket_json: Option<String>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectRecord {
@@ -698,21 +515,10 @@ impl Store {
 
         let mut doomed_runs = BTreeSet::new();
         for ticket_id in &stale_tickets {
-            let mut statement = transaction.prepare("SELECT id FROM runs WHERE ticket_id = ?1")?;
-            doomed_runs.extend(
-                statement
-                    .query_map(params![ticket_id], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
+            doomed_runs.extend(runs::tx::ids_for_ticket(&transaction, ticket_id)?);
         }
         for activation_id in &doomed_activations {
-            let mut statement =
-                transaction.prepare("SELECT id FROM runs WHERE activation_id = ?1")?;
-            doomed_runs.extend(
-                statement
-                    .query_map(params![activation_id], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
+            doomed_runs.extend(runs::tx::ids_for_activation(&transaction, activation_id)?);
         }
 
         let mut rows_dropped = 0;
@@ -733,8 +539,7 @@ impl Store {
                 )?;
             }
             rows_dropped += runs::tx::delete_notes_for_run(&transaction, run_id)?;
-            rows_dropped +=
-                transaction.execute("DELETE FROM runs WHERE id = ?1", params![run_id])?;
+            rows_dropped += runs::tx::delete(&transaction, run_id)?;
         }
         for activation_id in &doomed_activations {
             rows_dropped += transaction.execute(
@@ -789,11 +594,10 @@ impl Store {
                 if state == TicketState::Merged.as_str()
                     && matches!(previous.state.as_str(), "failed" | "needs_review")
                 {
-                    transaction.execute(
-                        "UPDATE runs SET cleanup_eligible_at_ms = ?2
-                         WHERE ticket_id = ?1 AND state IN ('failed', 'needs_review')
-                           AND cleanup_eligible_at_ms IS NULL AND cleaned_at_ms IS NULL",
-                        params![ticket.id, now_ms],
+                    runs::tx::mark_failed_or_review_runs_cleanup_eligible(
+                        &transaction,
+                        &ticket.id,
+                        now_ms,
                     )?;
                 }
             }
@@ -1085,16 +889,9 @@ impl Store {
     /// blocker list still points at this row; deleting it would then violate
     /// a foreign key or orphan run evidence.
     pub fn ticket_is_referenced(&self, id: &str) -> Result<bool, StoreError> {
-        let referenced = self.db.lock().query_row(
-            "SELECT EXISTS (SELECT 1 FROM runs WHERE ticket_id = ?1)
-                 OR EXISTS (SELECT 1 FROM leases WHERE ticket_id = ?1)
-                 OR EXISTS (SELECT 1 FROM activations WHERE ticket_id = ?1)
-                 OR EXISTS (SELECT 1 FROM activation_filters WHERE ticket_id = ?1)
-                 OR EXISTS (SELECT 1 FROM ticket_blockers WHERE blocker_id = ?1)",
-            params![id],
-            |row| row.get(0),
-        )?;
-        Ok(referenced)
+        self.run_store()
+            .ticket_is_referenced(id)
+            .map_err(StoreError::from)
     }
 
     pub fn delete_ticket(&self, id: &str) -> Result<(), StoreError> {
@@ -1200,12 +997,7 @@ impl Store {
                 requested: TicketState::Ready.as_str().into(),
             });
         }
-        transaction.execute(
-            "UPDATE runs SET cleanup_eligible_at_ms = ?2
-             WHERE ticket_id = ?1 AND state = 'failed'
-               AND cleanup_eligible_at_ms IS NULL AND cleaned_at_ms IS NULL",
-            params![id, now_ms],
-        )?;
+        runs::tx::mark_ticket_runs_cleanup_eligible(&transaction, id, RunState::Failed, now_ms)?;
         transaction.commit()?;
         Ok(previous)
     }
@@ -1395,45 +1187,27 @@ impl Store {
     ) -> Result<(), StoreError> {
         let mut connection = self.db.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "UPDATE runs
-             SET state = ?10, branch = ?2, worktree_path = ?3, pid = ?4,
-                 pid_start_time = ?5, process_group_id = ?6, worker_token = ?7,
-                 worker_socket_path = ?8, started_at_ms = ?9, updated_at_ms = ?9
-             WHERE id = ?1 AND state = ?11 AND exited_at_ms IS NULL",
-            params![
-                run_id,
-                branch,
-                worktree_path,
-                i64::from(pid),
-                pid_start_time,
-                i64::from(process_group_id),
-                worker_token,
-                worker_socket_path,
-                now_ms,
-                RunState::Running.as_str(),
-                RunState::Claimed.as_str(),
-            ],
+        let changed = runs::tx::mark_running(
+            &transaction,
+            run_id,
+            branch,
+            worktree_path,
+            pid,
+            pid_start_time,
+            process_group_id,
+            worker_token,
+            worker_socket_path,
+            now_ms,
         )?;
         if changed != 1 {
-            let state = transaction
-                .query_row(
-                    "SELECT state FROM runs WHERE id = ?1",
-                    params![run_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
+            let state = runs::tx::state(&transaction, run_id)?;
             return Err(StoreError::RunStateConflict {
                 run_id: run_id.into(),
                 state,
                 requested: RunState::Running.as_str().into(),
             });
         }
-        let ticket_id: String = transaction.query_row(
-            "SELECT ticket_id FROM runs WHERE id = ?1",
-            params![run_id],
-            |row| row.get(0),
-        )?;
+        let ticket_id = runs::tx::ticket_id(&transaction, run_id)?;
         runs::tx::record_event(
             &transaction,
             now_ms,
@@ -1466,27 +1240,9 @@ impl Store {
         let mut connection = self.db.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let run_state = RunState::from(outcome);
-        let changed = transaction.execute(
-            "UPDATE runs
-             SET state = ?2, exited_at_ms = ?3, exit_code = ?4, updated_at_ms = ?3,
-                 cleanup_eligible_at_ms = CASE WHEN ?2 = ?5 THEN ?3 ELSE NULL END
-             WHERE id = ?1 AND exited_at_ms IS NULL",
-            params![
-                run_id,
-                run_state.as_str(),
-                now_ms,
-                exit_code,
-                RunState::Merged.as_str(),
-            ],
-        )?;
+        let changed = runs::tx::finish(&transaction, run_id, run_state, exit_code, now_ms)?;
         if changed == 0 {
-            let existing: Option<(String, Option<i64>)> = transaction
-                .query_row(
-                    "SELECT state, exited_at_ms FROM runs WHERE id = ?1",
-                    params![run_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
+            let existing = runs::tx::state_and_exit(&transaction, run_id)?;
             match existing {
                 Some((_, Some(_))) => {
                     transaction.commit()?;
@@ -1515,10 +1271,10 @@ impl Store {
             params![ticket_id, ticket_state.as_str(), now_ms],
         )?;
         if outcome == Outcome::RateLimited {
+            let activation_id = runs::tx::activation_id(&transaction, run_id)?;
             transaction.execute(
-                "UPDATE activations SET state = 'queued', updated_at_ms = ?2
-                 WHERE id = (SELECT activation_id FROM runs WHERE id = ?1)",
-                params![run_id, now_ms],
+                "UPDATE activations SET state = 'queued', updated_at_ms = ?2 WHERE id = ?1",
+                params![activation_id, now_ms],
             )?;
         }
 
@@ -1648,26 +1404,9 @@ impl Store {
     ) -> Result<ExitClaim, StoreError> {
         let mut connection = self.db.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "UPDATE runs
-             SET state = ?4, exit_code = ?2, updated_at_ms = ?3
-             WHERE id = ?1 AND state = ?5 AND exited_at_ms IS NULL",
-            params![
-                run_id,
-                exit_code,
-                now_ms,
-                RunState::Aftercare.as_str(),
-                RunState::Running.as_str(),
-            ],
-        )?;
+        let changed = runs::tx::claim_agent_exit(&transaction, run_id, exit_code, now_ms)?;
         if changed == 0 {
-            let state: Option<String> = transaction
-                .query_row(
-                    "SELECT state FROM runs WHERE id = ?1",
-                    params![run_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
+            let state = runs::tx::state(&transaction, run_id)?;
             return match state {
                 Some(state) => Ok(ExitClaim::AlreadyClaimed { state }),
                 None => Err(StoreError::RunNotFound {
@@ -1746,29 +1485,17 @@ impl Store {
     /// Durably records an operator's cancellation intent, idempotently: the
     /// dedupe key makes a repeated `cancel` a no-op rather than new evidence.
     pub fn record_cancel_requested(&self, run_id: &str, now_ms: i64) -> Result<(), StoreError> {
-        self.db.lock().execute(
-            "INSERT OR IGNORE INTO run_evidence
-                 (run_id, kind, observed_at_ms, dedupe_key, data_json)
-             VALUES (?1, 'cancel_requested', ?2, 'cancel_requested:' || ?1, '{}')",
-            params![run_id, now_ms],
-        )?;
-        Ok(())
+        self.run_store()
+            .record_cancel_requested(run_id, now_ms)
+            .map_err(StoreError::from)
     }
 
     /// Whether cancellation intent was recorded for the run, so an exit event
     /// racing the cancel still resolves to `Cancelled`.
     pub fn cancellation_requested(&self, run_id: &str) -> Result<bool, StoreError> {
-        let found: Option<i64> = self
-            .db
-            .lock()
-            .query_row(
-                "SELECT 1 FROM run_evidence
-                 WHERE run_id = ?1 AND kind = 'cancel_requested'",
-                params![run_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(found.is_some())
+        self.run_store()
+            .cancellation_requested(run_id)
+            .map_err(StoreError::from)
     }
 
     /// Appends a worker's advisory note. The agent's only write: it records
@@ -1824,25 +1551,17 @@ impl Store {
         &self,
         project_id: &str,
     ) -> Result<Vec<ProjectCommitEvidence>, StoreError> {
-        let connection = self.db.lock();
-        let mut statement = connection.prepare(
-            "SELECT r.id, r.ticket_id, e.data_json
-             FROM run_evidence e
-             JOIN runs r ON r.id = e.run_id
-             JOIN tickets t ON t.id = r.ticket_id
-             WHERE t.project_id = ?1 AND e.kind = 'commits_observed'
-             ORDER BY r.ticket_id, r.created_at_ms, r.id, e.sequence",
-        )?;
-        statement
-            .query_map(params![project_id], |row| {
+        self.run_store()
+            .commit_evidence_for_project(project_id)?
+            .into_iter()
+            .map(|(run_id, ticket_id, data_json)| {
                 Ok(ProjectCommitEvidence {
-                    run_id: row.get(0)?,
-                    ticket_id: row.get(1)?,
-                    data_json: row.get(2)?,
+                    run_id,
+                    ticket_id,
+                    data_json,
                 })
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
+            })
+            .collect()
     }
 
     pub fn next_note_ordinal(&self) -> Result<i64, StoreError> {
@@ -1885,21 +1604,7 @@ impl Store {
         &self,
         ticket_id: &str,
     ) -> Result<Option<crate::vendor_error::VendorErrorMatch>, StoreError> {
-        let data: Option<String> = self
-            .db
-            .lock()
-            .query_row(
-                "SELECT e.data_json FROM run_evidence e
-                 JOIN runs r ON r.id = e.run_id
-                 WHERE r.id = (SELECT latest.id FROM runs latest
-                               WHERE latest.ticket_id = ?1
-                               ORDER BY latest.created_at_ms DESC, latest.id DESC LIMIT 1)
-                   AND e.kind = 'vendor_error_classified'
-                 ORDER BY e.sequence DESC LIMIT 1",
-                params![ticket_id],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let data = self.run_store().latest_vendor_error_for_ticket(ticket_id)?;
         Ok(data.and_then(|data| serde_json::from_str(&data).ok()))
     }
 
@@ -1915,12 +1620,7 @@ impl Store {
         let mut connection = self.db.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute("DELETE FROM leases WHERE run_id = ?1", params![run_id])?;
-        transaction.execute(
-            "UPDATE runs
-             SET state = ?3, exited_at_ms = ?2, updated_at_ms = ?2
-             WHERE id = ?1 AND exited_at_ms IS NULL",
-            params![run_id, now_ms, RunState::Aborted.as_str()],
-        )?;
+        runs::tx::abort(&transaction, run_id, now_ms)?;
         transaction.execute(
             "UPDATE tickets SET state = 'ready', held_reason = NULL, updated_at_ms = ?2
              WHERE id = ?1 AND state = 'claimed'",
@@ -1976,16 +1676,7 @@ impl Store {
     }
 
     pub fn run(&self, id: &str) -> Result<Option<RunRecord>, StoreError> {
-        let run = self
-            .db
-            .lock()
-            .query_row(
-                &format!("{RUN_RECORD_SELECT} WHERE id = ?1"),
-                params![id],
-                run_record,
-            )
-            .optional()?;
-        Ok(run)
+        self.run_store().run(id).map_err(StoreError::from)
     }
 
     /// The run a `<ticket>-r<attempt>` alias names. The pair is unique because
@@ -1995,32 +1686,17 @@ impl Store {
         ticket_id: &str,
         attempt: i64,
     ) -> Result<Option<RunRecord>, StoreError> {
-        let run = self
-            .db
-            .lock()
-            .query_row(
-                &format!(
-                    "{RUN_RECORD_SELECT} WHERE ticket_id = ?1 AND attempt = ?2
-                     ORDER BY created_at_ms DESC LIMIT 1"
-                ),
-                params![ticket_id, attempt],
-                run_record,
-            )
-            .optional()?;
-        Ok(run)
+        self.run_store()
+            .run_for_ticket_attempt(ticket_id, attempt)
+            .map_err(StoreError::from)
     }
 
     /// Every run a ticket has produced, newest attempt first, so a bare ticket
     /// reference can name the latest run and still report the earlier ones.
     pub fn runs_for_ticket(&self, ticket_id: &str) -> Result<Vec<RunRecord>, StoreError> {
-        let connection = self.db.lock();
-        let mut statement = connection.prepare(&format!(
-            "{RUN_RECORD_SELECT} WHERE ticket_id = ?1 ORDER BY attempt DESC, created_at_ms DESC"
-        ))?;
-        let runs = statement
-            .query_map(params![ticket_id], run_record)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(runs)
+        self.run_store()
+            .runs_for_ticket(ticket_id)
+            .map_err(StoreError::from)
     }
 
     /// Runs whose internal id starts with `prefix`. More than one row means the
@@ -2028,14 +1704,9 @@ impl Store {
     pub fn runs_with_id_prefix(&self, prefix: &str) -> Result<Vec<RunRecord>, StoreError> {
         // `LIKE` would treat `%` and `_` in a prefix as wildcards; run ids are
         // hexadecimal, but comparing on the substring keeps that beyond doubt.
-        let connection = self.db.lock();
-        let mut statement = connection.prepare(&format!(
-            "{RUN_RECORD_SELECT} WHERE SUBSTR(id, 1, ?2) = ?1 ORDER BY created_at_ms, id"
-        ))?;
-        let runs = statement
-            .query_map(params![prefix, prefix.len() as i64], run_record)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(runs)
+        self.run_store()
+            .runs_with_id_prefix(prefix)
+            .map_err(StoreError::from)
     }
 
     /// Every `needs_review` ticket paired with the branch of the run that
@@ -2043,57 +1714,16 @@ impl Store {
     /// integration. Only the newest `needs_review` run with a branch is
     /// returned per ticket; the tip itself is never cached here.
     pub(crate) fn needs_review_branches(&self) -> Result<Vec<NeedsReviewBranch>, StoreError> {
-        let connection = self.db.lock();
-        let mut statement = connection.prepare(
-            "SELECT t.id, r.id, r.branch
-             FROM tickets t
-             JOIN runs r ON r.id = (
-                 SELECT r2.id FROM runs r2
-                 WHERE r2.ticket_id = t.id
-                   AND r2.state = 'needs_review'
-                   AND r2.branch IS NOT NULL
-                 ORDER BY r2.created_at_ms DESC, r2.id DESC
-                 LIMIT 1
-             )
-             WHERE t.state = 'needs_review'",
-        )?;
-        statement
-            .query_map([], |row| {
-                Ok(NeedsReviewBranch {
-                    ticket_id: row.get(0)?,
-                    run_id: row.get(1)?,
-                    branch: row.get(2)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
+        self.run_store()
+            .needs_review_branches()
             .map_err(StoreError::from)
     }
 
     pub(crate) fn worktree_cleanup_candidates(
         &self,
     ) -> Result<Vec<WorktreeCleanupCandidate>, StoreError> {
-        let connection = self.db.lock();
-        let mut statement = connection.prepare(
-            "SELECT r.id, r.ticket_id, r.branch, r.worktree_path, r.cleanup_eligible_at_ms
-             FROM runs r
-             WHERE r.cleanup_eligible_at_ms IS NOT NULL
-               AND r.cleaned_at_ms IS NULL
-               AND r.branch IS NOT NULL
-               AND r.worktree_path IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.run_id = r.id)
-             ORDER BY r.cleanup_eligible_at_ms, r.id",
-        )?;
-        statement
-            .query_map([], |row| {
-                Ok(WorktreeCleanupCandidate {
-                    run_id: row.get(0)?,
-                    ticket_id: row.get(1)?,
-                    branch: row.get(2)?,
-                    worktree_path: row.get(3)?,
-                    cleanup_eligible_at_ms: row.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
+        self.run_store()
+            .worktree_cleanup_candidates()
             .map_err(StoreError::from)
     }
 
@@ -2102,21 +1732,9 @@ impl Store {
         retention_ms: i64,
         now_ms: i64,
     ) -> Result<Option<i64>, StoreError> {
-        let eligible_at: Option<i64> = self.db.lock().query_row(
-            "SELECT MIN(r.cleanup_eligible_at_ms)
-             FROM runs r
-             WHERE r.cleanup_eligible_at_ms IS NOT NULL
-               AND r.cleaned_at_ms IS NULL
-               AND r.branch IS NOT NULL
-               AND r.worktree_path IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.run_id = r.id)",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(eligible_at.and_then(|value| {
-            let deadline = value.saturating_add(retention_ms);
-            (deadline > now_ms).then_some(deadline)
-        }))
+        self.run_store()
+            .next_worktree_cleanup_at_ms(retention_ms, now_ms)
+            .map_err(StoreError::from)
     }
 
     pub(crate) fn mark_run_worktree_cleaned(
@@ -2124,31 +1742,9 @@ impl Store {
         candidate: &WorktreeCleanupCandidate,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
-        let mut connection = self.db.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "UPDATE runs SET cleaned_at_ms = ?2, updated_at_ms = ?2
-             WHERE id = ?1 AND cleanup_eligible_at_ms IS NOT NULL
-               AND cleaned_at_ms IS NULL
-               AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.run_id = runs.id)",
-            params![candidate.run_id, now_ms],
-        )?;
-        if changed == 1 {
-            runs::tx::record_event(
-                &transaction,
-                now_ms,
-                "run_worktree_cleaned",
-                Some(&candidate.run_id),
-                Some(&candidate.ticket_id),
-                &serde_json::json!({
-                    "branch": candidate.branch,
-                    "worktree": candidate.worktree_path,
-                })
-                .to_string(),
-            )?;
-        }
-        transaction.commit()?;
-        Ok(changed == 1)
+        self.run_store()
+            .mark_run_worktree_cleaned(candidate, now_ms)
+            .map_err(StoreError::from)
     }
 
     /// Settles a `needs_review` ticket whose run branch an operator merged by
@@ -2177,11 +1773,7 @@ impl Store {
             transaction.commit()?;
             return Ok(false);
         }
-        transaction.execute(
-            "UPDATE runs SET cleanup_eligible_at_ms = ?2
-             WHERE id = ?1 AND cleanup_eligible_at_ms IS NULL AND cleaned_at_ms IS NULL",
-            params![run_id, now_ms],
-        )?;
+        runs::tx::mark_cleanup_eligible(&transaction, run_id, now_ms)?;
         let data_json = serde_json::json!({
             "branch": branch,
             "branch_tip": branch_tip,
@@ -2212,91 +1804,21 @@ impl Store {
         &self,
         ticket_id: &str,
     ) -> Result<Option<(String, i64)>, StoreError> {
-        let run = self
-            .db
-            .lock()
-            .query_row(
-                "SELECT r.id, r.attempt FROM runs r
-                 JOIN leases l ON l.run_id = r.id
-                 WHERE r.ticket_id = ?1
-                   AND r.state IN (?2, ?3, ?4)
-                   AND r.exited_at_ms IS NULL
-                 ORDER BY r.created_at_ms DESC, r.id DESC LIMIT 1",
-                params![
-                    ticket_id,
-                    NONTERMINAL_RUN_STATES[0].as_str(),
-                    NONTERMINAL_RUN_STATES[1].as_str(),
-                    NONTERMINAL_RUN_STATES[2].as_str(),
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        Ok(run)
+        self.run_store()
+            .active_run_for_ticket(ticket_id)
+            .map_err(StoreError::from)
     }
 
     /// Leased nonterminal runs that consume capacity, oldest first.
     pub fn active_runs(&self) -> Result<Vec<ActiveRun>, StoreError> {
-        let connection = self.db.lock();
-        let mut statement = connection.prepare(
-            "SELECT r.id, r.ticket_id, r.attempt, t.name, t.project_id, r.state FROM runs r
-             JOIN leases l ON l.run_id = r.id
-             JOIN tickets t ON t.id = r.ticket_id
-             WHERE r.exited_at_ms IS NULL
-               AND r.state IN (?1, ?2, ?3)
-             ORDER BY r.created_at_ms, r.id",
-        )?;
-        let runs = statement
-            .query_map(nonterminal_state_params(), |row| {
-                Ok(ActiveRun {
-                    id: row.get(0)?,
-                    ticket_id: row.get(1)?,
-                    attempt: row.get(2)?,
-                    ticket_name: row.get(3)?,
-                    project_id: row.get(4)?,
-                    state: row.get(5)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(runs)
+        self.run_store().active_runs().map_err(StoreError::from)
     }
 
     /// Every nonterminal run that still owns a lease, oldest first. Startup
     /// must classify all of these before making another spawn decision.
     pub(crate) fn recoverable_runs(&self) -> Result<Vec<RecoverableRun>, StoreError> {
-        let connection = self.db.lock();
-        let mut statement = connection.prepare(
-            "SELECT r.id, r.ticket_id, t.target, r.state, r.branch, r.worktree_path,
-                    r.pid, r.pid_start_time, r.process_group_id, r.worker_token,
-                    r.worker_socket_path, r.exit_code, l.expires_at_ms, r.flow_json,
-                    r.ticket_json
-             FROM runs r
-             JOIN leases l ON l.run_id = r.id
-             JOIN tickets t ON t.id = r.ticket_id
-             WHERE r.exited_at_ms IS NULL
-               AND r.state IN (?1, ?2, ?3)
-             ORDER BY r.created_at_ms, r.id",
-        )?;
-        statement
-            .query_map(nonterminal_state_params(), |row| {
-                Ok(RecoverableRun {
-                    id: row.get(0)?,
-                    ticket_id: row.get(1)?,
-                    target: row.get(2)?,
-                    state: row.get(3)?,
-                    branch: row.get(4)?,
-                    worktree_path: row.get(5)?,
-                    pid: row.get(6)?,
-                    pid_start_time: row.get(7)?,
-                    process_group_id: row.get(8)?,
-                    worker_token: row.get(9)?,
-                    worker_socket_path: row.get(10)?,
-                    exit_code: row.get(11)?,
-                    lease_expires_at_ms: row.get(12)?,
-                    flow_json: row.get(13)?,
-                    ticket_json: row.get(14)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
+        self.run_store()
+            .recoverable_runs()
             .map_err(StoreError::from)
     }
 
@@ -2415,27 +1937,17 @@ impl Store {
         // `retry` resets `tickets.attempts`, and a reused number would make two
         // runs answer to the same alias. Allocating inside the claim
         // transaction keeps the sequence gap-free under concurrent claims.
-        let attempt: i64 = transaction.query_row(
-            "SELECT COALESCE(MAX(attempt), 0) + 1 FROM runs WHERE ticket_id = ?1",
-            params![claim.ticket_id],
-            |row| row.get(0),
-        )?;
+        let attempt = runs::tx::next_attempt(&transaction, claim.ticket_id)?;
 
-        transaction.execute(
-            "INSERT INTO runs
-                 (id, activation_id, ticket_id, state, attempt, flow_json, ticket_json,
-                  created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-            params![
-                claim.run_id,
-                claim.activation_id,
-                claim.ticket_id,
-                RunState::Claimed.as_str(),
-                attempt,
-                claim.flow_json,
-                claim.ticket_json,
-                now_ms,
-            ],
+        runs::tx::insert_claimed(
+            &transaction,
+            claim.run_id,
+            claim.activation_id,
+            claim.ticket_id,
+            attempt,
+            claim.flow_json,
+            claim.ticket_json,
+            now_ms,
         )?;
 
         let expires_at_ms = now_ms + claim.lease_ms;
@@ -2484,14 +1996,9 @@ impl Store {
         now_ms: i64,
     ) -> Result<i64, StoreError> {
         let expires_at_ms = now_ms + lease_ms;
-        let changed = self.db.lock().execute(
-            "UPDATE leases
-             SET renewed_at_ms = ?3, expires_at_ms = ?4
-             WHERE ticket_id = ?1 AND run_id = ?2
-               AND EXISTS (SELECT 1 FROM runs
-                           WHERE id = ?2 AND exited_at_ms IS NULL)",
-            params![ticket_id, run_id, now_ms, expires_at_ms],
-        )?;
+        let changed = self
+            .run_store()
+            .readopt_lease(ticket_id, run_id, now_ms, expires_at_ms)?;
         if changed != 1 {
             return Err(StoreError::LeaseNotHeld {
                 ticket_id: ticket_id.into(),
@@ -2866,8 +2373,7 @@ mod tests {
         ActivationKind, ClaimRequest, ExitClaim, NewActivation, ReindexTicket, RunState, Store,
         StoreError,
     };
-    use crate::domain::ticket::{TicketSnapshot, TicketState};
-    use crate::flow::{Flow, Stage, StageKind, VerdictPolicy};
+    use crate::domain::ticket::TicketState;
     use crate::outcome::Outcome;
 
     fn open_seeded(path: &std::path::Path) -> Store {
@@ -2938,64 +2444,6 @@ mod tests {
             flow_json: "{}",
             ticket_json: "{}",
         }
-    }
-
-    #[test]
-    fn claims_persist_flow_and_ticket_snapshots() {
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        let flow = Flow {
-            name: "default".into(),
-            stages: vec![
-                Stage {
-                    name: "build".into(),
-                    kind: StageKind::Agent,
-                    verdict: VerdictPolicy::Commits,
-                    on_fail: None,
-                },
-                Stage {
-                    name: "check".into(),
-                    kind: StageKind::Exec {
-                        cmd: vec!["cargo".into(), "test".into()],
-                    },
-                    verdict: VerdictPolicy::Exit,
-                    on_fail: None,
-                },
-            ],
-        };
-        let ticket = TicketSnapshot {
-            id: "T1".into(),
-            name: "Ticket one".into(),
-            blocked_by: vec![],
-            worktree: Some("sloop/T1".into()),
-            target: Some("claude".into()),
-            model: Some("sonnet".into()),
-            effort: Some("medium".into()),
-            body: "# Original body\n".into(),
-        };
-        let flow_json = serde_json::to_string(&flow).unwrap();
-        let ticket_json = serde_json::to_string(&ticket).unwrap();
-
-        store
-            .claim_ticket(
-                &ClaimRequest {
-                    flow_json: &flow_json,
-                    ticket_json: &ticket_json,
-                    ..claim_t1("R1")
-                },
-                2_000,
-            )
-            .unwrap();
-
-        let run = store.run("R1").unwrap().unwrap();
-        assert_eq!(
-            serde_json::from_str::<Flow>(run.flow_json.as_deref().unwrap()).unwrap(),
-            flow
-        );
-        assert_eq!(
-            serde_json::from_str::<TicketSnapshot>(run.ticket_json.as_deref().unwrap()).unwrap(),
-            ticket
-        );
     }
 
     #[test]
@@ -3247,43 +2695,6 @@ mod tests {
     }
 
     #[test]
-    fn active_run_for_ticket_tracks_claimed_and_running_runs_only() {
-        use crate::outcome::Outcome;
-
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
-
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
-        assert_eq!(
-            store.active_run_for_ticket("T1").unwrap(),
-            Some(("R1".into(), 1))
-        );
-        store
-            .mark_run_running(
-                "R1",
-                "branch",
-                "/tmp/worktree",
-                1,
-                Some(1),
-                1,
-                "token",
-                "/runtime/R1.sock",
-                2_100,
-            )
-            .unwrap();
-        assert_eq!(
-            store.active_run_for_ticket("T1").unwrap(),
-            Some(("R1".into(), 1))
-        );
-
-        store
-            .finish_run("R1", "T1", Some(1), Outcome::Failed, &[], None, 2_200)
-            .unwrap();
-        assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
-    }
-
-    #[test]
     fn aborted_claims_are_closed_and_no_longer_active() {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
@@ -3294,44 +2705,6 @@ mod tests {
         assert_eq!(store.run("R1").unwrap().unwrap().state, "aborted");
         assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
         assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("ready"));
-    }
-
-    #[test]
-    fn recoverable_runs_round_trip_process_identity_and_lease() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("sloop.db");
-        let mut store = open_seeded(&path);
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
-        store
-            .mark_run_running(
-                "R1",
-                "sloop/T1-a1-R1",
-                "/worktrees/R1",
-                123,
-                Some(456),
-                123,
-                "worker-token",
-                "/runtime/R1.sock",
-                2_100,
-            )
-            .unwrap();
-        drop(store);
-
-        let store = Store::open(&path, 3_000).unwrap();
-        let runs = store.recoverable_runs().unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].id, "R1");
-        assert_eq!(runs[0].ticket_id, "T1");
-        assert_eq!(runs[0].pid, Some(123));
-        assert_eq!(runs[0].pid_start_time, Some(456));
-        assert_eq!(runs[0].process_group_id, Some(123));
-        assert_eq!(runs[0].worker_token.as_deref(), Some("worker-token"));
-        assert_eq!(
-            runs[0].worker_socket_path.as_deref(),
-            Some("/runtime/R1.sock")
-        );
-        assert_eq!(runs[0].exit_code, None);
-        assert_eq!(runs[0].lease_expires_at_ms, 62_000);
     }
 
     #[test]
@@ -3749,47 +3122,6 @@ mod tests {
         // The lease expires at 62_000; renewal at or after that must fail.
         let error = store.renew_lease("T1", "R1", 60_000, 62_000).unwrap_err();
         assert!(matches!(error, StoreError::LeaseNotHeld { .. }));
-    }
-
-    #[test]
-    fn every_run_state_round_trips_through_its_stored_string() {
-        let states = [
-            RunState::Claimed,
-            RunState::Running,
-            RunState::Aftercare,
-            RunState::Aborted,
-            RunState::Merged,
-            RunState::Failed,
-            RunState::NeedsReview,
-            RunState::Cancelled,
-            RunState::RateLimited,
-            RunState::Orphaned,
-        ];
-        for state in states {
-            assert_eq!(RunState::parse(state.as_str()).unwrap(), state);
-        }
-        // Every outcome `finish_run` can write is one of those variants.
-        for outcome in [
-            crate::outcome::Outcome::Merged,
-            crate::outcome::Outcome::Failed,
-            crate::outcome::Outcome::NeedsReview,
-            crate::outcome::Outcome::Cancelled,
-            crate::outcome::Outcome::RateLimited,
-            crate::outcome::Outcome::Orphaned,
-        ] {
-            assert_eq!(RunState::from(outcome).as_str(), outcome.as_str());
-            assert!(RunState::from(outcome).is_terminal());
-        }
-        for state in [RunState::Claimed, RunState::Running, RunState::Aftercare] {
-            assert!(!state.is_terminal());
-        }
-        assert!(RunState::Aborted.is_terminal());
-    }
-
-    #[test]
-    fn an_unknown_stored_run_state_is_an_error_not_a_fallback() {
-        let error = RunState::parse("half_running").unwrap_err();
-        assert!(matches!(error, StoreError::UnknownRunState { state } if state == "half_running"));
     }
 
     #[test]

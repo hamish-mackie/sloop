@@ -7,7 +7,8 @@
 
 pub(crate) mod runs;
 
-pub use runs::{EventRecord, ProjectNote, RunTimeline};
+pub use runs::{ActiveRun, EventRecord, ProjectNote, RunRecord, RunState, RunTimeline};
+pub(crate) use runs::{NeedsReviewBranch, RecoverableRun, WorktreeCleanupCandidate};
 
 use rusqlite::TransactionBehavior;
 
