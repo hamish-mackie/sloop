@@ -1,18 +1,226 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use async_trait::async_trait;
+use rusqlite::{Transaction, TransactionBehavior};
 use serde_json::{Value, json};
 
 use crate::config::{AgentConfig, expand_agent_cmd};
 use crate::domain::ticket::TicketState;
+use crate::domain::work::{ExecutionHints, SourceVersion, TicketRef, WorkTicket, WorkTicketState};
 use crate::flow::Flow;
 use crate::frontmatter::{self, FrontmatterError};
 use crate::ids::{IdError, next_id};
 use crate::protocol::{PostActivation, PostArgs};
+use crate::run_store;
 use crate::store::{ActivationKind, NewActivation, Store, StoreError};
+use crate::work_state::local::{self, LocalTicketWrite};
+use crate::work_state::{SourceError, WorkStateAuthor};
+
+#[derive(Clone, Copy)]
+struct ActivationRequest {
+    kind: ActivationKind,
+    eligible_at_ms: Option<i64>,
+}
+
+static POST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct StagedWrite {
+    path: PathBuf,
+    target: PathBuf,
+    persisted: bool,
+}
+
+impl StagedWrite {
+    fn new(target: PathBuf, content: &str) -> io::Result<Self> {
+        let parent = target.parent().unwrap_or_else(|| Path::new("."));
+        let name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("ticket");
+        let (path, mut file) = loop {
+            let ordinal = POST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(
+                ".{name}.sloop-post-{}-{ordinal}.tmp",
+                std::process::id()
+            ));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => break (path, file),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        };
+        let staged = Self {
+            path,
+            target,
+            persisted: false,
+        };
+        if let Ok(metadata) = fs::metadata(&staged.target) {
+            fs::set_permissions(&staged.path, metadata.permissions())?;
+        }
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        Ok(staged)
+    }
+
+    fn persist(mut self) -> io::Result<()> {
+        fs::rename(&self.path, &self.target)?;
+        self.persisted = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagedWrite {
+    fn drop(&mut self) {
+        if !self.persisted {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Local markdown authoring over SQLite.
+///
+/// A [`SourceVersion`] is the lowercase hexadecimal FNV-1a hash of the
+/// complete markdown file content. Updates compare that version with the file
+/// immediately before committing, so a concurrent edit is rejected instead
+/// of silently overwritten.
+struct MarkdownWorkStateAuthor<'a> {
+    root: &'a Path,
+    file_path: &'a str,
+    worktree: &'a str,
+    store: &'a Store,
+    original_content: &'a str,
+    final_content: &'a str,
+    original_version: SourceVersion,
+    activation: Option<ActivationRequest>,
+    now_ms: i64,
+    activation_result: Mutex<Value>,
+}
+
+impl MarkdownWorkStateAuthor<'_> {
+    fn absolute_path(&self) -> PathBuf {
+        self.root.join(self.file_path)
+    }
+
+    fn ensure_source_version(&self, expected: &SourceVersion) -> Result<(), SourceError> {
+        let path = self.absolute_path();
+        let content = fs::read_to_string(&path).map_err(|error| SourceError::Corrupt {
+            message: format!("cannot read {}: {error}", path.display()),
+        })?;
+        let actual = source_version(&content);
+        if &actual != expected {
+            return Err(SourceError::Rejected {
+                message: format!(
+                    "source version conflict for `{}`: expected {}, found {}",
+                    self.file_path, expected.0, actual.0
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn commit(
+        &self,
+        ticket: &WorkTicket,
+        update: bool,
+        expected: &SourceVersion,
+    ) -> Result<(), SourceError> {
+        let staged = (self.final_content != self.original_content)
+            .then(|| StagedWrite::new(self.absolute_path(), self.final_content))
+            .transpose()
+            .map_err(|error| SourceError::Corrupt {
+                message: format!("cannot stage {}: {error}", self.file_path),
+            })?;
+        self.ensure_source_version(expected)?;
+        let db = self.store.db();
+        let mut connection = db.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::from)
+            .map_err(source_store_error)?;
+        let write = LocalTicketWrite {
+            id: &ticket.id,
+            project_id: &ticket.project_id,
+            file_path: self.file_path,
+            name: &ticket.name,
+            blocked_by: &ticket.blocked_by,
+            worktree: self.worktree,
+            target: ticket.hints.target.as_deref(),
+            model: ticket.hints.model.as_deref(),
+            effort: ticket.hints.effort.as_deref(),
+            flow: ticket.hints.flow.as_deref().unwrap_or_default(),
+            state: ticket.state.to_ticket_state(),
+            body: &ticket.body,
+            content_hash: &ticket.version.0,
+            now_ms: self.now_ms,
+        };
+        if update {
+            local::tx::update_authored_ticket(&transaction, &write).map_err(source_store_error)?;
+        } else {
+            local::tx::insert_authored_ticket(&transaction, &write).map_err(source_store_error)?;
+        }
+        let activation =
+            queue_activation_transaction(&transaction, &ticket.id, self.activation, self.now_ms)
+                .map_err(source_store_error)?;
+        self.ensure_source_version(expected)?;
+        transaction
+            .commit()
+            .map_err(StoreError::from)
+            .map_err(source_store_error)?;
+        drop(connection);
+
+        if let Some(staged) = staged {
+            staged.persist().map_err(|error| SourceError::Corrupt {
+                message: format!("cannot replace {}: {error}", self.file_path),
+            })?;
+        }
+        *self
+            .activation_result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = activation;
+        Ok(())
+    }
+
+    fn activation_result(&self) -> Value {
+        self.activation_result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+#[async_trait]
+impl WorkStateAuthor for MarkdownWorkStateAuthor<'_> {
+    async fn post(&self, ticket: &WorkTicket) -> Result<TicketRef, SourceError> {
+        self.commit(ticket, false, &self.original_version)?;
+        Ok(TicketRef {
+            id: ticket.id.clone(),
+            source: "local".into(),
+            source_ref: Some(self.file_path.into()),
+        })
+    }
+
+    async fn update(
+        &self,
+        ticket: &TicketRef,
+        content: &WorkTicket,
+        expected: &SourceVersion,
+    ) -> Result<SourceVersion, SourceError> {
+        if ticket.id != content.id || ticket.source_ref.as_deref() != Some(self.file_path) {
+            return Err(SourceError::Rejected {
+                message: format!("ticket reference conflict for `{}`", content.id),
+            });
+        }
+        self.commit(content, true, expected)?;
+        Ok(content.version.clone())
+    }
+}
 
 /// Registers a ticket file: validates and stamps frontmatter, indexes the
 /// ticket, and for `auto` and `at` creates one queued activation. Reposting
@@ -21,7 +229,7 @@ use crate::store::{ActivationKind, NewActivation, Store, StoreError};
 /// computes `at_eligible_ms` from its injected clock, so plain reads before
 /// writes here cannot race another writer.
 #[allow(clippy::too_many_arguments)]
-pub fn handle(
+pub async fn handle(
     root: &Path,
     ticket_dir: &Path,
     store: &Store,
@@ -134,7 +342,19 @@ pub fn handle(
                 (id.to_owned(), None)
             }
         }
-        None => (allocate_ticket_id(store, ticket_prefix)?, None),
+        None => match store.ticket_by_file(&relative_str)? {
+            Some(existing) => {
+                if existing.project_id != project {
+                    return Err(PostError::ProjectConflict {
+                        path: relative_str,
+                        stamped: project,
+                        requested: existing.project_id,
+                    });
+                }
+                (existing.id.clone(), Some(existing))
+            }
+            None => (allocate_ticket_id(store, ticket_prefix)?, None),
+        },
     };
     for blocker in &stamped.blocked_by {
         if blocker != &ticket_id && store.ticket(blocker)?.is_none() {
@@ -164,72 +384,76 @@ pub fn handle(
             })?
         }
     };
-    if existing.is_some() {
-        store.update_local_ticket(
-            &ticket_id,
-            &stamped.name,
-            &stamped.blocked_by,
-            &worktree,
-            target.as_deref(),
-            stamped.model.as_deref(),
-            stamped.effort.as_deref(),
-            &flow_name,
-            now_ms,
-        )?;
-    } else {
-        store.insert_local_ticket(
-            &ticket_id,
-            &project,
-            &relative_str,
-            &stamped.name,
-            &stamped.blocked_by,
-            &worktree,
-            target.as_deref(),
-            stamped.model.as_deref(),
-            stamped.effort.as_deref(),
-            &flow_name,
-            initial_state,
-            now_ms,
-        )?;
-    }
-    store.update_ticket_body(
-        &ticket_id,
-        frontmatter::body(&content).expect("validated frontmatter has a body"),
-        now_ms,
-    )?;
-    let ticket = store
-        .ticket(&ticket_id)?
-        .expect("registered ticket still exists");
-
-    if let Some(updated) = frontmatter::stamp(&content, &ticket.id, &project, &worktree, &flow_name)
+    let final_content = frontmatter::stamp(&content, &ticket_id, &project, &worktree, &flow_name)
         .map_err(|error| PostError::InvalidTicket {
             path: relative_str.clone(),
             error,
         })?
-    {
-        fs::write(&absolute, updated).map_err(|source| PostError::Io {
-            path: relative_str.clone(),
-            source,
-        })?;
-    }
-
-    let activation = match &args.activation {
-        PostActivation::Manual | PostActivation::Hold => Value::Null,
-        PostActivation::Auto => {
-            queue_activation(store, &ticket.id, ActivationKind::Auto, None, now_ms)?
-        }
-        PostActivation::At { .. } => {
-            let eligible_at_ms =
-                at_eligible_ms.expect("the dispatcher computes eligibility for at activations");
-            queue_activation(
-                store,
-                &ticket.id,
-                ActivationKind::At,
-                Some(eligible_at_ms),
-                now_ms,
-            )?
-        }
+        .unwrap_or_else(|| content.clone());
+    let activation_request = match &args.activation {
+        PostActivation::Manual | PostActivation::Hold => None,
+        PostActivation::Auto => Some(ActivationRequest {
+            kind: ActivationKind::Auto,
+            eligible_at_ms: None,
+        }),
+        PostActivation::At { .. } => Some(ActivationRequest {
+            kind: ActivationKind::At,
+            eligible_at_ms: Some(
+                at_eligible_ms.expect("the dispatcher computes eligibility for at activations"),
+            ),
+        }),
     };
+    let work_ticket = WorkTicket {
+        id: ticket_id.clone(),
+        project_id: project.clone(),
+        name: stamped.name.clone(),
+        body: frontmatter::body(&content)
+            .expect("validated frontmatter has a body")
+            .to_owned(),
+        state: WorkTicketState::from_ticket_state(
+            initial_state,
+            false,
+            String::new(),
+            crate::domain::work::OwnerId(String::new()),
+        ),
+        blocked_by: stamped.blocked_by.clone(),
+        attempts: existing.as_ref().map_or(0, |ticket| ticket.attempts as u32),
+        hints: ExecutionHints {
+            target,
+            model: stamped.model.clone(),
+            effort: stamped.effort.clone(),
+            flow: Some(flow_name.clone()),
+        },
+        version: source_version(&final_content),
+    };
+    let author = MarkdownWorkStateAuthor {
+        root,
+        file_path: &relative_str,
+        worktree: &worktree,
+        store,
+        original_content: &content,
+        final_content: &final_content,
+        original_version: source_version(&content),
+        activation: activation_request,
+        now_ms,
+        activation_result: Mutex::new(Value::Null),
+    };
+    let ticket_ref = TicketRef {
+        id: ticket_id,
+        source: "local".into(),
+        source_ref: Some(relative_str.clone()),
+    };
+    if existing.is_some() {
+        author
+            .update(&ticket_ref, &work_ticket, &author.original_version)
+            .await?;
+    } else {
+        author.post(&work_ticket).await?;
+    }
+    let activation = author.activation_result();
+    let ticket = store
+        .ticket(&work_ticket.id)?
+        .expect("registered ticket still exists");
 
     Ok(json!({
         "ticket": {
@@ -308,31 +532,35 @@ pub(crate) fn parse_ticket_frontmatter(
 }
 
 /// Reuses an existing queued activation of the same kind so reposting cannot
-/// enqueue duplicate work. A timed repost moves the queued activation to the
-/// newly requested instant instead of keeping the stale one.
-fn queue_activation(
-    store: &Store,
+/// enqueue duplicate work. Ticket registration, counter reservation, and this
+/// queue operation share one transaction.
+fn queue_activation_transaction(
+    transaction: &Transaction<'_>,
     ticket_id: &str,
-    kind: ActivationKind,
-    eligible_at_ms: Option<i64>,
+    request: Option<ActivationRequest>,
     now_ms: i64,
-) -> Result<Value, PostError> {
-    let id = match store.queued_ticket_activation(ticket_id, kind)? {
+) -> Result<Value, StoreError> {
+    let Some(request) = request else {
+        return Ok(Value::Null);
+    };
+    let id = match local::tx::queued_ticket_activation(transaction, ticket_id, request.kind)? {
         Some(id) => {
-            if let Some(eligible_at_ms) = eligible_at_ms {
-                store.reschedule_activation(&id, eligible_at_ms, now_ms)?;
+            if let Some(eligible_at_ms) = request.eligible_at_ms {
+                local::tx::reschedule_activation(transaction, &id, eligible_at_ms, now_ms)?;
             }
             id
         }
         None => {
-            let id = format!("A{}", store.next_activation_ordinal()?);
-            store.insert_activation(
+            let ordinal = run_store::tx::reserve_ordinal(transaction, "activation", "activations")?;
+            let id = format!("A{ordinal}");
+            local::tx::insert_activation(
+                transaction,
                 &NewActivation {
                     id: &id,
-                    kind,
+                    kind: request.kind,
                     ticket_id: Some(ticket_id),
                     project_id: None,
-                    eligible_at_ms,
+                    eligible_at_ms: request.eligible_at_ms,
                     interval_ms: None,
                 },
                 now_ms,
@@ -342,14 +570,33 @@ fn queue_activation(
     };
     let mut activation = json!({
         "id": id,
-        "kind": kind.as_str(),
+        "kind": request.kind.as_str(),
         "state": "queued",
         "ticket": ticket_id,
     });
-    if let Some(eligible_at_ms) = eligible_at_ms {
+    if let Some(eligible_at_ms) = request.eligible_at_ms {
         activation["eligible_at_ms"] = json!(eligible_at_ms);
     }
     Ok(activation)
+}
+
+fn source_store_error(error: StoreError) -> SourceError {
+    if error.is_disk_full() {
+        SourceError::Unavailable { retry_after: None }
+    } else {
+        SourceError::Corrupt {
+            message: error.to_string(),
+        }
+    }
+}
+
+fn source_version(content: &str) -> SourceVersion {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in content.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    SourceVersion(format!("{hash:016x}"))
 }
 
 fn allocate_ticket_id(store: &Store, prefix: &str) -> Result<String, PostError> {
@@ -487,8 +734,15 @@ pub enum PostError {
         path: String,
         source: io::Error,
     },
+    Source(SourceError),
     Store(StoreError),
     IdAllocation(IdError),
+}
+
+impl From<SourceError> for PostError {
+    fn from(error: SourceError) -> Self {
+        Self::Source(error)
+    }
 }
 
 impl From<StoreError> for PostError {
@@ -569,6 +823,7 @@ impl fmt::Display for PostError {
                 "ticket ID `{id}` is already registered by `{file}`"
             ),
             Self::Io { path, source } => write!(formatter, "{path}: {source}"),
+            Self::Source(error) => error.fmt(formatter),
             Self::Store(error) => error.fmt(formatter),
             Self::IdAllocation(error) => error.fmt(formatter),
         }
@@ -583,11 +838,15 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{PostError, handle as handle_with_directory};
+    use super::{
+        MarkdownWorkStateAuthor, PostError, handle as handle_with_directory, source_version,
+    };
     use crate::config::{AgentConfig, AgentTarget};
+    use crate::domain::work::{ExecutionHints, TicketRef, WorkTicket, WorkTicketState};
     use crate::flow::{Flow, Stage, StageKind, VerdictPolicy};
     use crate::protocol::{PostActivation, PostArgs};
     use crate::store::Store;
+    use crate::work_state::{SourceError, WorkStateAuthor};
 
     fn world() -> (tempfile::TempDir, Store) {
         let root = tempdir().unwrap();
@@ -615,18 +874,20 @@ mod tests {
         flows: &BTreeMap<String, Flow>,
         default_flow: &str,
     ) -> Result<serde_json::Value, PostError> {
-        handle_with_directory(
-            root,
-            std::path::Path::new(".agents/sloop/tickets"),
-            store,
-            args,
-            now_ms,
-            None,
-            ticket_prefix,
-            agent,
-            flows,
-            default_flow,
-        )
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(handle_with_directory(
+                root,
+                std::path::Path::new(".agents/sloop/tickets"),
+                store,
+                args,
+                now_ms,
+                None,
+                ticket_prefix,
+                agent,
+                flows,
+                default_flow,
+            ))
     }
 
     fn handle_at(
@@ -636,18 +897,20 @@ mod tests {
         now_ms: i64,
         at_eligible_ms: i64,
     ) -> Result<serde_json::Value, PostError> {
-        handle_with_directory(
-            root,
-            std::path::Path::new(".agents/sloop/tickets"),
-            store,
-            args,
-            now_ms,
-            Some(at_eligible_ms),
-            "TICK",
-            None,
-            &flows(),
-            "default",
-        )
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(handle_with_directory(
+                root,
+                std::path::Path::new(".agents/sloop/tickets"),
+                store,
+                args,
+                now_ms,
+                Some(at_eligible_ms),
+                "TICK",
+                None,
+                &flows(),
+                "default",
+            ))
     }
 
     fn post(file: &str, activation: PostActivation) -> PostArgs {
@@ -755,6 +1018,129 @@ mod tests {
         .unwrap();
         assert_eq!(first["ticket"]["id"], second["ticket"]["id"]);
         assert_eq!(first["activation"]["id"], second["activation"]["id"]);
+        let db = store.db();
+        let connection = db.lock();
+        let tickets: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tickets", [], |row| row.get(0))
+            .unwrap();
+        let activations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM activations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tickets, 1);
+        assert_eq!(activations, 1);
+    }
+
+    #[test]
+    fn stale_source_version_rejects_update_without_clobbering_the_file() {
+        let (root, store) = world();
+        let relative = ".agents/sloop/tickets/cas.md";
+        let path = root.path().join(relative);
+        std::fs::write(&path, ticket("", "# Original\n")).unwrap();
+        handle(
+            root.path(),
+            &store,
+            &post(relative, PostActivation::Manual),
+            2_000,
+            "TICK",
+            None,
+            &flows(),
+            "default",
+        )
+        .unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let replacement = original.replace("name: Test ticket", "name: Replacement");
+        let expected = source_version(&original);
+        let external_edit = original.replace("# Original", "# External edit");
+        std::fs::write(&path, &external_edit).unwrap();
+        let author = MarkdownWorkStateAuthor {
+            root: root.path(),
+            file_path: relative,
+            worktree: "cas",
+            store: &store,
+            original_content: &original,
+            final_content: &replacement,
+            original_version: expected.clone(),
+            activation: None,
+            now_ms: 3_000,
+            activation_result: std::sync::Mutex::new(serde_json::Value::Null),
+        };
+        let content = WorkTicket {
+            id: "TICK-1".into(),
+            project_id: "default".into(),
+            name: "Replacement".into(),
+            body: "# Replacement\n".into(),
+            state: WorkTicketState::Ready,
+            blocked_by: Vec::new(),
+            attempts: 0,
+            hints: ExecutionHints {
+                target: None,
+                model: None,
+                effort: None,
+                flow: Some("default".into()),
+            },
+            version: source_version(&replacement),
+        };
+        let ticket_ref = TicketRef {
+            id: content.id.clone(),
+            source: "local".into(),
+            source_ref: Some(relative.into()),
+        };
+
+        let error = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(author.update(&ticket_ref, &content, &expected))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SourceError::Rejected { message } if message.contains("source version conflict")
+        ));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), external_edit);
+        assert_eq!(store.ticket("TICK-1").unwrap().unwrap().name, "Test ticket");
+    }
+
+    #[test]
+    fn activation_insert_failure_leaves_idless_file_and_database_unchanged() {
+        let (root, store) = world();
+        let relative = ".agents/sloop/tickets/fail.md";
+        let path = root.path().join(relative);
+        let original = ticket("", "# Failure\n");
+        std::fs::write(&path, &original).unwrap();
+        store
+            .db()
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER reject_activation BEFORE INSERT ON activations
+                 BEGIN SELECT RAISE(ABORT, 'forced activation failure'); END;",
+            )
+            .unwrap();
+
+        let error = handle(
+            root.path(),
+            &store,
+            &post(relative, PostActivation::Auto),
+            2_000,
+            "TICK",
+            None,
+            &flows(),
+            "default",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("forced activation failure"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+        assert!(store.ticket_ids().unwrap().is_empty());
+        assert!(store.queued_activations().unwrap().is_empty());
+        let next_ordinal: i64 = store
+            .db()
+            .lock()
+            .query_row(
+                "SELECT next_ordinal FROM id_counters WHERE kind = 'activation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(next_ordinal, 1);
     }
 
     #[test]

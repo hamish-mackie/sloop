@@ -167,6 +167,23 @@ pub struct ReindexResult {
     pub rows_dropped: usize,
 }
 
+pub(crate) struct LocalTicketWrite<'a> {
+    pub id: &'a str,
+    pub project_id: &'a str,
+    pub file_path: &'a str,
+    pub name: &'a str,
+    pub blocked_by: &'a [String],
+    pub worktree: &'a str,
+    pub target: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    pub flow: &'a str,
+    pub state: TicketState,
+    pub body: &'a str,
+    pub content_hash: &'a str,
+    pub now_ms: i64,
+}
+
 fn ticket_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TicketRecord> {
     Ok(TicketRecord {
         id: row.get(0)?,
@@ -192,6 +209,117 @@ fn ticket_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TicketRecord> {
 
 pub(crate) mod tx {
     use super::*;
+
+    pub(crate) fn insert_authored_ticket(
+        transaction: &Transaction<'_>,
+        ticket: &LocalTicketWrite<'_>,
+    ) -> Result<(), StoreError> {
+        transaction.execute(
+            "INSERT INTO tickets
+                 (id, project_id, file_path, source, state, name, worktree, target, model, effort,
+                    flow, body, content_hash, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, 'local', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+            params![
+                ticket.id,
+                ticket.project_id,
+                ticket.file_path,
+                ticket.state.as_str(),
+                ticket.name,
+                ticket.worktree,
+                ticket.target,
+                ticket.model,
+                ticket.effort,
+                ticket.flow,
+                ticket.body,
+                ticket.content_hash,
+                ticket.now_ms,
+            ],
+        )?;
+        replace_ticket_blockers(transaction, ticket.id, ticket.blocked_by)?;
+        Ok(())
+    }
+
+    pub(crate) fn update_authored_ticket(
+        transaction: &Transaction<'_>,
+        ticket: &LocalTicketWrite<'_>,
+    ) -> Result<(), StoreError> {
+        transaction.execute(
+            "UPDATE tickets
+             SET name = ?2, worktree = ?3, target = ?4, model = ?5, effort = ?6, flow = ?7,
+                 body = ?8, content_hash = ?9, held_reason = NULL, missing_at_ms = NULL,
+                 updated_at_ms = ?10
+             WHERE id = ?1",
+            params![
+                ticket.id,
+                ticket.name,
+                ticket.worktree,
+                ticket.target,
+                ticket.model,
+                ticket.effort,
+                ticket.flow,
+                ticket.body,
+                ticket.content_hash,
+                ticket.now_ms,
+            ],
+        )?;
+        replace_ticket_blockers(transaction, ticket.id, ticket.blocked_by)?;
+        Ok(())
+    }
+
+    pub(crate) fn queued_ticket_activation(
+        transaction: &Transaction<'_>,
+        ticket_id: &str,
+        kind: ActivationKind,
+    ) -> rusqlite::Result<Option<String>> {
+        transaction
+            .query_row(
+                "SELECT id FROM activations
+                 WHERE ticket_id = ?1 AND kind = ?2 AND state = 'queued'
+                 ORDER BY created_at_ms LIMIT 1",
+                params![ticket_id, kind.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    pub(crate) fn reschedule_activation(
+        transaction: &Transaction<'_>,
+        id: &str,
+        eligible_at_ms: i64,
+        now_ms: i64,
+    ) -> rusqlite::Result<()> {
+        transaction.execute(
+            "UPDATE activations
+             SET eligible_at_ms = ?2, updated_at_ms = ?3
+             WHERE id = ?1 AND state = 'queued'",
+            params![id, eligible_at_ms, now_ms],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn insert_activation(
+        transaction: &Transaction<'_>,
+        activation: &NewActivation<'_>,
+        now_ms: i64,
+    ) -> rusqlite::Result<()> {
+        transaction.execute(
+            "INSERT INTO activations
+                 (id, kind, state, ticket_id, project_id, eligible_at_ms, interval_ms,
+                  created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            params![
+                activation.id,
+                activation.kind.as_str(),
+                ActivationState::Queued.as_str(),
+                activation.ticket_id,
+                activation.project_id,
+                activation.eligible_at_ms,
+                activation.interval_ms,
+                now_ms,
+            ],
+        )?;
+        Ok(())
+    }
 
     pub(crate) fn advance_activation(
         transaction: &Transaction<'_>,
