@@ -20,6 +20,7 @@ mod reindex_evidence;
 pub mod render;
 pub mod run_log;
 pub mod run_ref;
+pub mod run_store;
 pub mod runner;
 pub mod sources;
 pub mod store;

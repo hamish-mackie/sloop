@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -7,6 +7,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 pub use crate::db::SCHEMA_VERSION;
 use crate::db::{Db, DbError};
 use crate::domain::ticket::TicketState;
+pub use crate::run_store::{EventRecord, ProjectNote, RunTimeline};
+use crate::run_store::{RunStore, runs};
 
 /// Every value the `runs.state` column can hold. The ladder runs
 /// `claimed → running → aftercare` and then to one terminal state, either an
@@ -194,45 +196,6 @@ pub struct EvidenceRecord {
     pub data_json: String,
 }
 
-/// One row of the activity feed, ordered by `sequence`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EventRecord {
-    pub sequence: i64,
-    pub occurred_at_ms: i64,
-    pub kind: String,
-    pub run_id: Option<String>,
-    pub ticket_id: Option<String>,
-    pub data_json: String,
-}
-
-/// One run's wall-clock boundaries, derived from the activity feed. Every
-/// field is optional because a run is observable at each stage of its life:
-/// claimed but not started, started but not finished.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RunTimeline {
-    pub claimed_at_ms: Option<i64>,
-    pub started_at_ms: Option<i64>,
-    pub finished_at_ms: Option<i64>,
-}
-
-/// Appends one activity-feed row. Callers pass the transaction performing the
-/// transition so the event commits or rolls back with it.
-fn record_event(
-    connection: &Connection,
-    now_ms: i64,
-    kind: &str,
-    run_id: Option<&str>,
-    ticket_id: Option<&str>,
-    data_json: &str,
-) -> Result<(), rusqlite::Error> {
-    connection.execute(
-        "INSERT INTO events (occurred_at_ms, kind, run_id, ticket_id, data_json)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![now_ms, kind, run_id, ticket_id, data_json],
-    )?;
-    Ok(())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CooldownUpdate<'a> {
     pub target: &'a str,
@@ -378,15 +341,6 @@ pub struct ProjectRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectNote {
-    pub id: String,
-    pub run_id: String,
-    pub ticket_id: String,
-    pub text: String,
-    pub recorded_at_ms: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectCommitEvidence {
     pub run_id: String,
     pub ticket_id: String,
@@ -516,6 +470,10 @@ impl Store {
 
     pub fn db(&self) -> Db {
         self.db.clone()
+    }
+
+    fn run_store(&self) -> RunStore {
+        RunStore::from_db(self.db.clone())
     }
 
     fn with_connection<T>(
@@ -768,13 +726,13 @@ impl Store {
                 "run_evidence",
                 "aftercare_stages",
                 "budget_reservations",
-                "notes",
             ] {
                 rows_dropped += transaction.execute(
                     &format!("DELETE FROM {table} WHERE run_id = ?1"),
                     params![run_id],
                 )?;
             }
+            rows_dropped += runs::tx::delete_notes_for_run(&transaction, run_id)?;
             rows_dropped +=
                 transaction.execute("DELETE FROM runs WHERE id = ?1", params![run_id])?;
         }
@@ -1476,7 +1434,7 @@ impl Store {
             params![run_id],
             |row| row.get(0),
         )?;
-        record_event(
+        runs::tx::record_event(
             &transaction,
             now_ms,
             "run_started",
@@ -1576,7 +1534,7 @@ impl Store {
                 params![run_id, record.kind, now_ms, record.data_json],
             )?;
         }
-        record_event(
+        runs::tx::record_event(
             &transaction,
             now_ms,
             "run_finished",
@@ -1822,23 +1780,16 @@ impl Store {
         text: &str,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        self.db.lock().execute(
-            "INSERT INTO notes (id, run_id, text, recorded_at_ms)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![id, run_id, text, now_ms],
-        )?;
-        Ok(())
+        self.run_store()
+            .insert_note(id, run_id, text, now_ms)
+            .map_err(StoreError::from)
     }
 
     /// Notes recorded against one run, in the order they arrived.
     pub fn notes_for_run(&self, run_id: &str) -> Result<Vec<String>, StoreError> {
-        let connection = self.db.lock();
-        let mut statement = connection
-            .prepare("SELECT text FROM notes WHERE run_id = ?1 ORDER BY recorded_at_ms, id")?;
-        let rows = statement
-            .query_map(params![run_id], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        self.run_store()
+            .notes_for_run(run_id)
+            .map_err(StoreError::from)
     }
 
     /// Records the first worker-reported verdict for one stage. The unique
@@ -1864,26 +1815,8 @@ impl Store {
     }
 
     pub fn notes_for_project(&self, project_id: &str) -> Result<Vec<ProjectNote>, StoreError> {
-        let connection = self.db.lock();
-        let mut statement = connection.prepare(
-            "SELECT n.id, n.run_id, r.ticket_id, n.text, n.recorded_at_ms
-             FROM notes n
-             JOIN runs r ON r.id = n.run_id
-             JOIN tickets t ON t.id = r.ticket_id
-             WHERE t.project_id = ?1
-             ORDER BY r.ticket_id, n.recorded_at_ms, n.id",
-        )?;
-        statement
-            .query_map(params![project_id], |row| {
-                Ok(ProjectNote {
-                    id: row.get(0)?,
-                    run_id: row.get(1)?,
-                    ticket_id: row.get(2)?,
-                    text: row.get(3)?,
-                    recorded_at_ms: row.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
+        self.run_store()
+            .notes_for_project(project_id)
             .map_err(StoreError::from)
     }
 
@@ -1913,7 +1846,9 @@ impl Store {
     }
 
     pub fn next_note_ordinal(&self) -> Result<i64, StoreError> {
-        self.reserve_ordinal("note", "notes")
+        self.run_store()
+            .next_note_ordinal()
+            .map_err(StoreError::from)
     }
 
     /// Evidence rows for one run in observation order, as (kind, data_json).
@@ -1991,7 +1926,7 @@ impl Store {
              WHERE id = ?1 AND state = 'claimed'",
             params![ticket_id, now_ms],
         )?;
-        record_event(
+        runs::tx::record_event(
             &transaction,
             now_ms,
             "run_aborted",
@@ -2006,23 +1941,8 @@ impl Store {
     /// Reads activity-feed rows with `sequence > after`, oldest first. The
     /// last row's sequence is the caller's next cursor.
     pub fn events_after(&self, after: i64, limit: usize) -> Result<Vec<EventRecord>, StoreError> {
-        let connection = self.db.lock();
-        let mut statement = connection.prepare(
-            "SELECT sequence, occurred_at_ms, kind, run_id, ticket_id, data_json
-             FROM events WHERE sequence > ?1 ORDER BY sequence LIMIT ?2",
-        )?;
-        statement
-            .query_map(params![after, limit as i64], |row| {
-                Ok(EventRecord {
-                    sequence: row.get(0)?,
-                    occurred_at_ms: row.get(1)?,
-                    kind: row.get(2)?,
-                    run_id: row.get(3)?,
-                    ticket_id: row.get(4)?,
-                    data_json: row.get(5)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
+        self.run_store()
+            .events_after(after, limit)
             .map_err(StoreError::from)
     }
 
@@ -2037,57 +1957,22 @@ impl Store {
     pub fn run_timelines(
         &self,
         run_ids: &[&str],
-    ) -> Result<HashMap<String, RunTimeline>, StoreError> {
-        if run_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let placeholders = std::iter::repeat_n("?", run_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let connection = self.db.lock();
-        let mut statement = connection.prepare(&format!(
-            "SELECT run_id,
-                    MIN(CASE WHEN kind = 'run_claimed' THEN occurred_at_ms END),
-                    MIN(CASE WHEN kind = 'run_started' THEN occurred_at_ms END),
-                    MAX(CASE WHEN kind IN ('run_finished', 'run_aborted')
-                             THEN occurred_at_ms END)
-             FROM events
-             WHERE run_id IN ({placeholders})
-             GROUP BY run_id"
-        ))?;
-        let rows = statement
-            .query_map(rusqlite::params_from_iter(run_ids), |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    RunTimeline {
-                        claimed_at_ms: row.get(1)?,
-                        started_at_ms: row.get(2)?,
-                        finished_at_ms: row.get(3)?,
-                    },
-                ))
-            })?
-            .collect::<Result<HashMap<_, _>, _>>()?;
-        Ok(rows)
+    ) -> Result<std::collections::HashMap<String, RunTimeline>, StoreError> {
+        self.run_store()
+            .run_timelines(run_ids)
+            .map_err(StoreError::from)
     }
 
     pub fn latest_event_sequence(&self) -> Result<i64, StoreError> {
-        let latest = self.db.lock().query_row(
-            "SELECT COALESCE(MAX(sequence), 0) FROM events",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(latest)
+        self.run_store()
+            .latest_event_sequence()
+            .map_err(StoreError::from)
     }
 
     /// Drops all but the newest `keep` activity-feed rows. Sequences are never
     /// reused after a trim, so cursors held by watchers stay valid.
     pub fn trim_events(&self, keep: i64) -> Result<(), StoreError> {
-        self.db.lock().execute(
-            "DELETE FROM events
-             WHERE sequence <= (SELECT COALESCE(MAX(sequence), 0) FROM events) - ?1",
-            params![keep],
-        )?;
-        Ok(())
+        self.run_store().trim_events(keep).map_err(StoreError::from)
     }
 
     pub fn run(&self, id: &str) -> Result<Option<RunRecord>, StoreError> {
@@ -2249,7 +2134,7 @@ impl Store {
             params![candidate.run_id, now_ms],
         )?;
         if changed == 1 {
-            record_event(
+            runs::tx::record_event(
                 &transaction,
                 now_ms,
                 "run_worktree_cleaned",
@@ -2309,7 +2194,7 @@ impl Store {
              VALUES (?1, 'external_merge_observed', ?2, 'external_merge:' || ?1, ?3)",
             params![run_id, now_ms, data_json],
         )?;
-        record_event(
+        runs::tx::record_event(
             &transaction,
             now_ms,
             "external_merge_reconciled",
@@ -2457,29 +2342,9 @@ impl Store {
     /// Reserves the next activation ordinal without reusing IDs removed by
     /// reindex.
     pub fn next_activation_ordinal(&self) -> Result<i64, StoreError> {
-        self.reserve_ordinal("activation", "activations")
-    }
-
-    fn reserve_ordinal(&self, kind: &str, table: &str) -> Result<i64, StoreError> {
-        let mut connection = self.db.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let reserved: i64 = transaction.query_row(
-            "SELECT next_ordinal FROM id_counters WHERE kind = ?1",
-            params![kind],
-            |row| row.get(0),
-        )?;
-        let existing: i64 = transaction.query_row(
-            &format!("SELECT COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) + 1 FROM {table}"),
-            [],
-            |row| row.get(0),
-        )?;
-        let ordinal = reserved.max(existing);
-        transaction.execute(
-            "UPDATE id_counters SET next_ordinal = ?2 WHERE kind = ?1",
-            params![kind, ordinal + 1],
-        )?;
-        transaction.commit()?;
-        Ok(ordinal)
+        self.run_store()
+            .next_activation_ordinal()
+            .map_err(StoreError::from)
     }
 
     /// Claims a ready ticket for one run in a single transaction. The
@@ -2586,7 +2451,7 @@ impl Store {
                 expires_at_ms,
             ],
         )?;
-        record_event(
+        runs::tx::record_event(
             &transaction,
             now_ms,
             "run_claimed",
@@ -2665,29 +2530,19 @@ impl Store {
     }
 
     pub fn paused(&self) -> Result<bool, StoreError> {
-        let paused: i64 = self.db.lock().query_row(
-            "SELECT paused FROM scheduler_state WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(paused != 0)
+        self.run_store().paused().map_err(StoreError::from)
     }
 
     pub fn clear_restart_draining(&self, now_ms: i64) -> Result<(), StoreError> {
-        self.db.lock().execute(
-            "UPDATE scheduler_state SET draining = 0, updated_at_ms = ?1 WHERE singleton = 1",
-            params![now_ms],
-        )?;
-        Ok(())
+        self.run_store()
+            .clear_restart_draining(now_ms)
+            .map_err(StoreError::from)
     }
 
     pub fn restart_draining(&self) -> Result<bool, StoreError> {
-        let draining: i64 = self.db.lock().query_row(
-            "SELECT draining FROM scheduler_state WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(draining != 0)
+        self.run_store()
+            .restart_draining()
+            .map_err(StoreError::from)
     }
 
     pub fn active_cooldown_for_target(
@@ -2779,11 +2634,9 @@ impl Store {
     }
 
     pub fn set_paused(&self, paused: bool, now_ms: i64) -> Result<(), StoreError> {
-        self.db.lock().execute(
-            "UPDATE scheduler_state SET paused = ?1, updated_at_ms = ?2 WHERE singleton = 1",
-            params![i64::from(paused), now_ms],
-        )?;
-        Ok(())
+        self.run_store()
+            .set_paused(paused, now_ms)
+            .map_err(StoreError::from)
     }
 
     pub fn begin_restart_draining(
@@ -2791,54 +2644,24 @@ impl Store {
         active_runs: usize,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
-        let mut connection = self.db.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "UPDATE scheduler_state SET draining = 1, updated_at_ms = ?1
-             WHERE singleton = 1 AND draining = 0",
-            params![now_ms],
-        )? != 0;
-        if changed {
-            record_event(
-                &transaction,
-                now_ms,
-                "daemon_restart_requested",
-                None,
-                None,
-                &serde_json::json!({"active_runs": active_runs}).to_string(),
-            )?;
-        }
-        transaction.commit()?;
-        Ok(changed)
+        self.run_store()
+            .begin_restart_draining(active_runs, now_ms)
+            .map_err(StoreError::from)
     }
 
     /// Resuming cancels both scheduler holds in one durable transition.
     pub fn resume_scheduler(&mut self, now_ms: i64) -> Result<bool, StoreError> {
-        let mut connection = self.db.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let was_draining: bool = transaction.query_row(
-            "SELECT draining FROM scheduler_state WHERE singleton = 1",
-            [],
-            |row| row.get::<_, i64>(0).map(|value| value != 0),
-        )?;
-        transaction.execute(
-            "UPDATE scheduler_state
-             SET paused = 0, draining = 0, updated_at_ms = ?1
-             WHERE singleton = 1",
-            params![now_ms],
-        )?;
-        transaction.commit()?;
-        Ok(was_draining)
+        self.run_store()
+            .resume_scheduler(now_ms)
+            .map_err(StoreError::from)
     }
 
     /// Performs a small committed write used to detect when SQLite can make
     /// progress again after returning `SQLITE_FULL`.
     pub(crate) fn probe_writable(&self, now_ms: i64) -> Result<(), StoreError> {
-        self.db.lock().execute(
-            "UPDATE scheduler_state SET updated_at_ms = ?1 WHERE singleton = 1",
-            params![now_ms],
-        )?;
-        Ok(())
+        self.run_store()
+            .probe_writable(now_ms)
+            .map_err(StoreError::from)
     }
 
     pub fn ticket_counts(&self) -> Result<TicketCounts, StoreError> {
@@ -3037,12 +2860,11 @@ impl std::error::Error for StoreError {}
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::Connection;
     use tempfile::tempdir;
 
     use super::{
-        ActivationKind, ClaimRequest, ExitClaim, NewActivation, ReindexTicket, RunState,
-        SCHEMA_VERSION, Store, StoreError,
+        ActivationKind, ClaimRequest, ExitClaim, NewActivation, ReindexTicket, RunState, Store,
+        StoreError,
     };
     use crate::domain::ticket::{TicketSnapshot, TicketState};
     use crate::flow::{Flow, Stage, StageKind, VerdictPolicy};
@@ -3103,26 +2925,6 @@ mod tests {
             }
             .is_disk_full()
         );
-    }
-
-    #[test]
-    fn writable_probe_commits_without_changing_pause_state() {
-        let directory = tempdir().unwrap();
-        let store = open_seeded(&directory.path().join("sloop.db"));
-
-        store.probe_writable(2_000).unwrap();
-
-        assert!(!store.paused().unwrap());
-        let updated_at_ms: i64 = store
-            .db
-            .lock()
-            .query_row(
-                "SELECT updated_at_ms FROM scheduler_state WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(updated_at_ms, 2_000);
     }
 
     fn claim_t1<'a>(run_id: &'a str) -> ClaimRequest<'a> {
@@ -3726,57 +3528,6 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_transitions_append_ordered_events() {
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        running_r1(&mut store);
-        store
-            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, 2_300)
-            .unwrap();
-
-        let events = store.events_after(0, 10).unwrap();
-        let kinds: Vec<&str> = events.iter().map(|event| event.kind.as_str()).collect();
-        assert_eq!(kinds, ["run_claimed", "run_started", "run_finished"]);
-        assert!(events.iter().all(|event| {
-            event.run_id.as_deref() == Some("R1") && event.ticket_id.as_deref() == Some("T1")
-        }));
-        let finished: serde_json::Value = serde_json::from_str(&events[2].data_json).unwrap();
-        assert_eq!(finished["outcome"], "merged");
-        assert_eq!(finished["ticket_state"], "merged");
-
-        // Settling twice is idempotent, so no duplicate event appears.
-        store
-            .finish_run("R1", "T1", Some(1), Outcome::Failed, &[], None, 2_400)
-            .unwrap();
-        assert_eq!(store.latest_event_sequence().unwrap(), events[2].sequence);
-
-        let rest = store.events_after(events[0].sequence, 10).unwrap();
-        assert_eq!(rest.len(), 2);
-        assert_eq!(rest[0].kind, "run_started");
-
-        store.trim_events(1).unwrap();
-        let kept = store.events_after(0, 10).unwrap();
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].sequence, events[2].sequence);
-    }
-
-    #[test]
-    fn abandoned_claims_append_an_abort_event() {
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
-        store.abort_claim("R1", "T1", 2_100).unwrap();
-
-        let kinds: Vec<String> = store
-            .events_after(0, 10)
-            .unwrap()
-            .into_iter()
-            .map(|event| event.kind)
-            .collect();
-        assert_eq!(kinds, ["run_claimed", "run_aborted"]);
-    }
-
-    #[test]
     fn operator_hold_transitions_are_narrow_and_idempotent() {
         let directory = tempdir().unwrap();
         let store = open_seeded(&directory.path().join("sloop.db"));
@@ -4149,158 +3900,6 @@ mod tests {
     }
 
     #[test]
-    fn notes_round_trip_in_arrival_order() {
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
-
-        assert_eq!(store.next_note_ordinal().unwrap(), 1);
-        store.insert_note("N1", "R1", "first", 3_000).unwrap();
-        store.insert_note("N2", "R1", "second", 3_000).unwrap();
-        assert_eq!(store.next_note_ordinal().unwrap(), 3);
-
-        assert_eq!(
-            store.notes_for_run("R1").unwrap(),
-            vec!["first".to_owned(), "second".to_owned()]
-        );
-        assert!(store.notes_for_run("R2").unwrap().is_empty());
-    }
-
-    #[test]
-    fn version_three_migrates_ticket_metadata_and_newer_schemas_are_rejected() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("sloop.db");
-        drop(Store::open(&path, 1_000).unwrap());
-
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                "DROP TABLE ticket_blockers;
-                 ALTER TABLE tickets DROP COLUMN name;
-                 ALTER TABLE tickets DROP COLUMN worktree;
-                 ALTER TABLE tickets DROP COLUMN flow;
-                 ALTER TABLE tickets DROP COLUMN body;
-                 ALTER TABLE tickets DROP COLUMN held_reason;
-                 ALTER TABLE tickets DROP COLUMN missing_at_ms;
-                 ALTER TABLE scheduler_state DROP COLUMN draining;
-                 ALTER TABLE runs DROP COLUMN worker_socket_path;
-                 ALTER TABLE runs DROP COLUMN flow_json;
-                 ALTER TABLE runs DROP COLUMN ticket_json;
-                 ALTER TABLE runs DROP COLUMN cleanup_eligible_at_ms;
-                 ALTER TABLE runs DROP COLUMN cleaned_at_ms;",
-            )
-            .unwrap();
-        connection.pragma_update(None, "user_version", 3).unwrap();
-        drop(connection);
-
-        let store = Store::open(&path, 2_000).unwrap();
-        assert!(!store.paused().unwrap());
-        store
-            .insert_local_project(
-                "default",
-                ".agents/sloop/projects/default.md",
-                "Default",
-                2_000,
-            )
-            .unwrap();
-        store
-            .insert_local_ticket(
-                "T1",
-                "default",
-                ".agents/sloop/tickets/t1.md",
-                "Ticket one",
-                &[],
-                "sloop/T1",
-                Some("codex"),
-                None,
-                None,
-                "default",
-                TicketState::Ready,
-                2_000,
-            )
-            .unwrap();
-        assert_eq!(
-            store.ticket("T1").unwrap().unwrap().target.as_deref(),
-            Some("codex")
-        );
-        drop(store);
-
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 99).unwrap();
-        drop(connection);
-
-        assert!(matches!(
-            Store::open(&path, 3_000),
-            Err(StoreError::UnsupportedSchemaVersion(99))
-        ));
-    }
-
-    #[test]
-    fn version_eight_migrates_existing_runs_with_null_snapshots() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("sloop.db");
-        let mut store = open_seeded(&path);
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
-        drop(store);
-
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                "ALTER TABLE runs DROP COLUMN flow_json;
-                 ALTER TABLE runs DROP COLUMN ticket_json;
-                 ALTER TABLE tickets DROP COLUMN body;
-                 ALTER TABLE tickets DROP COLUMN held_reason;
-                 ALTER TABLE scheduler_state DROP COLUMN draining;
-                 ALTER TABLE runs DROP COLUMN cleanup_eligible_at_ms;
-                 ALTER TABLE runs DROP COLUMN cleaned_at_ms;",
-            )
-            .unwrap();
-        connection.pragma_update(None, "user_version", 8).unwrap();
-        drop(connection);
-
-        let store = Store::open(&path, 3_000).unwrap();
-        let run = store.run("R1").unwrap().unwrap();
-        assert_eq!(run.flow_json, None);
-        assert_eq!(run.ticket_json, None);
-    }
-
-    #[test]
-    fn version_ten_adds_source_metadata_without_disturbing_ticket_state() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("sloop.db");
-        let store = open_seeded(&path);
-        store
-            .db
-            .lock()
-            .execute(
-                "UPDATE tickets SET state = 'held', attempts = 3 WHERE id = 'T1'",
-                [],
-            )
-            .unwrap();
-        drop(store);
-
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                "ALTER TABLE tickets DROP COLUMN body;
-                 ALTER TABLE tickets DROP COLUMN held_reason;
-                 ALTER TABLE scheduler_state DROP COLUMN draining;
-                 ALTER TABLE runs DROP COLUMN cleanup_eligible_at_ms;
-                 ALTER TABLE runs DROP COLUMN cleaned_at_ms;",
-            )
-            .unwrap();
-        connection.pragma_update(None, "user_version", 10).unwrap();
-        drop(connection);
-
-        let store = Store::open(&path, 3_000).unwrap();
-        let ticket = store.ticket("T1").unwrap().unwrap();
-        assert_eq!(ticket.state, "held");
-        assert_eq!(ticket.attempts, 3);
-        assert_eq!(ticket.body, None);
-        assert_eq!(ticket.held_reason, None);
-    }
-
-    #[test]
     fn configured_default_backfills_tickets_that_predate_target_snapshots() {
         let directory = tempdir().unwrap();
         let store = open_seeded(&directory.path().join("sloop.db"));
@@ -4479,71 +4078,5 @@ mod tests {
             .filter(|(kind, _)| kind == "cancel_requested")
             .count();
         assert_eq!(cancels, 1);
-    }
-
-    #[test]
-    fn paused_state_persists() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("sloop.db");
-
-        let store = Store::open(&path, 1_000).unwrap();
-        store.set_paused(true, 2_000).unwrap();
-        drop(store);
-
-        assert!(Store::open(&path, 3_000).unwrap().paused().unwrap());
-    }
-
-    #[test]
-    fn restart_draining_is_durable_idempotent_and_cancelled_by_resume() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("sloop.db");
-        let mut store = Store::open(&path, 1_000).unwrap();
-
-        assert!(store.begin_restart_draining(2, 2_000).unwrap());
-        assert!(!store.begin_restart_draining(2, 2_100).unwrap());
-        assert!(store.restart_draining().unwrap());
-        assert_eq!(
-            store
-                .events_after(0, 10)
-                .unwrap()
-                .iter()
-                .filter(|event| event.kind == "daemon_restart_requested")
-                .count(),
-            1
-        );
-        drop(store);
-
-        let mut reopened = Store::open(&path, 3_000).unwrap();
-        assert!(reopened.restart_draining().unwrap());
-        assert!(reopened.resume_scheduler(4_000).unwrap());
-        assert!(!reopened.restart_draining().unwrap());
-    }
-
-    #[test]
-    fn version_eleven_adds_restart_draining_state() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("sloop.db");
-        drop(Store::open(&path, 1_000).unwrap());
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                "ALTER TABLE scheduler_state DROP COLUMN draining;
-                 ALTER TABLE runs DROP COLUMN cleanup_eligible_at_ms;
-                 ALTER TABLE runs DROP COLUMN cleaned_at_ms;
-                 PRAGMA user_version = 11;",
-            )
-            .unwrap();
-        drop(connection);
-
-        let store = Store::open(&path, 2_000).unwrap();
-        assert!(!store.restart_draining().unwrap());
-        assert_eq!(
-            store
-                .db
-                .lock()
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
-                .unwrap(),
-            SCHEMA_VERSION
-        );
     }
 }
