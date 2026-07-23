@@ -1,9 +1,8 @@
 //! Answers scheduling mutation intents with granted or denied decisions.
 //!
-//! This is the daemon's path for composing remaining cross-boundary run
-//! settlement. Read-only queries are not coordination
-//! and remain on [`Store`]. Rust's sibling-module visibility cannot enforce the
-//! boundary, so daemon code must not call the wrapped store methods directly.
+//! Read-only queries are not coordination and remain on [`Store`]. Rust's
+//! sibling-module visibility cannot enforce the boundary, so daemon code must
+//! not call the wrapped store methods directly.
 //!
 //! # Lease invariants
 //!
@@ -25,9 +24,8 @@
 //! Liveness of a run is determined by process identity — pid, pid start time,
 //! and process group id — never by lease expiry.
 //!
-//! A lease is released by deleting its row: on settlement (`settle`) or on
-//! claim rollback (`abandon`). An expired-but-present lease row is evidence
-//! of an owner that died mid-work.
+//! A lease is released through `WorkState` after the run outcome is durable.
+//! An expired-but-present lease row is evidence of an owner that died mid-work.
 //!
 //! The daemon renews the lease of every run it actively supervises, from the
 //! periodic reconcile pass, so `expires_at_ms` is truthful for as long as a run
@@ -40,10 +38,8 @@
 use std::collections::BTreeSet;
 
 use crate::db::Db;
-use crate::domain::ticket::TicketState;
-use crate::outcome::Outcome;
 use crate::run_store::{RunState, evidence, limits, runs};
-use crate::store::{CooldownUpdate, EvidenceRecord, ExitClaim, Store, StoreError};
+use crate::store::{ExitClaim, Store, StoreError};
 use crate::work_state::local::{self, LocalSqlite, ReindexResult, ReindexTicket};
 use rusqlite::TransactionBehavior;
 
@@ -114,11 +110,6 @@ pub struct Coordination(Store);
 
 impl Coordination {
     pub fn new(store: &mut Store) -> Self {
-        Self(Store::from_db(store.db()))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_shared(store: &Store) -> Self {
         Self(Store::from_db(store.db()))
     }
 
@@ -214,146 +205,6 @@ impl Coordination {
             Err(error) => Err(error),
         }
     }
-
-    /// Rolls back a claim whose launch failed before a process existed: the
-    /// lease is released, the run is closed, and the ticket returns to
-    /// `ready`. The consumed attempt is kept as evidence of the try.
-    pub fn abandon(
-        &mut self,
-        run_id: &str,
-        ticket_id: &str,
-        now_ms: i64,
-    ) -> Result<(), StoreError> {
-        let db = self.0.db();
-        let mut connection = db.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        local::tx::delete_lease(&transaction, run_id)?;
-        runs::tx::abort(&transaction, run_id, now_ms)?;
-        local::tx::abort_ticket(&transaction, ticket_id, now_ms)?;
-        runs::tx::record_event(
-            &transaction,
-            now_ms,
-            "run_aborted",
-            Some(run_id),
-            Some(ticket_id),
-            "{}",
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    /// Terminates a run in one transaction: the raw exit and derived outcome
-    /// land on the run, evidence is appended, the lease is freed, and the
-    /// ticket moves to its terminal state or back to `ready` when cancellation
-    /// or recovery releases it.
-    #[allow(clippy::too_many_arguments)]
-    pub fn settle(
-        &mut self,
-        run_id: &str,
-        ticket_id: &str,
-        exit_code: Option<i32>,
-        outcome: Outcome,
-        evidence: &[EvidenceRecord],
-        cooldown: Option<&CooldownUpdate<'_>>,
-        now_ms: i64,
-    ) -> Result<bool, StoreError> {
-        let db = self.0.db();
-        let mut connection = db.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let run_state = RunState::from(outcome);
-        let changed = runs::tx::finish(&transaction, run_id, run_state, exit_code, now_ms)?;
-        if changed == 0 {
-            let existing = runs::tx::state_and_exit(&transaction, run_id)?;
-            match existing {
-                Some((_, Some(_))) => {
-                    transaction.commit()?;
-                    return Ok(false);
-                }
-                Some((state, None)) => {
-                    return Err(StoreError::RunStateConflict {
-                        run_id: run_id.into(),
-                        state: Some(state),
-                        requested: run_state.as_str().into(),
-                    });
-                }
-                None => {
-                    return Err(StoreError::RunNotFound {
-                        run_id: run_id.into(),
-                    });
-                }
-            }
-        }
-        local::tx::delete_lease(&transaction, run_id)?;
-
-        let ticket_state = TicketState::after_outcome(outcome);
-        local::tx::settle_ticket(&transaction, ticket_id, ticket_state, now_ms)?;
-        if outcome == Outcome::RateLimited {
-            let activation_id = runs::tx::activation_id(&transaction, run_id)?;
-            local::tx::requeue_activation(&transaction, &activation_id, now_ms)?;
-        }
-
-        if let Some(cooldown) = cooldown {
-            limits::tx::upsert_cooldown(&transaction, run_id, cooldown, now_ms)?;
-        }
-
-        evidence::tx::record_settlement(&transaction, run_id, evidence, now_ms)?;
-        runs::tx::record_event(
-            &transaction,
-            now_ms,
-            "run_finished",
-            Some(run_id),
-            Some(ticket_id),
-            &serde_json::json!({
-                "outcome": outcome.as_str(),
-                "exit_code": exit_code,
-                "ticket_state": ticket_state.as_str(),
-            })
-            .to_string(),
-        )?;
-        transaction.commit()?;
-        Ok(true)
-    }
-
-    /// Settles a `needs_review` ticket whose run branch an operator merged by
-    /// hand. The ticket-state gate makes a repeated pass a no-op and the
-    /// evidence dedupe key keeps the observation unique across restarts.
-    #[allow(clippy::too_many_arguments)]
-    pub fn settle_external_merge(
-        &mut self,
-        run_id: &str,
-        ticket_id: &str,
-        branch: &str,
-        branch_tip: &str,
-        observed_default_tip: &str,
-        now_ms: i64,
-    ) -> Result<bool, StoreError> {
-        let db = self.0.db();
-        let mut connection = db.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = local::tx::settle_external_merge(&transaction, ticket_id, now_ms)?;
-        if changed == 0 {
-            transaction.commit()?;
-            return Ok(false);
-        }
-        runs::tx::mark_cleanup_eligible(&transaction, run_id, now_ms)?;
-        let data_json = serde_json::json!({
-            "branch": branch,
-            "branch_tip": branch_tip,
-            "observed_default_tip": observed_default_tip,
-        })
-        .to_string();
-        evidence::tx::record_external_merge(&transaction, run_id, &data_json, now_ms)?;
-        runs::tx::record_event(
-            &transaction,
-            now_ms,
-            "external_merge_reconciled",
-            Some(run_id),
-            Some(ticket_id),
-            &data_json,
-        )?;
-        transaction.commit()?;
-        Ok(true)
-    }
 }
 
 pub(crate) fn apply_reindex(
@@ -428,11 +279,8 @@ mod tests {
         StartDenial,
     };
     use crate::domain::ticket::TicketState;
-    use crate::outcome::Outcome;
-    use crate::store::{
-        ActivationKind, ClaimRequest, EvidenceRecord, NewActivation, StageRecord, Store,
-        claim_for_test,
-    };
+    use crate::run_store::RunStore;
+    use crate::store::{ActivationKind, ClaimRequest, NewActivation, Store, claim_for_test};
 
     fn claim_t1(run_id: &str) -> ClaimRequest<'_> {
         ClaimRequest {
@@ -528,215 +376,13 @@ mod tests {
     }
 
     #[test]
-    fn finish_run_settles_exactly_once() {
-        let directory = tempdir().unwrap();
-        let mut store = seeded_store(&directory);
-        claim_for_test(&store, &claim_t1("R1"), 2_000);
-        assert_eq!(
-            Coordination::start(
-                &store,
-                &RunStart {
-                    run_id: "R1",
-                    branch: "branch",
-                    worktree_path: "/worktree",
-                    pid: 123,
-                    pid_start_time: Some(456),
-                    process_group_id: 123,
-                    worker_token: "token",
-                    worker_socket_path: "/runtime/R1.sock",
-                },
-                2_100,
-            )
-            .unwrap(),
-            Start::Granted
-        );
-        store
-            .record_agent_exit(
-                "R1",
-                Some(0),
-                true,
-                r#"{"count":1,"oids":["abc"]}"#,
-                None,
-                None,
-                2_200,
-            )
-            .unwrap();
-
-        Coordination::new(&mut store)
-            .settle("R1", "T1", Some(0), Outcome::Merged, &[], None, 2_300)
-            .unwrap();
-        assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("merged"));
-        assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
-        let evidence = store.run_evidence("R1").unwrap();
-
-        Coordination::new(&mut store)
-            .settle("R1", "T1", Some(1), Outcome::Failed, &[], None, 2_400)
-            .unwrap();
-        let run = store.run("R1").unwrap().unwrap();
-        assert_eq!(run.state, "merged");
-        assert_eq!(run.exit_code, Some(0));
-        assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("merged"));
-        assert_eq!(store.run_evidence("R1").unwrap(), evidence);
-    }
-
-    #[test]
-    fn finishing_a_run_settles_ticket_lease_and_evidence_atomically() {
-        let directory = tempdir().unwrap();
-        let mut store = seeded_store(&directory);
-        claim_for_test(&store, &claim_t1("R1"), 2_000);
-        store
-            .record_aftercare_stage(
-                "R1",
-                &StageRecord {
-                    stage_index: 0,
-                    stage: "test".into(),
-                    state: "passed".into(),
-                    started_at_ms: 2_500,
-                    finished_at_ms: 2_900,
-                    exit_code: Some(0),
-                    output_ref: "runs/R1/output.ndjson".into(),
-                    verdict_source: "exit_code".into(),
-                    reason: None,
-                },
-            )
-            .unwrap();
-
-        Coordination::new(&mut store)
-            .settle(
-                "R1",
-                "T1",
-                Some(0),
-                Outcome::Merged,
-                &[EvidenceRecord {
-                    kind: "commits_observed",
-                    data_json: "{\"oids\":[\"abc\",\"def\"]}".into(),
-                }],
-                None,
-                3_000,
-            )
-            .unwrap();
-
-        assert_eq!(store.ticket_state("T1").unwrap().unwrap(), "merged");
-        let run = store.run("R1").unwrap().unwrap();
-        assert_eq!(run.state, "merged");
-        assert_eq!(run.exit_code, Some(0));
-        assert_eq!(run.exited_at_ms, Some(3_000));
-        let evidence = store.run_evidence("R1").unwrap();
-        assert_eq!(evidence[0].0, "commits_observed");
-        assert_eq!(store.aftercare_stages("R1").unwrap()[0].stage, "test");
-        assert!(store.renew_lease("T1", "R1", 60_000, 3_100).is_err());
-    }
-
-    #[test]
-    fn finishing_a_run_is_idempotent() {
-        let directory = tempdir().unwrap();
-        let mut store = seeded_store(&directory);
-        claim_for_test(&store, &claim_t1("R1"), 2_000);
-        let evidence = [EvidenceRecord {
-            kind: "exit_classified",
-            data_json: "{\"exit_code\":1}".into(),
-        }];
-
-        Coordination::new(&mut store)
-            .settle("R1", "T1", Some(1), Outcome::Failed, &evidence, None, 3_000)
-            .unwrap();
-        Coordination::new(&mut store)
-            .settle("R1", "T1", Some(1), Outcome::Failed, &evidence, None, 3_100)
-            .unwrap();
-
-        assert_eq!(store.run_evidence("R1").unwrap().len(), 1);
-        assert_eq!(store.run("R1").unwrap().unwrap().exited_at_ms, Some(3_000));
-    }
-
-    #[test]
-    fn a_cancelled_outcome_returns_the_ticket_to_ready() {
-        let directory = tempdir().unwrap();
-        let mut store = seeded_store(&directory);
-        claim_for_test(&store, &claim_t1("R1"), 2_000);
-
-        assert!(!store.cancellation_requested("R1").unwrap());
-        store.record_cancel_requested("R1", 2_500).unwrap();
-        store.record_cancel_requested("R1", 2_600).unwrap();
-        assert!(store.cancellation_requested("R1").unwrap());
-
-        Coordination::new(&mut store)
-            .settle("R1", "T1", None, Outcome::Cancelled, &[], None, 3_000)
-            .unwrap();
-        assert_eq!(store.ticket_state("T1").unwrap().unwrap(), "ready");
-        assert_eq!(store.ticket_counts().unwrap().ready, 1);
-
-        let cancels = store
-            .run_evidence("R1")
-            .unwrap()
-            .into_iter()
-            .filter(|(kind, _)| kind == "cancel_requested")
-            .count();
-        assert_eq!(cancels, 1);
-    }
-
-    #[test]
-    fn aborted_claims_are_closed_and_no_longer_active() {
-        let directory = tempdir().unwrap();
-        let mut store = seeded_store(&directory);
-        let mut coordination = Coordination::new(&mut store);
-        claim_for_test(&store, &claim_t1("R1"), 2_000);
-
-        coordination.abandon("R1", "T1", 2_100).unwrap();
-
-        assert_eq!(store.run("R1").unwrap().unwrap().state, "aborted");
-        assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
-        assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("ready"));
-    }
-
-    #[test]
-    fn orphaning_a_run_releases_the_ticket_without_failing_it() {
-        let directory = tempdir().unwrap();
-        let mut store = seeded_store(&directory);
-        let mut coordination = Coordination::new(&mut store);
-        claim_for_test(&store, &claim_t1("R1"), 2_000);
-
-        coordination
-            .settle("R1", "T1", None, Outcome::Orphaned, &[], None, 3_000)
-            .unwrap();
-
-        assert_eq!(store.run("R1").unwrap().unwrap().state, "orphaned");
-        assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("ready"));
-    }
-
-    #[test]
-    fn external_merge_settlement_is_atomic_and_idempotent() {
-        let directory = tempdir().unwrap();
-        let mut store = seeded_store(&directory);
-        let mut coordination = Coordination::new(&mut store);
-        claim_for_test(&store, &claim_t1("R1"), 2_000);
-        coordination
-            .settle("R1", "T1", Some(0), Outcome::NeedsReview, &[], None, 3_000)
-            .unwrap();
-
-        assert!(
-            coordination
-                .settle_external_merge("R1", "T1", "sloop/T1", "abc", "def", 4_000)
-                .unwrap()
-        );
-        assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("merged"));
-        let evidence = store.run_evidence("R1").unwrap();
-        assert_eq!(evidence.len(), 1);
-        assert_eq!(evidence[0].0, "external_merge_observed");
-        assert!(
-            !coordination
-                .settle_external_merge("R1", "T1", "sloop/T1", "abc", "def", 4_100)
-                .unwrap()
-        );
-        assert_eq!(store.run_evidence("R1").unwrap(), evidence);
-    }
-
-    #[test]
     fn starting_a_run_that_left_claimed_is_denied() {
         let directory = tempdir().unwrap();
-        let mut store = seeded_store(&directory);
-        let mut coordination = Coordination::new(&mut store);
+        let store = seeded_store(&directory);
         claim_for_test(&store, &claim_t1("R1"), 2_000);
-        coordination.abandon("R1", "T1", 2_050).unwrap();
+        RunStore::from_db(store.db())
+            .abort("R1", "T1", 2_050)
+            .unwrap();
 
         let start = RunStart {
             run_id: "R1",

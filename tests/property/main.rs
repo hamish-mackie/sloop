@@ -20,7 +20,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sloop::clock::Clock;
-use sloop::domain::work::{OwnerId, TicketRef};
+use sloop::domain::work::{Disposition, OwnerId, TicketRef};
+use sloop::outcome::Outcome;
+use sloop::run_store::{CooldownUpdate, RunStore};
 use sloop::store::{ClaimRequest, ClaimedRun, Store};
 use sloop::work_state::local::LocalSqlite;
 use sloop::work_state::{ClaimResult, WorkState};
@@ -78,4 +80,69 @@ fn claim(store: &Store, request: &ClaimRequest<'_>, now_ms: i64) -> Option<Claim
         }
         ClaimResult::Lost { .. } => None,
     }
+}
+
+fn settle(store: &Store, run_id: &str, outcome: Outcome, now_ms: i64) -> bool {
+    let cooldown = (outcome == Outcome::RateLimited).then_some(CooldownUpdate {
+        target: "opencode",
+        until_ms: now_ms + 60_000,
+        reason: "property test",
+    });
+    let (recorded, applied) = RunStore::from_db(store.db())
+        .settle(run_id, Some(0), outcome, &[], cooldown.as_ref(), now_ms)
+        .expect("record settlement");
+    let disposition = match recorded.work.verdict {
+        Outcome::Merged => Disposition::Complete,
+        Outcome::Failed => Disposition::Abandon,
+        Outcome::NeedsReview => Disposition::Park {
+            reason: "needs-review".into(),
+        },
+        Outcome::Cancelled | Outcome::Orphaned => Disposition::Retry {
+            not_before_ms: None,
+        },
+        Outcome::RateLimited => Disposition::Retry {
+            not_before_ms: recorded.not_before_ms,
+        },
+    };
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(
+            LocalSqlite::from_db_with_clock(store.db(), Arc::new(FixedClock(now_ms))).release(
+                &TicketRef {
+                    id: recorded.work.ticket_id.clone(),
+                    source: "local".into(),
+                    source_ref: None,
+                },
+                &recorded.work.owner,
+                disposition,
+            ),
+        )
+        .expect("release settled work");
+    applied
+}
+
+fn abort(store: &Store, run_id: &str, ticket_id: &str, now_ms: i64) {
+    RunStore::from_db(store.db())
+        .abort(run_id, ticket_id, now_ms)
+        .expect("record abort");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(
+            LocalSqlite::from_db_with_clock(store.db(), Arc::new(FixedClock(now_ms))).release(
+                &TicketRef {
+                    id: ticket_id.into(),
+                    source: "local".into(),
+                    source_ref: None,
+                },
+                &OwnerId(run_id.into()),
+                Disposition::Retry {
+                    not_before_ms: Some(now_ms),
+                },
+            ),
+        )
+        .expect("release aborted work");
 }

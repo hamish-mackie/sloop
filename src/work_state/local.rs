@@ -2159,42 +2159,110 @@ impl WorkState for LocalSqlite {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::from)
             .map_err(source_error)?;
-        let stored_owner = transaction
+        let lease = transaction
             .query_row(
-                "SELECT owner_id FROM leases WHERE ticket_id = ?1 AND run_id = ?2",
-                params![ticket.id, owner.0],
-                |row| row.get::<_, String>(0),
+                "SELECT run_id, owner_id FROM leases WHERE ticket_id = ?1",
+                params![ticket.id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
             .map_err(StoreError::from)
             .map_err(source_error)?;
-        let Some(stored_owner) = stored_owner else {
-            return Err(SourceError::Rejected {
-                message: format!(
-                    "owner `{}` does not hold the lease on ticket `{}`",
-                    owner.0, ticket.id
-                ),
-            });
+        let claimed_activation_id = match lease {
+            Some((run_id, stored_owner)) if run_id == owner.0 => {
+                decode_lease_owner(&stored_owner).1
+            }
+            Some(_) => {
+                // A newer owner proves this owner's release already completed.
+                // The stale retry must not disturb the newer claim.
+                transaction
+                    .commit()
+                    .map_err(StoreError::from)
+                    .map_err(source_error)?;
+                return Ok(());
+            }
+            None => {
+                let (state, held_reason) = transaction
+                    .query_row(
+                        "SELECT state, held_reason FROM tickets WHERE id = ?1",
+                        params![ticket.id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                    )
+                    .optional()
+                    .map_err(StoreError::from)
+                    .map_err(source_error)?
+                    .ok_or_else(|| SourceError::Rejected {
+                        message: format!("ticket `{}` does not exist", ticket.id),
+                    })?;
+                let converged = match &disposition {
+                    Disposition::Complete => state == TicketState::Merged.as_str(),
+                    Disposition::Retry { .. } => state == TicketState::Ready.as_str(),
+                    Disposition::Park { reason } if reason == "needs-review" => {
+                        state == TicketState::NeedsReview.as_str()
+                    }
+                    Disposition::Park { reason } => {
+                        state == TicketState::Held.as_str()
+                            && held_reason.as_deref() == Some(reason.as_str())
+                    }
+                    Disposition::Abandon => state == TicketState::Failed.as_str(),
+                };
+                if converged {
+                    transaction
+                        .commit()
+                        .map_err(StoreError::from)
+                        .map_err(source_error)?;
+                    return Ok(());
+                }
+                if matches!(disposition, Disposition::Complete)
+                    && state == TicketState::NeedsReview.as_str()
+                {
+                    tx::settle_external_merge(&transaction, &ticket.id, now_ms)
+                        .map_err(StoreError::from)
+                        .map_err(source_error)?;
+                    transaction
+                        .commit()
+                        .map_err(StoreError::from)
+                        .map_err(source_error)?;
+                    return Ok(());
+                }
+                if state != TicketState::Claimed.as_str() {
+                    transaction
+                        .commit()
+                        .map_err(StoreError::from)
+                        .map_err(source_error)?;
+                    return Ok(());
+                }
+                return Err(SourceError::Rejected {
+                    message: format!("ticket `{}` is no longer claimed", ticket.id),
+                });
+            }
         };
-        let (_, claimed_activation_id) = decode_lease_owner(&stored_owner);
 
         let changed = match disposition {
+            Disposition::Complete => {
+                tx::settle_ticket(&transaction, &ticket.id, TicketState::Merged, now_ms)
+                    .map_err(StoreError::from)
+                    .map_err(source_error)?
+            }
             Disposition::Retry { not_before_ms } => {
-                let activation_id = match claimed_activation_id {
-                    Some(activation_id) => activation_id,
-                    None => Self::activation_for_release_on(&transaction, &ticket.id)
-                        .map_err(source_error)?
-                        .ok_or_else(|| SourceError::Corrupt {
-                            message: format!("ticket `{}` has no activation to retry", ticket.id),
-                        })?,
-                };
                 let changed = tx::abort_ticket(&transaction, &ticket.id, now_ms)
                     .map_err(StoreError::from)
                     .map_err(source_error)?;
-                tx::requeue_activation(&transaction, &activation_id, now_ms)
-                    .map_err(StoreError::from)
-                    .map_err(source_error)?;
                 if let Some(eligible_at_ms) = not_before_ms {
+                    let activation_id = match claimed_activation_id {
+                        Some(activation_id) => activation_id,
+                        None => Self::activation_for_release_on(&transaction, &ticket.id)
+                            .map_err(source_error)?
+                            .ok_or_else(|| SourceError::Corrupt {
+                                message: format!(
+                                    "ticket `{}` has no activation to retry",
+                                    ticket.id
+                                ),
+                            })?,
+                    };
+                    tx::requeue_activation(&transaction, &activation_id, now_ms)
+                        .map_err(StoreError::from)
+                        .map_err(source_error)?;
                     transaction
                         .execute(
                             "UPDATE activations
@@ -2208,11 +2276,15 @@ impl WorkState for LocalSqlite {
                 changed
             }
             Disposition::Park { reason } => {
-                let changed =
-                    tx::settle_ticket(&transaction, &ticket.id, TicketState::Held, now_ms)
-                        .map_err(StoreError::from)
-                        .map_err(source_error)?;
-                if changed == 1 {
+                let ticket_state = if reason == "needs-review" {
+                    TicketState::NeedsReview
+                } else {
+                    TicketState::Held
+                };
+                let changed = tx::settle_ticket(&transaction, &ticket.id, ticket_state, now_ms)
+                    .map_err(StoreError::from)
+                    .map_err(source_error)?;
+                if changed == 1 && ticket_state == TicketState::Held {
                     transaction
                         .execute(
                             "UPDATE tickets SET held_reason = ?2 WHERE id = ?1 AND state = 'held'",
@@ -2257,7 +2329,6 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::coordination::Coordination;
     use crate::db::Db;
     use crate::domain::ticket::TicketState;
     use crate::domain::work::{Disposition, OwnerId, TicketRef, WorkTicket};
@@ -2506,6 +2577,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_work_state_release_is_idempotent_and_preserves_outcome_states() {
+        let (_complete_directory, completed) = open_seeded_local();
+        claim_local(&completed, "R1").await;
+        completed
+            .release(&ticket_ref(), &OwnerId("R1".into()), Disposition::Complete)
+            .await
+            .unwrap();
+        completed
+            .release(&ticket_ref(), &OwnerId("R1".into()), Disposition::Complete)
+            .await
+            .unwrap();
+        assert_eq!(completed.ticket("T1").unwrap().unwrap().state, "merged");
+
+        let (_review_directory, review) = open_seeded_local();
+        claim_local(&review, "R1").await;
+        review
+            .release(
+                &ticket_ref(),
+                &OwnerId("R1".into()),
+                Disposition::Park {
+                    reason: "needs-review".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(review.ticket("T1").unwrap().unwrap().state, "needs_review");
+    }
+
+    #[tokio::test]
     async fn local_work_state_denies_renewal_of_an_expired_lease() {
         let (_directory, local) = open_seeded_local();
         claim_local(&local, "R1").await;
@@ -2680,8 +2780,8 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
         granted_claim(&store, &claim_t1("R1"), 2_000);
-        Coordination::from_shared(&store)
-            .settle("R1", "T1", Some(0), Outcome::Failed, &[], None, 3_000)
+        store
+            .settle_for_test("R1", Some(0), Outcome::Failed, &[], None, 3_000)
             .unwrap();
 
         let error = store.readopt_lease("T1", "R1", 60_000, 4_000).unwrap_err();
@@ -2788,8 +2888,8 @@ mod tests {
         // T1 is claimed and T2's blocker has not merged: nothing is ready.
         assert_eq!(store.select_ready_ticket(&activation, 2_000).unwrap(), None);
 
-        Coordination::from_shared(&store)
-            .settle("R1", "T1", Some(0), Outcome::Merged, &[], None, 3_000)
+        store
+            .settle_for_test("R1", Some(0), Outcome::Merged, &[], None, 3_000)
             .unwrap();
         assert_eq!(
             store
@@ -3083,8 +3183,8 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = open_seeded(&directory.path().join("sloop.db"));
         assert_eq!(granted_claim(&store, &claim_t1("R1"), 2_000).attempt, 1);
-        Coordination::from_shared(&store)
-            .settle("R1", "T1", Some(0), Outcome::Failed, &[], None, 2_100)
+        store
+            .settle_for_test("R1", Some(0), Outcome::Failed, &[], None, 2_100)
             .unwrap();
 
         assert_eq!(store.retry_ticket("T1", 2_200).unwrap(), "failed");

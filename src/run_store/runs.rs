@@ -58,6 +58,19 @@ impl RunState {
     pub fn is_terminal(self) -> bool {
         !NONTERMINAL_RUN_STATES.contains(&self)
     }
+
+    pub(crate) fn outcome(self) -> Option<crate::outcome::Outcome> {
+        use crate::outcome::Outcome;
+        match self {
+            Self::Merged => Some(Outcome::Merged),
+            Self::Failed => Some(Outcome::Failed),
+            Self::NeedsReview => Some(Outcome::NeedsReview),
+            Self::Cancelled => Some(Outcome::Cancelled),
+            Self::RateLimited => Some(Outcome::RateLimited),
+            Self::Orphaned => Some(Outcome::Orphaned),
+            Self::Claimed | Self::Running | Self::Aftercare | Self::Aborted => None,
+        }
+    }
 }
 
 impl rusqlite::types::FromSql for RunState {
@@ -323,17 +336,6 @@ pub(crate) mod tx {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-    }
-
-    pub(crate) fn activation_id(
-        transaction: &Transaction<'_>,
-        run_id: &str,
-    ) -> rusqlite::Result<String> {
-        transaction.query_row(
-            "SELECT activation_id FROM runs WHERE id = ?1",
-            params![run_id],
-            |row| row.get(0),
-        )
     }
 
     pub(crate) fn abort(
@@ -1240,8 +1242,8 @@ mod tests {
             Some(("R1".into(), 1))
         );
 
-        Coordination::from_shared(&store)
-            .settle("R1", "T1", Some(1), Outcome::Failed, &[], None, 2_200)
+        store
+            .settle_for_test("R1", Some(1), Outcome::Failed, &[], None, 2_200)
             .unwrap();
         assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
     }
@@ -1310,8 +1312,8 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
         running_r1(&mut store);
-        Coordination::from_shared(&store)
-            .settle("R1", "T1", Some(0), Outcome::Merged, &[], None, 2_300)
+        store
+            .settle_for_test("R1", Some(0), Outcome::Merged, &[], None, 2_300)
             .unwrap();
 
         let events = store.events_after(0, 10).unwrap();
@@ -1324,8 +1326,8 @@ mod tests {
         assert_eq!(finished["outcome"], "merged");
         assert_eq!(finished["ticket_state"], "merged");
 
-        Coordination::from_shared(&store)
-            .settle("R1", "T1", Some(1), Outcome::Failed, &[], None, 2_400)
+        store
+            .settle_for_test("R1", Some(1), Outcome::Failed, &[], None, 2_400)
             .unwrap();
         assert_eq!(store.latest_event_sequence().unwrap(), events[2].sequence);
 
@@ -1344,9 +1346,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = open_seeded(&directory.path().join("sloop.db"));
         claim_run(&store, &claim_t1("R1"), 2_000);
-        Coordination::from_shared(&store)
-            .abandon("R1", "T1", 2_100)
-            .unwrap();
+        store.abort_for_test("R1", "T1", 2_100).unwrap();
 
         let kinds: Vec<String> = store
             .events_after(0, 10)

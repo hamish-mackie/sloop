@@ -870,6 +870,91 @@ impl Store {
     pub fn ticket_counts(&self) -> Result<TicketCounts, StoreError> {
         self.local_sqlite().ticket_counts()
     }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn settle_for_test(
+        &self,
+        run_id: &str,
+        exit_code: Option<i32>,
+        outcome: crate::outcome::Outcome,
+        evidence: &[EvidenceRecord],
+        cooldown: Option<&CooldownUpdate<'_>>,
+        now_ms: i64,
+    ) -> Result<bool, StoreError> {
+        use crate::domain::work::{Disposition, TicketRef};
+        use crate::work_state::WorkState;
+
+        let (recorded, applied) = self
+            .run_store()
+            .settle(run_id, exit_code, outcome, evidence, cooldown, now_ms)?;
+        let ticket =
+            self.ticket(&recorded.work.ticket_id)?
+                .ok_or_else(|| StoreError::TicketNotFound {
+                    ticket_id: recorded.work.ticket_id.clone(),
+                })?;
+        let disposition = match recorded.work.verdict {
+            crate::outcome::Outcome::Merged => Disposition::Complete,
+            crate::outcome::Outcome::Failed => Disposition::Abandon,
+            crate::outcome::Outcome::NeedsReview => Disposition::Park {
+                reason: "needs-review".into(),
+            },
+            crate::outcome::Outcome::Cancelled | crate::outcome::Outcome::Orphaned => {
+                Disposition::Retry {
+                    not_before_ms: None,
+                }
+            }
+            crate::outcome::Outcome::RateLimited => Disposition::Retry {
+                not_before_ms: recorded.not_before_ms,
+            },
+        };
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(self.local_sqlite().release(
+                &TicketRef {
+                    id: ticket.id,
+                    source: ticket.source,
+                    source_ref: ticket.source_ref,
+                },
+                &recorded.work.owner,
+                disposition,
+            ))
+            .unwrap();
+        Ok(applied)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn abort_for_test(
+        &self,
+        run_id: &str,
+        ticket_id: &str,
+        now_ms: i64,
+    ) -> Result<bool, StoreError> {
+        use crate::domain::work::{Disposition, OwnerId, TicketRef};
+        use crate::work_state::WorkState;
+
+        let applied = self.run_store().abort(run_id, ticket_id, now_ms)?;
+        let ticket = self
+            .ticket(ticket_id)?
+            .ok_or_else(|| StoreError::TicketNotFound {
+                ticket_id: ticket_id.into(),
+            })?;
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(self.local_sqlite().release(
+                &TicketRef {
+                    id: ticket.id,
+                    source: ticket.source,
+                    source_ref: ticket.source_ref,
+                },
+                &OwnerId(run_id.into()),
+                Disposition::Retry {
+                    not_before_ms: Some(now_ms),
+                },
+            ))
+            .unwrap();
+        Ok(applied)
+    }
 }
 
 /// Whether the caller won the `running` → `aftercare` transition and with it

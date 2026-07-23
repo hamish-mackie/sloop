@@ -405,24 +405,25 @@ impl Harness {
             return;
         }
         let ticket = self.model.runs[run_id].ticket.clone();
-        Coordination::new(&mut self.store)
-            .abandon(run_id, &ticket, self.now_ms)
-            .expect("abandon");
+        crate::abort(&self.store, run_id, &ticket, self.now_ms);
 
         self.model.leases.remove(&ticket);
         let run = self.model.runs.get_mut(run_id).expect("known run");
+        let activation = run.activation.clone();
         run.state = "aborted";
         run.exited = true;
         if self.model.tickets[ticket.as_str()] == "claimed" {
             *self.model.tickets.get_mut(&ticket).expect("known ticket") = "ready";
         }
+        self.queue_activation(&ticket, activation);
     }
 
     fn settle(&mut self, run_id: &str, outcome: Outcome) {
+        if self.model.runs[run_id].state == "aborted" {
+            return;
+        }
         let ticket = self.model.runs[run_id].ticket.clone();
-        let settled = Coordination::new(&mut self.store)
-            .settle(run_id, &ticket, Some(0), outcome, &[], None, self.now_ms)
-            .expect("settle");
+        let settled = crate::settle(&self.store, run_id, outcome, self.now_ms);
 
         if self.model.runs[run_id].exited {
             // Settling twice is an idempotent no-op, never an error.
@@ -461,7 +462,7 @@ impl Harness {
                 };
         }
         if outcome == Outcome::RateLimited {
-            // A rate-limited settlement re-queues the activation it consumed.
+            // A delayed retry re-queues the activation it consumed.
             self.queue_activation(&ticket, activation);
         }
     }

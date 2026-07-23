@@ -15,16 +15,26 @@ pub(crate) use runs::RunAdmission;
 pub use runs::{ActiveRun, EventRecord, ProjectNote, RunRecord, RunState, RunTimeline};
 pub(crate) use runs::{NeedsReviewBranch, RecoverableRun, WorktreeCleanupCandidate};
 
-use rusqlite::TransactionBehavior;
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::db::Db;
+use crate::domain::ticket::TicketState;
+use crate::domain::work::{OwnerId, WorkOutcome};
+use crate::outcome::Outcome;
+use crate::store::StoreError;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedOutcome {
+    pub work: WorkOutcome,
+    pub not_before_ms: Option<i64>,
+}
 
 pub struct RunStore {
     db: Db,
 }
 
 impl RunStore {
-    pub(crate) fn from_db(db: Db) -> Self {
+    pub fn from_db(db: Db) -> Self {
         Self { db }
     }
 
@@ -91,6 +101,214 @@ impl RunStore {
             tx::probe_writable(transaction, now_ms)
         })
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn settle(
+        &self,
+        run_id: &str,
+        exit_code: Option<i32>,
+        outcome: Outcome,
+        records: &[EvidenceRecord],
+        cooldown: Option<&CooldownUpdate<'_>>,
+        now_ms: i64,
+    ) -> Result<(RecordedOutcome, bool), StoreError> {
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run_state = RunState::from(outcome);
+        let changed = runs::tx::finish(&transaction, run_id, run_state, exit_code, now_ms)?;
+        if changed == 0 {
+            match runs::tx::state_and_exit(&transaction, run_id)? {
+                Some((_, Some(_))) => {}
+                Some((state, None)) => {
+                    return Err(StoreError::RunStateConflict {
+                        run_id: run_id.into(),
+                        state: Some(state),
+                        requested: run_state.as_str().into(),
+                    });
+                }
+                None => {
+                    return Err(StoreError::RunNotFound {
+                        run_id: run_id.into(),
+                    });
+                }
+            }
+        } else {
+            if let Some(cooldown) = cooldown {
+                limits::tx::upsert_cooldown(&transaction, run_id, cooldown, now_ms)?;
+            }
+            evidence::tx::record_settlement(&transaction, run_id, records, now_ms)?;
+            let ticket_id = runs::tx::ticket_id(&transaction, run_id)?;
+            runs::tx::record_event(
+                &transaction,
+                now_ms,
+                "run_finished",
+                Some(run_id),
+                Some(&ticket_id),
+                &serde_json::json!({
+                    "outcome": outcome.as_str(),
+                    "exit_code": exit_code,
+                    "ticket_state": TicketState::after_outcome(outcome).as_str(),
+                })
+                .to_string(),
+            )?;
+        }
+        let recorded = recorded_outcome(&transaction, run_id)?.ok_or_else(|| {
+            StoreError::RunStateConflict {
+                run_id: run_id.into(),
+                state: runs::tx::state(&transaction, run_id).ok().flatten(),
+                requested: run_state.as_str().into(),
+            }
+        })?;
+        transaction.commit()?;
+        Ok((recorded, changed != 0))
+    }
+
+    pub fn abort(&self, run_id: &str, ticket_id: &str, now_ms: i64) -> Result<bool, StoreError> {
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = runs::tx::abort(&transaction, run_id, now_ms)?;
+        if changed != 0 {
+            runs::tx::record_event(
+                &transaction,
+                now_ms,
+                "run_aborted",
+                Some(run_id),
+                Some(ticket_id),
+                "{}",
+            )?;
+        } else {
+            let state = runs::tx::state(&transaction, run_id)?;
+            if state.as_deref() != Some(RunState::Aborted.as_str()) {
+                return Err(StoreError::RunStateConflict {
+                    run_id: run_id.into(),
+                    state,
+                    requested: RunState::Aborted.as_str().into(),
+                });
+            }
+        }
+        transaction.commit()?;
+        Ok(changed != 0)
+    }
+
+    pub(crate) fn record_external_merge(
+        &self,
+        run_id: &str,
+        ticket_id: &str,
+        branch: &str,
+        branch_tip: &str,
+        observed_default_tip: &str,
+        now_ms: i64,
+    ) -> Result<bool, StoreError> {
+        self.write(TransactionBehavior::Immediate, |transaction| {
+            runs::tx::mark_cleanup_eligible(transaction, run_id, now_ms)?;
+            let data_json = serde_json::json!({
+                "branch": branch,
+                "branch_tip": branch_tip,
+                "observed_default_tip": observed_default_tip,
+            })
+            .to_string();
+            let inserted =
+                evidence::tx::record_external_merge(transaction, run_id, &data_json, now_ms)?;
+            if inserted {
+                runs::tx::record_event(
+                    transaction,
+                    now_ms,
+                    "external_merge_reconciled",
+                    Some(run_id),
+                    Some(ticket_id),
+                    &data_json,
+                )?;
+            }
+            Ok(inserted)
+        })
+        .map_err(StoreError::from)
+    }
+
+    pub fn recorded_outcome(&self, run_id: &str) -> Result<Option<RecordedOutcome>, StoreError> {
+        recorded_outcome(&self.db.lock(), run_id).map_err(StoreError::from)
+    }
+}
+
+fn recorded_outcome(
+    connection: &rusqlite::Connection,
+    run_id: &str,
+) -> rusqlite::Result<Option<RecordedOutcome>> {
+    let row = connection
+        .query_row(
+            "SELECT ticket_id, state, branch, attempt, exited_at_ms,
+                    (SELECT data_json FROM run_evidence
+                     WHERE run_id = runs.id AND kind = 'commits_observed'
+                     ORDER BY sequence DESC LIMIT 1),
+                    (SELECT data_json FROM run_evidence
+                     WHERE run_id = runs.id AND kind = 'vendor_error_classified'
+                     ORDER BY sequence DESC LIMIT 1),
+                    (SELECT until_ms FROM cooldowns WHERE source_run_id = runs.id
+                     ORDER BY until_ms DESC LIMIT 1),
+                    EXISTS(SELECT 1 FROM run_evidence
+                           WHERE run_id = runs.id AND kind = 'external_merge_observed')
+             FROM runs WHERE id = ?1",
+            params![run_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, RunState>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, bool>(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        ticket_id,
+        state,
+        branch,
+        attempt,
+        finished_at_ms,
+        commits,
+        vendor_error,
+        cooldown,
+        externally_merged,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let Some(verdict) = externally_merged
+        .then_some(Outcome::Merged)
+        .or_else(|| state.outcome())
+    else {
+        return Ok(None);
+    };
+    let Some(finished_at_ms) = finished_at_ms else {
+        return Ok(None);
+    };
+    let commit_count = commits
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .and_then(|value| value["oids"].as_array().map(Vec::len))
+        .unwrap_or(0)
+        .min(u32::MAX as usize) as u32;
+    let not_before_ms = vendor_error
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .and_then(|value| value["cooldown_until_ms"].as_i64())
+        .or(cooldown);
+    Ok(Some(RecordedOutcome {
+        work: WorkOutcome {
+            ticket_id,
+            owner: OwnerId(run_id.into()),
+            verdict,
+            branch,
+            commit_count,
+            attempt: attempt.clamp(0, i64::from(u32::MAX)) as u32,
+            finished_at_ms,
+        },
+        not_before_ms,
+    }))
 }
 
 fn paused(connection: &rusqlite::Connection) -> rusqlite::Result<bool> {

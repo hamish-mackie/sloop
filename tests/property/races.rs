@@ -266,14 +266,12 @@ fn simultaneous_settlements_land_exactly_once() {
         let landed: Vec<Option<Outcome>> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..THREADS)
                 .map(|thread| {
-                    let (arena, ticket, run_id, barrier) = (&arena, &ticket, &run_id, &barrier);
+                    let (arena, run_id, barrier) = (&arena, &run_id, &barrier);
                     scope.spawn(move || {
-                        let mut store = arena.open();
+                        let store = arena.open();
                         let outcome = OUTCOMES[thread % OUTCOMES.len()];
                         barrier.wait();
-                        let settled = Coordination::new(&mut store)
-                            .settle(run_id, ticket, Some(0), outcome, &[], None, arena.now())
-                            .expect("settle must land or no-op, never fail");
+                        let settled = crate::settle(&store, run_id, outcome, arena.now());
                         settled.then_some(outcome)
                     })
                 })
@@ -370,9 +368,7 @@ fn uncoordinated_lifecycle_hammer_preserves_invariants() {
                             Outcome::Merged
                         };
                         assert!(
-                            Coordination::new(&mut store)
-                                .settle(&run_id, ticket, Some(0), outcome, &[], None, arena.now())
-                                .expect("settle"),
+                            crate::settle(&store, &run_id, outcome, arena.now()),
                             "the owner's settlement must land"
                         );
                         completed += 1;

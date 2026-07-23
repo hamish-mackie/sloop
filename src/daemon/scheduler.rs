@@ -10,9 +10,8 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::config::expand_agent_cmd;
-use crate::coordination::Coordination;
 use crate::domain::ticket::TicketSnapshot;
-use crate::domain::work::{Disposition, OwnerId, TicketRef, WorkTicket};
+use crate::domain::work::{Disposition, OwnerId, TicketRef, WorkOutcome, WorkTicket};
 use crate::flow::Flow;
 use crate::frontmatter::Frontmatter;
 use crate::ids::next_id;
@@ -23,7 +22,8 @@ use crate::runner::local::{
 };
 use crate::runner::{AgentLaunch, RunnerError, StageExecution, StageOrder};
 use crate::store::{
-    ClaimRequest, QueuedActivation, RunState, Store, TicketRecord, WorktreeCleanupCandidate,
+    ClaimRequest, NeedsReviewBranch, QueuedActivation, RunState, Store, TicketRecord,
+    WorktreeCleanupCandidate,
 };
 use crate::work_state::ClaimResult;
 
@@ -31,8 +31,8 @@ use super::aftercare::{
     RepairContext, StoreStageHooks, gather_exit_evidence, git_is_ancestor, git_stdout,
 };
 use super::dispatcher::{
-    DispatcherState, RunEvent, close_worker_socket, mark_storage_full, recover_storage,
-    settle_pending_exits,
+    DispatcherState, RunEvent, close_worker_socket, disposition_for_outcome, mark_storage_full,
+    recover_storage, settle_pending_exits,
 };
 use super::recovery::{
     ProcessIdentity, classify_run_output, reconcile_run_liveness, recoverable_process_identity,
@@ -340,7 +340,7 @@ async fn release_unrecorded_claim(
             ticket,
             owner,
             Disposition::Retry {
-                not_before_ms: None,
+                not_before_ms: Some(state.clock.now_ms()),
             },
         )
         .await
@@ -435,11 +435,11 @@ pub(super) async fn reconcile(
     if !recover_storage(state, now_ms) {
         return;
     }
-    settle_pending_exits(state, log);
+    settle_pending_exits(state, log).await;
     // Settling externally merged review branches is independent of the dispatch
     // gates below: it releases blocked dependents even while paused, at
     // capacity, or outside running hours.
-    reconcile_external_merges(state, log);
+    reconcile_external_merges(state, log).await;
     reconcile_worktree_cleanup(state, log);
     // Supervised runs keep their leases truthful regardless of the dispatch
     // gates: a run outliving the TTL while the daemon is paused is still alive.
@@ -792,22 +792,47 @@ pub(super) async fn reconcile(
                 if let RunnerError::Hook(store_error) = &error {
                     mark_storage_full(state, store_error);
                 }
-                if let Err(abort_error) = Coordination::new(&mut state.store).abandon(
-                    &run_id,
-                    &ticket_id,
-                    state.clock.now_ms(),
-                ) {
-                    mark_storage_full(state, &abort_error);
-                    log.emit_with_fields(
-                        LogLevel::Error,
-                        "sloop::dispatcher",
-                        "claim_abort_failed",
-                        json!({
-                            "run_id": run_id,
-                            "ticket_id": ticket_id,
-                            "error": abort_error.to_string(),
-                        }),
-                    );
+                match state
+                    .run_store
+                    .abort(&run_id, &ticket_id, state.clock.now_ms())
+                {
+                    Ok(_) => {
+                        if let Err(abort_error) = state
+                            .work_state
+                            .release(
+                                &ticket_ref,
+                                &owner,
+                                Disposition::Retry {
+                                    not_before_ms: Some(state.clock.now_ms()),
+                                },
+                            )
+                            .await
+                        {
+                            log.emit_with_fields(
+                                LogLevel::Error,
+                                "sloop::dispatcher",
+                                "claim_release_failed",
+                                json!({
+                                    "run_id": run_id,
+                                    "ticket_id": ticket_id,
+                                    "error": abort_error.to_string(),
+                                }),
+                            );
+                        }
+                    }
+                    Err(abort_error) => {
+                        mark_storage_full(state, &abort_error);
+                        log.emit_with_fields(
+                            LogLevel::Error,
+                            "sloop::dispatcher",
+                            "claim_abort_failed",
+                            json!({
+                                "run_id": run_id,
+                                "ticket_id": ticket_id,
+                                "error": abort_error.to_string(),
+                            }),
+                        );
+                    }
                 }
                 // A launch can fail after the worker socket was bound.
                 close_worker_socket(state, &run_id);
@@ -833,7 +858,7 @@ pub(super) async fn reconcile(
 /// failure is a no-op for that ticket, since unprovable evidence is not
 /// evidence. Squash- and rebase-merges rewrite the commits and are invisible to
 /// ancestry, so they still require `sloop reindex`.
-fn reconcile_external_merges(state: &mut DispatcherState, log: &OperationalLog) {
+async fn reconcile_external_merges(state: &mut DispatcherState, log: &OperationalLog) {
     let branches = match state.store.needs_review_branches() {
         Ok(branches) => branches,
         Err(error) => {
@@ -849,12 +874,23 @@ fn reconcile_external_merges(state: &mut DispatcherState, log: &OperationalLog) 
     if branches.is_empty() {
         return;
     }
-    let default_tip = match git_stdout(&state.root, &["rev-parse", "HEAD"]) {
-        Ok(tip) => tip,
-        // Without the default branch tip nothing can be proven this pass.
-        Err(_) => return,
-    };
+    let default_tip = git_stdout(&state.root, &["rev-parse", "HEAD"]).ok();
     for branch in branches {
+        match state.run_store.recorded_outcome(&branch.run_id) {
+            Ok(Some(outcome)) if outcome.work.verdict == crate::outcome::Outcome::Merged => {
+                release_external_merge(state, &branch, outcome.work, log).await;
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                mark_storage_full(state, &error);
+                continue;
+            }
+        }
+        let Some(default_tip) = default_tip.as_deref() else {
+            // Without the default branch tip nothing new can be proven.
+            continue;
+        };
         let Ok(branch_tip) = git_stdout(&state.root, &["rev-parse", &branch.branch]) else {
             // A deleted branch ref or any git failure leaves the ticket alone.
             continue;
@@ -865,21 +901,32 @@ fn reconcile_external_merges(state: &mut DispatcherState, log: &OperationalLog) 
             continue;
         }
         if !matches!(
-            git_is_ancestor(&state.root, &branch_tip, &default_tip),
+            git_is_ancestor(&state.root, &branch_tip, default_tip),
             Ok(true)
         ) {
             continue;
         }
         let now_ms = state.clock.now_ms();
-        match Coordination::new(&mut state.store).settle_external_merge(
+        match state.run_store.record_external_merge(
             &branch.run_id,
             &branch.ticket_id,
             &branch.branch,
             &branch_tip,
-            &default_tip,
+            default_tip,
             now_ms,
         ) {
-            Ok(true) => {
+            Ok(applied) => {
+                let outcome = match state.run_store.recorded_outcome(&branch.run_id) {
+                    Ok(Some(outcome)) => outcome.work,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        mark_storage_full(state, &error);
+                        continue;
+                    }
+                };
+                if !release_external_merge(state, &branch, outcome, log).await || !applied {
+                    continue;
+                }
                 log.emit_with_fields(
                     LogLevel::Info,
                     "sloop::dispatcher",
@@ -893,8 +940,6 @@ fn reconcile_external_merges(state: &mut DispatcherState, log: &OperationalLog) 
                     }),
                 );
             }
-            // A concurrent settlement already moved the ticket out of review.
-            Ok(false) => {}
             Err(error) => {
                 mark_storage_full(state, &error);
                 log.emit_with_fields(
@@ -906,6 +951,52 @@ fn reconcile_external_merges(state: &mut DispatcherState, log: &OperationalLog) 
             }
         }
     }
+}
+
+async fn release_external_merge(
+    state: &mut DispatcherState,
+    branch: &NeedsReviewBranch,
+    outcome: WorkOutcome,
+    log: &OperationalLog,
+) -> bool {
+    let ticket = match state.store.ticket(&branch.ticket_id) {
+        Ok(Some(ticket)) => TicketRef {
+            id: ticket.id,
+            source: ticket.source,
+            source_ref: ticket.source_ref,
+        },
+        Ok(None) => return false,
+        Err(error) => {
+            mark_storage_full(state, &error);
+            return false;
+        }
+    };
+    if let Err(error) = state
+        .work_state
+        .release(
+            &ticket,
+            &outcome.owner,
+            disposition_for_outcome(outcome.verdict, None),
+        )
+        .await
+    {
+        log.emit_with_fields(
+            LogLevel::Error,
+            "sloop::dispatcher",
+            "external_merge_release_failed",
+            json!({"ticket_id": branch.ticket_id, "run_id": branch.run_id, "error": error.to_string()}),
+        );
+        return false;
+    }
+    if let Err(error) = state.work_state.push_outcome(&outcome).await {
+        log.emit_with_fields(
+            LogLevel::Warn,
+            "sloop::dispatcher",
+            "work_outcome_push_failed",
+            json!({"ticket_id": branch.ticket_id, "run_id": branch.run_id, "error": error.to_string()}),
+        );
+    }
+    true
 }
 
 fn worktree_cleanup_due(

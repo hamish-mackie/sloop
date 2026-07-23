@@ -26,7 +26,7 @@ use super::aftercare::{
     RepairContext, aftercare_cancelled, drive_flow, git_index_lock_path, git_index_matches_head,
     git_is_ancestor, git_stdout, shared_checkout_has_git_operation, try_commits_on_branch,
 };
-use super::dispatcher::{DispatcherState, RunEvent};
+use super::dispatcher::{DispatcherState, RunEvent, disposition_for_outcome};
 use super::scheduler::{DEFAULT_LEASE_MS, VENDOR_COOLDOWN_MS, bound_flow};
 use super::server::{DaemonError, serve_worker_socket};
 
@@ -44,7 +44,7 @@ pub(super) async fn recover_inflight_runs(
     events: &mpsc::Sender<RunEvent>,
     log: &OperationalLog,
 ) -> Result<(), DaemonError> {
-    release_unrecorded_claims(state, log).await?;
+    release_interrupted_claims(state, log).await?;
     let runs = state.store.recoverable_runs().map_err(DaemonError::Store)?;
     for run in runs {
         // Every durable lease consumes capacity until adoption or settlement
@@ -105,7 +105,7 @@ pub(super) async fn recover_inflight_runs(
     Ok(())
 }
 
-async fn release_unrecorded_claims(
+async fn release_interrupted_claims(
     state: &mut DispatcherState,
     log: &OperationalLog,
 ) -> Result<(), DaemonError> {
@@ -115,30 +115,68 @@ async fn release_unrecorded_claims(
         .await
         .map_err(DaemonError::WorkState)?
     {
-        if state
+        let run = state
             .run_store
             .run(&claim.owner.0)
             .map_err(crate::store::StoreError::from)
-            .map_err(DaemonError::Store)?
-            .is_some()
-        {
-            continue;
-        }
+            .map_err(DaemonError::Store)?;
+        let (disposition, outcome) = match run {
+            None => (
+                Disposition::Retry {
+                    not_before_ms: Some(state.clock.now_ms()),
+                },
+                None,
+            ),
+            Some(run) => {
+                let run_state = RunState::parse(&run.state).map_err(DaemonError::Store)?;
+                if !run_state.is_terminal() {
+                    continue;
+                }
+                if run_state == RunState::Aborted {
+                    (
+                        Disposition::Retry {
+                            not_before_ms: Some(state.clock.now_ms()),
+                        },
+                        None,
+                    )
+                } else {
+                    let recorded = state
+                        .run_store
+                        .recorded_outcome(&claim.owner.0)
+                        .map_err(DaemonError::Store)?
+                        .ok_or_else(|| {
+                            DaemonError::Store(crate::store::StoreError::RunStateConflict {
+                                run_id: claim.owner.0.clone(),
+                                state: Some(run.state),
+                                requested: "recorded outcome".into(),
+                            })
+                        })?;
+                    (
+                        disposition_for_outcome(recorded.work.verdict, recorded.not_before_ms),
+                        Some(recorded.work),
+                    )
+                }
+            }
+        };
         state
             .work_state
-            .release(
-                &claim.ticket,
-                &claim.owner,
-                Disposition::Retry {
-                    not_before_ms: None,
-                },
-            )
+            .release(&claim.ticket, &claim.owner, disposition)
             .await
             .map_err(DaemonError::WorkState)?;
+        if let Some(outcome) = outcome
+            && let Err(error) = state.work_state.push_outcome(&outcome).await
+        {
+            log.emit_with_fields(
+                LogLevel::Warn,
+                "sloop::recovery",
+                "work_outcome_push_failed",
+                json!({"run_id": claim.owner.0, "ticket_id": claim.ticket.id, "error": error.to_string()}),
+            );
+        }
         log.emit_with_fields(
             LogLevel::Info,
             "sloop::recovery",
-            "unrecorded_claim_released",
+            "interrupted_claim_released",
             json!({"run_id": claim.owner.0, "ticket_id": claim.ticket.id}),
         );
     }
@@ -652,7 +690,7 @@ pub(super) async fn reconcile_run_liveness(
     events: &mpsc::Sender<RunEvent>,
     log: &OperationalLog,
 ) {
-    if let Err(error) = release_unrecorded_claims(state, log).await {
+    if let Err(error) = release_interrupted_claims(state, log).await {
         state.reconciliation_blocked = true;
         log.emit_with_fields(
             LogLevel::Error,

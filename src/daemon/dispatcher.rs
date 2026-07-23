@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::clock::{Clock, next_local_minute_ms};
 use crate::config::{AgentConfig, RunningHours, parse_local_time};
-use crate::coordination::Coordination;
+use crate::domain::work::{Disposition, TicketRef};
 use crate::flow::Flow;
 use crate::logging::{LogLevel, OperationalLog};
 use crate::outcome::{MergeOutcome, RunEvidence, classify_exit, derive_outcome};
@@ -22,8 +22,8 @@ use crate::runner::local::worker_socket_path;
 use crate::sources::TicketSource;
 use crate::store::{CooldownUpdate, EvidenceRecord, Store, StoreError};
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
-use crate::work_state::WorkState;
 use crate::work_state::local::LocalSqlite;
+use crate::work_state::{SourceError, WorkState};
 
 use super::commands::{
     handle_cancel, handle_events, handle_hold, handle_list, handle_logs, handle_operator_show,
@@ -202,7 +202,7 @@ pub(super) async fn run_dispatcher(
             }
             event = events.recv() => {
                 let Some(event) = event else { break };
-                settle_run_exit(&mut state, event, &log);
+                settle_run_exit(&mut state, event, &log).await;
             }
             () = wait_for_deadline(clock, deadline) => {
                 log.emit(LogLevel::Info, "sloop::dispatcher", "timer_fired");
@@ -248,27 +248,26 @@ async fn wait_for_deadline(clock: Arc<dyn Clock>, deadline: Option<i64>) {
     }
 }
 
-/// Resolves one finished run: derives the outcome from the gathered evidence
-/// and commits the whole settlement in one store transaction. Cancellation
-/// intent recorded before the exit wins over every other reading, keeping a
-/// racing `cancel` and natural exit idempotent.
-fn settle_run_exit(state: &mut DispatcherState, event: RunEvent, log: &OperationalLog) {
+/// Resolves one finished run: durable outcome evidence lands first, then the
+/// work source releases its claim. Cancellation intent recorded before the exit
+/// wins over every other reading.
+async fn settle_run_exit(state: &mut DispatcherState, event: RunEvent, log: &OperationalLog) {
     let run_id = match &event {
         RunEvent::Exited { run_id, .. } => run_id.clone(),
     };
     state.pending_exits.insert(run_id, event);
     if !state.storage_full.get() {
-        settle_pending_exits(state, log);
+        settle_pending_exits(state, log).await;
     }
 }
 
-pub(super) fn settle_pending_exits(state: &mut DispatcherState, log: &OperationalLog) {
+pub(super) async fn settle_pending_exits(state: &mut DispatcherState, log: &OperationalLog) {
     let run_ids: Vec<String> = state.pending_exits.keys().cloned().collect();
     for run_id in run_ids {
         let Some(event) = state.pending_exits.remove(&run_id) else {
             continue;
         };
-        match try_settle_run_exit(state, &event) {
+        match try_settle_run_exit(state, &event, log).await {
             Ok((ticket_id, outcome, applied)) => {
                 state.cancelling.remove(&run_id);
                 state.active.remove(&run_id);
@@ -297,7 +296,7 @@ pub(super) fn settle_pending_exits(state: &mut DispatcherState, log: &Operationa
                     });
                 }
             }
-            Err(error) => {
+            Err(SettleError::Store(error)) => {
                 let disk_full = error.is_disk_full();
                 mark_storage_full(state, &error);
                 log.emit_with_fields(
@@ -311,14 +310,35 @@ pub(super) fn settle_pending_exits(state: &mut DispatcherState, log: &Operationa
                     break;
                 }
             }
+            Err(SettleError::WorkState(error)) => {
+                log.emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::dispatcher",
+                    "run_exit_release_failed",
+                    json!({"run_id": run_id, "error": error.to_string()}),
+                );
+                state.pending_exits.insert(run_id, event);
+            }
         }
     }
 }
 
-fn try_settle_run_exit(
+enum SettleError {
+    Store(StoreError),
+    WorkState(SourceError),
+}
+
+impl From<StoreError> for SettleError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+async fn try_settle_run_exit(
     state: &mut DispatcherState,
     event: &RunEvent,
-) -> Result<(String, crate::outcome::Outcome, bool), StoreError> {
+    log: &OperationalLog,
+) -> Result<(String, crate::outcome::Outcome, bool), SettleError> {
     let RunEvent::Exited {
         run_id,
         target,
@@ -393,13 +413,6 @@ fn try_settle_run_exit(
             data_json: vendor_error.evidence_json(*cooldown_until_ms),
         });
     }
-    let ticket_id = state
-        .store
-        .run(run_id)?
-        .ok_or_else(|| StoreError::RunNotFound {
-            run_id: run_id.clone(),
-        })?
-        .ticket_id;
     let cooldown = vendor_error
         .as_ref()
         .filter(|error| error.class.requires_cooldown() && !cancelled)
@@ -409,16 +422,63 @@ fn try_settle_run_exit(
             until_ms,
             reason: &error.diagnostic,
         });
-    let applied = Coordination::new(&mut state.store).settle(
+    let (recorded, applied) = state.run_store.settle(
         run_id,
-        &ticket_id,
         *exit_code,
         outcome,
         &records,
         cooldown.as_ref(),
         state.clock.now_ms(),
     )?;
-    Ok((ticket_id, outcome, applied))
+    let ticket_id = recorded.work.ticket_id.clone();
+    let ticket = state
+        .store
+        .ticket(&ticket_id)?
+        .ok_or_else(|| StoreError::TicketNotFound {
+            ticket_id: ticket_id.clone(),
+        })?;
+    let ticket_ref = TicketRef {
+        id: ticket.id,
+        source: ticket.source,
+        source_ref: ticket.source_ref,
+    };
+    state
+        .work_state
+        .release(
+            &ticket_ref,
+            &recorded.work.owner,
+            disposition_for_outcome(recorded.work.verdict, recorded.not_before_ms),
+        )
+        .await
+        .map_err(SettleError::WorkState)?;
+    if let Err(error) = state.work_state.push_outcome(&recorded.work).await {
+        log.emit_with_fields(
+            LogLevel::Warn,
+            "sloop::dispatcher",
+            "work_outcome_push_failed",
+            json!({"run_id": run_id, "ticket_id": ticket_id, "error": error.to_string()}),
+        );
+    }
+    Ok((ticket_id, recorded.work.verdict, applied))
+}
+
+pub(super) fn disposition_for_outcome(
+    outcome: crate::outcome::Outcome,
+    not_before_ms: Option<i64>,
+) -> Disposition {
+    match outcome {
+        crate::outcome::Outcome::Merged => Disposition::Complete,
+        crate::outcome::Outcome::Failed => Disposition::Abandon,
+        crate::outcome::Outcome::NeedsReview => Disposition::Park {
+            reason: "needs-review".into(),
+        },
+        crate::outcome::Outcome::Cancelled | crate::outcome::Outcome::Orphaned => {
+            Disposition::Retry {
+                not_before_ms: None,
+            }
+        }
+        crate::outcome::Outcome::RateLimited => Disposition::Retry { not_before_ms },
+    }
 }
 
 /// Tears down a run's worker boundary: the token stops validating, the

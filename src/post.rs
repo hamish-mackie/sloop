@@ -419,6 +419,8 @@ pub async fn handle(
         blocked_by: stamped.blocked_by.clone(),
         attempts: existing.as_ref().map_or(0, |ticket| ticket.attempts as u32),
         hints: ExecutionHints {
+            worktree: Some(worktree.clone()),
+            activation_id: None,
             target,
             model: stamped.model.clone(),
             effort: stamped.effort.clone(),
@@ -1073,6 +1075,8 @@ mod tests {
             blocked_by: Vec::new(),
             attempts: 0,
             hints: ExecutionHints {
+                worktree: Some("sloop/TICK-1".into()),
+                activation_id: None,
                 target: None,
                 model: None,
                 effort: None,

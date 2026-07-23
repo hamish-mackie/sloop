@@ -138,7 +138,6 @@ mod tests {
     use tempfile::tempdir;
 
     use super::CooldownUpdate;
-    use crate::coordination::Coordination;
     use crate::domain::ticket::TicketState;
     use crate::outcome::Outcome;
     use crate::store::{
@@ -218,10 +217,9 @@ mod tests {
         };
 
         claim_run(&store, "R1", 2_000);
-        Coordination::from_shared(&store)
-            .settle(
+        store
+            .settle_for_test(
                 "R1",
-                "T1",
                 Some(1),
                 Outcome::RateLimited,
                 &[],
@@ -239,10 +237,9 @@ mod tests {
         assert_eq!(store.active_cooldowns(5_000).unwrap()[0].target, "claude");
 
         claim_run(&store, "R2", 5_000);
-        Coordination::from_shared(&store)
-            .settle(
+        store
+            .settle_for_test(
                 "R2",
-                "T1",
                 Some(1),
                 Outcome::RateLimited,
                 &[],
@@ -275,10 +272,9 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = open_seeded(&directory.path().join("sloop.db"));
         claim_run(&store, "R1", 2_000);
-        Coordination::from_shared(&store)
-            .settle(
+        store
+            .settle_for_test(
                 "R1",
-                "T1",
                 Some(1),
                 Outcome::Failed,
                 &[],

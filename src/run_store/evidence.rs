@@ -214,14 +214,14 @@ pub(crate) mod tx {
         run_id: &str,
         data_json: &str,
         now_ms: i64,
-    ) -> rusqlite::Result<()> {
-        transaction.execute(
+    ) -> rusqlite::Result<bool> {
+        let inserted = transaction.execute(
             "INSERT OR IGNORE INTO run_evidence
                  (run_id, kind, observed_at_ms, dedupe_key, data_json)
              VALUES (?1, 'external_merge_observed', ?2, 'external_merge:' || ?1, ?3)",
             params![run_id, now_ms, data_json],
         )?;
-        Ok(())
+        Ok(inserted == 1)
     }
 
     pub(crate) fn record_repair_attempt(
@@ -638,8 +638,8 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut store = open_seeded(&directory.path().join("sloop.db"));
         running_r1(&mut store);
-        Coordination::from_shared(&store)
-            .settle("R1", "T1", Some(0), Outcome::Merged, &[], None, 2_200)
+        store
+            .settle_for_test("R1", Some(0), Outcome::Merged, &[], None, 2_200)
             .unwrap();
 
         let claim = store

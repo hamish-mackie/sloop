@@ -59,8 +59,7 @@ impl std::error::Error for SourceError {}
 ///
 /// Implementations must uphold these invariants:
 ///
-/// - Attempts increment only inside [`WorkState::claim`] or
-///   [`WorkState::release`] with [`Disposition::Retry`], never elsewhere.
+/// - Attempts increment only inside [`WorkState::claim`], never on release.
 /// - A claim is committed at the source before any run is recorded against it.
 /// - An outcome is durably recorded before [`WorkState::release`] or
 ///   [`WorkState::push_outcome`] is called.
@@ -91,7 +90,8 @@ pub trait WorkState: Send + Sync {
     /// Heartbeat for long runs. An expired claim is reclaimable by peers.
     async fn renew(&self, ticket: &TicketRef, owner: &OwnerId) -> Result<ClaimResult, SourceError>;
 
-    /// Give the ticket back, per policy. Increments attempts on `Retry`.
+    /// Give the ticket back, per policy. Repeating a completed release is an
+    /// idempotent success; it never consumes another attempt.
     async fn release(
         &self,
         ticket: &TicketRef,
@@ -200,10 +200,8 @@ mod tests {
         ) -> Result<(), SourceError> {
             let mut stored = self.ticket.lock().unwrap();
             stored.state = match disposition {
-                Disposition::Retry { .. } => {
-                    stored.attempts += 1;
-                    WorkTicketState::Ready
-                }
+                Disposition::Complete => WorkTicketState::Done,
+                Disposition::Retry { .. } => WorkTicketState::Ready,
                 Disposition::Park { reason } => WorkTicketState::Held { reason },
                 Disposition::Abandon => WorkTicketState::Failed,
             };

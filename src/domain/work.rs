@@ -89,8 +89,15 @@ impl WorkTicketState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Disposition {
-    Retry { not_before_ms: Option<i64> },
-    Park { reason: String },
+    Complete,
+    /// Return work to ready. A timestamp also reactivates the consumed local
+    /// request at that deadline; `None` releases without scheduling a rerun.
+    Retry {
+        not_before_ms: Option<i64>,
+    },
+    Park {
+        reason: String,
+    },
     Abandon,
 }
 
