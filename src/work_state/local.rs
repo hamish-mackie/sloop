@@ -1,14 +1,21 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::db::Db;
 use crate::domain::ticket::TicketState;
+use crate::domain::work::{
+    Disposition, ExecutionHints, OwnerId, SourceVersion, TicketRef, WorkOutcome, WorkTicket,
+    WorkTicketState,
+};
 use crate::store::{ClaimRequest, StoreError};
+use crate::work_state::{ClaimResult, ClaimStrength, SourceError, WorkState};
 
 const TICKET_RECORD_SELECT: &str =
     "SELECT id, project_id, file_path, source, source_ref, state, name, worktree,
-            target, model, effort, flow, attempts, body, held_reason, created_at_ms
+            target, model, effort, flow, attempts, body, held_reason, created_at_ms, updated_at_ms
      FROM tickets";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +122,7 @@ pub struct TicketRecord {
     pub held_reason: Option<String>,
     /// When the ticket was registered. `sloop list` orders on this.
     pub created_at_ms: i64,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +176,7 @@ fn ticket_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TicketRecord> {
         body: row.get(13)?,
         held_reason: row.get(14)?,
         created_at_ms: row.get(15)?,
+        updated_at_ms: row.get(16)?,
     })
 }
 
@@ -1325,19 +1334,452 @@ impl LocalSqlite {
         }
         Ok(counts)
     }
+
+    fn ticket_on(connection: &Connection, id: &str) -> Result<Option<TicketRecord>, StoreError> {
+        let mut ticket = connection
+            .query_row(
+                &format!("{TICKET_RECORD_SELECT} WHERE id = ?1"),
+                params![id],
+                ticket_record,
+            )
+            .optional()?;
+        if let Some(ticket) = ticket.as_mut() {
+            ticket.blocked_by = Self::ticket_blockers(connection, &ticket.id)?;
+        }
+        Ok(ticket)
+    }
+
+    fn claimable_activation_on(
+        transaction: &Transaction<'_>,
+        ticket_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<QueuedActivation>, StoreError> {
+        transaction
+            .query_row(
+                "SELECT a.id, a.kind, a.ticket_id, a.project_id, a.eligible_at_ms, a.interval_ms
+                 FROM activations a
+                 JOIN tickets t ON t.id = ?1
+                 WHERE a.state = 'queued'
+                   AND (a.kind IN ('immediate', 'auto') OR a.eligible_at_ms <= ?2)
+                   AND (a.ticket_id = t.id
+                        OR (a.ticket_id IS NULL
+                            AND (a.project_id IS NULL OR a.project_id = t.project_id)))
+                   AND (NOT EXISTS (SELECT 1 FROM activation_filters f
+                                    WHERE f.activation_id = a.id)
+                        OR EXISTS (SELECT 1 FROM activation_filters f
+                                   WHERE f.activation_id = a.id AND f.ticket_id = t.id))
+                 ORDER BY a.created_at_ms, a.id
+                 LIMIT 1",
+                params![ticket_id, now_ms],
+                |row| {
+                    Ok(QueuedActivation {
+                        id: row.get(0)?,
+                        kind: row.get(1)?,
+                        ticket_id: row.get(2)?,
+                        project_id: row.get(3)?,
+                        eligible_at_ms: row.get(4)?,
+                        interval_ms: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn activation_for_release_on(
+        transaction: &Transaction<'_>,
+        ticket_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        transaction
+            .query_row(
+                "SELECT a.id
+                 FROM activations a
+                 JOIN tickets t ON t.id = ?1
+                 WHERE (a.state = 'completed' OR (a.state = 'queued' AND a.kind = 'every'))
+                   AND (a.ticket_id = t.id
+                        OR (a.ticket_id IS NULL
+                            AND (a.project_id IS NULL OR a.project_id = t.project_id)))
+                   AND (NOT EXISTS (SELECT 1 FROM activation_filters f
+                                    WHERE f.activation_id = a.id)
+                        OR EXISTS (SELECT 1 FROM activation_filters f
+                                   WHERE f.activation_id = a.id AND f.ticket_id = t.id))
+                 ORDER BY a.updated_at_ms DESC, a.created_at_ms, a.id
+                 LIMIT 1",
+                params![ticket_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+}
+
+fn source_error(error: StoreError) -> SourceError {
+    match error {
+        StoreError::TicketNotFound { .. }
+        | StoreError::TicketStateConflict { .. }
+        | StoreError::ActivationNotQueued { .. }
+        | StoreError::LeaseNotHeld { .. }
+        | StoreError::TicketNotReady { .. } => SourceError::Rejected {
+            message: error.to_string(),
+        },
+        _ => SourceError::Unavailable { retry_after: None },
+    }
+}
+
+fn now_ms() -> Result<i64, SourceError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| SourceError::Corrupt {
+            message: format!("system clock is before the Unix epoch: {error}"),
+        })?;
+    i64::try_from(elapsed.as_millis()).map_err(|_| SourceError::Corrupt {
+        message: "system clock is outside the supported range".into(),
+    })
+}
+
+fn lease_ms(ttl: Duration) -> Result<i64, SourceError> {
+    i64::try_from(ttl.as_millis()).map_err(|_| SourceError::Rejected {
+        message: "lease duration is outside the supported range".into(),
+    })
+}
+
+fn rearm_every_at(eligible_at_ms: i64, interval_ms: i64, now_ms: i64) -> Option<i64> {
+    if interval_ms <= 0 || eligible_at_ms > now_ms {
+        return None;
+    }
+    let missed = now_ms.checked_sub(eligible_at_ms)?.div_euclid(interval_ms);
+    let steps = missed.checked_add(1)?;
+    eligible_at_ms.checked_add(interval_ms.checked_mul(steps)?)
+}
+
+fn work_ticket(
+    record: TicketRecord,
+    blocked: bool,
+    owner: OwnerId,
+) -> Result<WorkTicket, SourceError> {
+    let state = match record.state.as_str() {
+        "ready" => TicketState::Ready,
+        "held" => TicketState::Held,
+        "claimed" => TicketState::Claimed,
+        "merged" => TicketState::Merged,
+        "failed" => TicketState::Failed,
+        "needs_review" => TicketState::NeedsReview,
+        state => {
+            return Err(SourceError::Corrupt {
+                message: format!("ticket `{}` has unknown state `{state}`", record.id),
+            });
+        }
+    };
+    let attempts = u32::try_from(record.attempts).map_err(|_| SourceError::Corrupt {
+        message: format!(
+            "ticket `{}` has invalid attempt count {}",
+            record.id, record.attempts
+        ),
+    })?;
+
+    Ok(WorkTicket {
+        id: record.id,
+        project_id: record.project_id,
+        name: record.name,
+        body: record.body.unwrap_or_default(),
+        state: WorkTicketState::from_ticket_state(
+            state,
+            blocked,
+            record.held_reason.unwrap_or_default(),
+            owner,
+        ),
+        blocked_by: record.blocked_by,
+        attempts,
+        hints: ExecutionHints {
+            target: record.target,
+            model: record.model,
+            effort: record.effort,
+            flow: record.flow,
+        },
+        version: SourceVersion(record.updated_at_ms.to_string()),
+    })
+}
+
+/// SQLite satisfies atomic claims with an IMMEDIATE transaction and a
+/// conditional ticket update. The ticket row is authoritative for attempts:
+/// claim consumes one attempt, while release preserves that count as evidence
+/// of the completed try. This backend never records runs, and its local-source
+/// outcome push is idempotent because release already applied the durable
+/// ticket state.
+#[async_trait]
+impl WorkState for LocalSqlite {
+    fn claim_strength(&self) -> ClaimStrength {
+        ClaimStrength::Atomic
+    }
+
+    async fn pull_ready(&self) -> Result<Vec<WorkTicket>, SourceError> {
+        let now_ms = now_ms()?;
+        let activations = self
+            .dispatchable_activations(now_ms)
+            .map_err(source_error)?;
+        let mut seen = BTreeSet::new();
+        let mut selected = Vec::new();
+        for activation in activations {
+            let ticket_id = match activation.ticket_id {
+                Some(ticket_id) => self
+                    .ticket_is_dispatchable(&ticket_id)
+                    .map_err(source_error)?
+                    .then_some(ticket_id),
+                None => self
+                    .select_ready_ticket(activation.project_id.as_deref(), &activation.id, now_ms)
+                    .map_err(source_error)?,
+            };
+            if let Some(ticket_id) = ticket_id
+                && seen.insert(ticket_id.clone())
+            {
+                selected.push(ticket_id);
+            }
+        }
+
+        selected
+            .into_iter()
+            .map(|id| {
+                let record = self.ticket(&id).map_err(source_error)?.ok_or_else(|| {
+                    SourceError::Corrupt {
+                        message: format!("selected ticket `{id}` no longer exists"),
+                    }
+                })?;
+                work_ticket(record, false, OwnerId(String::new()))
+            })
+            .collect()
+    }
+
+    async fn claim(
+        &self,
+        ticket: &TicketRef,
+        owner: &OwnerId,
+        ttl: Duration,
+    ) -> Result<ClaimResult, SourceError> {
+        let now_ms = now_ms()?;
+        let lease_ms = lease_ms(ttl)?;
+        let mut connection = self.db.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::from)
+            .map_err(source_error)?;
+        let Some(activation) = Self::claimable_activation_on(&transaction, &ticket.id, now_ms)
+            .map_err(source_error)?
+        else {
+            return Ok(ClaimResult::Lost { held_by: None });
+        };
+        let next_activation_eligible_at_ms = if activation.kind == "every" {
+            match (activation.eligible_at_ms, activation.interval_ms) {
+                (Some(eligible_at_ms), Some(interval_ms)) => {
+                    rearm_every_at(eligible_at_ms, interval_ms, now_ms)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if activation.kind == "every" && next_activation_eligible_at_ms.is_none() {
+            return Err(SourceError::Corrupt {
+                message: format!(
+                    "recurring activation `{}` has an invalid cadence",
+                    activation.id
+                ),
+            });
+        }
+        let claim = ClaimRequest {
+            ticket_id: &ticket.id,
+            run_id: &owner.0,
+            activation_id: &activation.id,
+            owner_id: &owner.0,
+            lease_ms,
+            next_activation_eligible_at_ms,
+            flow_json: "",
+            ticket_json: "",
+        };
+
+        match tx::claim_ticket(&transaction, &claim, now_ms) {
+            Ok(()) => {}
+            Err(StoreError::TicketNotReady { .. }) => {
+                let held_by = transaction
+                    .query_row(
+                        "SELECT owner_id FROM leases WHERE ticket_id = ?1",
+                        params![ticket.id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(StoreError::from)
+                    .map_err(source_error)?
+                    .map(OwnerId);
+                return Ok(ClaimResult::Lost { held_by });
+            }
+            Err(error) => return Err(source_error(error)),
+        }
+        tx::advance_activation(&transaction, &claim, now_ms).map_err(source_error)?;
+        tx::insert_lease(&transaction, &claim, now_ms).map_err(source_error)?;
+        let record = Self::ticket_on(&transaction, &ticket.id)
+            .map_err(source_error)?
+            .ok_or_else(|| SourceError::Corrupt {
+                message: format!("claimed ticket `{}` no longer exists", ticket.id),
+            })?;
+        let ticket = work_ticket(record, false, owner.clone())?;
+        transaction
+            .commit()
+            .map_err(StoreError::from)
+            .map_err(source_error)?;
+        Ok(ClaimResult::Claimed { ticket })
+    }
+
+    async fn renew(&self, ticket: &TicketRef, owner: &OwnerId) -> Result<ClaimResult, SourceError> {
+        let now_ms = now_ms()?;
+        let lease_ms = self
+            .db
+            .lock()
+            .query_row(
+                "SELECT expires_at_ms - renewed_at_ms FROM leases
+                 WHERE ticket_id = ?1 AND run_id = ?2 AND owner_id = ?2",
+                params![ticket.id, owner.0],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+            .map_err(source_error)?;
+        let Some(lease_ms) = lease_ms else {
+            return Ok(ClaimResult::Lost { held_by: None });
+        };
+        match self.renew_lease(&ticket.id, &owner.0, lease_ms, now_ms) {
+            Ok(_) => {}
+            Err(StoreError::LeaseNotHeld { .. }) => {
+                return Ok(ClaimResult::Lost { held_by: None });
+            }
+            Err(error) => return Err(source_error(error)),
+        }
+        let record = self
+            .ticket(&ticket.id)
+            .map_err(source_error)?
+            .ok_or_else(|| SourceError::Corrupt {
+                message: format!("leased ticket `{}` no longer exists", ticket.id),
+            })?;
+        Ok(ClaimResult::Claimed {
+            ticket: work_ticket(record, false, owner.clone())?,
+        })
+    }
+
+    async fn release(
+        &self,
+        ticket: &TicketRef,
+        owner: &OwnerId,
+        disposition: Disposition,
+    ) -> Result<(), SourceError> {
+        let now_ms = now_ms()?;
+        let mut connection = self.db.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::from)
+            .map_err(source_error)?;
+        let holds_lease: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM leases
+                               WHERE ticket_id = ?1 AND run_id = ?2 AND owner_id = ?2)",
+                params![ticket.id, owner.0],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
+            .map_err(source_error)?;
+        if !holds_lease {
+            return Err(SourceError::Rejected {
+                message: format!(
+                    "owner `{}` does not hold the lease on ticket `{}`",
+                    owner.0, ticket.id
+                ),
+            });
+        }
+
+        let changed = match disposition {
+            Disposition::Retry { not_before_ms } => {
+                let activation_id = Self::activation_for_release_on(&transaction, &ticket.id)
+                    .map_err(source_error)?
+                    .ok_or_else(|| SourceError::Corrupt {
+                        message: format!("ticket `{}` has no activation to retry", ticket.id),
+                    })?;
+                let changed = tx::abort_ticket(&transaction, &ticket.id, now_ms)
+                    .map_err(StoreError::from)
+                    .map_err(source_error)?;
+                tx::requeue_activation(&transaction, &activation_id, now_ms)
+                    .map_err(StoreError::from)
+                    .map_err(source_error)?;
+                if let Some(eligible_at_ms) = not_before_ms {
+                    transaction
+                        .execute(
+                            "UPDATE activations
+                             SET eligible_at_ms = ?2, updated_at_ms = ?3
+                             WHERE id = ?1 AND state = 'queued'",
+                            params![activation_id, eligible_at_ms, now_ms],
+                        )
+                        .map_err(StoreError::from)
+                        .map_err(source_error)?;
+                }
+                changed
+            }
+            Disposition::Park { reason } => {
+                let changed =
+                    tx::settle_ticket(&transaction, &ticket.id, TicketState::Held, now_ms)
+                        .map_err(StoreError::from)
+                        .map_err(source_error)?;
+                if changed == 1 {
+                    transaction
+                        .execute(
+                            "UPDATE tickets SET held_reason = ?2 WHERE id = ?1 AND state = 'held'",
+                            params![ticket.id, reason],
+                        )
+                        .map_err(StoreError::from)
+                        .map_err(source_error)?;
+                }
+                changed
+            }
+            Disposition::Abandon => {
+                tx::settle_ticket(&transaction, &ticket.id, TicketState::Failed, now_ms)
+                    .map_err(StoreError::from)
+                    .map_err(source_error)?
+            }
+        };
+        if changed != 1 {
+            return Err(SourceError::Rejected {
+                message: format!("ticket `{}` is no longer claimed", ticket.id),
+            });
+        }
+        tx::delete_lease(&transaction, &owner.0)
+            .map_err(StoreError::from)
+            .map_err(source_error)?;
+        transaction
+            .commit()
+            .map_err(StoreError::from)
+            .map_err(source_error)?;
+        Ok(())
+    }
+
+    async fn push_outcome(&self, _outcome: &WorkOutcome) -> Result<(), SourceError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use rusqlite::params;
     use tempfile::tempdir;
 
     use crate::coordination::{Claim, ClaimDenial, Coordination};
+    use crate::db::Db;
     use crate::domain::ticket::TicketState;
+    use crate::domain::work::{Disposition, OwnerId, TicketRef, WorkTicket};
     use crate::outcome::Outcome;
     use crate::store::{
         ActivationKind, ClaimRequest, ClaimedRun, NewActivation, QueuedActivation, ReindexTicket,
         Store, StoreError,
     };
+    use crate::work_state::{ClaimResult, WorkState};
+
+    use super::LocalSqlite;
 
     fn open_seeded(path: &std::path::Path) -> Store {
         let store = Store::open(path, 1_000).unwrap();
@@ -1379,6 +1821,188 @@ mod tests {
             )
             .unwrap();
         store
+    }
+
+    fn open_seeded_local() -> (tempfile::TempDir, LocalSqlite) {
+        let directory = tempdir().unwrap();
+        let local =
+            LocalSqlite::from_db(Db::open(&directory.path().join("sloop.db"), 1_000).unwrap());
+        local
+            .insert_local_project(
+                "default",
+                ".agents/sloop/projects/default.md",
+                "Default",
+                1_000,
+            )
+            .unwrap();
+        local
+            .insert_local_ticket(
+                "T1",
+                "default",
+                ".agents/sloop/tickets/t1.md",
+                "Ticket one",
+                &[],
+                "sloop/T1",
+                Some("claude"),
+                Some("sonnet"),
+                Some("medium"),
+                "default",
+                TicketState::Ready,
+                1_000,
+            )
+            .unwrap();
+        local
+            .insert_activation(
+                &super::NewActivation {
+                    id: "A1",
+                    kind: super::ActivationKind::Immediate,
+                    ticket_id: Some("T1"),
+                    project_id: None,
+                    eligible_at_ms: None,
+                    interval_ms: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        (directory, local)
+    }
+
+    fn ticket_ref() -> TicketRef {
+        TicketRef {
+            id: "T1".into(),
+            source: "local".into(),
+            source_ref: None,
+        }
+    }
+
+    fn seed_run(local: &LocalSqlite, run_id: &str) {
+        local
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO runs
+                     (id, activation_id, ticket_id, state, attempt, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'A1', 'T1', 'claimed', 1, 1000, 1000)",
+                params![run_id],
+            )
+            .unwrap();
+    }
+
+    async fn claim_local(local: &LocalSqlite, run_id: &str) -> ClaimResult {
+        local
+            .claim(
+                &ticket_ref(),
+                &OwnerId(run_id.into()),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn local_work_state_claim_is_atomic() {
+        let (_directory, local) = open_seeded_local();
+        seed_run(&local, "R1");
+
+        assert!(matches!(
+            claim_local(&local, "R1").await,
+            ClaimResult::Claimed {
+                ticket: WorkTicket { attempts: 1, .. }
+            }
+        ));
+        assert_eq!(
+            claim_local(&local, "R1").await,
+            ClaimResult::Lost { held_by: None }
+        );
+    }
+
+    #[tokio::test]
+    async fn local_work_state_retry_preserves_attempts_until_the_next_claim() {
+        let (_directory, local) = open_seeded_local();
+        seed_run(&local, "R1");
+        claim_local(&local, "R1").await;
+
+        local
+            .release(
+                &ticket_ref(),
+                &OwnerId("R1".into()),
+                Disposition::Retry {
+                    not_before_ms: Some(2_000),
+                },
+            )
+            .await
+            .unwrap();
+        let retried = local.ticket("T1").unwrap().unwrap();
+        assert_eq!(retried.state, "ready");
+        assert_eq!(retried.attempts, 1);
+        assert_eq!(
+            local
+                .queued_activations()
+                .unwrap()
+                .first()
+                .and_then(|activation| activation.eligible_at_ms),
+            Some(2_000)
+        );
+
+        seed_run(&local, "R2");
+        assert!(matches!(
+            claim_local(&local, "R2").await,
+            ClaimResult::Claimed {
+                ticket: WorkTicket { attempts: 2, .. }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_work_state_park_and_abandon_apply_the_disposition() {
+        let (_park_directory, parked) = open_seeded_local();
+        seed_run(&parked, "R1");
+        claim_local(&parked, "R1").await;
+        parked
+            .release(
+                &ticket_ref(),
+                &OwnerId("R1".into()),
+                Disposition::Park {
+                    reason: "operator review".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let ticket = parked.ticket("T1").unwrap().unwrap();
+        assert_eq!(ticket.state, "held");
+        assert_eq!(ticket.held_reason.as_deref(), Some("operator review"));
+
+        let (_abandon_directory, abandoned) = open_seeded_local();
+        seed_run(&abandoned, "R1");
+        claim_local(&abandoned, "R1").await;
+        abandoned
+            .release(&ticket_ref(), &OwnerId("R1".into()), Disposition::Abandon)
+            .await
+            .unwrap();
+        assert_eq!(abandoned.ticket("T1").unwrap().unwrap().state, "failed");
+    }
+
+    #[tokio::test]
+    async fn local_work_state_denies_renewal_of_an_expired_lease() {
+        let (_directory, local) = open_seeded_local();
+        seed_run(&local, "R1");
+        claim_local(&local, "R1").await;
+        local
+            .db
+            .lock()
+            .execute(
+                "UPDATE leases SET expires_at_ms = renewed_at_ms WHERE run_id = 'R1'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            local
+                .renew(&ticket_ref(), &OwnerId("R1".into()))
+                .await
+                .unwrap(),
+            ClaimResult::Lost { held_by: None }
+        );
     }
 
     fn claim_t1<'a>(run_id: &'a str) -> ClaimRequest<'a> {
