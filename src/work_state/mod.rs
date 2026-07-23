@@ -7,6 +7,7 @@ use crate::domain::work::{
 };
 
 pub mod local;
+pub mod markdown;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimStrength {

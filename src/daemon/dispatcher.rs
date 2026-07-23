@@ -21,6 +21,7 @@ use crate::runner::local::worker_socket_path;
 use crate::sources::TicketSource;
 use crate::store::{CooldownUpdate, EvidenceRecord, Store, StoreError};
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
+use crate::work_state::local::LocalSqlite;
 
 use super::commands::{
     handle_cancel, handle_events, handle_hold, handle_list, handle_logs, handle_operator_show,
@@ -89,6 +90,7 @@ pub(super) struct DispatcherState {
     pub(super) socket: PathBuf,
     pub(super) daemon_log: PathBuf,
     pub(super) store: Store,
+    pub(super) work_state: LocalSqlite,
     /// `SQLITE_FULL` is a dispatcher gate. The daemon retains active and
     /// pending run evidence in memory until a committed probe succeeds.
     pub(super) storage_full: Cell<bool>,
