@@ -11,6 +11,7 @@ pub(crate) mod runs;
 
 pub use evidence::{EvidenceRecord, StageRecord};
 pub use limits::{CooldownRecord, CooldownUpdate};
+pub(crate) use runs::RunAdmission;
 pub use runs::{ActiveRun, EventRecord, ProjectNote, RunRecord, RunState, RunTimeline};
 pub(crate) use runs::{NeedsReviewBranch, RecoverableRun, WorktreeCleanupCandidate};
 

@@ -25,6 +25,12 @@ pub enum ClaimResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveClaim {
+    pub ticket: TicketRef,
+    pub owner: OwnerId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceError {
     Unavailable { retry_after: Option<Duration> },
     Rejected { message: String },
@@ -68,6 +74,10 @@ pub trait WorkState: Send + Sync {
     /// Refresh the daemon's read cache. Selection runs on the cache;
     /// pull is periodic, never per-tick.
     async fn pull_ready(&self) -> Result<Vec<WorkTicket>, SourceError>;
+
+    /// Claims visible at the source. Recovery compares these with recorded
+    /// runs and releases a claim whose second admission commit never landed.
+    async fn active_claims(&self) -> Result<Vec<ActiveClaim>, SourceError>;
 
     /// The only authoritative check. Succeeds iff the ticket is still
     /// ready at the source. Lost is a normal, silent outcome.
@@ -134,6 +144,17 @@ mod tests {
                 .then_some(ticket)
                 .into_iter()
                 .collect())
+        }
+
+        async fn active_claims(&self) -> Result<Vec<ActiveClaim>, SourceError> {
+            let ticket = self.ticket.lock().unwrap();
+            let WorkTicketState::Claimed { by } = &ticket.state else {
+                return Ok(Vec::new());
+            };
+            Ok(vec![ActiveClaim {
+                ticket: ticket_ref(&ticket),
+                owner: by.clone(),
+            }])
         }
 
         async fn claim(
@@ -232,6 +253,8 @@ mod tests {
             blocked_by: Vec::new(),
             attempts: 0,
             hints: ExecutionHints {
+                worktree: None,
+                activation_id: None,
                 target: None,
                 model: None,
                 effort: None,

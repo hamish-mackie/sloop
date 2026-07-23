@@ -302,7 +302,10 @@ async fn serve(
     log.emit(LogLevel::Info, "sloop::daemon", "daemon_started");
 
     let paused = store.paused().map_err(DaemonError::Store)?;
-    let work_state = LocalSqlite::from_db(store.db());
+    let db = store.db();
+    let local_work_state = LocalSqlite::from_db(db.clone());
+    let work_state = Box::new(LocalSqlite::from_db_with_clock(db.clone(), clock.clone()));
+    let run_store = crate::run_store::RunStore::from_db(db);
     let (dispatcher_tx, dispatcher_rx) = mpsc::channel(DISPATCH_CHANNEL_CAPACITY);
     let (events_tx, events_rx) = mpsc::channel(DISPATCH_CHANNEL_CAPACITY);
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<DaemonControl>(1);
@@ -347,7 +350,9 @@ async fn serve(
         socket: repository.operator_socket.clone(),
         daemon_log: repository.daemon_log.clone(),
         store,
+        local_work_state,
         work_state,
+        run_store,
         storage_full: Cell::new(false),
         reconciliation_blocked: false,
         active: HashSet::new(),
@@ -367,7 +372,7 @@ async fn serve(
         shutdown: shutdown_tx.clone(),
         shutdown_flag: shutdown_flag.clone(),
     };
-    recover_inflight_runs(&mut state, &events_tx, &log)?;
+    recover_inflight_runs(&mut state, &events_tx, &log).await?;
     let dispatcher_task = tokio::spawn(run_dispatcher(
         state,
         dispatcher_rx,
@@ -714,6 +719,7 @@ pub enum DaemonError {
     Config(ConfigError),
     Catalog(CatalogError),
     Store(StoreError),
+    WorkState(crate::work_state::SourceError),
     CurrentDirectory(io::Error),
     CurrentExecutable(io::Error),
     Io {
@@ -768,6 +774,7 @@ impl std::fmt::Display for DaemonError {
             Self::Config(error) => error.fmt(formatter),
             Self::Catalog(error) => error.fmt(formatter),
             Self::Store(error) => error.fmt(formatter),
+            Self::WorkState(error) => write!(formatter, "work source error: {error:?}"),
             Self::CurrentDirectory(error) => {
                 write!(formatter, "cannot read current directory: {error}")
             }

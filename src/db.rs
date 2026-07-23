@@ -119,8 +119,9 @@ CREATE INDEX runs_by_activation ON runs(activation_id, created_at_ms);
 -- run: the durable guard against double-spawn, backstopping the conditional
 -- `UPDATE ... WHERE state='ready'` in `claim_ticket`.
 --
--- Leases are held only by the daemon; `owner_id` records which daemon process
--- took the claim. Workers never hold, renew, or observe leases — a worker's
+-- Leases are held only by the daemon; `owner_id` stores the source's ownership
+-- token, including the activation needed to recover an interrupted claim.
+-- Workers never hold, renew, or observe leases — a worker's
 -- only credential is a per-run capability token granting the worker verbs on
 -- its own run.
 --

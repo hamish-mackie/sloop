@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 719181460ce23bc1a1d6a8405815a6efa0de0a8098f180b60dd2d0d39577fb65 # shrinks to ops = [Enqueue { ticket: 1 }, Enqueue { ticket: 1 }, Claim { ticket: 1 }, Settle { run: 0, outcome: RateLimited }, Claim { ticket: 1 }]
+cc 7db4555a2512b726278252b63d4fad1c63b5b0f9ac19787704543b831ecc160e # shrinks to ops = [Enqueue { ticket: 0 }, Enqueue { ticket: 0 }, Enqueue { ticket: 0 }, Enqueue { ticket: 0 }, Enqueue { ticket: 0 }, Enqueue { ticket: 0 }, Enqueue { ticket: 0 }, Enqueue { ticket: 0 }, Enqueue { ticket: 2 }, Enqueue { ticket: 0 }, Enqueue { ticket: 2 }, Claim { ticket: 2 }]

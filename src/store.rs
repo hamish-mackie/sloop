@@ -59,6 +59,29 @@ pub struct Store {
     db: Db,
 }
 
+#[cfg(test)]
+pub(crate) fn claim_for_test(store: &Store, claim: &ClaimRequest<'_>, now_ms: i64) -> ClaimedRun {
+    let db = store.db();
+    let mut connection = db.lock();
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .unwrap();
+    {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        crate::work_state::local::tx::claim_ticket(&transaction, claim, now_ms).unwrap();
+        crate::work_state::local::tx::advance_activation(&transaction, claim, now_ms).unwrap();
+        crate::work_state::local::tx::insert_lease(&transaction, claim, now_ms).unwrap();
+        transaction.commit().unwrap();
+    }
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    drop(connection);
+    store.insert_claimed_run(claim, now_ms).unwrap()
+}
+
 impl Store {
     /// Opens (creating if needed) the database and migrates it to the current
     /// schema version. The daemon is the only writer; `now_ms` is injected so
@@ -75,6 +98,30 @@ impl Store {
 
     pub fn db(&self) -> Db {
         self.db.clone()
+    }
+
+    pub fn insert_claimed_run(
+        &self,
+        claim: &ClaimRequest<'_>,
+        now_ms: i64,
+    ) -> Result<ClaimedRun, StoreError> {
+        self.run_store()
+            .insert_claimed_run(
+                &crate::run_store::RunAdmission {
+                    run_id: claim.run_id,
+                    activation_id: claim.activation_id,
+                    ticket_id: claim.ticket_id,
+                    flow_json: claim.flow_json,
+                    ticket_json: claim.ticket_json,
+                },
+                now_ms,
+            )
+            .map(|run| ClaimedRun {
+                run_id: run.run_id,
+                attempt: run.attempt,
+                lease_expires_at_ms: now_ms + claim.lease_ms,
+            })
+            .map_err(StoreError::from)
     }
 
     fn run_store(&self) -> RunStore {

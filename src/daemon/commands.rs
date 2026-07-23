@@ -1112,7 +1112,7 @@ pub(super) fn handle_reindex(state: &mut DispatcherState) -> Result<serde_json::
     )
     .map_err(|error| internal(&format!("cannot reindex projects: {error}")))?;
     state
-        .work_state
+        .local_work_state
         .sync_from_source(
             &state.root,
             state.ticket_source.as_ref(),
