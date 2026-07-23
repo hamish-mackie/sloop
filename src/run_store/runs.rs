@@ -508,20 +508,6 @@ pub(crate) mod tx {
         Ok(())
     }
 
-    pub(crate) fn record_cancel_requested(
-        transaction: &Transaction<'_>,
-        run_id: &str,
-        now_ms: i64,
-    ) -> rusqlite::Result<()> {
-        transaction.execute(
-            "INSERT OR IGNORE INTO run_evidence
-                 (run_id, kind, observed_at_ms, dedupe_key, data_json)
-             VALUES (?1, 'cancel_requested', ?2, 'cancel_requested:' || ?1, '{}')",
-            params![run_id, now_ms],
-        )?;
-        Ok(())
-    }
-
     pub(crate) fn mark_worktree_cleaned(
         transaction: &Transaction<'_>,
         candidate: &WorktreeCleanupCandidate,
@@ -651,21 +637,6 @@ pub(crate) fn latest_event_sequence(connection: &Connection) -> rusqlite::Result
     })
 }
 
-pub(crate) fn cancellation_requested(
-    connection: &Connection,
-    run_id: &str,
-) -> rusqlite::Result<bool> {
-    let found: Option<i64> = connection
-        .query_row(
-            "SELECT 1 FROM run_evidence
-             WHERE run_id = ?1 AND kind = 'cancel_requested'",
-            params![run_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(found.is_some())
-}
-
 pub(crate) fn ticket_is_referenced(
     connection: &Connection,
     ticket_id: &str,
@@ -679,44 +650,6 @@ pub(crate) fn ticket_is_referenced(
         params![ticket_id],
         |row| row.get(0),
     )
-}
-
-pub(crate) fn commit_evidence_for_project(
-    connection: &Connection,
-    project_id: &str,
-) -> rusqlite::Result<Vec<(String, String, String)>> {
-    let mut statement = connection.prepare(
-        "SELECT r.id, r.ticket_id, e.data_json
-         FROM run_evidence e
-         JOIN runs r ON r.id = e.run_id
-         JOIN tickets t ON t.id = r.ticket_id
-         WHERE t.project_id = ?1 AND e.kind = 'commits_observed'
-         ORDER BY r.ticket_id, r.created_at_ms, r.id, e.sequence",
-    )?;
-    statement
-        .query_map(params![project_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()
-}
-
-pub(crate) fn latest_vendor_error_for_ticket(
-    connection: &Connection,
-    ticket_id: &str,
-) -> rusqlite::Result<Option<String>> {
-    connection
-        .query_row(
-            "SELECT e.data_json FROM run_evidence e
-             JOIN runs r ON r.id = e.run_id
-             WHERE r.id = (SELECT latest.id FROM runs latest
-                           WHERE latest.ticket_id = ?1
-                           ORDER BY latest.created_at_ms DESC, latest.id DESC LIMIT 1)
-               AND e.kind = 'vendor_error_classified'
-             ORDER BY e.sequence DESC LIMIT 1",
-            params![ticket_id],
-            |row| row.get(0),
-        )
-        .optional()
 }
 
 pub(crate) fn readopt_lease(
@@ -993,36 +926,8 @@ impl RunStore {
         })
     }
 
-    pub(crate) fn record_cancel_requested(
-        &self,
-        run_id: &str,
-        now_ms: i64,
-    ) -> rusqlite::Result<()> {
-        self.write(TransactionBehavior::Deferred, |transaction| {
-            tx::record_cancel_requested(transaction, run_id, now_ms)
-        })
-    }
-
-    pub(crate) fn cancellation_requested(&self, run_id: &str) -> rusqlite::Result<bool> {
-        cancellation_requested(&self.db.lock(), run_id)
-    }
-
     pub(crate) fn ticket_is_referenced(&self, ticket_id: &str) -> rusqlite::Result<bool> {
         ticket_is_referenced(&self.db.lock(), ticket_id)
-    }
-
-    pub(crate) fn commit_evidence_for_project(
-        &self,
-        project_id: &str,
-    ) -> rusqlite::Result<Vec<(String, String, String)>> {
-        commit_evidence_for_project(&self.db.lock(), project_id)
-    }
-
-    pub(crate) fn latest_vendor_error_for_ticket(
-        &self,
-        ticket_id: &str,
-    ) -> rusqlite::Result<Option<String>> {
-        latest_vendor_error_for_ticket(&self.db.lock(), ticket_id)
     }
 
     pub(crate) fn readopt_lease(

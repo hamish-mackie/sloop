@@ -7,9 +7,12 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 pub use crate::db::SCHEMA_VERSION;
 use crate::db::{Db, DbError};
 use crate::domain::ticket::TicketState;
-pub use crate::run_store::{ActiveRun, EventRecord, ProjectNote, RunRecord, RunState, RunTimeline};
+pub use crate::run_store::{
+    ActiveRun, CooldownRecord, CooldownUpdate, EventRecord, EvidenceRecord, ProjectNote, RunRecord,
+    RunState, RunTimeline, StageRecord,
+};
 pub(crate) use crate::run_store::{NeedsReviewBranch, RecoverableRun, WorktreeCleanupCandidate};
-use crate::run_store::{RunStore, runs};
+use crate::run_store::{RunStore, evidence, limits, runs};
 
 impl RunState {
     /// Reads a state written by an older or newer binary. An unrecognized
@@ -98,41 +101,6 @@ pub struct TicketCounts {
     pub merged: u64,
     pub failed: u64,
     pub needs_review: u64,
-}
-
-/// One appended `run_evidence` row: a kind plus kind-specific JSON facts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EvidenceRecord {
-    pub kind: &'static str,
-    pub data_json: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CooldownUpdate<'a> {
-    pub target: &'a str,
-    pub until_ms: i64,
-    pub reason: &'a str,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CooldownRecord {
-    pub target: String,
-    pub until_ms: i64,
-    pub reason: String,
-}
-
-/// One executed aftercare stage, persisted alongside the run's outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StageRecord {
-    pub stage_index: usize,
-    pub stage: String,
-    pub state: String,
-    pub started_at_ms: i64,
-    pub finished_at_ms: i64,
-    pub exit_code: Option<i32>,
-    pub output_ref: String,
-    pub verdict_source: String,
-    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -523,21 +491,11 @@ impl Store {
 
         let mut rows_dropped = 0;
         for run_id in &doomed_runs {
-            transaction.execute(
-                "UPDATE cooldowns SET source_run_id = NULL WHERE source_run_id = ?1",
-                params![run_id],
-            )?;
-            for table in [
-                "leases",
-                "run_evidence",
-                "aftercare_stages",
-                "budget_reservations",
-            ] {
-                rows_dropped += transaction.execute(
-                    &format!("DELETE FROM {table} WHERE run_id = ?1"),
-                    params![run_id],
-                )?;
-            }
+            limits::tx::detach_cooldowns_from_run(&transaction, run_id)?;
+            rows_dropped +=
+                transaction.execute("DELETE FROM leases WHERE run_id = ?1", params![run_id])?;
+            rows_dropped += evidence::tx::delete_for_run(&transaction, run_id)?;
+            rows_dropped += limits::tx::delete_budget_reservation_for_run(&transaction, run_id)?;
             rows_dropped += runs::tx::delete_notes_for_run(&transaction, run_id)?;
             rows_dropped += runs::tx::delete(&transaction, run_id)?;
         }
@@ -1108,32 +1066,9 @@ impl Store {
         activation: &QueuedActivation,
         now_ms: i64,
     ) -> Result<Option<String>, StoreError> {
-        let ticket = self
-            .db
-            .lock()
-            .query_row(
-                "SELECT t.id FROM tickets t
-                 WHERE t.state = 'ready'
-                   AND t.missing_at_ms IS NULL
-                   AND (?1 IS NULL OR t.project_id = ?1)
-                   AND NOT EXISTS (SELECT 1 FROM ticket_blockers b
-                                   JOIN tickets bt ON bt.id = b.blocker_id
-                                   WHERE b.ticket_id = t.id
-                                     AND bt.state != 'merged')
-                    AND (NOT EXISTS (SELECT 1 FROM activation_filters f
-                                    WHERE f.activation_id = ?2)
-                        OR EXISTS (SELECT 1 FROM activation_filters f
-                                    WHERE f.activation_id = ?2 AND f.ticket_id = t.id))
-                   AND NOT EXISTS (SELECT 1 FROM cooldowns c
-                                   WHERE c.key = 'agent_target:' || t.target
-                                     AND c.until_ms > ?3)
-                  ORDER BY t.created_at_ms, t.id
-                  LIMIT 1",
-                params![activation.project_id, activation.id, now_ms],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(ticket)
+        self.run_store()
+            .select_ready_ticket(activation.project_id.as_deref(), &activation.id, now_ms)
+            .map_err(StoreError::from)
     }
 
     pub fn ticket_is_dispatchable(&self, ticket_id: &str) -> Result<bool, StoreError> {
@@ -1279,17 +1214,10 @@ impl Store {
         }
 
         if let Some(cooldown) = cooldown {
-            upsert_cooldown(&transaction, run_id, cooldown, now_ms)?;
+            limits::tx::upsert_cooldown(&transaction, run_id, cooldown, now_ms)?;
         }
 
-        for record in evidence {
-            transaction.execute(
-                "INSERT OR IGNORE INTO run_evidence
-                     (run_id, kind, observed_at_ms, dedupe_key, data_json)
-                 VALUES (?1, ?2, ?3, 'settlement:' || ?1 || ':' || ?2, ?4)",
-                params![run_id, record.kind, now_ms, record.data_json],
-            )?;
-        }
+        evidence::tx::record_settlement(&transaction, run_id, evidence, now_ms)?;
         runs::tx::record_event(
             &transaction,
             now_ms,
@@ -1314,76 +1242,14 @@ impl Store {
         run_id: &str,
         stage: &StageRecord,
     ) -> Result<(), StoreError> {
-        let evidence_json = serde_json::json!({
-            "output": stage.output_ref,
-            "verdict_source": stage.verdict_source,
-            "reason": stage.reason,
-        })
-        .to_string();
-        self.db.lock().execute(
-            "INSERT INTO aftercare_stages
-                 (run_id, stage_index, stage, state, started_at_ms, finished_at_ms, exit_code,
-                  evidence_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(run_id, stage_index, attempt) DO UPDATE SET
-                 stage = excluded.stage,
-                 state = excluded.state,
-                 started_at_ms = excluded.started_at_ms,
-                 finished_at_ms = excluded.finished_at_ms,
-                 exit_code = excluded.exit_code,
-                 evidence_json = excluded.evidence_json",
-            params![
-                run_id,
-                stage.stage_index as i64,
-                stage.stage,
-                stage.state,
-                stage.started_at_ms,
-                stage.finished_at_ms,
-                stage.exit_code,
-                evidence_json,
-            ],
-        )?;
-        Ok(())
+        self.run_store()
+            .record_aftercare_stage(run_id, stage)
+            .map_err(StoreError::from)
     }
 
     pub(crate) fn aftercare_stages(&self, run_id: &str) -> Result<Vec<StageRecord>, StoreError> {
-        let connection = self.db.lock();
-        let mut statement = connection.prepare(
-            "SELECT stage_index, stage, state, started_at_ms, finished_at_ms, exit_code,
-                    evidence_json
-             FROM aftercare_stages WHERE run_id = ?1 ORDER BY stage_index",
-        )?;
-        statement
-            .query_map(params![run_id], |row| {
-                let evidence_json: Option<String> = row.get(6)?;
-                let output_ref = evidence_json
-                    .as_deref()
-                    .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-                    .and_then(|value| value["output"].as_str().map(str::to_owned))
-                    .unwrap_or_default();
-                let evidence = evidence_json
-                    .as_deref()
-                    .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
-                Ok(StageRecord {
-                    stage_index: row.get::<_, i64>(0)? as usize,
-                    stage: row.get(1)?,
-                    state: row.get(2)?,
-                    started_at_ms: row.get(3)?,
-                    finished_at_ms: row.get(4)?,
-                    exit_code: row.get(5)?,
-                    output_ref,
-                    verdict_source: evidence
-                        .as_ref()
-                        .and_then(|value| value["verdict_source"].as_str())
-                        .unwrap_or("exit_code")
-                        .to_owned(),
-                    reason: evidence
-                        .as_ref()
-                        .and_then(|value| value["reason"].as_str())
-                        .map(str::to_owned),
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
+        self.run_store()
+            .aftercare_stages(run_id)
             .map_err(StoreError::from)
     }
 
@@ -1414,42 +1280,16 @@ impl Store {
                 }),
             };
         }
-        for (kind, data_json) in [
-            (
-                "exit_classified",
-                serde_json::json!({"exit_code": exit_code}).to_string(),
-            ),
-            ("commits_observed", commits_json.to_owned()),
-        ] {
-            transaction.execute(
-                "INSERT OR IGNORE INTO run_evidence
-                     (run_id, kind, observed_at_ms, dedupe_key, data_json)
-                 VALUES (?1, ?2, ?3, 'settlement:' || ?1 || ':' || ?2, ?4)",
-                params![run_id, kind, now_ms, data_json],
-            )?;
-        }
-        if let Some(vendor_error) = vendor_error {
-            transaction.execute(
-                "INSERT OR IGNORE INTO run_evidence
-                     (run_id, kind, observed_at_ms, dedupe_key, data_json)
-                 VALUES (?1, 'vendor_error_classified', ?2,
-                         'settlement:' || ?1 || ':vendor_error_classified', ?3)",
-                params![
-                    run_id,
-                    now_ms,
-                    vendor_error.evidence_json(cooldown_until_ms)
-                ],
-            )?;
-        }
-        if !capture_complete {
-            transaction.execute(
-                "INSERT OR IGNORE INTO run_evidence
-                     (run_id, kind, observed_at_ms, dedupe_key, data_json)
-                 VALUES (?1, 'capture_incomplete', ?2,
-                         'settlement:' || ?1 || ':capture_incomplete', '{}')",
-                params![run_id, now_ms],
-            )?;
-        }
+        evidence::tx::record_agent_exit(
+            &transaction,
+            run_id,
+            exit_code,
+            capture_complete,
+            commits_json,
+            vendor_error,
+            cooldown_until_ms,
+            now_ms,
+        )?;
         transaction.commit()?;
         Ok(ExitClaim::Claimed)
     }
@@ -1461,25 +1301,15 @@ impl Store {
         data_json: &str,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        self.db.lock().execute(
-            "INSERT INTO run_evidence
-                 (run_id, kind, observed_at_ms, dedupe_key, data_json)
-             VALUES (?1, ?2, ?3, 'settlement:' || ?1 || ':' || ?2, ?4)
-             ON CONFLICT(dedupe_key) DO UPDATE SET
-                 observed_at_ms = excluded.observed_at_ms,
-                 data_json = excluded.data_json",
-            params![run_id, kind, now_ms, data_json],
-        )?;
-        Ok(())
+        self.run_store()
+            .record_aftercare_evidence(run_id, kind, data_json, now_ms)
+            .map_err(StoreError::from)
     }
 
     pub(crate) fn clear_aftercare_process(&self, run_id: &str) -> Result<(), StoreError> {
-        self.db.lock().execute(
-            "DELETE FROM run_evidence
-             WHERE run_id = ?1 AND dedupe_key = 'settlement:' || ?1 || ':aftercare_process'",
-            params![run_id],
-        )?;
-        Ok(())
+        self.run_store()
+            .clear_aftercare_process(run_id)
+            .map_err(StoreError::from)
     }
 
     /// Durably records an operator's cancellation intent, idempotently: the
@@ -1529,16 +1359,9 @@ impl Store {
         reason: Option<&str>,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
-        let dedupe_key = format!("verdict:{run_id}:{stage}");
-        let data_json =
-            serde_json::json!({"stage": stage, "verdict": verdict, "reason": reason}).to_string();
-        let inserted = self.db.lock().execute(
-            "INSERT OR IGNORE INTO run_evidence
-                 (run_id, kind, observed_at_ms, dedupe_key, data_json)
-             VALUES (?1, 'stage_verdict', ?2, ?3, ?4)",
-            params![run_id, now_ms, dedupe_key, data_json],
-        )?;
-        Ok(inserted == 1)
+        self.run_store()
+            .record_stage_verdict(run_id, stage, verdict, reason, now_ms)
+            .map_err(StoreError::from)
     }
 
     pub fn notes_for_project(&self, project_id: &str) -> Result<Vec<ProjectNote>, StoreError> {
@@ -1572,31 +1395,16 @@ impl Store {
 
     /// Evidence rows for one run in observation order, as (kind, data_json).
     pub fn run_evidence(&self, run_id: &str) -> Result<Vec<(String, String)>, StoreError> {
-        let connection = self.db.lock();
-        let mut statement = connection.prepare(
-            "SELECT kind, data_json FROM run_evidence WHERE run_id = ?1 ORDER BY sequence",
-        )?;
-        let rows = statement
-            .query_map(params![run_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        self.run_store()
+            .run_evidence(run_id)
+            .map_err(StoreError::from)
     }
 
     pub fn vendor_error_for_run(
         &self,
         run_id: &str,
     ) -> Result<Option<crate::vendor_error::VendorErrorMatch>, StoreError> {
-        let data: Option<String> = self
-            .db
-            .lock()
-            .query_row(
-                "SELECT data_json FROM run_evidence
-                 WHERE run_id = ?1 AND kind = 'vendor_error_classified'
-                 ORDER BY sequence DESC LIMIT 1",
-                params![run_id],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let data = self.run_store().vendor_error_for_run(run_id)?;
         Ok(data.and_then(|data| serde_json::from_str(&data).ok()))
     }
 
@@ -1780,12 +1588,7 @@ impl Store {
             "observed_default_tip": observed_default_tip,
         })
         .to_string();
-        transaction.execute(
-            "INSERT OR IGNORE INTO run_evidence
-                 (run_id, kind, observed_at_ms, dedupe_key, data_json)
-             VALUES (?1, 'external_merge_observed', ?2, 'external_merge:' || ?1, ?3)",
-            params![run_id, now_ms, data_json],
-        )?;
+        evidence::tx::record_external_merge(&transaction, run_id, &data_json, now_ms)?;
         runs::tx::record_event(
             &transaction,
             now_ms,
@@ -2057,21 +1860,8 @@ impl Store {
         target: &str,
         now_ms: i64,
     ) -> Result<Option<CooldownRecord>, StoreError> {
-        self.db
-            .lock()
-            .query_row(
-                "SELECT ?1, until_ms, reason FROM cooldowns
-                 WHERE key = 'agent_target:' || ?1 AND until_ms > ?2",
-                params![target, now_ms],
-                |row| {
-                    Ok(CooldownRecord {
-                        target: row.get(0)?,
-                        until_ms: row.get(1)?,
-                        reason: row.get(2)?,
-                    })
-                },
-            )
-            .optional()
+        self.run_store()
+            .active_cooldown_for_target(target, now_ms)
             .map_err(StoreError::from)
     }
 
@@ -2097,46 +1887,20 @@ impl Store {
         data_json: &str,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        self.db.lock().execute(
-            "INSERT INTO run_evidence
-                 (run_id, kind, observed_at_ms, dedupe_key, data_json)
-             VALUES (?1, 'repair_attempt', ?2,
-                     'repair:' || ?1 || ':' || ?3 || ':' || ?4, ?5)
-             ON CONFLICT(dedupe_key) DO UPDATE SET
-                 observed_at_ms = excluded.observed_at_ms,
-                 data_json = excluded.data_json",
-            params![run_id, now_ms, stage, attempt as i64, data_json],
-        )?;
-        Ok(())
+        self.run_store()
+            .record_repair_attempt(run_id, stage, attempt, data_json, now_ms)
+            .map_err(StoreError::from)
     }
 
     pub fn active_cooldowns(&self, now_ms: i64) -> Result<Vec<CooldownRecord>, StoreError> {
-        let connection = self.db.lock();
-        let mut statement = connection.prepare(
-            "SELECT SUBSTR(key, 14), until_ms, reason FROM cooldowns
-             WHERE key LIKE 'agent_target:%' AND until_ms > ?1
-             ORDER BY key",
-        )?;
-        statement
-            .query_map(params![now_ms], |row| {
-                Ok(CooldownRecord {
-                    target: row.get(0)?,
-                    until_ms: row.get(1)?,
-                    reason: row.get(2)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
+        self.run_store()
+            .active_cooldowns(now_ms)
             .map_err(StoreError::from)
     }
 
     pub fn next_active_cooldown(&self, now_ms: i64) -> Result<Option<i64>, StoreError> {
-        self.db
-            .lock()
-            .query_row(
-                "SELECT MIN(until_ms) FROM cooldowns WHERE until_ms > ?1",
-                params![now_ms],
-                |row| row.get(0),
-            )
+        self.run_store()
+            .next_active_cooldown(now_ms)
             .map_err(StoreError::from)
     }
 
@@ -2212,33 +1976,6 @@ impl Store {
 pub(crate) enum ExitClaim {
     Claimed,
     AlreadyClaimed { state: String },
-}
-
-fn upsert_cooldown(
-    transaction: &rusqlite::Transaction<'_>,
-    run_id: &str,
-    cooldown: &CooldownUpdate<'_>,
-    now_ms: i64,
-) -> Result<(), rusqlite::Error> {
-    transaction.execute(
-        "INSERT INTO cooldowns (key, until_ms, reason, source_run_id, updated_at_ms)
-         VALUES ('agent_target:' || ?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(key) DO UPDATE SET
-             until_ms = MAX(cooldowns.until_ms, excluded.until_ms),
-             reason = CASE WHEN excluded.until_ms >= cooldowns.until_ms
-                           THEN excluded.reason ELSE cooldowns.reason END,
-             source_run_id = CASE WHEN excluded.until_ms >= cooldowns.until_ms
-                                  THEN excluded.source_run_id ELSE cooldowns.source_run_id END,
-             updated_at_ms = excluded.updated_at_ms",
-        params![
-            cooldown.target,
-            cooldown.until_ms,
-            cooldown.reason,
-            run_id,
-            now_ms
-        ],
-    )?;
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -2369,12 +2106,8 @@ impl std::error::Error for StoreError {}
 mod tests {
     use tempfile::tempdir;
 
-    use super::{
-        ActivationKind, ClaimRequest, ExitClaim, NewActivation, ReindexTicket, RunState, Store,
-        StoreError,
-    };
+    use super::{ActivationKind, ClaimRequest, NewActivation, ReindexTicket, Store, StoreError};
     use crate::domain::ticket::TicketState;
-    use crate::outcome::Outcome;
 
     fn open_seeded(path: &std::path::Path) -> Store {
         let store = Store::open(path, 1_000).unwrap();
@@ -2705,199 +2438,6 @@ mod tests {
         assert_eq!(store.run("R1").unwrap().unwrap().state, "aborted");
         assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
         assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("ready"));
-    }
-
-    #[test]
-    fn agent_exit_and_aftercare_results_are_checkpointed_idempotently() {
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
-        store
-            .mark_run_running(
-                "R1",
-                "branch",
-                "/worktree",
-                123,
-                Some(456),
-                123,
-                "token",
-                "/runtime/R1.sock",
-                2_100,
-            )
-            .unwrap();
-
-        store
-            .record_agent_exit(
-                "R1",
-                Some(0),
-                true,
-                r#"{"count":1,"oids":["abc"]}"#,
-                None,
-                None,
-                2_200,
-            )
-            .unwrap();
-        store
-            .record_aftercare_evidence(
-                "R1",
-                "test_result",
-                r#"{"passed":true,"exit_code":0}"#,
-                2_300,
-            )
-            .unwrap();
-        store
-            .record_aftercare_evidence(
-                "R1",
-                "test_result",
-                r#"{"passed":true,"exit_code":0}"#,
-                2_400,
-            )
-            .unwrap();
-
-        let run = store.run("R1").unwrap().unwrap();
-        assert_eq!(run.state, "aftercare");
-        assert_eq!(run.exit_code, Some(0));
-        assert_eq!(
-            store.recoverable_runs().unwrap()[0].state,
-            RunState::Aftercare
-        );
-        let evidence = store.run_evidence("R1").unwrap();
-        assert_eq!(
-            evidence
-                .iter()
-                .filter(|(kind, _)| kind == "test_result")
-                .count(),
-            1
-        );
-    }
-
-    fn running_r1(store: &mut Store) {
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
-        store
-            .mark_run_running(
-                "R1",
-                "branch",
-                "/worktree",
-                123,
-                Some(456),
-                123,
-                "token",
-                "/runtime/R1.sock",
-                2_100,
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn agent_exit_checkpoint_is_an_exclusive_ownership_handoff() {
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        running_r1(&mut store);
-
-        let first = store
-            .record_agent_exit(
-                "R1",
-                Some(0),
-                true,
-                r#"{"oids":["abc"]}"#,
-                None,
-                None,
-                2_200,
-            )
-            .unwrap();
-        assert_eq!(first, ExitClaim::Claimed);
-        assert_eq!(store.run("R1").unwrap().unwrap().state, "aftercare");
-        let evidence = store.run_evidence("R1").unwrap();
-        assert!(evidence.iter().any(|(kind, _)| kind == "exit_classified"));
-        assert!(evidence.iter().any(|(kind, _)| kind == "commits_observed"));
-
-        let second = store
-            .record_agent_exit("R1", Some(1), false, r#"{"oids":[]}"#, None, None, 2_300)
-            .unwrap();
-        assert_eq!(
-            second,
-            ExitClaim::AlreadyClaimed {
-                state: "aftercare".into()
-            }
-        );
-        let run = store.run("R1").unwrap().unwrap();
-        assert_eq!(run.state, "aftercare");
-        assert_eq!(run.exit_code, Some(0));
-        assert_eq!(store.run_evidence("R1").unwrap(), evidence);
-    }
-
-    #[test]
-    fn agent_exit_checkpoint_reports_terminal_and_missing_runs() {
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        running_r1(&mut store);
-        store
-            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, 2_200)
-            .unwrap();
-
-        let claim = store
-            .record_agent_exit(
-                "R1",
-                Some(0),
-                true,
-                r#"{"count":0,"oids":[]}"#,
-                None,
-                None,
-                2_300,
-            )
-            .unwrap();
-        assert_eq!(
-            claim,
-            ExitClaim::AlreadyClaimed {
-                state: "merged".into()
-            }
-        );
-        assert_eq!(store.run("R1").unwrap().unwrap().state, "merged");
-
-        let missing = store.record_agent_exit(
-            "R9",
-            Some(0),
-            true,
-            r#"{"count":0,"oids":[]}"#,
-            None,
-            None,
-            2_300,
-        );
-        assert!(matches!(missing, Err(StoreError::RunNotFound { .. })));
-    }
-
-    #[test]
-    fn finish_run_settles_exactly_once() {
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        running_r1(&mut store);
-        store
-            .record_agent_exit(
-                "R1",
-                Some(0),
-                true,
-                r#"{"count":1,"oids":["abc"]}"#,
-                None,
-                None,
-                2_200,
-            )
-            .unwrap();
-
-        store
-            .finish_run("R1", "T1", Some(0), Outcome::Merged, &[], None, 2_300)
-            .unwrap();
-        assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("merged"));
-        assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
-        let evidence = store.run_evidence("R1").unwrap();
-
-        store
-            .finish_run("R1", "T1", Some(1), Outcome::Failed, &[], None, 2_400)
-            .unwrap();
-        let run = store.run("R1").unwrap().unwrap();
-        assert_eq!(run.state, "merged");
-        assert_eq!(run.exit_code, Some(0));
-        assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("merged"));
-        assert_eq!(store.run_evidence("R1").unwrap(), evidence);
     }
 
     #[test]
@@ -3298,78 +2838,6 @@ mod tests {
     }
 
     #[test]
-    fn finishing_a_run_settles_ticket_lease_and_evidence_atomically() {
-        use crate::outcome::Outcome;
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
-        store
-            .record_aftercare_stage(
-                "R1",
-                &super::StageRecord {
-                    stage_index: 0,
-                    stage: "test".into(),
-                    state: "passed".into(),
-                    started_at_ms: 2_500,
-                    finished_at_ms: 2_900,
-                    exit_code: Some(0),
-                    output_ref: "runs/R1/output.ndjson".into(),
-                    verdict_source: "exit_code".into(),
-                    reason: None,
-                },
-            )
-            .unwrap();
-
-        store
-            .finish_run(
-                "R1",
-                "T1",
-                Some(0),
-                Outcome::Merged,
-                &[super::EvidenceRecord {
-                    kind: "commits_observed",
-                    data_json: "{\"oids\":[\"abc\",\"def\"]}".into(),
-                }],
-                None,
-                3_000,
-            )
-            .unwrap();
-
-        assert_eq!(store.ticket_state("T1").unwrap().unwrap(), "merged");
-        let run = store.run("R1").unwrap().unwrap();
-        assert_eq!(run.state, "merged");
-        assert_eq!(run.exit_code, Some(0));
-        assert_eq!(run.exited_at_ms, Some(3_000));
-        let evidence = store.run_evidence("R1").unwrap();
-        assert_eq!(evidence[0].0, "commits_observed");
-        assert_eq!(store.aftercare_stages("R1").unwrap()[0].stage, "test");
-        // The lease is gone: the same run cannot renew it.
-        assert!(store.renew_lease("T1", "R1", 60_000, 3_100).is_err());
-    }
-
-    #[test]
-    fn finishing_a_run_is_idempotent() {
-        use crate::outcome::Outcome;
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
-        let evidence = [super::EvidenceRecord {
-            kind: "exit_classified",
-            data_json: "{\"exit_code\":1}".into(),
-        }];
-
-        store
-            .finish_run("R1", "T1", Some(1), Outcome::Failed, &evidence, None, 3_000)
-            .unwrap();
-        store
-            .finish_run("R1", "T1", Some(1), Outcome::Failed, &evidence, None, 3_100)
-            .unwrap();
-
-        assert_eq!(store.run_evidence("R1").unwrap().len(), 1);
-        assert_eq!(store.run("R1").unwrap().unwrap().exited_at_ms, Some(3_000));
-    }
-
-    #[test]
     fn orphaning_a_run_releases_the_ticket_without_failing_it() {
         use crate::outcome::Outcome;
         let directory = tempdir().unwrap();
@@ -3382,33 +2850,5 @@ mod tests {
 
         assert_eq!(store.run("R1").unwrap().unwrap().state, "orphaned");
         assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("ready"));
-    }
-
-    #[test]
-    fn a_cancelled_outcome_returns_the_ticket_to_ready() {
-        use crate::outcome::Outcome;
-        let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        store.claim_ticket(&claim_t1("R1"), 2_000).unwrap();
-
-        assert!(!store.cancellation_requested("R1").unwrap());
-        store.record_cancel_requested("R1", 2_500).unwrap();
-        store.record_cancel_requested("R1", 2_600).unwrap();
-        assert!(store.cancellation_requested("R1").unwrap());
-
-        store
-            .finish_run("R1", "T1", None, Outcome::Cancelled, &[], None, 3_000)
-            .unwrap();
-        assert_eq!(store.ticket_state("T1").unwrap().unwrap(), "ready");
-        assert_eq!(store.ticket_counts().unwrap().ready, 1);
-
-        // Intent stayed deduplicated to one evidence row.
-        let cancels = store
-            .run_evidence("R1")
-            .unwrap()
-            .into_iter()
-            .filter(|(kind, _)| kind == "cancel_requested")
-            .count();
-        assert_eq!(cancels, 1);
     }
 }

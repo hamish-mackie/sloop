@@ -1,12 +1,16 @@
 //! Concrete SQLite storage for run supervision state.
 //!
 //! `runs` owns run lifecycle records and their attached notes and activity
-//! events. Later carve-outs add `evidence` for verdict and aftercare facts and
-//! `limits` for cooldown and budget state. Scheduler state and shared ID
-//! counters stay on [`RunStore`] because they apply across those families.
+//! events, `evidence` owns verdict and aftercare facts, and `limits` owns
+//! cooldown and budget state. Scheduler state and shared ID counters stay on
+//! [`RunStore`] because they apply across those families.
 
+pub(crate) mod evidence;
+pub(crate) mod limits;
 pub(crate) mod runs;
 
+pub use evidence::{EvidenceRecord, StageRecord};
+pub use limits::{CooldownRecord, CooldownUpdate};
 pub use runs::{ActiveRun, EventRecord, ProjectNote, RunRecord, RunState, RunTimeline};
 pub(crate) use runs::{NeedsReviewBranch, RecoverableRun, WorktreeCleanupCandidate};
 
