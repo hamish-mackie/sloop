@@ -4,6 +4,7 @@ worktree_retention: 7d
 
 scheduler:
   stall_report_after: 10m
+  stall_after: 2h
 
 agent:
   default_target: claude

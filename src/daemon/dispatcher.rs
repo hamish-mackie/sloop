@@ -75,6 +75,7 @@ pub(super) struct DispatcherState {
     pub(super) restart_signalled: bool,
     pub(super) max_agents: usize,
     pub(super) stall_report_after_ms: i64,
+    pub(super) stall_after_ms: i64,
     pub(super) ticket_prefix: String,
     pub(super) project_prefix: String,
     pub(super) running_hours: Option<RunningHours>,
@@ -117,6 +118,8 @@ pub(super) struct DispatcherState {
     /// Run IDs whose cancellation was requested but whose exit has not been
     /// resolved yet; mirrors the durable `cancel_requested` evidence.
     pub(super) cancelling: HashSet<String>,
+    /// Run IDs with durable output-stall intent awaiting final settlement.
+    pub(super) stalling: HashSet<String>,
     /// Tokens issued to live runs; a worker request must present its run's
     /// token exactly. Entries die with the run.
     pub(super) worker_tokens: HashMap<String, String>,
@@ -279,6 +282,7 @@ pub(super) async fn settle_pending_exits(state: &mut DispatcherState, log: &Oper
         match try_settle_run_exit(state, &event, log).await {
             Ok((ticket_id, outcome, applied)) => {
                 state.cancelling.remove(&run_id);
+                state.stalling.remove(&run_id);
                 state.active.remove(&run_id);
                 state.supervised.remove(&run_id);
                 state.suspected_dead.remove(&run_id);
@@ -365,8 +369,10 @@ async fn try_settle_run_exit(
 
     let cancelled =
         state.cancelling.contains(run_id) || state.store.cancellation_requested(run_id)?;
+    let stalled = state.stalling.contains(run_id) || state.store.output_stall(run_id)?.is_some();
     let evidence = RunEvidence {
         cancelled,
+        stalled,
         exit: classify_exit(*exit_code),
         vendor_error: vendor_error.as_ref().map(|error| error.class),
         commit_count: commit_observation_complete.then_some(commits.len()),
@@ -375,6 +381,7 @@ async fn try_settle_run_exit(
     };
     let outcome = if *recovery == Some(RecoveryClassification::Orphaned)
         && !cancelled
+        && !stalled
         && vendor_error.is_none()
     {
         crate::outcome::Outcome::Orphaned
@@ -425,7 +432,7 @@ async fn try_settle_run_exit(
     }
     let cooldown = vendor_error
         .as_ref()
-        .filter(|error| error.class.requires_cooldown() && !cancelled)
+        .filter(|error| error.class.requires_cooldown() && !cancelled && !stalled)
         .and_then(|error| cooldown_until_ms.map(|until_ms| (error, until_ms)))
         .map(|(error, until_ms)| CooldownUpdate {
             target,

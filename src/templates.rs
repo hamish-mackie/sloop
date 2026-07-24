@@ -194,6 +194,7 @@ mod tests {
         assert_eq!(config.worktree_retention_ms, Some(7 * 24 * 60 * 60 * 1000));
         assert_eq!(config.max_parallel_tasks, 1);
         assert_eq!(config.stall_report_after_ms, 10 * 60 * 1000);
+        assert_eq!(config.stall_after_ms, 2 * 60 * 60 * 1000);
         assert_eq!(config.ticket_prefix, "TICK");
     }
 

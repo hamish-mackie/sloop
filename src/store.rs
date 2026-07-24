@@ -489,6 +489,26 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    pub(crate) fn record_output_stall(
+        &self,
+        run_id: &str,
+        evidence: &crate::run_store::OutputStallEvidence,
+        now_ms: i64,
+    ) -> Result<bool, StoreError> {
+        self.run_store()
+            .record_output_stall(run_id, evidence, now_ms)
+            .map_err(StoreError::from)
+    }
+
+    pub(crate) fn output_stall(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::run_store::OutputStallEvidence>, StoreError> {
+        self.run_store()
+            .output_stall(run_id)
+            .map_err(StoreError::from)
+    }
+
     /// Appends a worker's advisory note. The agent's only write: it records
     /// text against the run and moves nothing.
     pub fn insert_note(

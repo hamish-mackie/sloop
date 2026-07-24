@@ -332,6 +332,7 @@ async fn serve(
         restart_signalled: false,
         max_agents: config.max_parallel_tasks,
         stall_report_after_ms: config.stall_report_after_ms,
+        stall_after_ms: config.stall_after_ms,
         ticket_prefix: config.ticket_prefix.clone(),
         project_prefix: config.project_prefix.clone(),
         running_hours: config.running_hours.clone(),
@@ -361,6 +362,7 @@ async fn serve(
         suspected_dead: HashSet::new(),
         recovering: HashSet::new(),
         cancelling: HashSet::new(),
+        stalling: HashSet::new(),
         worker_tokens: HashMap::new(),
         worker_listeners: HashMap::new(),
         worker_socket_paths: HashMap::new(),
@@ -375,8 +377,8 @@ async fn serve(
         shutdown: shutdown_tx.clone(),
         shutdown_flag: shutdown_flag.clone(),
     };
-    recover_inflight_runs(&mut state, &events_tx, &log).await?;
     restore_reported_output_stalls(&mut state);
+    recover_inflight_runs(&mut state, &events_tx, &log).await?;
     let dispatcher_task = tokio::spawn(run_dispatcher(
         state,
         dispatcher_rx,

@@ -14,7 +14,8 @@ use crate::coordination::{Coordination, Exit, ExitDenial, Renewal, RenewalDenial
 use crate::domain::work::Disposition;
 use crate::flow::Flow;
 use crate::logging::{LogLevel, OperationalLog};
-use crate::run_log::OutputStream;
+use crate::run_log::{OutputStream, output_staleness};
+use crate::run_store::OutputStallEvidence;
 use crate::runner::WorkerCredentials;
 use crate::runner::local::{
     process_start_time, run_output_path, wait_for_test_hook, worker_socket_path,
@@ -50,22 +51,113 @@ pub(super) async fn recover_inflight_runs(
         // Every durable lease consumes capacity until adoption or settlement
         // succeeds; a transient database error must never permit double-spawn.
         state.active.insert(run.id.clone());
-        match recoverable_process_identity(&run) {
+        let process_identity = recoverable_process_identity(&run);
+        let cancellation_requested = state
+            .store
+            .cancellation_requested(&run.id)
+            .map_err(DaemonError::Store)?;
+        if cancellation_requested {
+            state.cancelling.insert(run.id.clone());
+        }
+        let mut stall = state
+            .store
+            .output_stall(&run.id)
+            .map_err(DaemonError::Store)?;
+        if run.state == RunState::Running && !cancellation_requested && stall.is_none() {
+            let started_at_ms = state
+                .store
+                .run_timelines(&[run.id.as_str()])
+                .map_err(DaemonError::Store)?
+                .remove(&run.id)
+                .and_then(|timeline| timeline.started_at_ms);
+            if let Some(started_at_ms) = started_at_ms
+                && let Ok(staleness) = output_staleness(
+                    &run_output_path(&state.state_dir, &run.id),
+                    started_at_ms,
+                    state.clock.now_ms(),
+                    state.stall_after_ms,
+                )
+                && staleness.stalled
+            {
+                let evidence = OutputStallEvidence {
+                    stage: agent_stage(&run),
+                    last_output_at_ms: staleness.last_output_at_ms,
+                    threshold_ms: state.stall_after_ms,
+                    last_output_sequence: staleness.last_sequence,
+                };
+                state
+                    .store
+                    .record_output_stall(&run.id, &evidence, state.clock.now_ms())
+                    .map_err(DaemonError::Store)?;
+                stall = state
+                    .store
+                    .output_stall(&run.id)
+                    .map_err(DaemonError::Store)?;
+            }
+        }
+        if let Some(stall) =
+            stall.filter(|_| !cancellation_requested && run.state == RunState::Running)
+        {
+            if state.reported_stalls.get(&run.id) != Some(&stall.last_output_sequence) {
+                log.emit_with_fields(
+                    LogLevel::Warn,
+                    "sloop::dispatcher",
+                    "run_output_stalled",
+                    json!({
+                        "run_id": run.id,
+                        "ticket_id": run.ticket_id,
+                        "stage": stall.stage,
+                        "silent_for_ms": state.clock.now_ms().saturating_sub(stall.last_output_at_ms),
+                        "last_output_sequence": stall.last_output_sequence,
+                    }),
+                );
+                state
+                    .reported_stalls
+                    .insert(run.id.clone(), stall.last_output_sequence);
+            }
+            state.stalling.insert(run.id.clone());
+            match process_identity {
+                ProcessIdentity::Matches | ProcessIdentity::Unverifiable => {
+                    state.supervised.insert(run.id.clone());
+                    if let Err(error) =
+                        stop_agent_process_group(run.pid, run.pid_start_time, run.process_group_id)
+                    {
+                        log.emit_with_fields(
+                            LogLevel::Error,
+                            "sloop::recovery",
+                            "output_stall_signal_refused",
+                            json!({"run_id": run.id, "error": error}),
+                        );
+                    }
+                    monitor_recovered_run(state, events.clone(), run.clone());
+                }
+                ProcessIdentity::GoneOrReused => {
+                    state.recovering.insert(run.id.clone());
+                    spawn_dead_run_recovery(state, events.clone(), run.clone(), log.clone());
+                }
+            }
+            log.emit_with_fields(
+                LogLevel::Warn,
+                "sloop::recovery",
+                "stalled_run_recovered",
+                json!({"run_id": run.id, "ticket_id": run.ticket_id}),
+            );
+            continue;
+        }
+        match process_identity {
             ProcessIdentity::Matches | ProcessIdentity::Unverifiable => {
                 state.supervised.insert(run.id.clone());
                 rearm_adopted_lease(state, &run, log);
-                let cancellation_requested = state
-                    .store
-                    .cancellation_requested(&run.id)
-                    .map_err(DaemonError::Store)?;
                 if cancellation_requested {
-                    state.cancelling.insert(run.id.clone());
-                    if recoverable_process_matches(&run)
-                        && let Some(group) = run.process_group_id
+                    if let Err(error) =
+                        stop_agent_process_group(run.pid, run.pid_start_time, run.process_group_id)
                     {
-                        unsafe {
-                            libc::kill(-(group as libc::pid_t), libc::SIGKILL);
-                        }
+                        log.emit_with_fields(
+                            LogLevel::Error,
+                            "sloop::recovery",
+                            "agent_cancel_signal_refused",
+                            json!({"run_id": run.id, "error": error}),
+                        );
                     }
                 }
                 if let Err(error) = restore_worker_socket(state, &run) {
@@ -103,6 +195,18 @@ pub(super) async fn recover_inflight_runs(
         }
     }
     Ok(())
+}
+
+fn agent_stage(run: &RecoverableRun) -> String {
+    run.flow_json
+        .as_deref()
+        .and_then(|snapshot| serde_json::from_str::<Flow>(snapshot).ok())
+        .and_then(|flow| {
+            flow.stages
+                .into_iter()
+                .find(|stage| matches!(stage.kind, crate::flow::StageKind::Agent))
+        })
+        .map_or_else(|| "agent".to_owned(), |stage| stage.name)
 }
 
 async fn release_interrupted_claims(
@@ -625,6 +729,7 @@ pub(super) fn aftercare_process_identity(
     }))
 }
 
+#[cfg(test)]
 pub(super) fn recoverable_process_matches(run: &RecoverableRun) -> bool {
     recoverable_process_identity(run) == ProcessIdentity::Matches
 }
@@ -913,14 +1018,14 @@ pub(super) fn stop_persisted_process_group(
         || identity.group != i64::from(identity.pid)
         || libc::pid_t::try_from(identity.group).is_err()
     {
-        return Err("the persisted aftercare process group is not its recorded leader".into());
+        return Err("the persisted process group is not its recorded leader".into());
     }
     match persisted_process_state(identity) {
         PersistedProcessState::ReusedLeader => {
-            return Err("the aftercare process group ID was reused; refusing to signal it".into());
+            return Err("the process group ID was reused; refusing to signal it".into());
         }
         PersistedProcessState::UnverifiableLeader => {
-            return Err("cannot verify the persisted aftercare process leader".into());
+            return Err("cannot verify the persisted process leader".into());
         }
         // The group may still exist, but without the recorded leader its
         // identity is unverifiable and signaling it is unsafe.
@@ -933,11 +1038,28 @@ pub(super) fn stop_persisted_process_group(
     let deadline = Instant::now() + Duration::from_secs(5);
     while process_group_alive(identity.group) {
         if Instant::now() >= deadline {
-            return Err("the interrupted aftercare process group did not exit".into());
+            return Err("the persisted process group did not exit".into());
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     Ok(PersistedProcessStop::StoppedOriginal)
+}
+
+pub(super) fn stop_agent_process_group(
+    pid: Option<i64>,
+    start_time: Option<i64>,
+    group: Option<i64>,
+) -> Result<PersistedProcessStop, String> {
+    let identity = AftercareProcessIdentity {
+        pid: pid
+            .and_then(|pid| u32::try_from(pid).ok())
+            .ok_or_else(|| "the persisted agent PID is invalid".to_owned())?,
+        start_time: start_time
+            .ok_or_else(|| "the persisted agent start time is missing".to_owned())?,
+        group: group.ok_or_else(|| "the persisted agent process group is missing".to_owned())?,
+        merge: None,
+    };
+    stop_persisted_process_group(&identity)
 }
 
 fn process_exists(pid: u32) -> bool {

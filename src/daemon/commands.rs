@@ -12,7 +12,7 @@ use crate::domain::ticket::TicketState;
 use crate::frontmatter;
 use crate::logging::LogLevel;
 use crate::protocol::{ErrorBody, ListArgs, ShowArgs};
-use crate::runner::local::{process_identity_matches, run_output_path};
+use crate::runner::local::run_output_path;
 use crate::store::{ActivationKind, NewActivation, Store, StoreError};
 
 use super::dispatcher::{
@@ -20,7 +20,8 @@ use super::dispatcher::{
     mark_storage_full, not_found,
 };
 use super::recovery::{
-    PersistedProcessStop, aftercare_process_identity, stop_persisted_process_group,
+    PersistedProcessStop, aftercare_process_identity, stop_agent_process_group,
+    stop_persisted_process_group,
 };
 use super::scheduler::{index_projects, next_dispatch_deadline, running_hours_open};
 use super::worker_api::{current_ticket_vendor_error, ticket_show};
@@ -180,10 +181,14 @@ fn run_detail(
     // A classified vendor rejection is the more specific account of the same
     // ending, so it still wins the `reason` line; otherwise the reason is
     // derived from the stage evidence rather than left empty.
-    let reason = vendor_error
-        .as_ref()
-        .map(|error| error.diagnostic.clone())
-        .or_else(|| history.derived_reason());
+    let reason = if history.stalled() {
+        history.derived_reason()
+    } else {
+        vendor_error
+            .as_ref()
+            .map(|error| error.diagnostic.clone())
+            .or_else(|| history.derived_reason())
+    };
     let mut detail = json!({
         "ref": reference,
         "kind": "run",
@@ -1021,17 +1026,15 @@ pub(super) fn handle_cancel(
             }
         }
     } else {
-        let process_matches = run
-            .pid
-            .and_then(|pid| u32::try_from(pid).ok())
-            .is_some_and(|pid| process_identity_matches(pid, run.pid_start_time));
-        if process_matches && let Some(group) = run.process_group_id {
-            // A negative PID signals the whole group, so grandchildren die too.
-            // ESRCH means the group already exited; the race resolves through
-            // the recorded intent.
-            unsafe {
-                libc::kill(-(group as libc::pid_t), libc::SIGKILL);
-            }
+        if let Err(error) =
+            stop_agent_process_group(run.pid, run.pid_start_time, run.process_group_id)
+        {
+            state.log.emit_with_fields(
+                LogLevel::Error,
+                "sloop::supervisor",
+                "agent_cancel_signal_refused",
+                json!({"run_id": run.id, "error": error}),
+            );
         }
     }
 

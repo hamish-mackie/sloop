@@ -617,6 +617,16 @@ fn duration(milliseconds: i64) -> String {
     }
 }
 
+fn run_state(value: &Value) -> String {
+    let state = value["state"].as_str().unwrap_or("?");
+    if state == "failed"
+        && let Some(threshold_ms) = value["stall"]["threshold_ms"].as_i64()
+    {
+        return format!("failed (stalled: no output for {})", duration(threshold_ms));
+    }
+    state.to_owned()
+}
+
 /// The run's stage table: how far the flow got, and on what evidence. This is
 /// the view that answers "how did this run fail" without opening the database.
 fn run_stages(stages: &Value) -> String {
@@ -674,7 +684,7 @@ fn render_run_show(data: &Value) -> String {
         text,
         "{}  ({})",
         value["alias"].as_str().unwrap_or("?"),
-        value["state"].as_str().unwrap_or("?"),
+        run_state(value),
     );
     let ticket = value["ticket"].as_str().unwrap_or("?");
     match value["ticket_name"].as_str() {

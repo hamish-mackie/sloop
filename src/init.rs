@@ -217,6 +217,7 @@ mod tests {
         assert!(config.contains("effort: high"));
         assert!(config.contains("worktree_retention: 7d"));
         assert!(config.contains("stall_report_after: 10m"));
+        assert!(config.contains("stall_after: 2h"));
         assert!(config.contains("- claude"));
         assert!(config.contains("- opencode"));
         assert!(config.contains("- codex"));
