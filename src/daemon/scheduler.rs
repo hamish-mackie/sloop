@@ -16,6 +16,7 @@ use crate::flow::Flow;
 use crate::frontmatter::Frontmatter;
 use crate::ids::next_id;
 use crate::logging::{LogLevel, OperationalLog};
+use crate::run_log::output_staleness;
 use crate::run_store::RunAdmission;
 use crate::runner::local::{
     compose_worker_prompt, launch_agent, run_output_path, wait_for_test_hook, worker_socket_path,
@@ -436,6 +437,7 @@ pub(super) async fn reconcile(
         return;
     }
     settle_pending_exits(state, log).await;
+    reconcile_output_stalls(state, log);
     // Settling externally merged review branches is independent of the dispatch
     // gates below: it releases blocked dependents even while paused, at
     // capacity, or outside running hours.
@@ -651,8 +653,14 @@ pub(super) async fn reconcile(
                 let branch = order.branch.clone();
                 let output_path = order.output_path.clone();
                 let hooks = StoreStageHooks::new(&state.store, log);
-                launch_agent(order, &hooks, state.clock.as_ref())
-                    .map(|launched| (launched, target, worktree, branch, output_path))
+                let notify = state.output_notify.clone();
+                launch_agent(
+                    order,
+                    &hooks,
+                    state.clock.clone(),
+                    std::sync::Arc::new(move || notify.notify_one()),
+                )
+                .map(|launched| (launched, target, worktree, branch, output_path))
             },
         );
         match launch {
@@ -1175,10 +1183,136 @@ pub(super) fn next_dispatch_deadline(state: &DispatcherState) -> Option<i64> {
             .ok()
             .flatten()
     });
-    [hours_deadline, cooldown_deadline, cleanup_deadline]
+    let stall_deadline = next_output_stall_deadline(state);
+    [
+        hours_deadline,
+        cooldown_deadline,
+        cleanup_deadline,
+        stall_deadline,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
+fn supervised_running_runs(
+    state: &DispatcherState,
+) -> impl Iterator<Item = crate::run_store::RunRecord> + '_ {
+    state
+        .store
+        .recoverable_runs()
+        .unwrap_or_default()
         .into_iter()
-        .flatten()
+        .filter(|run| run.state == RunState::Running)
+        .filter(|run| state.supervised.contains(&run.id))
+        .filter(|run| !state.cancelling.contains(&run.id))
+        .filter(|run| !state.suspected_dead.contains(&run.id))
+        .filter(|run| !state.recovering.contains(&run.id))
+        .filter(|run| !state.pending_exits.contains_key(&run.id))
+        .filter_map(|run| state.store.run(&run.id).ok().flatten())
+}
+
+pub(super) fn running_output_staleness(
+    state: &DispatcherState,
+    run: &crate::run_store::RunRecord,
+    now_ms: i64,
+) -> Option<crate::run_log::OutputStaleness> {
+    let started_at_ms = state
+        .store
+        .run_timelines(&[run.id.as_str()])
+        .ok()?
+        .remove(&run.id)?
+        .started_at_ms?;
+    output_staleness(
+        &run_output_path(&state.state_dir, &run.id),
+        started_at_ms,
+        now_ms,
+        state.stall_report_after_ms,
+    )
+    .ok()
+}
+
+fn next_output_stall_deadline(state: &DispatcherState) -> Option<i64> {
+    let now_ms = state.clock.now_ms();
+    supervised_running_runs(state)
+        .filter_map(|run| running_output_staleness(state, &run, now_ms))
+        .filter(|staleness| !staleness.stalled)
+        .map(|staleness| staleness.deadline_ms)
         .min()
+}
+
+fn reconcile_output_stalls(state: &mut DispatcherState, log: &OperationalLog) {
+    let now_ms = state.clock.now_ms();
+    let running = supervised_running_runs(state).collect::<Vec<_>>();
+    for run in running {
+        let Some(staleness) = running_output_staleness(state, &run, now_ms) else {
+            continue;
+        };
+        if !staleness.stalled
+            || state.reported_stalls.get(&run.id) == Some(&staleness.last_sequence)
+        {
+            continue;
+        }
+        let stage = run
+            .flow_json
+            .as_deref()
+            .and_then(|snapshot| serde_json::from_str::<Flow>(snapshot).ok())
+            .and_then(|flow| {
+                flow.stages
+                    .into_iter()
+                    .find(|stage| matches!(stage.kind, crate::flow::StageKind::Agent))
+            })
+            .map_or_else(|| "agent".to_owned(), |stage| stage.name);
+        log.emit_with_fields(
+            LogLevel::Warn,
+            "sloop::dispatcher",
+            "run_output_stalled",
+            json!({
+                "run_id": run.id,
+                "ticket_id": run.ticket_id,
+                "stage": stage,
+                "silent_for_ms": staleness.silent_for_ms,
+                "last_output_sequence": staleness.last_sequence,
+            }),
+        );
+        state
+            .reported_stalls
+            .insert(run.id, staleness.last_sequence);
+    }
+}
+
+/// Restores warning episode markers from the append-only operational log.
+/// This keeps a daemon restart from warning twice for unchanged output while
+/// requiring no runtime schema change.
+pub(super) fn restore_reported_output_stalls(state: &mut DispatcherState) {
+    let contents = match fs::read_to_string(&state.daemon_log) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(_) => return,
+    };
+    for line in contents.lines() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if record["event"] != "run_output_stalled" {
+            continue;
+        }
+        let Some(fields) = record["fields"].as_object() else {
+            continue;
+        };
+        let (Some(run_id), Some(sequence)) = (
+            fields.get("run_id").and_then(serde_json::Value::as_str),
+            fields.get("last_output_sequence"),
+        ) else {
+            continue;
+        };
+        if !state.active.contains(run_id) {
+            continue;
+        }
+        state
+            .reported_stalls
+            .insert(run_id.to_owned(), sequence.as_u64());
+    }
 }
 
 fn eligible_ticket(store: &Store, activation: &QueuedActivation, now_ms: i64) -> Option<String> {

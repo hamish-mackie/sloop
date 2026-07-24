@@ -17,6 +17,7 @@ pub const DEFAULT_WORKTREE_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 pub const DEFAULT_WORKTREE_DIR: &str = ".worktrees";
 pub const DEFAULT_PROJECT_DIR: &str = ".agents/sloop/projects";
 pub const DEFAULT_TICKET_DIR: &str = ".agents/sloop/tickets";
+pub const DEFAULT_STALL_REPORT_AFTER_MS: i64 = 10 * 60 * 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repository {
@@ -68,6 +69,7 @@ pub struct Config {
     pub ticket_dir: PathBuf,
     pub ticket_source: TicketSourceConfig,
     pub max_parallel_tasks: usize,
+    pub stall_report_after_ms: i64,
     pub running_hours: Option<RunningHours>,
     /// Repository-scoped exec-shaped agent adapters. Absent means the
     /// repository has not configured an agent yet; queued work stays queued.
@@ -247,6 +249,18 @@ impl Config {
             });
         }
 
+        let stall_report_after_ms = repository_scheduler
+            .and_then(|scheduler| scheduler.stall_report_after.as_deref())
+            .or_else(|| defaults.and_then(|scheduler| scheduler.stall_report_after.as_deref()))
+            .map(|value| {
+                parse_duration_ms(value).map_err(|message| ConfigError::Invalid {
+                    path: repository.config_path.clone(),
+                    message: format!("scheduler.stall_report_after: {message}"),
+                })
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_STALL_REPORT_AFTER_MS);
+
         let running_hours = repository_scheduler
             .and_then(|scheduler| scheduler.running_hours.clone())
             .or_else(|| defaults.and_then(|scheduler| scheduler.running_hours.clone()))
@@ -341,6 +355,7 @@ impl Config {
             ticket_dir,
             ticket_source,
             max_parallel_tasks,
+            stall_report_after_ms,
             running_hours,
             agent,
             flows,
@@ -734,6 +749,7 @@ struct RawAgentTarget {
 #[derive(Debug, Deserialize)]
 struct RawScheduler {
     max_parallel_tasks: Option<usize>,
+    stall_report_after: Option<String>,
     running_hours: Option<RawRunningHours>,
 }
 
@@ -839,6 +855,7 @@ mod tests {
                 "version: 1\n",
                 "scheduler:\n",
                 "  max_parallel_tasks: 3\n",
+                "  stall_report_after: 7m\n",
                 "  running_hours:\n",
                 "    start: '22:00'\n",
                 "    end: '06:00'\n"
@@ -849,7 +866,32 @@ mod tests {
         let repository = Repository::discover(root.path()).unwrap();
         let config = Config::load(&repository).unwrap();
         assert_eq!(config.max_parallel_tasks, 3);
+        assert_eq!(config.stall_report_after_ms, 7 * 60 * 1000);
         assert_eq!(config.running_hours.unwrap().start, "22:00");
+    }
+
+    #[test]
+    fn stall_report_after_defaults_and_rejects_non_positive_durations() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".agents/sloop")).unwrap();
+        let path = root.path().join(".agents/sloop/config.yaml");
+        fs::write(&path, "version: 1\n").unwrap();
+        let repository = Repository::discover(root.path()).unwrap();
+        assert_eq!(
+            Config::load(&repository).unwrap().stall_report_after_ms,
+            10 * 60 * 1000
+        );
+
+        for duration in ["0m", "-1m"] {
+            fs::write(
+                &path,
+                format!("version: 1\nscheduler:\n  stall_report_after: {duration}\n"),
+            )
+            .unwrap();
+            let error = Config::load(&repository).unwrap_err().to_string();
+            assert!(error.contains("scheduler.stall_report_after"), "{error}");
+            assert!(error.contains("positive duration"), "{error}");
+        }
     }
 
     #[test]

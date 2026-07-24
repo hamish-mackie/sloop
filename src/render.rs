@@ -550,6 +550,13 @@ fn stage_strip(stages: &Value) -> String {
         .unwrap_or_default()
         .iter()
         .map(|stage| {
+            if let Some(silent_for_ms) = stage["silent_for_ms"].as_i64() {
+                return format!(
+                    "{}:running (no output {})",
+                    stage["stage"].as_str().unwrap_or("?"),
+                    duration(silent_for_ms),
+                );
+            }
             format!(
                 "{}:{}",
                 stage["stage"].as_str().unwrap_or("?"),
@@ -647,6 +654,9 @@ fn run_stages(stages: &Value) -> String {
         }
         if let Some(source) = stage["verdict_source"].as_str() {
             let _ = write!(line, "  verdict from {source}");
+        }
+        if let Some(silent_for_ms) = stage["silent_for_ms"].as_i64() {
+            let _ = write!(line, "  (no output {})", duration(silent_for_ms));
         }
         let _ = writeln!(text, "{}", line.trim_end());
     }

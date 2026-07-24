@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -13,6 +13,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+
+use crate::clock::format_timestamp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,9 +113,29 @@ impl RunLogWriter {
         stream: OutputStream,
         bytes: &[u8],
     ) -> io::Result<u64> {
-        let timestamp = OffsetDateTime::now_utc()
-            .format(&Rfc3339)
-            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into());
+        let timestamp_ms = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+        self.append_at(
+            i64::try_from(timestamp_ms).unwrap_or(0),
+            source,
+            stage,
+            stream,
+            bytes,
+        )
+    }
+
+    /// Appends a chunk with a caller-supplied clock instant. Agent output uses
+    /// the daemon clock so scheduler deadlines and persisted output agree in
+    /// tests as well as production.
+    pub fn append_at(
+        &self,
+        timestamp_ms: i64,
+        source: OutputSource,
+        stage: Option<&str>,
+        stream: OutputStream,
+        bytes: &[u8],
+    ) -> io::Result<u64> {
+        let timestamp =
+            format_timestamp(timestamp_ms).unwrap_or_else(|| "1970-01-01T00:00:00Z".into());
         let mut inner = self
             .inner
             .lock()
@@ -144,10 +166,91 @@ impl RunLogWriter {
     }
 }
 
+/// The reusable output-silence signal for one running agent stage. The file is
+/// authoritative: reopening after daemon restart reconstructs both the last
+/// append instant and the silence episode from its final complete agent record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputStaleness {
+    pub last_sequence: Option<u64>,
+    pub last_output_at_ms: i64,
+    pub silent_for_ms: i64,
+    pub deadline_ms: i64,
+    pub stalled: bool,
+}
+
+/// Measures agent-output silence from the last complete record, falling back
+/// to the durable stage start when the agent has not written anything yet.
+pub fn output_staleness(
+    path: &Path,
+    started_at_ms: i64,
+    now_ms: i64,
+    report_after_ms: i64,
+) -> io::Result<OutputStaleness> {
+    let last = last_agent_output(path)?;
+    let (last_sequence, last_output_at_ms) = last
+        .map(|(sequence, at_ms)| (Some(sequence), at_ms))
+        .unwrap_or((None, started_at_ms));
+    let silent_for_ms = now_ms.saturating_sub(last_output_at_ms).max(0);
+    let deadline_ms = last_output_at_ms.saturating_add(report_after_ms);
+    Ok(OutputStaleness {
+        last_sequence,
+        last_output_at_ms,
+        silent_for_ms,
+        deadline_ms,
+        stalled: now_ms >= deadline_ms,
+    })
+}
+
+/// Reads backward so frequent scheduler recomputations cost at most the final
+/// record in the common case rather than repeatedly scanning a large run log.
+fn last_agent_output(path: &Path) -> io::Result<Option<(u64, i64)>> {
+    const BLOCK: usize = 8 * 1024;
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut position = file.metadata()?.len();
+    let mut suffix = Vec::new();
+    while position > 0 {
+        let start = position.saturating_sub(BLOCK as u64);
+        let mut block = vec![0; usize::try_from(position - start).unwrap_or(BLOCK)];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut block)?;
+        block.extend_from_slice(&suffix);
+
+        let mut end = block.len();
+        while let Some(newline) = block[..end].iter().rposition(|byte| *byte == b'\n') {
+            if let Some(last) = agent_output_record(&block[newline + 1..end]) {
+                return Ok(Some(last));
+            }
+            end = newline;
+        }
+        suffix = block[..end].to_vec();
+        position = start;
+    }
+    Ok(agent_output_record(&suffix))
+}
+
+fn agent_output_record(line: &[u8]) -> Option<(u64, i64)> {
+    if line.is_empty() {
+        return None;
+    }
+    let record = serde_json::from_slice::<OutputRecord>(line).ok()?;
+    (record.source == OutputSource::Agent)
+        .then(|| parse_timestamp_ms(&record.timestamp).map(|at_ms| (record.sequence, at_ms)))?
+}
+
+fn parse_timestamp_ms(timestamp: &str) -> Option<i64> {
+    let nanos = OffsetDateTime::parse(timestamp, &Rfc3339)
+        .ok()?
+        .unix_timestamp_nanos();
+    i64::try_from(nanos / 1_000_000).ok()
+}
+
 /// True when the file is empty or its last byte is a newline, meaning the
 /// next append starts a fresh record.
 fn ends_with_newline(path: &Path) -> io::Result<bool> {
-    use std::io::{Read, Seek, SeekFrom};
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
@@ -338,7 +441,7 @@ mod tests {
 
     use super::{
         OutputChunk, OutputSource, OutputStream, PageQuery, RunLogWriter, StageFilter,
-        read_agent_output, read_filtered_page, read_page,
+        output_staleness, read_agent_output, read_filtered_page, read_page,
     };
 
     /// Writes one record per call, so a test controls entry boundaries the
@@ -566,6 +669,54 @@ mod tests {
             page.entries[1].chunk,
             OutputChunk::Utf8 { text: "two".into() }
         );
+    }
+
+    #[test]
+    fn staleness_uses_the_last_complete_agent_record_across_reopen() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("output.ndjson");
+        let writer = RunLogWriter::open(&path).unwrap();
+        writer
+            .append_at(
+                100_000,
+                OutputSource::Agent,
+                Some("build"),
+                OutputStream::Stdout,
+                b"first",
+            )
+            .unwrap();
+        writer
+            .append_at(
+                200_000,
+                OutputSource::Aftercare,
+                Some("test"),
+                OutputStream::Stdout,
+                b"ignored",
+            )
+            .unwrap();
+        drop(writer);
+
+        let stale = output_staleness(&path, 50_000, 160_000, 60_000).unwrap();
+        assert_eq!(stale.last_sequence, Some(1));
+        assert_eq!(stale.last_output_at_ms, 100_000);
+        assert_eq!(stale.silent_for_ms, 60_000);
+        assert!(stale.stalled);
+
+        let writer = RunLogWriter::open(&path).unwrap();
+        writer
+            .append_at(
+                160_000,
+                OutputSource::Agent,
+                Some("build"),
+                OutputStream::Stdout,
+                b"resumed",
+            )
+            .unwrap();
+        drop(writer);
+        let resumed = output_staleness(&path, 50_000, 160_000, 60_000).unwrap();
+        assert_eq!(resumed.last_sequence, Some(3));
+        assert_eq!(resumed.silent_for_ms, 0);
+        assert!(!resumed.stalled);
     }
 
     #[test]

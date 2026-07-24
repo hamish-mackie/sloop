@@ -46,6 +46,7 @@ struct Stage {
     exit_code: Option<i32>,
     verdict_source: Option<String>,
     reason: Option<String>,
+    silent_for_ms: Option<i64>,
 }
 
 impl Stage {
@@ -60,6 +61,7 @@ impl Stage {
             "exit_code": self.exit_code,
             "verdict_source": self.verdict_source,
             "reason": self.reason,
+            "silent_for_ms": self.silent_for_ms,
         })
     }
 
@@ -111,8 +113,22 @@ fn history_with_timeline(
 ) -> Result<RunHistory, ErrorBody> {
     let recorded = lookup(state, |store| store.aftercare_stages(&run.id))?;
     let evidence = lookup(state, |store| store.run_evidence(&run.id))?;
+    let mut stages = stages(run, &recorded, &evidence, is_terminal(&run.state));
+    if run.state == "running"
+        && state.supervised.contains(&run.id)
+        && !state.cancelling.contains(&run.id)
+        && !state.suspected_dead.contains(&run.id)
+        && !state.recovering.contains(&run.id)
+        && !state.pending_exits.contains_key(&run.id)
+        && let Some(staleness) =
+            super::scheduler::running_output_staleness(state, run, state.clock.now_ms())
+        && staleness.stalled
+        && let Some(stage) = stages.iter_mut().find(|stage| stage.state == "running")
+    {
+        stage.silent_for_ms = Some(staleness.silent_for_ms);
+    }
     Ok(RunHistory {
-        stages: stages(run, &recorded, &evidence, is_terminal(&run.state)),
+        stages,
         state: run.state.clone(),
         exit_code: run.exit_code,
         commits: observed_commits(&evidence),
@@ -131,7 +147,13 @@ impl RunHistory {
     pub(super) fn strip_json(&self) -> Vec<Value> {
         self.stages
             .iter()
-            .map(|stage| json!({"stage": stage.name, "state": stage.state}))
+            .map(|stage| {
+                json!({
+                    "stage": stage.name,
+                    "state": stage.state,
+                    "silent_for_ms": stage.silent_for_ms,
+                })
+            })
             .collect()
     }
 
@@ -247,6 +269,7 @@ fn stages(
                     exit_code: None,
                     verdict_source: None,
                     reason: None,
+                    silent_for_ms: None,
                 };
             };
             Stage {
@@ -261,6 +284,7 @@ fn stages(
                 exit_code: row.exit_code,
                 verdict_source: Some(row.verdict_source.clone()),
                 reason: row.reason.clone(),
+                silent_for_ms: None,
                 name,
             }
         })

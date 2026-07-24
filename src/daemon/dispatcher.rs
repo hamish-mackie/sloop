@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use serde_json::json;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::clock::{Clock, next_local_minute_ms};
 use crate::config::{AgentConfig, RunningHours, parse_local_time};
@@ -74,6 +74,7 @@ pub(super) struct DispatcherState {
     pub(super) restart_acknowledged: bool,
     pub(super) restart_signalled: bool,
     pub(super) max_agents: usize,
+    pub(super) stall_report_after_ms: i64,
     pub(super) ticket_prefix: String,
     pub(super) project_prefix: String,
     pub(super) running_hours: Option<RunningHours>,
@@ -125,6 +126,12 @@ pub(super) struct DispatcherState {
     /// Exit evidence remains here until its atomic store transaction commits.
     /// The dispatcher retries these records on every reconciliation pass.
     pub(super) pending_exits: HashMap<String, RunEvent>,
+    /// Last output sequence warned for each run. A different sequence is a
+    /// later silence episode and may warn again.
+    pub(super) reported_stalls: HashMap<String, Option<u64>>,
+    /// Output pumps notify the dispatcher after a durable append so its one
+    /// existing deadline can be recomputed without a polling loop.
+    pub(super) output_notify: Arc<Notify>,
     /// The dispatcher's own request channel, cloned into each worker
     /// accept loop so every request funnels through the single owner.
     pub(super) requests_tx: mpsc::Sender<DispatcherMessage>,
@@ -177,6 +184,7 @@ pub(super) async fn run_dispatcher(
     loop {
         let deadline = next_dispatch_deadline(&state);
         let clock = state.clock.clone();
+        let output_notify = state.output_notify.clone();
         tokio::select! {
             message = requests.recv() => {
                 let Some(message) = message else { break };
@@ -207,6 +215,7 @@ pub(super) async fn run_dispatcher(
             () = wait_for_deadline(clock, deadline) => {
                 log.emit(LogLevel::Info, "sloop::dispatcher", "timer_fired");
             }
+            () = output_notify.notified() => {}
             // Wall-clock is deliberate: this is a liveness probe, not
             // decision logic, so the manual test clock must not gate it.
             _ = liveness_tick.tick() => {
@@ -274,6 +283,7 @@ pub(super) async fn settle_pending_exits(state: &mut DispatcherState, log: &Oper
                 state.supervised.remove(&run_id);
                 state.suspected_dead.remove(&run_id);
                 state.recovering.remove(&run_id);
+                state.reported_stalls.remove(&run_id);
                 close_worker_socket(state, &run_id);
                 log.emit_with_fields(
                     LogLevel::Info,

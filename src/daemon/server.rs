@@ -15,7 +15,7 @@ use fs2::FileExt;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::clock::{Clock, FileClock, SystemClock};
 use crate::config::{Config, ConfigError, Repository, TicketSourceConfig};
@@ -39,7 +39,7 @@ use super::dispatcher::{
     run_dispatcher, unauthorized,
 };
 use super::recovery::recover_inflight_runs;
-use super::scheduler::{index_projects, reconcile_tickets};
+use super::scheduler::{index_projects, reconcile_tickets, restore_reported_output_stalls};
 
 const MAX_ENVELOPE_BYTES: u64 = 1024 * 1024;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -331,6 +331,7 @@ async fn serve(
         restart_acknowledged: false,
         restart_signalled: false,
         max_agents: config.max_parallel_tasks,
+        stall_report_after_ms: config.stall_report_after_ms,
         ticket_prefix: config.ticket_prefix.clone(),
         project_prefix: config.project_prefix.clone(),
         running_hours: config.running_hours.clone(),
@@ -364,6 +365,8 @@ async fn serve(
         worker_listeners: HashMap::new(),
         worker_socket_paths: HashMap::new(),
         pending_exits: HashMap::new(),
+        reported_stalls: HashMap::new(),
+        output_notify: Arc::new(Notify::new()),
         requests_tx: dispatcher_tx.clone(),
         log: log.clone(),
         clock,
@@ -373,6 +376,7 @@ async fn serve(
         shutdown_flag: shutdown_flag.clone(),
     };
     recover_inflight_runs(&mut state, &events_tx, &log).await?;
+    restore_reported_output_stalls(&mut state);
     let dispatcher_task = tokio::spawn(run_dispatcher(
         state,
         dispatcher_rx,
