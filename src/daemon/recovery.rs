@@ -10,24 +10,25 @@ use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 
 use crate::clock::Clock;
-use crate::coordination::{Coordination, Exit, ExitDenial, Renewal, RenewalDenial, RunExit};
+use crate::db::{Db, StoreError};
 use crate::domain::work::Disposition;
 use crate::flow::Flow;
 use crate::logging::{LogLevel, OperationalLog};
 use crate::run_log::OutputStream;
+use crate::run_store::{Exit, ExitDenial, RecoverableRun, RunExit, RunState, RunStore};
 use crate::runner::WorkerCredentials;
 use crate::runner::local::{
     process_start_time, run_output_path, wait_for_test_hook, worker_socket_path,
 };
-use crate::store::{RecoverableRun, RunState, Store};
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
+use crate::work_state::local::LocalSqlite;
 
 use super::aftercare::{
     RepairContext, aftercare_cancelled, drive_flow, git_index_lock_path, git_index_matches_head,
     git_is_ancestor, git_stdout, shared_checkout_has_git_operation, try_commits_on_branch,
 };
-use super::dispatcher::{DispatcherState, RunEvent, disposition_for_outcome};
-use super::scheduler::{DEFAULT_LEASE_MS, VENDOR_COOLDOWN_MS, bound_flow};
+use super::dispatcher::{DispatcherState, RunEvent, disposition_for_outcome, push_work_outcome};
+use super::scheduler::{DEFAULT_LEASE_MS, VENDOR_COOLDOWN_MS};
 use super::server::{DaemonError, serve_worker_socket};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +46,10 @@ pub(super) async fn recover_inflight_runs(
     log: &OperationalLog,
 ) -> Result<(), DaemonError> {
     release_interrupted_claims(state, log).await?;
-    let runs = state.store.recoverable_runs().map_err(DaemonError::Store)?;
+    let runs = state
+        .run_store
+        .recoverable_runs()
+        .map_err(DaemonError::Store)?;
     for run in runs {
         // Every durable lease consumes capacity until adoption or settlement
         // succeeds; a transient database error must never permit double-spawn.
@@ -55,7 +59,7 @@ pub(super) async fn recover_inflight_runs(
                 state.supervised.insert(run.id.clone());
                 rearm_adopted_lease(state, &run, log);
                 let cancellation_requested = state
-                    .store
+                    .run_store
                     .cancellation_requested(&run.id)
                     .map_err(DaemonError::Store)?;
                 if cancellation_requested {
@@ -118,7 +122,6 @@ async fn release_interrupted_claims(
         let run = state
             .run_store
             .run(&claim.owner.0)
-            .map_err(crate::store::StoreError::from)
             .map_err(DaemonError::Store)?;
         let (disposition, outcome) = match run {
             None => (
@@ -145,7 +148,7 @@ async fn release_interrupted_claims(
                         .recorded_outcome(&claim.owner.0)
                         .map_err(DaemonError::Store)?
                         .ok_or_else(|| {
-                            DaemonError::Store(crate::store::StoreError::RunStateConflict {
+                            DaemonError::Store(StoreError::RunStateConflict {
                                 run_id: claim.owner.0.clone(),
                                 state: Some(run.state),
                                 requested: "recorded outcome".into(),
@@ -163,15 +166,8 @@ async fn release_interrupted_claims(
             .release(&claim.ticket, &claim.owner, disposition)
             .await
             .map_err(DaemonError::WorkState)?;
-        if let Some(outcome) = outcome
-            && let Err(error) = state.work_state.push_outcome(&outcome).await
-        {
-            log.emit_with_fields(
-                LogLevel::Warn,
-                "sloop::recovery",
-                "work_outcome_push_failed",
-                json!({"run_id": claim.owner.0, "ticket_id": claim.ticket.id, "error": error.to_string()}),
-            );
+        if let Some(outcome) = outcome {
+            push_work_outcome(state, outcome, log, "sloop::recovery");
         }
         log.emit_with_fields(
             LogLevel::Info,
@@ -197,15 +193,13 @@ pub(super) fn rearm_adopted_lease(
     log: &OperationalLog,
 ) {
     let now_ms = state.clock.now_ms();
-    let readopted = Coordination::new(&mut state.store).readopt(
-        &run.ticket_id,
-        &run.id,
-        DEFAULT_LEASE_MS,
-        now_ms,
-    );
+    let readopted =
+        state
+            .local_work_state
+            .readopt_lease(&run.ticket_id, &run.id, DEFAULT_LEASE_MS, now_ms);
     match readopted {
-        Ok(Renewal::Granted(_)) => {}
-        Ok(Renewal::Denied(RenewalDenial::LeaseNotHeld)) => log.emit_with_fields(
+        Ok(_) => {}
+        Err(StoreError::LeaseNotHeld { .. }) => log.emit_with_fields(
             LogLevel::Warn,
             "sloop::recovery",
             "lease_rearm_denied",
@@ -413,8 +407,30 @@ pub(super) fn spawn_aftercare_recovery(
                 run.id
             ))
         })?,
-        None => bound_flow(&state.store, &state.flows, &run.ticket_id)
-            .map_err(DaemonError::InvalidResponse)?,
+        None => {
+            let ticket = state
+                .local_work_state
+                .ticket(&run.ticket_id)
+                .map_err(DaemonError::Store)?
+                .ok_or_else(|| {
+                    DaemonError::InvalidResponse(format!(
+                        "ticket `{}` no longer exists",
+                        run.ticket_id
+                    ))
+                })?;
+            let flow_name = ticket.flow.as_deref().ok_or_else(|| {
+                DaemonError::InvalidResponse(format!(
+                    "ticket `{}` has no bound flow",
+                    run.ticket_id
+                ))
+            })?;
+            state.flows.get(flow_name).cloned().ok_or_else(|| {
+                DaemonError::InvalidResponse(format!(
+                    "ticket `{}` names unknown bound flow `{flow_name}`",
+                    run.ticket_id
+                ))
+            })?
+        }
     };
     let clock = state.clock.clone();
     let db_path = state.state_dir.join("sloop.db");
@@ -430,9 +446,11 @@ pub(super) fn spawn_aftercare_recovery(
     };
     tokio::task::spawn_blocking(move || {
         while !shutdown.load(Ordering::Acquire) {
-            let result = Store::open(&db_path, clock.now_ms())
+            let result = Db::open(&db_path, clock.now_ms())
                 .map_err(|error| error.to_string())
-                .and_then(|store| {
+                .and_then(|db| {
+                    let run_store = RunStore::from_db(db.clone());
+                    let local_work_state = LocalSqlite::from_db_with_clock(db, clock.clone());
                     resume_aftercare(
                         &root,
                         &state_dir,
@@ -440,7 +458,8 @@ pub(super) fn spawn_aftercare_recovery(
                         &worker,
                         test_cmd.as_deref(),
                         clock.as_ref(),
-                        &store,
+                        &run_store,
+                        &local_work_state,
                         &run,
                         repair.as_ref(),
                         &log,
@@ -474,12 +493,13 @@ pub(super) fn resume_aftercare(
     worker: &WorkerCredentials,
     test_cmd: Option<&[String]>,
     clock: &dyn Clock,
-    store: &Store,
+    run_store: &RunStore,
+    local_work_state: &LocalSqlite,
     run: &RecoverableRun,
     repair: Option<&RepairContext>,
     log: &OperationalLog,
 ) -> Result<RunEvent, String> {
-    let rows = store
+    let rows = run_store
         .run_evidence(&run.id)
         .map_err(|error| error.to_string())?;
     let value = |kind: &str| {
@@ -506,7 +526,7 @@ pub(super) fn resume_aftercare(
     let cooldown_until_ms =
         value("vendor_error_classified").and_then(|data| data["cooldown_until_ms"].as_i64());
     let output_path = run_output_path(state_dir, &run.id);
-    if aftercare_cancelled(store, &run.id, log) {
+    if aftercare_cancelled(run_store, &run.id, log) {
         return Ok(RunEvent::Exited {
             run_id: run.id.clone(),
             target: run.target.clone(),
@@ -542,7 +562,8 @@ pub(super) fn resume_aftercare(
         commit_observation_complete,
         &output_path,
         clock,
-        store,
+        run_store,
+        local_work_state,
         &run.id,
         repair,
         log,
@@ -648,18 +669,21 @@ fn claim_recovered_exit(
         ..
     } = event;
     let now_ms = clock.now_ms();
-    let result = Store::open(db_path, now_ms).and_then(|mut store| {
-        let exit = RunExit {
-            run_id,
-            exit_code: *exit_code,
-            capture_complete: *capture_complete,
-            commits_json: &json!({"complete": commit_observation_complete, "oids": commits})
-                .to_string(),
-            vendor_error: vendor_error.as_ref(),
-            cooldown_until_ms: *cooldown_until_ms,
-        };
-        Coordination::new(&mut store).record_exit(&exit, now_ms)
-    });
+    let result = Db::open(db_path, now_ms)
+        .map_err(StoreError::from)
+        .and_then(|db| {
+            let run_store = RunStore::from_db(db);
+            let exit = RunExit {
+                run_id,
+                exit_code: *exit_code,
+                capture_complete: *capture_complete,
+                commits_json: &json!({"complete": commit_observation_complete, "oids": commits})
+                    .to_string(),
+                vendor_error: vendor_error.as_ref(),
+                cooldown_until_ms: *cooldown_until_ms,
+            };
+            run_store.record_exit(&exit, now_ms)
+        });
     match result {
         Ok(Exit::Granted) => Ok(true),
         Ok(Exit::Denied(ExitDenial::AlreadyClaimed { state })) => {
@@ -700,7 +724,7 @@ pub(super) async fn reconcile_run_liveness(
         );
         return;
     }
-    let runs = match state.store.recoverable_runs() {
+    let runs = match state.run_store.recoverable_runs() {
         Ok(runs) => {
             state.reconciliation_blocked = false;
             runs
@@ -991,8 +1015,8 @@ mod tests {
         PersistedProcessState, ProcessIdentity, classify_persisted_process,
         recoverable_process_identity, recoverable_process_matches,
     };
+    use crate::run_store::{RecoverableRun, RunState};
     use crate::runner::local::process_start_time;
-    use crate::store::{RecoverableRun, RunState};
 
     fn recoverable_current_process(start_time: Option<i64>) -> RecoverableRun {
         RecoverableRun {

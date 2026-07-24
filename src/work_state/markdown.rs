@@ -3,10 +3,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::frontmatter::{self, Frontmatter};
-use crate::outcome::Outcome;
 use crate::post::parse_ticket_frontmatter;
-use crate::sources::{AuthoredTicket, SourceError, TicketSource};
 
+use super::{AuthoredTicket, TicketFeedError};
+
+#[derive(Clone)]
 pub struct MarkdownTicketSource {
     root: PathBuf,
     ticket_dir: PathBuf,
@@ -19,10 +20,8 @@ impl MarkdownTicketSource {
             ticket_dir: ticket_dir.into(),
         }
     }
-}
 
-impl TicketSource for MarkdownTicketSource {
-    fn pull(&self) -> Result<Vec<AuthoredTicket>, SourceError> {
+    pub fn pull(&self) -> Result<Vec<AuthoredTicket>, TicketFeedError> {
         let directory = self.root.join(&self.ticket_dir);
         let mut paths = Vec::new();
         collect_markdown_files(&directory, &mut paths)?;
@@ -32,7 +31,7 @@ impl TicketSource for MarkdownTicketSource {
             .into_iter()
             .map(|path| {
                 let relative = path.strip_prefix(&self.root).map_err(|_| {
-                    SourceError::new(format!(
+                    TicketFeedError::new(format!(
                         "ticket path `{}` is outside repository `{}`",
                         path.display(),
                         self.root.display()
@@ -58,13 +57,12 @@ impl TicketSource for MarkdownTicketSource {
             })
             .collect()
     }
-
-    fn report(&self, _ticket_id: &str, _outcome: &Outcome) -> Result<(), SourceError> {
-        Ok(())
-    }
 }
 
-fn collect_markdown_files(directory: &Path, paths: &mut Vec<PathBuf>) -> Result<(), SourceError> {
+fn collect_markdown_files(
+    directory: &Path,
+    paths: &mut Vec<PathBuf>,
+) -> Result<(), TicketFeedError> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -141,8 +139,8 @@ fn scalar(mapping: &serde_yaml::Mapping, key: &str) -> Option<String> {
     }
 }
 
-fn io_error(path: &Path, error: io::Error) -> SourceError {
-    SourceError::new(format!("{}: {error}", path.display()))
+fn io_error(path: &Path, error: io::Error) -> TicketFeedError {
+    TicketFeedError::new(format!("{}: {error}", path.display()))
 }
 
 #[cfg(test)]
@@ -152,7 +150,6 @@ mod tests {
     use tempfile::tempdir;
 
     use super::MarkdownTicketSource;
-    use crate::sources::TicketSource;
 
     #[test]
     fn invalid_files_are_returned_with_recovered_identity() {

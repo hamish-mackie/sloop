@@ -520,3 +520,147 @@ impl fmt::Display for DbError {
 }
 
 impl std::error::Error for DbError {}
+
+#[derive(Debug)]
+pub enum StoreError {
+    Open {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
+    Sqlite(rusqlite::Error),
+    UnsupportedSchemaVersion(u32),
+    TicketNotReady {
+        ticket_id: String,
+        state: Option<String>,
+    },
+    TicketNotFound {
+        ticket_id: String,
+    },
+    TicketStateConflict {
+        ticket_id: String,
+        state: String,
+        requested: String,
+    },
+    ActivationNotQueued {
+        activation_id: String,
+    },
+    LeaseNotHeld {
+        ticket_id: String,
+        run_id: String,
+    },
+    RunNotFound {
+        run_id: String,
+    },
+    RunStateConflict {
+        run_id: String,
+        state: Option<String>,
+        requested: String,
+    },
+    UnknownRunState {
+        state: String,
+    },
+}
+
+impl StoreError {
+    pub fn is_disk_full(&self) -> bool {
+        let source = match self {
+            Self::Open { source, .. } | Self::Sqlite(source) => source,
+            _ => return false,
+        };
+        matches!(
+            source,
+            rusqlite::Error::SqliteFailure(error, _)
+                if error.code == rusqlite::ffi::ErrorCode::DiskFull
+        )
+    }
+}
+
+impl From<rusqlite::Error> for StoreError {
+    fn from(source: rusqlite::Error) -> Self {
+        Self::Sqlite(source)
+    }
+}
+
+impl From<DbError> for StoreError {
+    fn from(source: DbError) -> Self {
+        match source {
+            DbError::Open { path, source } => Self::Open { path, source },
+            DbError::Sqlite(source) => Self::Sqlite(source),
+            DbError::UnsupportedSchemaVersion(version) => Self::UnsupportedSchemaVersion(version),
+        }
+    }
+}
+
+impl fmt::Display for StoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open { path, source } => {
+                write!(formatter, "cannot open {}: {source}", path.display())
+            }
+            Self::Sqlite(source) => write!(formatter, "database error: {source}"),
+            Self::UnsupportedSchemaVersion(version) => {
+                write!(formatter, "unsupported database schema version {version}")
+            }
+            Self::TicketNotReady { ticket_id, state } => match state {
+                Some(state) => write!(formatter, "ticket `{ticket_id}` is `{state}`, not `ready`"),
+                None => write!(formatter, "ticket `{ticket_id}` does not exist"),
+            },
+            Self::TicketNotFound { ticket_id } => {
+                write!(formatter, "ticket `{ticket_id}` does not exist")
+            }
+            Self::TicketStateConflict {
+                ticket_id,
+                state,
+                requested,
+            } => write!(
+                formatter,
+                "ticket `{ticket_id}` is `{state}` and cannot be changed to `{requested}`"
+            ),
+            Self::ActivationNotQueued { activation_id } => write!(
+                formatter,
+                "activation `{activation_id}` is not queued for dispatch"
+            ),
+            Self::LeaseNotHeld { ticket_id, run_id } => write!(
+                formatter,
+                "run `{run_id}` does not hold the lease on ticket `{ticket_id}`"
+            ),
+            Self::RunNotFound { run_id } => write!(formatter, "run `{run_id}` does not exist"),
+            Self::RunStateConflict {
+                run_id,
+                state,
+                requested,
+            } => match state {
+                Some(state) => write!(
+                    formatter,
+                    "run `{run_id}` is `{state}` and cannot be changed to `{requested}`"
+                ),
+                None => write!(formatter, "run `{run_id}` does not exist"),
+            },
+            Self::UnknownRunState { state } => {
+                write!(formatter, "unrecognized run state `{state}`")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+#[cfg(test)]
+mod tests {
+    use super::StoreError;
+
+    #[test]
+    fn sqlite_full_errors_are_classified_for_backpressure() {
+        let sqlite = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            None,
+        );
+        assert!(StoreError::from(sqlite).is_disk_full());
+        assert!(
+            !StoreError::TicketNotFound {
+                ticket_id: "T1".into()
+            }
+            .is_disk_full()
+        );
+    }
+}

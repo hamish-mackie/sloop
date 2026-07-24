@@ -1,6 +1,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::RunStore;
+use crate::db::StoreError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CooldownUpdate<'a> {
@@ -120,16 +121,16 @@ impl RunStore {
         &self,
         target: &str,
         now_ms: i64,
-    ) -> rusqlite::Result<Option<CooldownRecord>> {
-        active_cooldown_for_target(&self.db.lock(), target, now_ms)
+    ) -> Result<Option<CooldownRecord>, StoreError> {
+        active_cooldown_for_target(&self.db.lock(), target, now_ms).map_err(StoreError::from)
     }
 
-    pub(crate) fn active_cooldowns(&self, now_ms: i64) -> rusqlite::Result<Vec<CooldownRecord>> {
-        active_cooldowns(&self.db.lock(), now_ms)
+    pub(crate) fn active_cooldowns(&self, now_ms: i64) -> Result<Vec<CooldownRecord>, StoreError> {
+        active_cooldowns(&self.db.lock(), now_ms).map_err(StoreError::from)
     }
 
-    pub(crate) fn next_active_cooldown(&self, now_ms: i64) -> rusqlite::Result<Option<i64>> {
-        next_active_cooldown(&self.db.lock(), now_ms)
+    pub(crate) fn next_active_cooldown(&self, now_ms: i64) -> Result<Option<i64>, StoreError> {
+        next_active_cooldown(&self.db.lock(), now_ms).map_err(StoreError::from)
     }
 }
 
@@ -137,120 +138,47 @@ impl RunStore {
 mod tests {
     use tempfile::tempdir;
 
-    use super::CooldownUpdate;
-    use crate::domain::ticket::TicketState;
+    use super::{CooldownUpdate, tx};
     use crate::outcome::Outcome;
-    use crate::store::{
-        ActivationKind, ClaimRequest, NewActivation, QueuedActivation, Store, claim_for_test,
-    };
-
-    fn open_seeded(path: &std::path::Path) -> Store {
-        let store = Store::open(path, 1_000).unwrap();
-        store
-            .insert_local_project(
-                "default",
-                ".agents/sloop/projects/default.md",
-                "Default",
-                1_000,
-            )
-            .unwrap();
-        store
-            .insert_local_ticket(
-                "T1",
-                "default",
-                ".agents/sloop/tickets/t1.md",
-                "Ticket one",
-                &[],
-                "sloop/T1",
-                Some("claude"),
-                None,
-                None,
-                "default",
-                TicketState::Ready,
-                1_000,
-            )
-            .unwrap();
-        store
-            .insert_activation(
-                &NewActivation {
-                    id: "A1",
-                    kind: ActivationKind::Immediate,
-                    ticket_id: Some("T1"),
-                    project_id: None,
-                    eligible_at_ms: None,
-                    interval_ms: None,
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-    }
-
-    fn claim<'a>(run_id: &'a str) -> ClaimRequest<'a> {
-        ClaimRequest {
-            ticket_id: "T1",
-            run_id,
-            activation_id: "A1",
-            owner_id: "daemon-1",
-            lease_ms: 60_000,
-            next_activation_eligible_at_ms: None,
-            flow_json: "{}",
-            ticket_json: "{}",
-        }
-    }
-
-    fn claim_run(store: &Store, run_id: &str, now_ms: i64) {
-        claim_for_test(store, &claim(run_id), now_ms);
-    }
+    use crate::run_store::test_support::{claim_run, open_seeded, settle_run};
 
     #[test]
-    fn cooldowns_extend_without_shortening_and_gate_ready_work() {
+    fn cooldowns_extend_without_shortening() {
         let directory = tempdir().unwrap();
         let store = open_seeded(&directory.path().join("sloop.db"));
-        let activation = QueuedActivation {
-            id: "A1".into(),
-            kind: "immediate".into(),
-            ticket_id: Some("T1".into()),
-            project_id: None,
-            eligible_at_ms: None,
-            interval_ms: None,
-        };
 
-        claim_run(&store, "R1", 2_000);
-        store
-            .settle_for_test(
-                "R1",
-                Some(1),
-                Outcome::RateLimited,
-                &[],
-                Some(&CooldownUpdate {
-                    target: "claude",
-                    until_ms: 10_000,
-                    reason: "rate limit",
-                }),
-                2_100,
-            )
-            .unwrap();
+        claim_run(&store, "R1", "{}", "{}", 2_000);
+        settle_run(
+            &store,
+            "R1",
+            Some(1),
+            Outcome::RateLimited,
+            &[],
+            Some(&CooldownUpdate {
+                target: "claude",
+                until_ms: 10_000,
+                reason: "rate limit",
+            }),
+            2_100,
+        );
 
-        assert_eq!(store.select_ready_ticket(&activation, 5_000).unwrap(), None);
         assert_eq!(store.next_active_cooldown(5_000).unwrap(), Some(10_000));
         assert_eq!(store.active_cooldowns(5_000).unwrap()[0].target, "claude");
 
-        claim_run(&store, "R2", 5_000);
-        store
-            .settle_for_test(
-                "R2",
-                Some(1),
-                Outcome::RateLimited,
-                &[],
-                Some(&CooldownUpdate {
-                    target: "claude",
-                    until_ms: 8_000,
-                    reason: "shorter retry",
-                }),
-                5_100,
-            )
-            .unwrap();
+        claim_run(&store, "R2", "{}", "{}", 5_000);
+        settle_run(
+            &store,
+            "R2",
+            Some(1),
+            Outcome::RateLimited,
+            &[],
+            Some(&CooldownUpdate {
+                target: "claude",
+                until_ms: 8_000,
+                reason: "shorter retry",
+            }),
+            5_100,
+        );
 
         let cooldown = store
             .active_cooldown_for_target("claude", 6_000)
@@ -258,34 +186,27 @@ mod tests {
             .unwrap();
         assert_eq!(cooldown.until_ms, 10_000);
         assert_eq!(cooldown.reason, "rate limit");
-        assert_eq!(
-            store
-                .select_ready_ticket(&activation, 10_000)
-                .unwrap()
-                .as_deref(),
-            Some("T1")
-        );
+        assert!(store.active_cooldowns(10_000).unwrap().is_empty());
     }
 
     #[test]
-    fn reindex_detaches_cooldowns_and_deletes_budget_reservations() {
+    fn run_deletion_detaches_cooldowns_and_deletes_budget_reservations() {
         let directory = tempdir().unwrap();
         let store = open_seeded(&directory.path().join("sloop.db"));
-        claim_run(&store, "R1", 2_000);
-        store
-            .settle_for_test(
-                "R1",
-                Some(1),
-                Outcome::Failed,
-                &[],
-                Some(&CooldownUpdate {
-                    target: "claude",
-                    until_ms: 10_000,
-                    reason: "rate limit",
-                }),
-                2_100,
-            )
-            .unwrap();
+        claim_run(&store, "R1", "{}", "{}", 2_000);
+        settle_run(
+            &store,
+            "R1",
+            Some(1),
+            Outcome::Failed,
+            &[],
+            Some(&CooldownUpdate {
+                target: "claude",
+                until_ms: 10_000,
+                reason: "rate limit",
+            }),
+            2_100,
+        );
         store
             .db()
             .lock()
@@ -298,9 +219,13 @@ mod tests {
             )
             .unwrap();
 
-        store
-            .apply_reindex(&["default".into()], &[], 3_000)
-            .unwrap();
+        let database = store.db();
+        let mut connection = database.lock();
+        let transaction = connection.transaction().unwrap();
+        tx::detach_cooldowns_from_run(&transaction, "R1").unwrap();
+        tx::delete_budget_reservation_for_run(&transaction, "R1").unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
 
         let database = store.db();
         let connection = database.lock();

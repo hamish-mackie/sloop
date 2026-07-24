@@ -10,9 +10,9 @@
 
 use serde_json::{Value, json};
 
-use crate::store::{RunRecord, RunTimeline, StageRecord};
+use crate::run_store::{RunRecord, RunTimeline, StageRecord};
 
-use super::commands::lookup;
+use super::commands::run_lookup;
 use super::dispatcher::DispatcherState;
 use crate::protocol::ErrorBody;
 
@@ -87,7 +87,7 @@ pub(super) fn histories(
     runs: &[RunRecord],
 ) -> Result<Vec<RunHistory>, ErrorBody> {
     let ids = runs.iter().map(|run| run.id.as_str()).collect::<Vec<_>>();
-    let mut timelines = lookup(state, |store| store.run_timelines(&ids))?;
+    let mut timelines = run_lookup(state, |run_store| run_store.run_timelines(&ids))?;
     runs.iter()
         .map(|run| {
             let timeline = timelines.remove(&run.id).unwrap_or_default();
@@ -98,9 +98,11 @@ pub(super) fn histories(
 
 /// Reads one run's history, including the timeline.
 pub(super) fn history(state: &DispatcherState, run: &RunRecord) -> Result<RunHistory, ErrorBody> {
-    let timeline = lookup(state, |store| store.run_timelines(&[run.id.as_str()]))?
-        .remove(&run.id)
-        .unwrap_or_default();
+    let timeline = run_lookup(state, |run_store| {
+        run_store.run_timelines(&[run.id.as_str()])
+    })?
+    .remove(&run.id)
+    .unwrap_or_default();
     history_with_timeline(state, run, timeline)
 }
 
@@ -109,8 +111,8 @@ fn history_with_timeline(
     run: &RunRecord,
     timeline: RunTimeline,
 ) -> Result<RunHistory, ErrorBody> {
-    let recorded = lookup(state, |store| store.aftercare_stages(&run.id))?;
-    let evidence = lookup(state, |store| store.run_evidence(&run.id))?;
+    let recorded = run_lookup(state, |run_store| run_store.aftercare_stages(&run.id))?;
+    let evidence = run_lookup(state, |run_store| run_store.run_evidence(&run.id))?;
     Ok(RunHistory {
         stages: stages(run, &recorded, &evidence, is_terminal(&run.state)),
         state: run.state.clone(),

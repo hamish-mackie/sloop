@@ -293,7 +293,8 @@ fn a_running_agent_reads_its_brief_and_records_a_note() {
     assert_eq!(note["data"]["note"]["text"], "work in progress");
 
     // The note is durable evidence, not a courtesy reply.
-    let store = sloop::store::Store::open(&world.db_path(), 0).expect("open runtime store");
+    let db = sloop::db::Db::open(&world.db_path(), 0).expect("open runtime database");
+    let store = sloop::run_store::RunStore::from_db(db);
     let notes = store.notes_for_run(&world.run_id(1)).expect("read notes");
     assert_eq!(notes, vec!["work in progress".to_owned()]);
 }

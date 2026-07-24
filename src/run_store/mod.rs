@@ -4,6 +4,9 @@
 //! events, `evidence` owns verdict and aftercare facts, and `limits` owns
 //! cooldown and budget state. Scheduler state and shared ID counters stay on
 //! [`RunStore`] because they apply across those families.
+//!
+//! This module must never import the work-state sibling; run persistence is an
+//! independent boundary composed with work state by the daemon.
 
 pub(crate) mod evidence;
 pub(crate) mod limits;
@@ -11,17 +14,77 @@ pub(crate) mod runs;
 
 pub use evidence::{EvidenceRecord, StageRecord};
 pub use limits::{CooldownRecord, CooldownUpdate};
-pub(crate) use runs::RunAdmission;
 pub use runs::{ActiveRun, EventRecord, ProjectNote, RunRecord, RunState, RunTimeline};
+pub use runs::{AdmittedRun, RunAdmission};
 pub(crate) use runs::{NeedsReviewBranch, RecoverableRun, WorktreeCleanupCandidate};
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
-use crate::db::Db;
+use crate::db::{Db, StoreError};
 use crate::domain::ticket::TicketState;
 use crate::domain::work::{OwnerId, WorkOutcome};
 use crate::outcome::Outcome;
-use crate::store::StoreError;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCommitEvidence {
+    pub run_id: String,
+    pub ticket_id: String,
+    pub data_json: String,
+}
+
+/// Whether the caller won the `running` to `aftercare` transition and with it
+/// ownership of exit processing and aftercare for the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitClaim {
+    Claimed,
+    AlreadyClaimed { state: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Start {
+    Granted,
+    Denied(StartDenial),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartDenial {
+    /// The run left `claimed` before its process was recorded.
+    NotClaimed { state: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Exit {
+    Granted,
+    Denied(ExitDenial),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitDenial {
+    /// Another path checkpointed this exit first and owns aftercare.
+    AlreadyClaimed { state: String },
+}
+
+/// Facts about a launched agent process, recorded when the run turns running.
+pub struct RunStart<'a> {
+    pub run_id: &'a str,
+    pub branch: &'a str,
+    pub worktree_path: &'a str,
+    pub pid: u32,
+    pub pid_start_time: Option<i64>,
+    pub process_group_id: u32,
+    pub worker_token: &'a str,
+    pub worker_socket_path: &'a str,
+}
+
+/// Facts about an agent exit at the checkpoint that hands the run to aftercare.
+pub struct RunExit<'a> {
+    pub run_id: &'a str,
+    pub exit_code: Option<i32>,
+    pub capture_complete: bool,
+    pub commits_json: &'a str,
+    pub vendor_error: Option<&'a crate::vendor_error::VendorErrorMatch>,
+    pub cooldown_until_ms: Option<i64>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedOutcome {
@@ -38,11 +101,16 @@ impl RunStore {
         Self { db }
     }
 
+    #[cfg(test)]
+    pub(crate) fn db(&self) -> Db {
+        self.db.clone()
+    }
+
     fn write<T>(
         &self,
         behavior: TransactionBehavior,
         operation: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<T>,
-    ) -> rusqlite::Result<T> {
+    ) -> Result<T, StoreError> {
         let mut connection = self.db.lock();
         let transaction = connection.transaction_with_behavior(behavior)?;
         let result = operation(&transaction)?;
@@ -50,31 +118,32 @@ impl RunStore {
         Ok(result)
     }
 
-    pub(crate) fn next_note_ordinal(&self) -> rusqlite::Result<i64> {
+    pub(crate) fn next_note_ordinal(&self) -> Result<i64, StoreError> {
         self.reserve_ordinal("note", "notes")
     }
 
-    fn reserve_ordinal(&self, kind: &str, table: &str) -> rusqlite::Result<i64> {
+    fn reserve_ordinal(&self, kind: &str, table: &str) -> Result<i64, StoreError> {
         self.write(TransactionBehavior::Immediate, |transaction| {
             tx::reserve_ordinal(transaction, kind, table)
         })
     }
 
-    pub(crate) fn paused(&self) -> rusqlite::Result<bool> {
-        paused(&self.db.lock())
+    pub(crate) fn paused(&self) -> Result<bool, StoreError> {
+        paused(&self.db.lock()).map_err(StoreError::from)
     }
 
-    pub(crate) fn clear_restart_draining(&self, now_ms: i64) -> rusqlite::Result<()> {
+    pub(crate) fn clear_restart_draining(&self, now_ms: i64) -> Result<(), StoreError> {
         self.write(TransactionBehavior::Deferred, |transaction| {
             tx::clear_restart_draining(transaction, now_ms)
         })
     }
 
-    pub(crate) fn restart_draining(&self) -> rusqlite::Result<bool> {
-        restart_draining(&self.db.lock())
+    #[cfg(test)]
+    pub(crate) fn restart_draining(&self) -> Result<bool, StoreError> {
+        restart_draining(&self.db.lock()).map_err(StoreError::from)
     }
 
-    pub(crate) fn set_paused(&self, paused: bool, now_ms: i64) -> rusqlite::Result<()> {
+    pub(crate) fn set_paused(&self, paused: bool, now_ms: i64) -> Result<(), StoreError> {
         self.write(TransactionBehavior::Deferred, |transaction| {
             tx::set_paused(transaction, paused, now_ms)
         })
@@ -84,19 +153,19 @@ impl RunStore {
         &self,
         active_runs: usize,
         now_ms: i64,
-    ) -> rusqlite::Result<bool> {
+    ) -> Result<bool, StoreError> {
         self.write(TransactionBehavior::Immediate, |transaction| {
             tx::begin_restart_draining(transaction, active_runs, now_ms)
         })
     }
 
-    pub(crate) fn resume_scheduler(&self, now_ms: i64) -> rusqlite::Result<bool> {
+    pub(crate) fn resume_scheduler(&self, now_ms: i64) -> Result<bool, StoreError> {
         self.write(TransactionBehavior::Immediate, |transaction| {
             tx::resume_scheduler(transaction, now_ms)
         })
     }
 
-    pub(crate) fn probe_writable(&self, now_ms: i64) -> rusqlite::Result<()> {
+    pub(crate) fn probe_writable(&self, now_ms: i64) -> Result<(), StoreError> {
         self.write(TransactionBehavior::Deferred, |transaction| {
             tx::probe_writable(transaction, now_ms)
         })
@@ -221,11 +290,101 @@ impl RunStore {
             }
             Ok(inserted)
         })
-        .map_err(StoreError::from)
     }
 
-    pub fn recorded_outcome(&self, run_id: &str) -> Result<Option<RecordedOutcome>, StoreError> {
+    pub(crate) fn recorded_outcome(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<RecordedOutcome>, StoreError> {
         recorded_outcome(&self.db.lock(), run_id).map_err(StoreError::from)
+    }
+
+    /// Turns a claimed run running once its agent process exists.
+    pub fn start(&self, start: &RunStart<'_>, now_ms: i64) -> Result<Start, StoreError> {
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = runs::tx::mark_running(
+            &transaction,
+            start.run_id,
+            start.branch,
+            start.worktree_path,
+            start.pid,
+            start.pid_start_time,
+            start.process_group_id,
+            start.worker_token,
+            start.worker_socket_path,
+            now_ms,
+        )?;
+        if changed != 1 {
+            let state = runs::tx::state(&transaction, start.run_id)?;
+            return Ok(Start::Denied(StartDenial::NotClaimed { state }));
+        }
+        let ticket_id = runs::tx::ticket_id(&transaction, start.run_id)?;
+        runs::tx::record_event(
+            &transaction,
+            now_ms,
+            "run_started",
+            Some(start.run_id),
+            Some(&ticket_id),
+            "{}",
+        )?;
+        transaction.commit()?;
+        Ok(Start::Granted)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_agent_exit(
+        &self,
+        run_id: &str,
+        exit_code: Option<i32>,
+        capture_complete: bool,
+        commits_json: &str,
+        vendor_error: Option<&crate::vendor_error::VendorErrorMatch>,
+        cooldown_until_ms: Option<i64>,
+        now_ms: i64,
+    ) -> Result<ExitClaim, StoreError> {
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = runs::tx::claim_agent_exit(&transaction, run_id, exit_code, now_ms)?;
+        if changed == 0 {
+            let state = runs::tx::state(&transaction, run_id)?;
+            return match state {
+                Some(state) => Ok(ExitClaim::AlreadyClaimed { state }),
+                None => Err(StoreError::RunNotFound {
+                    run_id: run_id.into(),
+                }),
+            };
+        }
+        evidence::tx::record_agent_exit(
+            &transaction,
+            run_id,
+            exit_code,
+            capture_complete,
+            commits_json,
+            vendor_error,
+            cooldown_until_ms,
+            now_ms,
+        )?;
+        transaction.commit()?;
+        Ok(ExitClaim::Claimed)
+    }
+
+    /// Checkpoints an agent exit, granting one caller ownership of aftercare.
+    pub fn record_exit(&self, exit: &RunExit<'_>, now_ms: i64) -> Result<Exit, StoreError> {
+        match self.record_agent_exit(
+            exit.run_id,
+            exit.exit_code,
+            exit.capture_complete,
+            exit.commits_json,
+            exit.vendor_error,
+            exit.cooldown_until_ms,
+            now_ms,
+        )? {
+            ExitClaim::Claimed => Ok(Exit::Granted),
+            ExitClaim::AlreadyClaimed { state } => {
+                Ok(Exit::Denied(ExitDenial::AlreadyClaimed { state }))
+            }
+        }
     }
 }
 
@@ -320,6 +479,7 @@ fn paused(connection: &rusqlite::Connection) -> rusqlite::Result<bool> {
     Ok(paused != 0)
 }
 
+#[cfg(test)]
 fn restart_draining(connection: &rusqlite::Connection) -> rusqlite::Result<bool> {
     let draining: i64 = connection.query_row(
         "SELECT draining FROM scheduler_state WHERE singleton = 1",
@@ -428,5 +588,140 @@ pub(crate) mod tx {
             params![now_ms],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+
+    use rusqlite::{TransactionBehavior, params};
+
+    use super::{CooldownUpdate, EvidenceRecord, RunAdmission, RunStore};
+    use crate::db::Db;
+    use crate::outcome::Outcome;
+
+    pub(crate) fn open_seeded(path: &Path) -> RunStore {
+        let db = Db::open(path, 1_000).unwrap();
+        db.lock()
+            .execute_batch(
+                "INSERT INTO projects
+                     (id, file_path, source, source_ref, title, created_at_ms, updated_at_ms)
+                 VALUES
+                     ('default', '.agents/sloop/projects/default.md', 'local', NULL,
+                      'Default', 1000, 1000);
+                 INSERT INTO tickets
+                     (id, project_id, file_path, source, source_ref, state, attempts,
+                      content_hash, name, worktree, target, model, effort, flow, body,
+                      created_at_ms, updated_at_ms)
+                 VALUES
+                     ('T1', 'default', '.agents/sloop/tickets/t1.md', 'local', NULL,
+                      'ready', 0, '', 'Ticket one', 'sloop/T1', 'claude', 'sonnet',
+                      'medium', 'default', '', 1000, 1000);
+                 INSERT INTO activations
+                     (id, kind, state, ticket_id, project_id, eligible_at_ms, interval_ms,
+                      created_at_ms, updated_at_ms)
+                 VALUES ('A1', 'immediate', 'queued', 'T1', NULL, NULL, NULL, 1000, 1000);",
+            )
+            .unwrap();
+        RunStore::from_db(db)
+    }
+
+    pub(crate) fn claim_run(
+        store: &RunStore,
+        run_id: &str,
+        flow_json: &str,
+        ticket_json: &str,
+        now_ms: i64,
+    ) {
+        store
+            .insert_claimed_run(
+                &RunAdmission {
+                    run_id,
+                    activation_id: "A1",
+                    ticket_id: "T1",
+                    flow_json,
+                    ticket_json,
+                },
+                now_ms,
+            )
+            .unwrap();
+        let db = store.db();
+        let mut connection = db.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE tickets SET state = 'claimed', attempts = attempts + 1,
+                                    updated_at_ms = ?1 WHERE id = 'T1'",
+                params![now_ms],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO leases
+                     (ticket_id, run_id, owner_id, acquired_at_ms, renewed_at_ms, expires_at_ms)
+                 VALUES ('T1', ?1, 'daemon-1', ?2, ?2, ?3)",
+                params![run_id, now_ms, now_ms + 60_000],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+
+    pub(crate) fn settle_run(
+        store: &RunStore,
+        run_id: &str,
+        exit_code: Option<i32>,
+        outcome: Outcome,
+        evidence: &[EvidenceRecord],
+        cooldown: Option<&CooldownUpdate<'_>>,
+        now_ms: i64,
+    ) -> bool {
+        let (_, applied) = store
+            .settle(run_id, exit_code, outcome, evidence, cooldown, now_ms)
+            .unwrap();
+        let ticket_state = match outcome {
+            Outcome::Merged => "merged",
+            Outcome::Failed => "failed",
+            Outcome::NeedsReview => "needs_review",
+            Outcome::Cancelled | Outcome::RateLimited | Outcome::Orphaned => "ready",
+        };
+        let db = store.db();
+        let mut connection = db.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute("DELETE FROM leases WHERE run_id = ?1", params![run_id])
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE tickets SET state = ?1, updated_at_ms = ?2 WHERE id = 'T1'",
+                params![ticket_state, now_ms],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        applied
+    }
+
+    pub(crate) fn abort_run(store: &RunStore, run_id: &str, now_ms: i64) -> bool {
+        let applied = store.abort(run_id, "T1", now_ms).unwrap();
+        let db = store.db();
+        let mut connection = db.lock();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute("DELETE FROM leases WHERE run_id = ?1", params![run_id])
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE tickets SET state = 'ready', updated_at_ms = ?1 WHERE id = 'T1'",
+                params![now_ms],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        applied
     }
 }

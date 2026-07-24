@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::clock::{Clock, FileClock, SystemClock};
 use crate::config::{Config, ConfigError, Repository, TicketSourceConfig};
+use crate::db::{Db, StoreError};
 use crate::frontmatter::FrontmatterError;
 use crate::ids::IdError;
 use crate::logging::{LogLevel, OperationalLog};
@@ -26,13 +27,11 @@ use crate::protocol::{
     Capability, ErrorBody, ErrorCode, Request, RequestEnvelope, RequestId, ResponseEnvelope,
 };
 use crate::run_ref::{RandomRunIds, RunIdSource};
+use crate::run_store::RunStore;
 use crate::runner::local::{process_identity_matches, process_start_time};
-use crate::sources::TicketSource;
-use crate::sources::exec::ExecTicketSource;
-use crate::store::{Store, StoreError};
 use crate::vendor_error::{CatalogError, VendorErrorClassifier};
+use crate::work_state::TicketFeeder;
 use crate::work_state::local::LocalSqlite;
-use crate::work_state::markdown::MarkdownTicketSource;
 
 use super::dispatcher::{
     DaemonControl, DispatcherMessage, DispatcherState, RequestOrigin, internal, protocol_error,
@@ -213,32 +212,37 @@ fn serve_current_repository_once() -> Result<ServeExit, DaemonError> {
         Some(path) => Arc::new(FileClock::new(path.into())),
         None => Arc::new(SystemClock),
     };
-    let store = Store::open(&repository.db_path, clock.now_ms()).map_err(DaemonError::Store)?;
+    let db = Db::open(&repository.db_path, clock.now_ms())
+        .map_err(StoreError::from)
+        .map_err(DaemonError::Store)?;
+    let local_work_state = LocalSqlite::from_db(db.clone());
+    let run_store = RunStore::from_db(db.clone());
     // A fresh process satisfies any persisted restart intent, including after
     // a crash during a drain or a successful self-exec.
-    store
+    run_store
         .clear_restart_draining(clock.now_ms())
         .map_err(DaemonError::Store)?;
     // Bound the activity feed once per daemon lifetime; watchers page by
     // sequence, so trimming old rows never invalidates a held cursor.
-    store
+    run_store
         .trim_events(EVENT_RETENTION)
         .map_err(DaemonError::Store)?;
     if let Some(agent) = &config.agent {
-        store
+        local_work_state
             .backfill_ticket_targets(&agent.default_target, clock.now_ms())
             .map_err(DaemonError::Store)?;
     }
     let _ = index_projects(
         &repository.root,
         &config.project_dir,
-        &store,
+        &local_work_state,
         clock.now_ms(),
         &config.project_prefix,
     )?;
     reconcile_tickets(
         &repository.root,
-        &store,
+        &local_work_state,
+        &run_store,
         clock.now_ms(),
         config.delete_missing_after_ms,
     )?;
@@ -252,7 +256,7 @@ fn serve_current_repository_once() -> Result<ServeExit, DaemonError> {
     let control = runtime.block_on(serve(
         repository,
         config,
-        store,
+        db,
         lock,
         legacy_lock,
         clock,
@@ -268,7 +272,7 @@ fn serve_current_repository_once() -> Result<ServeExit, DaemonError> {
 async fn serve(
     repository: Repository,
     config: Config,
-    store: Store,
+    db: Db,
     _lock: fs::File,
     _legacy_lock: fs::File,
     clock: Arc<dyn Clock>,
@@ -301,29 +305,25 @@ async fn serve(
     })?;
     log.emit(LogLevel::Info, "sloop::daemon", "daemon_started");
 
-    let paused = store.paused().map_err(DaemonError::Store)?;
-    let db = store.db();
-    let local_work_state = LocalSqlite::from_db(db.clone());
-    let work_state = Box::new(LocalSqlite::from_db_with_clock(db.clone(), clock.clone()));
-    let run_store = crate::run_store::RunStore::from_db(db);
+    let run_store = RunStore::from_db(db.clone());
+    let paused = run_store.paused().map_err(DaemonError::Store)?;
     let (dispatcher_tx, dispatcher_rx) = mpsc::channel(DISPATCH_CHANNEL_CAPACITY);
     let (events_tx, events_rx) = mpsc::channel(DISPATCH_CHANNEL_CAPACITY);
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<DaemonControl>(1);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let (ticket_source, work_state_author_enabled): (Arc<dyn TicketSource>, bool) =
-        match &config.ticket_source {
-            TicketSourceConfig::Markdown => (
-                Arc::new(MarkdownTicketSource::new(
-                    &repository.root,
-                    &config.ticket_dir,
-                )),
-                true,
-            ),
-            TicketSourceConfig::Exec(argv) => (
-                Arc::new(ExecTicketSource::new(&repository.root, argv.clone())),
-                false,
-            ),
-        };
+    let ticket_source = match &config.ticket_source {
+        TicketSourceConfig::Markdown => {
+            TicketFeeder::markdown(&repository.root, &config.ticket_dir)
+        }
+        TicketSourceConfig::Exec(argv) => TicketFeeder::exec(&repository.root, argv.clone()),
+    };
+    let work_state_author_enabled = ticket_source.supports_authoring();
+    let local_work_state = LocalSqlite::from_db(db.clone());
+    let work_state = Arc::new(LocalSqlite::from_db_with_clock_and_reporter(
+        db,
+        clock.clone(),
+        ticket_source.exec_reporter(),
+    )) as Arc<dyn crate::work_state::WorkState>;
     let mut state = DispatcherState {
         pid: std::process::id(),
         paused,
@@ -349,7 +349,6 @@ async fn serve(
         runtime_dir: repository.runtime_dir.clone(),
         socket: repository.operator_socket.clone(),
         daemon_log: repository.daemon_log.clone(),
-        store,
         local_work_state,
         work_state,
         run_store,

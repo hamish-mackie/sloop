@@ -1,6 +1,6 @@
-//! Model-based test of `Store` + `Coordination`.
+//! Model-based test of the work-state and run-store facets.
 //!
-//! Random sequences of coordination verbs run against the real store on a
+//! Random sequences of lifecycle verbs run against the real storage boundaries on a
 //! tempfile SQLite database, mirrored by a deliberately simple in-memory
 //! reference model. After every operation the full database state — leases,
 //! ticket states, run states, queued activations — must equal the model's
@@ -18,11 +18,14 @@ use std::path::PathBuf;
 
 use proptest::prelude::*;
 use rusqlite::Connection;
-use sloop::coordination::{Coordination, Exit, Renewal, RunExit, RunStart, Start};
+use sloop::db::StoreError;
 use sloop::domain::ticket::TicketState;
 use sloop::outcome::Outcome;
-use sloop::store::{ActivationKind, ClaimRequest, NewActivation, Store};
+use sloop::run_store::{Exit, RunAdmission, RunExit, RunStart, Start};
+use sloop::work_state::local::{ActivationKind, NewActivation};
 use tempfile::TempDir;
+
+use crate::TestStore;
 
 const TICKETS: [&str; 3] = ["T0", "T1", "T2"];
 const CLAIM_LEASE_MS: i64 = 60_000;
@@ -123,7 +126,7 @@ struct Model {
 struct Harness {
     _directory: TempDir,
     db_path: PathBuf,
-    store: Store,
+    store: TestStore,
     model: Model,
     now_ms: i64,
     run_counter: usize,
@@ -135,14 +138,16 @@ impl Harness {
         let directory = TempDir::new().expect("create tempdir");
         let db_path = directory.path().join("sloop.db");
         let now_ms = 1_000;
-        let store = Store::open(&db_path, now_ms).expect("open store");
+        let store = TestStore::open(&db_path, now_ms);
         store
+            .local
             .insert_local_project("default", "projects/default.md", "Default", now_ms)
             .expect("insert project");
 
         let mut model = Model::default();
         for ticket in TICKETS {
             store
+                .local
                 .insert_local_ticket(
                     ticket,
                     "default",
@@ -224,6 +229,7 @@ impl Harness {
         let id = format!("A{}", self.activation_counter);
         self.activation_counter += 1;
         self.store
+            .local
             .insert_activation(
                 &NewActivation {
                     id: &id,
@@ -262,17 +268,14 @@ impl Harness {
         let activation_id = activation.clone().unwrap_or_else(|| "A-none".into());
         let run_id = format!("R{}", self.run_counter);
 
-        let request = ClaimRequest {
+        let admission = RunAdmission {
             ticket_id: ticket,
             run_id: &run_id,
             activation_id: &activation_id,
-            owner_id: "daemon-prop",
-            lease_ms: CLAIM_LEASE_MS,
-            next_activation_eligible_at_ms: None,
             flow_json: "{}",
             ticket_json: "{}",
         };
-        let claim = crate::claim(&self.store, &request, self.now_ms);
+        let claim = crate::claim(&self.store, &admission, CLAIM_LEASE_MS, self.now_ms);
 
         let ticket_ready = self.model.tickets[ticket] == "ready";
         match (ticket_ready, activation) {
@@ -286,7 +289,7 @@ impl Harness {
             (true, Some(activation)) => {
                 let granted =
                     claim.unwrap_or_else(|| panic!("model expected a grant for {ticket}"));
-                assert_eq!(granted.run_id, run_id);
+                assert_eq!(granted.run.run_id, run_id);
                 assert_eq!(granted.lease_expires_at_ms, self.now_ms + CLAIM_LEASE_MS);
                 self.run_counter += 1;
                 *self.model.tickets.get_mut(ticket).expect("known ticket") = "claimed";
@@ -327,7 +330,7 @@ impl Harness {
             worker_token: "token",
             worker_socket_path: "/tmp/worker.sock",
         };
-        let result = Coordination::start(&self.store, &start, self.now_ms).expect("start");
+        let result = self.store.runs.start(&start, self.now_ms).expect("start");
         let run = self.model.runs.get_mut(run_id).expect("known run");
         if run.state == "claimed" {
             assert_eq!(result, Start::Granted);
@@ -350,7 +353,9 @@ impl Harness {
             vendor_error: None,
             cooldown_until_ms: None,
         };
-        let result = Coordination::new(&mut self.store)
+        let result = self
+            .store
+            .runs
             .record_exit(&exit, self.now_ms)
             .expect("record_exit");
         let run = self.model.runs.get_mut(run_id).expect("known run");
@@ -368,12 +373,17 @@ impl Harness {
 
     fn renew(&mut self, run_id: &str, lease_ms: i64, readopt: bool) {
         let ticket = self.model.runs[run_id].ticket.clone();
+        let work_state = self.store.local_at(self.now_ms);
         let result = if readopt {
-            Coordination::new(&mut self.store).readopt(&ticket, run_id, lease_ms, self.now_ms)
+            work_state.readopt_lease(&ticket, run_id, lease_ms, self.now_ms)
         } else {
-            Coordination::new(&mut self.store).renew(&ticket, run_id, lease_ms, self.now_ms)
-        }
-        .expect("renewal");
+            work_state.renew_lease(&ticket, run_id, lease_ms, self.now_ms)
+        };
+        let result = match result {
+            Ok(expires_at_ms) => Some(expires_at_ms),
+            Err(StoreError::LeaseNotHeld { .. }) => None,
+            Err(error) => panic!("renewal failed: {error}"),
+        };
 
         let lease = self.model.leases.get_mut(&ticket);
         let held = lease.as_ref().is_some_and(|lease| lease.run == run_id);
@@ -389,11 +399,11 @@ impl Harness {
                 .is_some_and(|lease| lease.expires_at_ms > self.now_ms)
         };
         if granted {
-            assert_eq!(result, Renewal::Granted(self.now_ms + lease_ms));
+            assert_eq!(result, Some(self.now_ms + lease_ms));
             lease.expect("held lease").expires_at_ms = self.now_ms + lease_ms;
         } else {
             assert!(
-                matches!(result, Renewal::Denied(_)),
+                result.is_none(),
                 "model expected denial renewing {run_id}, got {result:?}"
             );
         }
@@ -468,7 +478,7 @@ impl Harness {
     }
 
     /// Compares the entire database against the model over an independent
-    /// read connection, so the check cannot lean on `Store`'s own accessors.
+    /// read connection, so the check cannot lean on either facet's accessors.
     fn assert_matches_model(&self) {
         let connection = Connection::open(&self.db_path).expect("open check connection");
 
@@ -640,7 +650,7 @@ proptest! {
     })]
 
     #[test]
-    fn coordination_agrees_with_the_reference_model(
+    fn storage_boundaries_agree_with_the_reference_model(
         ops in prop::collection::vec(op(), 0..40)
     ) {
         let mut harness = Harness::new();
@@ -652,7 +662,7 @@ proptest! {
         // Reopening the database must reproduce the same state: settlement
         // and claims are durable, not artifacts of the live connection.
         drop(harness.store);
-        harness.store = Store::open(&harness.db_path, harness.now_ms).expect("reopen");
+        harness.store = TestStore::open(&harness.db_path, harness.now_ms);
         harness.assert_matches_model();
     }
 }

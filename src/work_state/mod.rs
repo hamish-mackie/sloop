@@ -1,4 +1,10 @@
+//! Authored ticket ingestion and daemon-owned work state.
+//!
+//! This module must never import the run-storage sibling; work-state
+//! transitions and run evidence are separate storage boundaries.
+
 use std::fmt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -7,8 +13,79 @@ use crate::domain::work::{
     Disposition, OwnerId, SourceVersion, TicketRef, WorkOutcome, WorkTicket,
 };
 
+use crate::frontmatter::Frontmatter;
+
+pub(crate) mod exec;
 pub mod local;
-pub mod markdown;
+pub(crate) mod markdown;
+
+use exec::ExecTicketSource;
+use markdown::MarkdownTicketSource;
+
+#[derive(Debug, Clone)]
+pub(crate) struct AuthoredTicket {
+    pub frontmatter: Frontmatter,
+    pub body: String,
+    pub source: String,
+    pub source_ref: String,
+    pub file_path: Option<PathBuf>,
+    pub original_content: Option<String>,
+    pub validation_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TicketFeedError(String);
+
+impl TicketFeedError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl fmt::Display for TicketFeedError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TicketFeedError {}
+
+/// The configured authored-ticket feeder. The public extension seam is the
+/// exec wire protocol, so server wiring uses this concrete enum rather than a
+/// Rust implementation trait.
+#[derive(Clone)]
+pub(crate) enum TicketFeeder {
+    Markdown(MarkdownTicketSource),
+    Exec(ExecTicketSource),
+}
+
+impl TicketFeeder {
+    pub(crate) fn markdown(root: impl Into<PathBuf>, ticket_dir: impl Into<PathBuf>) -> Self {
+        Self::Markdown(MarkdownTicketSource::new(root, ticket_dir))
+    }
+
+    pub(crate) fn exec(root: impl Into<PathBuf>, argv: Vec<String>) -> Self {
+        Self::Exec(ExecTicketSource::new(root, argv))
+    }
+
+    pub(crate) fn pull(&self) -> Result<Vec<AuthoredTicket>, TicketFeedError> {
+        match self {
+            Self::Markdown(source) => source.pull(),
+            Self::Exec(source) => source.pull(),
+        }
+    }
+
+    pub(crate) fn supports_authoring(&self) -> bool {
+        matches!(self, Self::Markdown(_))
+    }
+
+    pub(crate) fn exec_reporter(&self) -> Option<ExecTicketSource> {
+        match self {
+            Self::Markdown(_) => None,
+            Self::Exec(source) => Some(source.clone()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimStrength {

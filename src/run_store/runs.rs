@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::RunStore;
+use crate::db::StoreError;
 
 /// Every value the `runs.state` column can hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +54,14 @@ impl RunState {
             "orphaned" => Some(Self::Orphaned),
             _ => None,
         }
+    }
+
+    /// Reads a state written by an older or newer binary. Unknown values are
+    /// errors so the daemon never acts on a run it cannot classify.
+    pub fn parse(value: &str) -> Result<Self, StoreError> {
+        Self::from_stored(value).ok_or_else(|| StoreError::UnknownRunState {
+            state: value.into(),
+        })
     }
 
     pub fn is_terminal(self) -> bool {
@@ -134,52 +143,52 @@ pub struct RunRecord {
     pub ticket_json: Option<String>,
 }
 
-pub(crate) struct RunAdmission<'a> {
-    pub(crate) run_id: &'a str,
-    pub(crate) activation_id: &'a str,
-    pub(crate) ticket_id: &'a str,
-    pub(crate) flow_json: &'a str,
-    pub(crate) ticket_json: &'a str,
+pub struct RunAdmission<'a> {
+    pub run_id: &'a str,
+    pub activation_id: &'a str,
+    pub ticket_id: &'a str,
+    pub flow_json: &'a str,
+    pub ticket_json: &'a str,
 }
 
-pub(crate) struct AdmittedRun {
-    pub(crate) run_id: String,
-    pub(crate) attempt: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NeedsReviewBranch {
-    pub(crate) ticket_id: String,
-    pub(crate) run_id: String,
-    pub(crate) branch: String,
+pub struct AdmittedRun {
+    pub run_id: String,
+    pub attempt: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorktreeCleanupCandidate {
-    pub(crate) run_id: String,
-    pub(crate) ticket_id: String,
-    pub(crate) branch: String,
-    pub(crate) worktree_path: String,
-    pub(crate) cleanup_eligible_at_ms: i64,
+pub struct NeedsReviewBranch {
+    pub ticket_id: String,
+    pub run_id: String,
+    pub branch: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RecoverableRun {
-    pub(crate) id: String,
-    pub(crate) ticket_id: String,
-    pub(crate) target: String,
-    pub(crate) state: RunState,
-    pub(crate) branch: Option<String>,
-    pub(crate) worktree_path: Option<String>,
-    pub(crate) pid: Option<i64>,
-    pub(crate) pid_start_time: Option<i64>,
-    pub(crate) process_group_id: Option<i64>,
-    pub(crate) worker_token: Option<String>,
-    pub(crate) worker_socket_path: Option<String>,
-    pub(crate) exit_code: Option<i64>,
-    pub(crate) lease_expires_at_ms: i64,
-    pub(crate) flow_json: Option<String>,
-    pub(crate) ticket_json: Option<String>,
+pub struct WorktreeCleanupCandidate {
+    pub run_id: String,
+    pub ticket_id: String,
+    pub branch: String,
+    pub worktree_path: String,
+    pub cleanup_eligible_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverableRun {
+    pub id: String,
+    pub ticket_id: String,
+    pub target: String,
+    pub state: RunState,
+    pub branch: Option<String>,
+    pub worktree_path: Option<String>,
+    pub pid: Option<i64>,
+    pub pid_start_time: Option<i64>,
+    pub process_group_id: Option<i64>,
+    pub worker_token: Option<String>,
+    pub worker_socket_path: Option<String>,
+    pub exit_code: Option<i64>,
+    pub lease_expires_at_ms: i64,
+    pub flow_json: Option<String>,
+    pub ticket_json: Option<String>,
 }
 
 const RUN_RECORD_SELECT: &str = "SELECT id, ticket_id, attempt, state, branch, worktree_path, pid,
@@ -872,11 +881,15 @@ pub(crate) fn recoverable_runs(connection: &Connection) -> rusqlite::Result<Vec<
 }
 
 impl RunStore {
-    pub(crate) fn insert_claimed_run(
+    pub(crate) fn ticket_is_referenced(&self, id: &str) -> Result<bool, StoreError> {
+        ticket_is_referenced(&self.db.lock(), id).map_err(StoreError::from)
+    }
+
+    pub fn insert_claimed_run(
         &self,
         claim: &RunAdmission<'_>,
         now_ms: i64,
-    ) -> rusqlite::Result<AdmittedRun> {
+    ) -> Result<AdmittedRun, StoreError> {
         self.write(TransactionBehavior::Immediate, |transaction| {
             let attempt = tx::next_attempt(transaction, claim.ticket_id)?;
             tx::insert_claimed(
@@ -910,91 +923,94 @@ impl RunStore {
         run_id: &str,
         text: &str,
         now_ms: i64,
-    ) -> rusqlite::Result<()> {
+    ) -> Result<(), StoreError> {
         self.write(TransactionBehavior::Deferred, |transaction| {
             tx::insert_note(transaction, id, run_id, text, now_ms)
         })
     }
 
-    pub(crate) fn notes_for_run(&self, run_id: &str) -> rusqlite::Result<Vec<String>> {
-        notes_for_run(&self.db.lock(), run_id)
+    pub fn notes_for_run(&self, run_id: &str) -> Result<Vec<String>, StoreError> {
+        notes_for_run(&self.db.lock(), run_id).map_err(StoreError::from)
     }
 
-    pub(crate) fn notes_for_project(&self, project_id: &str) -> rusqlite::Result<Vec<ProjectNote>> {
-        notes_for_project(&self.db.lock(), project_id)
+    pub(crate) fn notes_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<ProjectNote>, StoreError> {
+        notes_for_project(&self.db.lock(), project_id).map_err(StoreError::from)
     }
 
     pub(crate) fn events_after(
         &self,
         after: i64,
         limit: usize,
-    ) -> rusqlite::Result<Vec<EventRecord>> {
-        events_after(&self.db.lock(), after, limit)
+    ) -> Result<Vec<EventRecord>, StoreError> {
+        events_after(&self.db.lock(), after, limit).map_err(StoreError::from)
     }
 
     pub(crate) fn run_timelines(
         &self,
         run_ids: &[&str],
-    ) -> rusqlite::Result<HashMap<String, RunTimeline>> {
+    ) -> Result<HashMap<String, RunTimeline>, StoreError> {
         if run_ids.is_empty() {
             return Ok(HashMap::new());
         }
-        run_timelines(&self.db.lock(), run_ids)
+        run_timelines(&self.db.lock(), run_ids).map_err(StoreError::from)
     }
 
-    pub(crate) fn latest_event_sequence(&self) -> rusqlite::Result<i64> {
-        latest_event_sequence(&self.db.lock())
+    pub(crate) fn latest_event_sequence(&self) -> Result<i64, StoreError> {
+        latest_event_sequence(&self.db.lock()).map_err(StoreError::from)
     }
 
-    pub(crate) fn trim_events(&self, keep: i64) -> rusqlite::Result<()> {
+    pub(crate) fn trim_events(&self, keep: i64) -> Result<(), StoreError> {
         self.write(TransactionBehavior::Deferred, |transaction| {
             tx::trim_events(transaction, keep)
         })
     }
 
-    pub(crate) fn run(&self, id: &str) -> rusqlite::Result<Option<RunRecord>> {
-        run(&self.db.lock(), id)
+    pub(crate) fn run(&self, id: &str) -> Result<Option<RunRecord>, StoreError> {
+        run(&self.db.lock(), id).map_err(StoreError::from)
     }
 
     pub(crate) fn run_for_ticket_attempt(
         &self,
         ticket_id: &str,
         attempt: i64,
-    ) -> rusqlite::Result<Option<RunRecord>> {
-        run_for_ticket_attempt(&self.db.lock(), ticket_id, attempt)
+    ) -> Result<Option<RunRecord>, StoreError> {
+        run_for_ticket_attempt(&self.db.lock(), ticket_id, attempt).map_err(StoreError::from)
     }
 
-    pub(crate) fn runs_for_ticket(&self, ticket_id: &str) -> rusqlite::Result<Vec<RunRecord>> {
-        runs_for_ticket(&self.db.lock(), ticket_id)
+    pub(crate) fn runs_for_ticket(&self, ticket_id: &str) -> Result<Vec<RunRecord>, StoreError> {
+        runs_for_ticket(&self.db.lock(), ticket_id).map_err(StoreError::from)
     }
 
-    pub(crate) fn runs_with_id_prefix(&self, prefix: &str) -> rusqlite::Result<Vec<RunRecord>> {
-        runs_with_id_prefix(&self.db.lock(), prefix)
+    pub(crate) fn runs_with_id_prefix(&self, prefix: &str) -> Result<Vec<RunRecord>, StoreError> {
+        runs_with_id_prefix(&self.db.lock(), prefix).map_err(StoreError::from)
     }
 
-    pub(crate) fn needs_review_branches(&self) -> rusqlite::Result<Vec<NeedsReviewBranch>> {
-        needs_review_branches(&self.db.lock())
+    pub(crate) fn needs_review_branches(&self) -> Result<Vec<NeedsReviewBranch>, StoreError> {
+        needs_review_branches(&self.db.lock()).map_err(StoreError::from)
     }
 
     pub(crate) fn worktree_cleanup_candidates(
         &self,
-    ) -> rusqlite::Result<Vec<WorktreeCleanupCandidate>> {
-        worktree_cleanup_candidates(&self.db.lock())
+    ) -> Result<Vec<WorktreeCleanupCandidate>, StoreError> {
+        worktree_cleanup_candidates(&self.db.lock()).map_err(StoreError::from)
     }
 
     pub(crate) fn next_worktree_cleanup_at_ms(
         &self,
         retention_ms: i64,
         now_ms: i64,
-    ) -> rusqlite::Result<Option<i64>> {
-        next_worktree_cleanup_at_ms(&self.db.lock(), retention_ms, now_ms)
+    ) -> Result<Option<i64>, StoreError> {
+        next_worktree_cleanup_at_ms(&self.db.lock(), retention_ms, now_ms).map_err(StoreError::from)
     }
 
     pub(crate) fn mark_run_worktree_cleaned(
         &self,
         candidate: &WorktreeCleanupCandidate,
         now_ms: i64,
-    ) -> rusqlite::Result<bool> {
+    ) -> Result<bool, StoreError> {
         self.write(TransactionBehavior::Immediate, |transaction| {
             tx::mark_worktree_cleaned(transaction, candidate, now_ms)
         })
@@ -1003,16 +1019,16 @@ impl RunStore {
     pub(crate) fn active_run_for_ticket(
         &self,
         ticket_id: &str,
-    ) -> rusqlite::Result<Option<(String, i64)>> {
-        active_run_for_ticket(&self.db.lock(), ticket_id)
+    ) -> Result<Option<(String, i64)>, StoreError> {
+        active_run_for_ticket(&self.db.lock(), ticket_id).map_err(StoreError::from)
     }
 
-    pub(crate) fn active_runs(&self) -> rusqlite::Result<Vec<ActiveRun>> {
-        active_runs(&self.db.lock())
+    pub(crate) fn active_runs(&self) -> Result<Vec<ActiveRun>, StoreError> {
+        active_runs(&self.db.lock()).map_err(StoreError::from)
     }
 
-    pub(crate) fn recoverable_runs(&self) -> rusqlite::Result<Vec<RecoverableRun>> {
-        recoverable_runs(&self.db.lock())
+    pub(crate) fn recoverable_runs(&self) -> Result<Vec<RecoverableRun>, StoreError> {
+        recoverable_runs(&self.db.lock()).map_err(StoreError::from)
     }
 }
 
@@ -1021,84 +1037,46 @@ mod tests {
     use rusqlite::Connection;
     use tempfile::tempdir;
 
-    use super::RunState;
-    use crate::coordination::{Coordination, RunStart, Start};
-    use crate::db::SCHEMA_VERSION;
-    use crate::domain::ticket::{TicketSnapshot, TicketState};
+    use super::{RunState, RunStore};
+    use crate::db::{Db, SCHEMA_VERSION, StoreError};
+    use crate::domain::ticket::TicketSnapshot;
     use crate::flow::{Flow, Stage, StageKind, VerdictPolicy};
     use crate::outcome::Outcome;
-    use crate::store::{
-        ActivationKind, ClaimRequest, NewActivation, Store, StoreError, claim_for_test,
-    };
+    use crate::run_store::test_support::{abort_run, claim_run, open_seeded, settle_run};
+    use crate::run_store::{RunAdmission, RunStart, Start, StartDenial};
 
-    fn open_seeded(path: &std::path::Path) -> Store {
-        let store = Store::open(path, 1_000).unwrap();
-        store
-            .insert_local_project(
-                "default",
-                ".agents/sloop/projects/default.md",
-                "Default",
-                1_000,
-            )
-            .unwrap();
-        store
-            .insert_local_ticket(
-                "T1",
-                "default",
-                ".agents/sloop/tickets/t1.md",
-                "Ticket one",
-                &[],
-                "sloop/T1",
-                Some("claude"),
-                Some("sonnet"),
-                Some("medium"),
-                "default",
-                TicketState::Ready,
-                1_000,
-            )
-            .unwrap();
-        store
-            .insert_activation(
-                &NewActivation {
-                    id: "A1",
-                    kind: ActivationKind::Immediate,
-                    ticket_id: Some("T1"),
-                    project_id: None,
-                    eligible_at_ms: None,
-                    interval_ms: None,
-                },
-                1_000,
-            )
-            .unwrap();
-        store
+    fn open(path: &std::path::Path, now_ms: i64) -> Result<RunStore, StoreError> {
+        Db::open(path, now_ms)
+            .map(RunStore::from_db)
+            .map_err(StoreError::from)
     }
 
-    fn claim_t1<'a>(run_id: &'a str) -> ClaimRequest<'a> {
-        ClaimRequest {
+    fn claim_t1(run_id: &str) -> RunAdmission<'_> {
+        RunAdmission {
             ticket_id: "T1",
             run_id,
             activation_id: "A1",
-            owner_id: "daemon-1",
-            lease_ms: 60_000,
-            next_activation_eligible_at_ms: None,
             flow_json: "{}",
             ticket_json: "{}",
         }
     }
 
-    fn claim_run(store: &Store, claim: &ClaimRequest<'_>, now_ms: i64) {
-        claim_for_test(store, claim, now_ms);
-    }
-
-    fn start_run(store: &Store, start: &RunStart<'_>, now_ms: i64) {
-        assert_eq!(
-            Coordination::start(store, start, now_ms).unwrap(),
-            Start::Granted
+    fn admit(store: &RunStore, claim: &RunAdmission<'_>, now_ms: i64) {
+        claim_run(
+            store,
+            claim.run_id,
+            claim.flow_json,
+            claim.ticket_json,
+            now_ms,
         );
     }
 
-    fn running_r1(store: &mut Store) {
-        claim_run(store, &claim_t1("R1"), 2_000);
+    fn start_run(store: &RunStore, start: &RunStart<'_>, now_ms: i64) {
+        assert_eq!(store.start(start, now_ms).unwrap(), Start::Granted);
+    }
+
+    fn running_r1(store: &RunStore) {
+        admit(store, &claim_t1("R1"), 2_000);
         start_run(
             store,
             &RunStart {
@@ -1191,9 +1169,9 @@ mod tests {
         let flow_json = serde_json::to_string(&flow).unwrap();
         let ticket_json = serde_json::to_string(&ticket).unwrap();
 
-        claim_run(
+        admit(
             &store,
-            &ClaimRequest {
+            &RunAdmission {
                 flow_json: &flow_json,
                 ticket_json: &ticket_json,
                 ..claim_t1("R1")
@@ -1218,7 +1196,7 @@ mod tests {
         let store = open_seeded(&directory.path().join("sloop.db"));
         assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
 
-        claim_run(&store, &claim_t1("R1"), 2_000);
+        admit(&store, &claim_t1("R1"), 2_000);
         assert_eq!(
             store.active_run_for_ticket("T1").unwrap(),
             Some(("R1".into(), 1))
@@ -1242,10 +1220,38 @@ mod tests {
             Some(("R1".into(), 1))
         );
 
-        store
-            .settle_for_test("R1", Some(1), Outcome::Failed, &[], None, 2_200)
-            .unwrap();
+        settle_run(&store, "R1", Some(1), Outcome::Failed, &[], None, 2_200);
         assert_eq!(store.active_run_for_ticket("T1").unwrap(), None);
+    }
+
+    #[test]
+    fn starting_a_run_that_left_claimed_is_denied() {
+        let directory = tempdir().unwrap();
+        let store = open_seeded(&directory.path().join("sloop.db"));
+        admit(&store, &claim_t1("R1"), 2_000);
+        abort_run(&store, "R1", 2_050);
+
+        let result = store
+            .start(
+                &RunStart {
+                    run_id: "R1",
+                    branch: "branch",
+                    worktree_path: "/tmp/worktree",
+                    pid: 1,
+                    pid_start_time: Some(1),
+                    process_group_id: 1,
+                    worker_token: "token",
+                    worker_socket_path: "/runtime/R1.sock",
+                },
+                2_100,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            Start::Denied(StartDenial::NotClaimed {
+                state: Some("aborted".into()),
+            })
+        );
     }
 
     #[test]
@@ -1253,7 +1259,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("sloop.db");
         let store = open_seeded(&path);
-        claim_run(&store, &claim_t1("R1"), 2_000);
+        admit(&store, &claim_t1("R1"), 2_000);
         start_run(
             &store,
             &RunStart {
@@ -1270,7 +1276,7 @@ mod tests {
         );
         drop(store);
 
-        let store = Store::open(&path, 3_000).unwrap();
+        let store = open(&path, 3_000).unwrap();
         let runs = store.recoverable_runs().unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].id, "R1");
@@ -1310,11 +1316,9 @@ mod tests {
     #[test]
     fn lifecycle_transitions_append_ordered_events() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        running_r1(&mut store);
-        store
-            .settle_for_test("R1", Some(0), Outcome::Merged, &[], None, 2_300)
-            .unwrap();
+        let store = open_seeded(&directory.path().join("sloop.db"));
+        running_r1(&store);
+        settle_run(&store, "R1", Some(0), Outcome::Merged, &[], None, 2_300);
 
         let events = store.events_after(0, 10).unwrap();
         let kinds: Vec<&str> = events.iter().map(|event| event.kind.as_str()).collect();
@@ -1326,9 +1330,7 @@ mod tests {
         assert_eq!(finished["outcome"], "merged");
         assert_eq!(finished["ticket_state"], "merged");
 
-        store
-            .settle_for_test("R1", Some(1), Outcome::Failed, &[], None, 2_400)
-            .unwrap();
+        settle_run(&store, "R1", Some(1), Outcome::Failed, &[], None, 2_400);
         assert_eq!(store.latest_event_sequence().unwrap(), events[2].sequence);
 
         let rest = store.events_after(events[0].sequence, 10).unwrap();
@@ -1345,8 +1347,8 @@ mod tests {
     fn abandoned_claims_append_an_abort_event() {
         let directory = tempdir().unwrap();
         let store = open_seeded(&directory.path().join("sloop.db"));
-        claim_run(&store, &claim_t1("R1"), 2_000);
-        store.abort_for_test("R1", "T1", 2_100).unwrap();
+        admit(&store, &claim_t1("R1"), 2_000);
+        abort_run(&store, "R1", 2_100);
 
         let kinds: Vec<String> = store
             .events_after(0, 10)
@@ -1361,7 +1363,7 @@ mod tests {
     fn notes_round_trip_in_arrival_order() {
         let directory = tempdir().unwrap();
         let store = open_seeded(&directory.path().join("sloop.db"));
-        claim_run(&store, &claim_t1("R1"), 2_000);
+        admit(&store, &claim_t1("R1"), 2_000);
 
         assert_eq!(store.next_note_ordinal().unwrap(), 1);
         store.insert_note("N1", "R1", "first", 3_000).unwrap();
@@ -1379,7 +1381,7 @@ mod tests {
     fn version_three_migrates_ticket_metadata_and_newer_schemas_are_rejected() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("sloop.db");
-        drop(Store::open(&path, 1_000).unwrap());
+        drop(open(&path, 1_000).unwrap());
 
         let connection = Connection::open(&path).unwrap();
         connection
@@ -1402,36 +1404,30 @@ mod tests {
         connection.pragma_update(None, "user_version", 3).unwrap();
         drop(connection);
 
-        let store = Store::open(&path, 2_000).unwrap();
+        let store = open(&path, 2_000).unwrap();
         assert!(!store.paused().unwrap());
         store
-            .insert_local_project(
-                "default",
-                ".agents/sloop/projects/default.md",
-                "Default",
-                2_000,
+            .db()
+            .lock()
+            .execute_batch(
+                "INSERT INTO projects
+                     (id, file_path, source, title, created_at_ms, updated_at_ms)
+                 VALUES ('default', 'projects/default.md', 'local', 'Default', 2000, 2000);
+                 INSERT INTO tickets
+                     (id, project_id, file_path, source, state, name, worktree, target, flow,
+                      created_at_ms, updated_at_ms)
+                 VALUES ('T1', 'default', 'tickets/t1.md', 'local', 'ready', 'Ticket one',
+                         'sloop/T1', 'codex', 'default', 2000, 2000);",
             )
             .unwrap();
-        store
-            .insert_local_ticket(
-                "T1",
-                "default",
-                ".agents/sloop/tickets/t1.md",
-                "Ticket one",
-                &[],
-                "sloop/T1",
-                Some("codex"),
-                None,
-                None,
-                "default",
-                TicketState::Ready,
-                2_000,
-            )
+        let target: String = store
+            .db()
+            .lock()
+            .query_row("SELECT target FROM tickets WHERE id = 'T1'", [], |row| {
+                row.get(0)
+            })
             .unwrap();
-        assert_eq!(
-            store.ticket("T1").unwrap().unwrap().target.as_deref(),
-            Some("codex")
-        );
+        assert_eq!(target, "codex");
         drop(store);
 
         let connection = Connection::open(&path).unwrap();
@@ -1439,7 +1435,7 @@ mod tests {
         drop(connection);
 
         assert!(matches!(
-            Store::open(&path, 3_000),
+            open(&path, 3_000),
             Err(StoreError::UnsupportedSchemaVersion(99))
         ));
     }
@@ -1449,7 +1445,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("sloop.db");
         let store = open_seeded(&path);
-        claim_run(&store, &claim_t1("R1"), 2_000);
+        admit(&store, &claim_t1("R1"), 2_000);
         drop(store);
 
         let connection = Connection::open(&path).unwrap();
@@ -1467,7 +1463,7 @@ mod tests {
         connection.pragma_update(None, "user_version", 8).unwrap();
         drop(connection);
 
-        let store = Store::open(&path, 3_000).unwrap();
+        let store = open(&path, 3_000).unwrap();
         let run = store.run("R1").unwrap().unwrap();
         assert_eq!(run.flow_json, None);
         assert_eq!(run.ticket_json, None);
@@ -1501,12 +1497,24 @@ mod tests {
         connection.pragma_update(None, "user_version", 10).unwrap();
         drop(connection);
 
-        let store = Store::open(&path, 3_000).unwrap();
-        let ticket = store.ticket("T1").unwrap().unwrap();
-        assert_eq!(ticket.state, "held");
-        assert_eq!(ticket.attempts, 3);
-        assert_eq!(ticket.body, None);
-        assert_eq!(ticket.held_reason, None);
+        let store = open(&path, 3_000).unwrap();
+        let ticket = store
+            .db()
+            .lock()
+            .query_row(
+                "SELECT state, attempts, body, held_reason FROM tickets WHERE id = 'T1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(ticket, ("held".into(), 3, None, None));
     }
 
     #[test]
@@ -1514,18 +1522,18 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("sloop.db");
 
-        let store = Store::open(&path, 1_000).unwrap();
+        let store = open(&path, 1_000).unwrap();
         store.set_paused(true, 2_000).unwrap();
         drop(store);
 
-        assert!(Store::open(&path, 3_000).unwrap().paused().unwrap());
+        assert!(open(&path, 3_000).unwrap().paused().unwrap());
     }
 
     #[test]
     fn restart_draining_is_durable_idempotent_and_cancelled_by_resume() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("sloop.db");
-        let mut store = Store::open(&path, 1_000).unwrap();
+        let store = open(&path, 1_000).unwrap();
 
         assert!(store.begin_restart_draining(2, 2_000).unwrap());
         assert!(!store.begin_restart_draining(2, 2_100).unwrap());
@@ -1541,7 +1549,7 @@ mod tests {
         );
         drop(store);
 
-        let mut reopened = Store::open(&path, 3_000).unwrap();
+        let reopened = open(&path, 3_000).unwrap();
         assert!(reopened.restart_draining().unwrap());
         assert!(reopened.resume_scheduler(4_000).unwrap());
         assert!(!reopened.restart_draining().unwrap());
@@ -1551,7 +1559,7 @@ mod tests {
     fn version_eleven_adds_restart_draining_state() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("sloop.db");
-        drop(Store::open(&path, 1_000).unwrap());
+        drop(open(&path, 1_000).unwrap());
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
@@ -1563,7 +1571,7 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let store = Store::open(&path, 2_000).unwrap();
+        let store = open(&path, 2_000).unwrap();
         assert!(!store.restart_draining().unwrap());
         assert_eq!(
             store

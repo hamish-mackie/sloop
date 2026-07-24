@@ -8,26 +8,27 @@ use serde_json::json;
 use crate::frontmatter::Frontmatter;
 use crate::outcome::Outcome;
 
-use super::{AuthoredTicket, SourceError, TicketSource};
+use super::{AuthoredTicket, TicketFeedError};
 
-pub struct ExecTicketSource {
+#[derive(Clone)]
+pub(crate) struct ExecTicketSource {
     root: PathBuf,
     argv: Vec<String>,
 }
 
 impl ExecTicketSource {
-    pub fn new(root: impl Into<PathBuf>, argv: Vec<String>) -> Self {
+    pub(crate) fn new(root: impl Into<PathBuf>, argv: Vec<String>) -> Self {
         Self {
             root: root.into(),
             argv,
         }
     }
 
-    fn invoke(&self, request: &serde_json::Value) -> Result<std::process::Output, SourceError> {
+    fn invoke(&self, request: &serde_json::Value) -> Result<std::process::Output, TicketFeedError> {
         let (program, arguments) = self
             .argv
             .split_first()
-            .ok_or_else(|| SourceError::new("sources.tickets.exec must name a command"))?;
+            .ok_or_else(|| TicketFeedError::new("sources.tickets.exec must name a command"))?;
         let mut child = Command::new(program)
             .args(arguments)
             .current_dir(&self.root)
@@ -36,10 +37,11 @@ impl ExecTicketSource {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| {
-                SourceError::new(format!("cannot start ticket source `{program}`: {error}"))
+                TicketFeedError::new(format!("cannot start ticket source `{program}`: {error}"))
             })?;
-        let input = serde_json::to_vec(request)
-            .map_err(|error| SourceError::new(format!("cannot encode source request: {error}")))?;
+        let input = serde_json::to_vec(request).map_err(|error| {
+            TicketFeedError::new(format!("cannot encode source request: {error}"))
+        })?;
         let write_result = child
             .stdin
             .take()
@@ -48,20 +50,18 @@ impl ExecTicketSource {
         if let Err(error) = write_result {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(SourceError::new(format!(
+            return Err(TicketFeedError::new(format!(
                 "cannot write to ticket source `{program}`: {error}"
             )));
         }
         child.wait_with_output().map_err(|error| {
-            SourceError::new(format!(
+            TicketFeedError::new(format!(
                 "cannot wait for ticket source `{program}`: {error}"
             ))
         })
     }
-}
 
-impl TicketSource for ExecTicketSource {
-    fn pull(&self) -> Result<Vec<AuthoredTicket>, SourceError> {
+    pub(crate) fn pull(&self) -> Result<Vec<AuthoredTicket>, TicketFeedError> {
         let output = self.invoke(&json!({ "verb": "pull" }))?;
         if !output.status.success() {
             return Err(command_failed(&self.argv, &output));
@@ -69,7 +69,7 @@ impl TicketSource for ExecTicketSource {
         parse_tickets(&output.stdout)
     }
 
-    fn report(&self, ticket_id: &str, outcome: &Outcome) -> Result<(), SourceError> {
+    pub(crate) fn report(&self, ticket_id: &str, outcome: &Outcome) -> Result<(), TicketFeedError> {
         let output = self.invoke(&json!({
             "verb": "report",
             "ticket": ticket_id,
@@ -98,9 +98,9 @@ struct ExecTicket {
     body: String,
 }
 
-fn parse_tickets(output: &[u8]) -> Result<Vec<AuthoredTicket>, SourceError> {
+fn parse_tickets(output: &[u8]) -> Result<Vec<AuthoredTicket>, TicketFeedError> {
     let tickets: Vec<ExecTicket> = serde_json::from_slice(output)
-        .map_err(|error| SourceError::new(format!("invalid ticket source output: {error}")))?;
+        .map_err(|error| TicketFeedError::new(format!("invalid ticket source output: {error}")))?;
     Ok(tickets
         .into_iter()
         .enumerate()
@@ -126,7 +126,7 @@ fn parse_tickets(output: &[u8]) -> Result<Vec<AuthoredTicket>, SourceError> {
         .collect())
 }
 
-fn command_failed(argv: &[String], output: &std::process::Output) -> SourceError {
+fn command_failed(argv: &[String], output: &std::process::Output) -> TicketFeedError {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let detail = stderr.trim();
     let detail = if detail.is_empty() {
@@ -134,7 +134,7 @@ fn command_failed(argv: &[String], output: &std::process::Output) -> SourceError
     } else {
         format!(": {detail}")
     };
-    SourceError::new(format!(
+    TicketFeedError::new(format!(
         "ticket source `{}` exited with {}{detail}",
         argv.join(" "),
         output.status

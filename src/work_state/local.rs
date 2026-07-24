@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::clock::{Clock, SystemClock};
 use crate::config::{AgentConfig, expand_agent_cmd};
-use crate::db::Db;
+use crate::db::{Db, StoreError};
 use crate::domain::ticket::TicketState;
 use crate::domain::work::{
     Disposition, ExecutionHints, OwnerId, SourceVersion, TicketRef, WorkOutcome, WorkTicket,
@@ -21,9 +21,10 @@ use crate::flow::Flow;
 use crate::frontmatter;
 use crate::ids::next_id;
 use crate::reindex::ReindexError;
-use crate::sources::TicketSource;
-use crate::store::{ClaimRequest, StoreError};
-use crate::work_state::{ActiveClaim, ClaimResult, ClaimStrength, SourceError, WorkState};
+use crate::work_state::exec::ExecTicketSource;
+use crate::work_state::{
+    ActiveClaim, ClaimResult, ClaimStrength, SourceError, TicketFeeder, WorkState,
+};
 
 const TICKET_RECORD_SELECT: &str =
     "SELECT id, project_id, file_path, source, source_ref, state, name, worktree,
@@ -76,6 +77,16 @@ pub struct NewActivation<'a> {
     pub project_id: Option<&'a str>,
     pub eligible_at_ms: Option<i64>,
     pub interval_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaimTransaction<'a> {
+    pub(crate) ticket_id: &'a str,
+    pub(crate) run_id: &'a str,
+    pub(crate) activation_id: &'a str,
+    pub(crate) owner_id: &'a str,
+    pub(crate) lease_ms: i64,
+    pub(crate) next_activation_eligible_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,7 +336,7 @@ pub(crate) mod tx {
 
     pub(crate) fn advance_activation(
         transaction: &Transaction<'_>,
-        claim: &ClaimRequest<'_>,
+        claim: &ClaimTransaction<'_>,
         now_ms: i64,
     ) -> Result<(), StoreError> {
         let activation_changed = match claim.next_activation_eligible_at_ms {
@@ -351,7 +362,7 @@ pub(crate) mod tx {
 
     pub(crate) fn insert_lease(
         transaction: &Transaction<'_>,
-        claim: &ClaimRequest<'_>,
+        claim: &ClaimTransaction<'_>,
         now_ms: i64,
     ) -> Result<i64, StoreError> {
         let expires_at_ms = now_ms + claim.lease_ms;
@@ -409,7 +420,7 @@ pub(crate) mod tx {
 
     pub(crate) fn claim_ticket(
         transaction: &Transaction<'_>,
-        claim: &ClaimRequest<'_>,
+        claim: &ClaimTransaction<'_>,
         now_ms: i64,
     ) -> Result<(), StoreError> {
         let changed = transaction.execute(
@@ -502,6 +513,7 @@ pub struct LocalSqlite {
     db: Db,
     clock: Arc<dyn Clock>,
     last_sync_ms: AtomicI64,
+    outcome_reporter: Option<ExecTicketSource>,
 }
 
 impl LocalSqlite {
@@ -510,11 +522,24 @@ impl LocalSqlite {
     }
 
     pub fn from_db_with_clock(db: Db, clock: Arc<dyn Clock>) -> Self {
+        Self::from_db_with_clock_and_reporter(db, clock, None)
+    }
+
+    pub(crate) fn from_db_with_clock_and_reporter(
+        db: Db,
+        clock: Arc<dyn Clock>,
+        outcome_reporter: Option<ExecTicketSource>,
+    ) -> Self {
         Self {
             db,
             clock,
             last_sync_ms: AtomicI64::new(i64::MIN),
+            outcome_reporter,
         }
+    }
+
+    pub(crate) fn db(&self) -> Db {
+        self.db.clone()
     }
 
     pub fn last_sync_ms(&self) -> Option<i64> {
@@ -818,7 +843,7 @@ impl LocalSqlite {
     pub(crate) fn sync_from_source<DropRuns, MarkRuns>(
         &self,
         root: &Path,
-        ticket_source: &dyn TicketSource,
+        ticket_source: &TicketFeeder,
         worktree_dir: &Path,
         now_ms: i64,
         ticket_prefix: &str,
@@ -1496,7 +1521,7 @@ impl LocalSqlite {
             .map_err(StoreError::from)
     }
 
-    pub(crate) fn readopt_lease(
+    pub fn readopt_lease(
         &self,
         ticket_id: &str,
         run_id: &str,
@@ -1521,7 +1546,7 @@ impl LocalSqlite {
         Ok(expires_at_ms)
     }
 
-    pub(crate) fn renew_lease(
+    pub fn renew_lease(
         &self,
         ticket_id: &str,
         run_id: &str,
@@ -1620,6 +1645,10 @@ impl LocalSqlite {
             params![id],
             |row| row.get(0),
         )
+    }
+
+    pub(crate) fn ticket_has_work_references(&self, id: &str) -> Result<bool, StoreError> {
+        Self::ticket_has_work_references_on(&self.db.lock(), id).map_err(StoreError::from)
     }
 
     pub fn delete_ticket(&self, id: &str) -> Result<(), StoreError> {
@@ -2059,15 +2088,13 @@ impl WorkState for LocalSqlite {
                 });
             }
             let stored_owner = lease_owner(owner, &activation.id);
-            let claim = ClaimRequest {
+            let claim = ClaimTransaction {
                 ticket_id: &ticket.id,
                 run_id: &owner.0,
                 activation_id: &activation.id,
                 owner_id: &stored_owner,
                 lease_ms,
                 next_activation_eligible_at_ms,
-                flow_json: "",
-                ticket_json: "",
             };
 
             match tx::claim_ticket(&transaction, &claim, now_ms) {
@@ -2316,8 +2343,17 @@ impl WorkState for LocalSqlite {
         Ok(())
     }
 
-    async fn push_outcome(&self, _outcome: &WorkOutcome) -> Result<(), SourceError> {
-        Ok(())
+    async fn push_outcome(&self, outcome: &WorkOutcome) -> Result<(), SourceError> {
+        let Some(reporter) = self.outcome_reporter.clone() else {
+            return Ok(());
+        };
+        let ticket_id = outcome.ticket_id.clone();
+        let verdict = outcome.verdict;
+        reporter
+            .report(&ticket_id, &verdict)
+            .map_err(|error| SourceError::Rejected {
+                message: error.to_string(),
+            })
     }
 }
 
@@ -2325,25 +2361,24 @@ impl WorkState for LocalSqlite {
 mod tests {
     use std::collections::BTreeMap;
     use std::process::Command;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use tempfile::tempdir;
 
-    use crate::db::Db;
+    use crate::db::{Db, StoreError};
     use crate::domain::ticket::TicketState;
-    use crate::domain::work::{Disposition, OwnerId, TicketRef, WorkTicket};
+    use crate::domain::work::{Disposition, OwnerId, TicketRef, WorkOutcome, WorkTicket};
     use crate::outcome::Outcome;
-    use crate::sources::{AuthoredTicket, SourceError, TicketSource};
-    use crate::store::{
-        ActivationKind, ClaimRequest, ClaimedRun, NewActivation, QueuedActivation, ReindexTicket,
-        Store, StoreError, claim_for_test,
+    use crate::work_state::{ClaimResult, TicketFeeder, WorkState};
+
+    use super::{
+        ActivationKind, ClaimTransaction, LocalSqlite, NewActivation, QueuedActivation,
+        ReindexTicket,
     };
-    use crate::work_state::{ClaimResult, WorkState};
 
-    use super::LocalSqlite;
-
-    fn open_seeded(path: &std::path::Path) -> Store {
-        let store = Store::open(path, 1_000).unwrap();
+    fn open_seeded(path: &std::path::Path) -> LocalSqlite {
+        let store = LocalSqlite::from_db(Db::open(path, 1_000).unwrap());
         store
             .insert_local_project(
                 "default",
@@ -2382,6 +2417,105 @@ mod tests {
             )
             .unwrap();
         store
+    }
+
+    fn insert_claimed_run(store: &LocalSqlite, claim: &ClaimTransaction<'_>, now_ms: i64) -> i64 {
+        let connection = store.db.lock();
+        let attempt = connection
+            .query_row(
+                "SELECT COALESCE(MAX(attempt), 0) + 1 FROM runs WHERE ticket_id = ?1",
+                rusqlite::params![claim.ticket_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs
+                     (id, activation_id, ticket_id, state, attempt, flow_json, ticket_json,
+                      created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, 'claimed', ?4, '{}', '{}', ?5, ?5)",
+                rusqlite::params![
+                    claim.run_id,
+                    claim.activation_id,
+                    claim.ticket_id,
+                    attempt,
+                    now_ms
+                ],
+            )
+            .unwrap();
+        attempt
+    }
+
+    fn granted_claim(store: &LocalSqlite, claim: &ClaimTransaction<'_>, now_ms: i64) -> i64 {
+        let mut connection = store.db.lock();
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .unwrap();
+        {
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            super::tx::claim_ticket(&transaction, claim, now_ms).unwrap();
+            super::tx::advance_activation(&transaction, claim, now_ms).unwrap();
+            super::tx::insert_lease(&transaction, claim, now_ms).unwrap();
+            transaction.commit().unwrap();
+        }
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        drop(connection);
+        insert_claimed_run(store, claim, now_ms)
+    }
+
+    fn settle_for_test(store: &LocalSqlite, run_id: &str, outcome: Outcome, now_ms: i64) {
+        let state = outcome.as_str();
+        let ticket_state = match outcome {
+            Outcome::Merged => "merged",
+            Outcome::Failed => "failed",
+            Outcome::NeedsReview => "needs_review",
+            Outcome::Cancelled | Outcome::RateLimited | Outcome::Orphaned => "ready",
+        };
+        let mut connection = store.db.lock();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute(
+                "UPDATE runs SET state = ?2, exited_at_ms = ?3, updated_at_ms = ?3 WHERE id = ?1",
+                rusqlite::params![run_id, state, now_ms],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE tickets SET state = ?2, updated_at_ms = ?3
+                 WHERE id = (SELECT ticket_id FROM runs WHERE id = ?1)",
+                rusqlite::params![run_id, ticket_state, now_ms],
+            )
+            .unwrap();
+        transaction
+            .execute("DELETE FROM leases WHERE run_id = ?1", [run_id])
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+
+    fn select_ready_ticket(
+        store: &LocalSqlite,
+        activation: &QueuedActivation,
+        now_ms: i64,
+    ) -> Option<String> {
+        store
+            .select_ready_ticket(activation.project_id.as_deref(), &activation.id, now_ms)
+            .unwrap()
+    }
+
+    fn apply_reindex(store: &LocalSqlite, tickets: &[ReindexTicket], now_ms: i64) {
+        store
+            .apply_reindex(
+                &["default".into()],
+                tickets,
+                now_ms,
+                |_, _, _| Ok(0),
+                |_, _, _| Ok(()),
+            )
+            .unwrap();
     }
 
     fn open_seeded_local() -> (tempfile::TempDir, LocalSqlite) {
@@ -2482,21 +2616,18 @@ mod tests {
             );
         }
         assert_eq!(local.active_claims().await.unwrap().len(), 1);
-        Store::from_db(local.db.clone())
-            .insert_claimed_run(
-                &ClaimRequest {
-                    ticket_id: "T1",
-                    run_id: "R1",
-                    activation_id: "A1",
-                    owner_id: "R1",
-                    lease_ms: 60_000,
-                    next_activation_eligible_at_ms: None,
-                    flow_json: "{}",
-                    ticket_json: "{}",
-                },
-                2_000,
-            )
-            .unwrap();
+        insert_claimed_run(
+            &local,
+            &ClaimTransaction {
+                ticket_id: "T1",
+                run_id: "R1",
+                activation_id: "A1",
+                owner_id: "R1",
+                lease_ms: 60_000,
+                next_activation_eligible_at_ms: None,
+            },
+            2_000,
+        );
         assert_eq!(
             local
                 .db
@@ -2627,28 +2758,69 @@ mod tests {
         );
     }
 
-    struct EmptyTicketSource;
+    #[tokio::test]
+    async fn local_work_state_reports_exec_outcomes_with_the_existing_wire_shape() {
+        let directory = tempdir().unwrap();
+        let request_path = directory.path().join("report.json");
+        let feeder = TicketFeeder::exec(
+            directory.path(),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "cat > \"$1\"".into(),
+                "ticket-source".into(),
+                request_path.to_string_lossy().into_owned(),
+            ],
+        );
+        let local = LocalSqlite::from_db_with_clock_and_reporter(
+            Db::open(&directory.path().join("sloop.db"), 1_000).unwrap(),
+            Arc::new(crate::clock::SystemClock),
+            feeder.exec_reporter(),
+        );
 
-    impl TicketSource for EmptyTicketSource {
-        fn pull(&self) -> Result<Vec<AuthoredTicket>, SourceError> {
-            Ok(Vec::new())
-        }
+        local
+            .push_outcome(&WorkOutcome {
+                ticket_id: "T1".into(),
+                owner: OwnerId("R1".into()),
+                verdict: Outcome::Merged,
+                branch: Some("sloop/T1".into()),
+                commit_count: 1,
+                attempt: 1,
+                finished_at_ms: 2_000,
+            })
+            .await
+            .unwrap();
 
-        fn report(&self, _ticket_id: &str, _outcome: &Outcome) -> Result<(), SourceError> {
-            Ok(())
-        }
+        let request: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(request_path).unwrap()).unwrap();
+        assert_eq!(
+            request,
+            serde_json::json!({
+                "verb": "report",
+                "ticket": "T1",
+                "outcome": "merged",
+            })
+        );
     }
 
-    struct FailingTicketSource;
+    #[tokio::test]
+    async fn local_work_state_without_an_exec_reporter_keeps_outcome_push_a_no_op() {
+        let directory = tempdir().unwrap();
+        let local =
+            LocalSqlite::from_db(Db::open(&directory.path().join("sloop.db"), 1_000).unwrap());
 
-    impl TicketSource for FailingTicketSource {
-        fn pull(&self) -> Result<Vec<AuthoredTicket>, SourceError> {
-            Err(SourceError::new("pull failed"))
-        }
-
-        fn report(&self, _ticket_id: &str, _outcome: &Outcome) -> Result<(), SourceError> {
-            Ok(())
-        }
+        local
+            .push_outcome(&WorkOutcome {
+                ticket_id: "T1".into(),
+                owner: OwnerId("R1".into()),
+                verdict: Outcome::Merged,
+                branch: None,
+                commit_count: 0,
+                attempt: 1,
+                finished_at_ms: 2_000,
+            })
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -2662,11 +2834,20 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let store = Store::open(&directory.path().join("sloop.db"), 1_000).unwrap();
-        store
+        let work_state =
+            LocalSqlite::from_db(Db::open(&directory.path().join("sloop.db"), 1_000).unwrap());
+        work_state
             .insert_local_project("default", "projects/default.md", "Default", 1_000)
             .unwrap();
-        let work_state = super::LocalSqlite::from_db(store.db());
+        let empty_source = TicketFeeder::markdown(directory.path(), "tickets");
+        let failing_source = TicketFeeder::exec(
+            directory.path(),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "printf 'pull failed' >&2; exit 1".into(),
+            ],
+        );
         let project_ids = vec!["default".to_owned()];
         let drop_runs = |_: &rusqlite::Transaction<'_>, _: &[String], _: &_| Ok(0);
         let mark_runs = |_: &rusqlite::Transaction<'_>, _: &str, _: i64| Ok(());
@@ -2675,7 +2856,7 @@ mod tests {
         work_state
             .sync_from_source(
                 directory.path(),
-                &EmptyTicketSource,
+                &empty_source,
                 &directory.path().join("worktrees"),
                 2_000,
                 "T",
@@ -2692,7 +2873,7 @@ mod tests {
         let error = work_state
             .sync_from_source(
                 directory.path(),
-                &FailingTicketSource,
+                &failing_source,
                 &directory.path().join("worktrees"),
                 3_000,
                 "T",
@@ -2704,31 +2885,25 @@ mod tests {
                 mark_runs,
             )
             .unwrap_err();
-        assert_eq!(error.to_string(), "pull failed");
+        assert!(error.to_string().contains("pull failed"));
         assert_eq!(work_state.last_sync_ms(), Some(2_000));
     }
 
-    fn claim_t1<'a>(run_id: &'a str) -> ClaimRequest<'a> {
-        ClaimRequest {
+    fn claim_t1<'a>(run_id: &'a str) -> ClaimTransaction<'a> {
+        ClaimTransaction {
             ticket_id: "T1",
             run_id,
             activation_id: "A1",
             owner_id: "daemon-1",
             lease_ms: 60_000,
             next_activation_eligible_at_ms: None,
-            flow_json: "{}",
-            ticket_json: "{}",
         }
-    }
-
-    fn granted_claim(store: &Store, claim: &ClaimRequest<'_>, now_ms: i64) -> ClaimedRun {
-        claim_for_test(store, claim, now_ms)
     }
 
     #[test]
     fn renewing_a_held_lease_extends_its_expiry() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        let store = open_seeded(&directory.path().join("sloop.db"));
         granted_claim(&store, &claim_t1("R1"), 2_000);
 
         let expires = store.renew_lease("T1", "R1", 60_000, 10_000).unwrap();
@@ -2738,7 +2913,7 @@ mod tests {
     #[test]
     fn a_run_cannot_renew_a_lease_it_does_not_hold() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        let store = open_seeded(&directory.path().join("sloop.db"));
         granted_claim(&store, &claim_t1("R1"), 2_000);
 
         let error = store.renew_lease("T1", "R2", 60_000, 10_000).unwrap_err();
@@ -2748,7 +2923,7 @@ mod tests {
     #[test]
     fn an_expired_lease_cannot_be_renewed() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        let store = open_seeded(&directory.path().join("sloop.db"));
         granted_claim(&store, &claim_t1("R1"), 2_000);
 
         // The lease expires at 62_000; renewal at or after that must fail.
@@ -2759,7 +2934,7 @@ mod tests {
     #[test]
     fn a_readopted_lease_is_re_armed_even_after_it_expired() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        let store = open_seeded(&directory.path().join("sloop.db"));
         granted_claim(&store, &claim_t1("R1"), 2_000);
 
         // The lease expired at 62_000, so ordinary renewal is refused...
@@ -2778,11 +2953,9 @@ mod tests {
     #[test]
     fn a_settled_run_cannot_be_readopted() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
+        let store = open_seeded(&directory.path().join("sloop.db"));
         granted_claim(&store, &claim_t1("R1"), 2_000);
-        store
-            .settle_for_test("R1", Some(0), Outcome::Failed, &[], None, 3_000)
-            .unwrap();
+        settle_for_test(&store, "R1", Outcome::Failed, 3_000);
 
         let error = store.readopt_lease("T1", "R1", 60_000, 4_000).unwrap_err();
         assert!(matches!(error, StoreError::LeaseNotHeld { .. }));
@@ -2832,19 +3005,13 @@ mod tests {
 
         // T1 was registered first, so it wins despite T0 sorting lower.
         assert_eq!(
-            store
-                .select_ready_ticket(&activation, 2_000)
-                .unwrap()
-                .as_deref(),
+            select_ready_ticket(&store, &activation, 2_000).as_deref(),
             Some("T1")
         );
 
         store.insert_activation_filter("A2", "T0").unwrap();
         assert_eq!(
-            store
-                .select_ready_ticket(&activation, 2_000)
-                .unwrap()
-                .as_deref(),
+            select_ready_ticket(&store, &activation, 2_000).as_deref(),
             Some("T0")
         );
 
@@ -2852,7 +3019,7 @@ mod tests {
             project_id: Some("elsewhere".into()),
             ..activation
         };
-        assert_eq!(store.select_ready_ticket(&scoped, 2_000).unwrap(), None);
+        assert_eq!(select_ready_ticket(&store, &scoped, 2_000), None);
     }
 
     #[test]
@@ -2886,16 +3053,11 @@ mod tests {
             interval_ms: None,
         };
         // T1 is claimed and T2's blocker has not merged: nothing is ready.
-        assert_eq!(store.select_ready_ticket(&activation, 2_000).unwrap(), None);
+        assert_eq!(select_ready_ticket(&store, &activation, 2_000), None);
 
-        store
-            .settle_for_test("R1", Some(0), Outcome::Merged, &[], None, 3_000)
-            .unwrap();
+        settle_for_test(&store, "R1", Outcome::Merged, 3_000);
         assert_eq!(
-            store
-                .select_ready_ticket(&activation, 3_000)
-                .unwrap()
-                .as_deref(),
+            select_ready_ticket(&store, &activation, 3_000).as_deref(),
             Some("T2")
         );
     }
@@ -2913,7 +3075,7 @@ mod tests {
             eligible_at_ms: None,
             interval_ms: None,
         };
-        assert_eq!(store.select_ready_ticket(&activation, 2_000).unwrap(), None);
+        assert_eq!(select_ready_ticket(&store, &activation, 2_000), None);
         assert_eq!(store.ticket("T1").unwrap().unwrap().attempts, 0);
 
         store.mark_ticket_missing("T1", 5_000).unwrap();
@@ -2923,10 +3085,7 @@ mod tests {
         );
         store.clear_ticket_missing("T1", 6_000).unwrap();
         assert_eq!(
-            store
-                .select_ready_ticket(&activation, 6_000)
-                .unwrap()
-                .as_deref(),
+            select_ready_ticket(&store, &activation, 6_000).as_deref(),
             Some("T1")
         );
     }
@@ -2962,33 +3121,27 @@ mod tests {
 
         assert_eq!(store.unmerged_blockers("T2").unwrap(), ["T1"]);
         assert_eq!(
-            store
-                .select_ready_ticket(&activation, 2_000)
-                .unwrap()
-                .as_deref(),
+            select_ready_ticket(&store, &activation, 2_000).as_deref(),
             Some("T1")
         );
         assert_eq!(store.ticket_counts().unwrap().blocked, 1);
 
         store
-            .db()
+            .db
             .lock()
             .execute("UPDATE tickets SET state = 'failed' WHERE id = 'T1'", [])
             .unwrap();
-        assert_eq!(store.select_ready_ticket(&activation, 2_000).unwrap(), None);
+        assert_eq!(select_ready_ticket(&store, &activation, 2_000), None);
         assert_eq!(store.ticket("T2").unwrap().unwrap().attempts, 0);
 
         store
-            .db()
+            .db
             .lock()
             .execute("UPDATE tickets SET state = 'merged' WHERE id = 'T1'", [])
             .unwrap();
         assert!(store.unmerged_blockers("T2").unwrap().is_empty());
         assert_eq!(
-            store
-                .select_ready_ticket(&activation, 2_000)
-                .unwrap()
-                .as_deref(),
+            select_ready_ticket(&store, &activation, 2_000).as_deref(),
             Some("T2")
         );
         let counts = store.ticket_counts().unwrap();
@@ -3004,7 +3157,7 @@ mod tests {
         granted_claim(&store, &claim_t1("R1"), 2_000);
         drop(store);
 
-        let store = Store::open(&path, 3_000).unwrap();
+        let store = LocalSqlite::from_db(Db::open(&path, 3_000).unwrap());
         assert_eq!(
             store.ticket_state("T1").unwrap().as_deref(),
             Some("claimed")
@@ -3042,8 +3195,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let ticket = Store::open(&path, 3_000)
-            .unwrap()
+        let ticket = LocalSqlite::from_db(Db::open(&path, 3_000).unwrap())
             .ticket("T2")
             .unwrap()
             .unwrap();
@@ -3140,28 +3292,22 @@ mod tests {
             derived_state: None,
         };
 
-        store
-            .apply_reindex(
-                &["default".into()],
-                &[ticket(Some("flow `missing` is not defined"))],
-                2_000,
-            )
-            .unwrap();
+        apply_reindex(
+            &store,
+            &[ticket(Some("flow `missing` is not defined"))],
+            2_000,
+        );
         assert_eq!(
             store.ticket("T1").unwrap().unwrap().held_reason.as_deref(),
             Some("flow `missing` is not defined")
         );
-        store
-            .apply_reindex(&["default".into()], &[ticket(None)], 2_100)
-            .unwrap();
+        apply_reindex(&store, &[ticket(None)], 2_100);
         assert_eq!(store.ticket_state("T1").unwrap().as_deref(), Some("ready"));
 
         store
             .set_ticket_hold("T1", TicketState::Held, 2_200)
             .unwrap();
-        store
-            .apply_reindex(&["default".into()], &[ticket(None)], 2_300)
-            .unwrap();
+        apply_reindex(&store, &[ticket(None)], 2_300);
         let operator_held = store.ticket("T1").unwrap().unwrap();
         assert_eq!(operator_held.state, "held");
         assert_eq!(operator_held.held_reason, None);
@@ -3182,12 +3328,13 @@ mod tests {
     fn retry_only_requeues_failed_tickets_and_resets_attempts() {
         let directory = tempdir().unwrap();
         let store = open_seeded(&directory.path().join("sloop.db"));
-        assert_eq!(granted_claim(&store, &claim_t1("R1"), 2_000).attempt, 1);
-        store
-            .settle_for_test("R1", Some(0), Outcome::Failed, &[], None, 2_100)
-            .unwrap();
+        assert_eq!(granted_claim(&store, &claim_t1("R1"), 2_000), 1);
+        settle_for_test(&store, "R1", Outcome::Failed, 2_100);
 
-        assert_eq!(store.retry_ticket("T1", 2_200).unwrap(), "failed");
+        assert_eq!(
+            store.retry_ticket("T1", 2_200, |_, _, _| Ok(())).unwrap(),
+            "failed"
+        );
         store
             .insert_activation(
                 &NewActivation {
@@ -3204,22 +3351,21 @@ mod tests {
         assert_eq!(
             granted_claim(
                 &store,
-                &ClaimRequest {
+                &ClaimTransaction {
                     activation_id: "A2",
                     ..claim_t1("R2")
                 },
                 2_300,
-            )
-            .attempt,
+            ),
             2
         );
         assert_eq!(store.ticket("T1").unwrap().unwrap().attempts, 1);
         assert!(matches!(
-            store.retry_ticket("T1", 2_400),
+            store.retry_ticket("T1", 2_400, |_, _, _| Ok(())),
             Err(StoreError::TicketStateConflict { state, .. }) if state == "claimed"
         ));
         assert!(matches!(
-            store.retry_ticket("missing", 2_400),
+            store.retry_ticket("missing", 2_400, |_, _, _| Ok(())),
             Err(StoreError::TicketNotFound { .. })
         ));
     }

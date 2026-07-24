@@ -7,8 +7,8 @@
 //! `leases` primary key and the conditional `UPDATE ... WHERE state = ...`
 //! guards — with the supervisor-vs-recovery race decided by whoever
 //! checkpoints first. These tests hold those guards under real thread-level
-//! simultaneity: N threads, each with its own `Store` connection, releasing
-//! from a barrier at the same instant.
+//! simultaneity: N threads, each with its own `Db` connection and local/run
+//! facets, releasing from a barrier at the same instant.
 //!
 //! Time stays injected even here: a shared atomic counter hands every
 //! operation a distinct logical timestamp.
@@ -17,12 +17,13 @@ use std::sync::Barrier;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use rusqlite::Connection;
-use sloop::coordination::{Coordination, Exit, RunExit, RunStart, Start};
 use sloop::domain::ticket::TicketState;
 use sloop::outcome::Outcome;
-use sloop::store::{ActivationKind, ClaimRequest, NewActivation, Store};
+use sloop::run_store::{Exit, RunAdmission, RunExit, RunStart, Start};
+use sloop::work_state::local::{ActivationKind, NewActivation};
 use tempfile::TempDir;
 
+use crate::TestStore;
 use crate::model::extra_invariants;
 
 const THREADS: usize = 8;
@@ -37,8 +38,9 @@ impl Arena {
     fn new() -> Self {
         let directory = TempDir::new().expect("create tempdir");
         let db_path = directory.path().join("sloop.db");
-        let store = Store::open(&db_path, 1_000).expect("open store");
+        let store = TestStore::open(&db_path, 1_000);
         store
+            .local
             .insert_local_project("default", "projects/default.md", "Default", 1_000)
             .expect("insert project");
         Self {
@@ -52,12 +54,13 @@ impl Arena {
         self.clock.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn open(&self) -> Store {
-        Store::open(&self.db_path, self.now()).expect("open per-thread store")
+    fn open(&self) -> TestStore {
+        TestStore::open(&self.db_path, self.now())
     }
 
-    fn add_ticket(&self, store: &Store, ticket: &str) {
+    fn add_ticket(&self, store: &TestStore, ticket: &str) {
         store
+            .local
             .insert_local_ticket(
                 ticket,
                 "default",
@@ -75,8 +78,9 @@ impl Arena {
             .expect("insert ticket");
     }
 
-    fn add_activation(&self, store: &Store, id: &str, ticket: &str) {
+    fn add_activation(&self, store: &TestStore, id: &str, ticket: &str) {
         store
+            .local
             .insert_activation(
                 &NewActivation {
                     id,
@@ -97,14 +101,11 @@ impl Arena {
     }
 }
 
-fn claim_request<'a>(ticket: &'a str, run_id: &'a str, activation_id: &'a str) -> ClaimRequest<'a> {
-    ClaimRequest {
+fn run_admission<'a>(ticket: &'a str, run_id: &'a str, activation_id: &'a str) -> RunAdmission<'a> {
+    RunAdmission {
         ticket_id: ticket,
         run_id,
         activation_id,
-        owner_id: "daemon-race",
-        lease_ms: 60_000,
-        next_activation_eligible_at_ms: None,
         flow_json: "{}",
         ticket_json: "{}",
     }
@@ -160,7 +161,8 @@ fn simultaneous_claims_grant_exactly_one_winner() {
                         barrier.wait();
                         crate::claim(
                             &store,
-                            &claim_request(ticket, &run_id, activation),
+                            &run_admission(ticket, &run_id, activation),
+                            60_000,
                             arena.now(),
                         )
                         .is_some()
@@ -195,12 +197,16 @@ fn simultaneous_exit_checkpoints_grant_exactly_one_owner() {
         assert!(
             crate::claim(
                 &setup,
-                &claim_request(&ticket, &run_id, &activation),
+                &run_admission(&ticket, &run_id, &activation),
+                60_000,
                 arena.now()
             )
             .is_some()
         );
-        let started = Coordination::start(&setup, &run_start(&run_id), arena.now()).expect("start");
+        let started = setup
+            .runs
+            .start(&run_start(&run_id), arena.now())
+            .expect("start");
         assert_eq!(started, Start::Granted);
 
         let barrier = Barrier::new(THREADS);
@@ -209,9 +215,10 @@ fn simultaneous_exit_checkpoints_grant_exactly_one_owner() {
                 .map(|_| {
                     let (arena, run_id, barrier) = (&arena, &run_id, &barrier);
                     scope.spawn(move || {
-                        let mut store = arena.open();
+                        let store = arena.open();
                         barrier.wait();
-                        let exit = Coordination::new(&mut store)
+                        let exit = store
+                            .runs
                             .record_exit(&run_exit(run_id), arena.now())
                             .expect("record_exit must grant or deny, never fail");
                         matches!(exit, Exit::Granted)
@@ -243,7 +250,7 @@ fn simultaneous_settlements_land_exactly_once() {
     ];
 
     let arena = Arena::new();
-    let mut setup = arena.open();
+    let setup = arena.open();
 
     for round in 0..20 {
         let ticket = format!("T{round}");
@@ -253,12 +260,17 @@ fn simultaneous_settlements_land_exactly_once() {
         arena.add_activation(&setup, &activation, &ticket);
         crate::claim(
             &setup,
-            &claim_request(&ticket, &run_id, &activation),
+            &run_admission(&ticket, &run_id, &activation),
+            60_000,
             arena.now(),
         )
         .expect("claim");
-        Coordination::start(&setup, &run_start(&run_id), arena.now()).expect("start");
-        Coordination::new(&mut setup)
+        setup
+            .runs
+            .start(&run_start(&run_id), arena.now())
+            .expect("start");
+        setup
+            .runs
             .record_exit(&run_exit(&run_id), arena.now())
             .expect("record exit");
 
@@ -331,7 +343,7 @@ fn uncoordinated_lifecycle_hammer_preserves_invariants() {
             .map(|thread| {
                 let (arena, barrier) = (&arena, &barrier);
                 scope.spawn(move || {
-                    let mut store = arena.open();
+                    let store = arena.open();
                     let mut completed = 0;
                     barrier.wait();
                     for iteration in 0..ITERATIONS {
@@ -342,7 +354,8 @@ fn uncoordinated_lifecycle_hammer_preserves_invariants() {
 
                         if crate::claim(
                             &store,
-                            &claim_request(ticket, &run_id, &activation),
+                            &run_admission(ticket, &run_id, &activation),
+                            60_000,
                             arena.now(),
                         )
                         .is_none()
@@ -352,12 +365,15 @@ fn uncoordinated_lifecycle_hammer_preserves_invariants() {
                         // Walk the whole lifecycle; every step must be
                         // granted, because this thread owns the run.
                         assert_eq!(
-                            Coordination::start(&store, &run_start(&run_id), arena.now())
+                            store
+                                .runs
+                                .start(&run_start(&run_id), arena.now())
                                 .expect("start"),
                             Start::Granted
                         );
                         assert_eq!(
-                            Coordination::new(&mut store)
+                            store
+                                .runs
                                 .record_exit(&run_exit(&run_id), arena.now())
                                 .expect("record exit"),
                             Exit::Granted

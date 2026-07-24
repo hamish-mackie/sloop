@@ -1,6 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use regex::{Regex, RegexBuilder};
@@ -8,21 +9,26 @@ use serde_json::json;
 
 use crate::clock::{format_timestamp, next_local_minute_ms};
 use crate::config::parse_local_time;
+use crate::db::StoreError;
 use crate::domain::ticket::TicketState;
-use crate::frontmatter;
+use crate::frontmatter::{self, Frontmatter};
+use crate::ids::next_id;
 use crate::logging::LogLevel;
 use crate::protocol::{ErrorBody, ListArgs, ShowArgs};
+use crate::run_store::{EventRecord, RunRecord, RunState, RunStore};
 use crate::runner::local::{process_identity_matches, run_output_path};
-use crate::store::{ActivationKind, NewActivation, Store, StoreError};
+use crate::work_state::local::{
+    ActivationKind, LocalSqlite, NewActivation, ProjectRecord, TicketRecord,
+};
 
 use super::dispatcher::{
     DispatcherState, LOGS_PAGE_LIMIT, LOGS_TAIL_LIMIT, conflict, internal, invalid_arguments,
-    mark_storage_full, not_found,
+    not_found,
 };
 use super::recovery::{
     PersistedProcessStop, aftercare_process_identity, stop_persisted_process_group,
 };
-use super::scheduler::{index_projects, next_dispatch_deadline, running_hours_open};
+use super::scheduler::{next_dispatch_deadline, running_hours_open};
 use super::worker_api::{current_ticket_vendor_error, ticket_show};
 
 /// The operator read view for `show`: resolve the reference, then render
@@ -56,10 +62,10 @@ pub(super) fn handle_operator_show(
 /// The ticket and run records dwarf the project one, so both are boxed to keep
 /// the enum cheap to move through the resolution ladder.
 pub(super) enum OperatorReference {
-    Ticket(Box<crate::store::TicketRecord>),
-    Run(Box<crate::store::RunRecord>),
-    Project(crate::store::ProjectRecord),
-    Matches(Vec<crate::store::TicketRecord>),
+    Ticket(Box<TicketRecord>),
+    Run(Box<RunRecord>),
+    Project(ProjectRecord),
+    Matches(Vec<TicketRecord>),
 }
 
 /// The resolution ladder behind `show` and scoped `events`, ordered by how
@@ -74,24 +80,24 @@ pub(super) fn resolve_operator_reference(
     state: &DispatcherState,
     reference: &str,
 ) -> Result<OperatorReference, ErrorBody> {
-    if let Some(ticket) = lookup(state, |store| store.ticket(reference))? {
+    if let Some(ticket) = local_lookup(state, |work_state| work_state.ticket(reference))? {
         return Ok(OperatorReference::Ticket(Box::new(ticket)));
     }
-    if let Some(run) = lookup(state, |store| store.run(reference))? {
+    if let Some(run) = run_lookup(state, |run_store| run_store.run(reference))? {
         return Ok(OperatorReference::Run(Box::new(run)));
     }
-    if let Some(ticket) = lookup(state, |store| store.ticket_by_name(reference))? {
+    if let Some(ticket) = local_lookup(state, |work_state| work_state.ticket_by_name(reference))? {
         return Ok(OperatorReference::Ticket(Box::new(ticket)));
     }
     if let Some((ticket_id, attempt)) = crate::run_ref::parse_alias(reference)
-        && let Some(run) = lookup(state, |store| {
-            store.run_for_ticket_attempt(ticket_id, attempt)
+        && let Some(run) = run_lookup(state, |run_store| {
+            run_store.run_for_ticket_attempt(ticket_id, attempt)
         })?
     {
         return Ok(OperatorReference::Run(Box::new(run)));
     }
     if let Some(prefix) = crate::run_ref::as_id_prefix(reference) {
-        let mut candidates = lookup(state, |store| store.runs_with_id_prefix(&prefix))?;
+        let mut candidates = run_lookup(state, |run_store| run_store.runs_with_id_prefix(&prefix))?;
         if candidates.len() == 1 {
             return Ok(OperatorReference::Run(Box::new(candidates.remove(0))));
         }
@@ -99,11 +105,11 @@ pub(super) fn resolve_operator_reference(
             return Err(ambiguous_run_prefix(reference, &candidates));
         }
     }
-    if let Some(project) = lookup(state, |store| store.project(reference))? {
+    if let Some(project) = local_lookup(state, |work_state| work_state.project(reference))? {
         return Ok(OperatorReference::Project(project));
     }
     let pattern = ticket_pattern(reference)?;
-    let tickets = lookup(state, Store::tickets)?
+    let tickets = local_lookup(state, LocalSqlite::tickets)?
         .into_iter()
         .filter(|ticket| pattern.is_match(&ticket.id) || pattern.is_match(&ticket.name))
         .collect();
@@ -133,14 +139,14 @@ fn ticket_pattern(pattern: &str) -> Result<Regex, ErrorBody> {
 fn ticket_detail(
     state: &DispatcherState,
     reference: &str,
-    ticket: &crate::store::TicketRecord,
+    ticket: &TicketRecord,
 ) -> Result<serde_json::Value, ErrorBody> {
     let vendor_error = current_ticket_vendor_error(state, ticket)?;
     let mut detail = ticket_show(reference, ticket, vendor_error.as_ref());
     // Where the ticket got to, and how. The runs section sits between the
     // summary and the body so `show` answers "what has happened to this?"
     // without an operator having to guess run aliases to find out.
-    let runs = lookup(state, |store| store.runs_for_ticket(&ticket.id))?;
+    let runs = run_lookup(state, |run_store| run_store.runs_for_ticket(&ticket.id))?;
     let histories = super::history::histories(state, &runs)?;
     detail["value"]["runs"] = json!(
         runs.iter()
@@ -173,8 +179,8 @@ fn run_detail(
     resolved: &ResolvedRun,
 ) -> Result<serde_json::Value, ErrorBody> {
     let run = &resolved.run;
-    let ticket = lookup(state, |store| store.ticket(&run.ticket_id))?;
-    let vendor_error = lookup(state, |store| store.vendor_error_for_run(&run.id))?;
+    let ticket = local_lookup(state, |work_state| work_state.ticket(&run.ticket_id))?;
+    let vendor_error = run_lookup(state, |run_store| run_store.vendor_error_for_run(&run.id))?;
     let terminal = super::history::is_terminal(&run.state);
     let history = super::history::history(state, run)?;
     // A classified vendor rejection is the more specific account of the same
@@ -213,9 +219,11 @@ fn run_detail(
 fn project_activity(
     state: &DispatcherState,
     reference: &str,
-    project: &crate::store::ProjectRecord,
+    project: &ProjectRecord,
 ) -> Result<serde_json::Value, ErrorBody> {
-    let tickets = lookup(state, |store| store.tickets_for_project(reference))?;
+    let tickets = local_lookup(state, |work_state| {
+        work_state.tickets_for_project(reference)
+    })?;
     let mut vendor_errors = HashMap::new();
     for ticket in &tickets {
         if let Some(error) = current_ticket_vendor_error(state, ticket)? {
@@ -228,7 +236,7 @@ fn project_activity(
     // project's activity can mention.
     let mut aliases: HashMap<String, String> = HashMap::new();
     for ticket in &tickets {
-        for run in lookup(state, |store| store.runs_for_ticket(&ticket.id))? {
+        for run in run_lookup(state, |run_store| run_store.runs_for_ticket(&ticket.id))? {
             aliases.insert(run.id, crate::run_ref::alias(&run.ticket_id, run.attempt));
         }
     }
@@ -240,7 +248,7 @@ fn project_activity(
     };
 
     let mut notes: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
-    for note in lookup(state, |store| store.notes_for_project(reference))? {
+    for note in run_lookup(state, |run_store| run_store.notes_for_project(reference))? {
         notes.entry(note.ticket_id).or_default().push(json!({
             "id": note.id,
             "run": alias_of(&note.run_id),
@@ -251,7 +259,9 @@ fn project_activity(
     }
 
     let mut commits: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
-    for evidence in lookup(state, |store| store.commit_evidence_for_project(reference))? {
+    for evidence in run_lookup(state, |run_store| {
+        run_store.commit_evidence_for_project(reference)
+    })? {
         let data: serde_json::Value = serde_json::from_str(&evidence.data_json)
             .map_err(|error| internal(&format!("cannot decode commit evidence: {error}")))?;
         for oid in data["oids"]
@@ -325,12 +335,12 @@ fn git_commit(root: &Path, oid: &str) -> Result<(String, String), ErrorBody> {
 }
 
 pub(super) fn handle_status(state: &DispatcherState) -> Result<serde_json::Value, ErrorBody> {
-    let tickets = lookup(state, Store::ticket_counts)?;
-    let active = lookup(state, Store::active_runs)?;
+    let tickets = local_lookup(state, LocalSqlite::ticket_counts)?;
+    let active = run_lookup(state, RunStore::active_runs)?;
     let mut active_runs = Vec::with_capacity(active.len());
     for run in &active {
         active_runs.push(
-            lookup(state, |store| store.run(&run.id))?
+            run_lookup(state, |run_store| run_store.run(&run.id))?
                 .ok_or_else(|| internal(&format!("active run `{}` no longer exists", run.id)))?,
         );
     }
@@ -348,7 +358,7 @@ pub(super) fn handle_status(state: &DispatcherState) -> Result<serde_json::Value
         })
         .collect::<Vec<_>>();
     let active_agents = runs.len();
-    let queued = lookup(state, Store::queued_activations)?
+    let queued = local_lookup(state, LocalSqlite::queued_activations)?
         .into_iter()
         .map(|activation| {
             json!({
@@ -377,7 +387,7 @@ pub(super) fn handle_status(state: &DispatcherState) -> Result<serde_json::Value
         });
     }
     gate["cooldowns"] = json!(
-        lookup(state, |store| store.active_cooldowns(now_ms))?
+        run_lookup(state, |run_store| run_store.active_cooldowns(now_ms))?
             .into_iter()
             .map(|cooldown| {
                 json!({
@@ -420,7 +430,7 @@ fn dashboard(
     requested_limit: Option<u32>,
 ) -> Result<serde_json::Value, ErrorBody> {
     const DEFAULT_RECENT_LIMIT: u32 = 10;
-    let tickets = lookup(state, Store::tickets)?;
+    let tickets = local_lookup(state, LocalSqlite::tickets)?;
     let total = tickets.len();
     let limit = requested_limit.unwrap_or(DEFAULT_RECENT_LIMIT);
     let recent = ticket_rows(state, tickets, Some(limit))?;
@@ -436,16 +446,20 @@ pub(super) fn handle_list(
     state: &DispatcherState,
     args: &ListArgs,
 ) -> Result<serde_json::Value, ErrorBody> {
-    ticket_rows(state, lookup(state, Store::tickets)?, args.limit)
+    ticket_rows(
+        state,
+        local_lookup(state, LocalSqlite::tickets)?,
+        args.limit,
+    )
 }
 
 fn ticket_rows(
     state: &DispatcherState,
-    mut tickets: Vec<crate::store::TicketRecord>,
+    mut tickets: Vec<TicketRecord>,
     limit: Option<u32>,
 ) -> Result<serde_json::Value, ErrorBody> {
     let now_ms = state.clock.now_ms();
-    let at_capacity = lookup(state, Store::active_runs)?.len() >= state.max_agents;
+    let at_capacity = run_lookup(state, RunStore::active_runs)?.len() >= state.max_agents;
     let gates = crate::eligibility::Gates {
         paused: state.paused,
         draining: state.draining,
@@ -453,7 +467,7 @@ fn ticket_rows(
         agent_configured: state.agent.is_some(),
         hours_open: running_hours_open(state, now_ms),
         at_capacity,
-        has_queued_activation: !lookup(state, Store::queued_activations)?.is_empty(),
+        has_queued_activation: !local_lookup(state, LocalSqlite::queued_activations)?.is_empty(),
     };
     // `tickets` already arrives newest first, so truncating here keeps the
     // newest N and spares the per-ticket lookups below for the rest.
@@ -464,19 +478,21 @@ fn ticket_rows(
     }
     let mut rows = Vec::new();
     for ticket in tickets {
-        let active_run = lookup(state, |store| store.active_run_for_ticket(&ticket.id))?;
+        let active_run = run_lookup(state, |run_store| {
+            run_store.active_run_for_ticket(&ticket.id)
+        })?;
         // Every ineligibility reason and list row names the run by alias; the
         // internal id rides alongside for machine consumers.
         let active_alias = active_run
             .as_ref()
             .map(|(_, attempt)| crate::run_ref::alias(&ticket.id, *attempt));
-        let blockers = lookup(state, |store| store.unmerged_blockers(&ticket.id))?;
-        let mut vendor_error = lookup(state, |store| {
-            store.latest_vendor_error_for_ticket(&ticket.id)
+        let blockers = local_lookup(state, |work_state| work_state.unmerged_blockers(&ticket.id))?;
+        let mut vendor_error = run_lookup(state, |run_store| {
+            run_store.latest_vendor_error_for_ticket(&ticket.id)
         })?;
         let cooldown = match ticket.target.as_deref() {
-            Some(target) => lookup(state, |store| {
-                store.active_cooldown_for_target(target, now_ms)
+            Some(target) => run_lookup(state, |run_store| {
+                run_store.active_cooldown_for_target(target, now_ms)
             })?,
             None => None,
         };
@@ -547,7 +563,7 @@ pub(super) fn handle_run(
         ));
     }
     if let Some(ticket_id) = &args.ticket {
-        let Some(ticket) = lookup(state, |store| store.ticket(ticket_id))? else {
+        let Some(ticket) = local_lookup(state, |work_state| work_state.ticket(ticket_id))? else {
             return Err(not_found(&format!(
                 "ticket `{ticket_id}` is not registered; run `sloop show` to see registered ticket ids"
             )));
@@ -559,12 +575,12 @@ pub(super) fn handle_run(
         }
     }
     if let Some(project) = &args.project
-        && !lookup(state, |store| store.project_exists(project))?
+        && !local_lookup(state, |work_state| work_state.project_exists(project))?
     {
         return Err(not_found(&format!("project `{project}` is not indexed")));
     }
     for only in &args.only {
-        let Some(ticket) = lookup(state, |store| store.ticket(only))? else {
+        let Some(ticket) = local_lookup(state, |work_state| work_state.ticket(only))? else {
             return Err(not_found(&format!(
                 "ticket `{only}` is not registered; run `sloop show` to see registered ticket ids"
             )));
@@ -623,10 +639,10 @@ pub(super) fn handle_run(
     };
     let activation_id = format!(
         "A{}",
-        lookup(state, |store| store.next_activation_ordinal())?
+        local_lookup(state, LocalSqlite::next_activation_ordinal)?
     );
-    lookup(state, |store| {
-        store.insert_activation(
+    local_lookup(state, |work_state| {
+        work_state.insert_activation(
             &NewActivation {
                 id: &activation_id,
                 kind,
@@ -639,8 +655,8 @@ pub(super) fn handle_run(
         )
     })?;
     for only in &args.only {
-        lookup(state, |store| {
-            store.insert_activation_filter(&activation_id, only)
+        local_lookup(state, |work_state| {
+            work_state.insert_activation_filter(&activation_id, only)
         })?;
     }
 
@@ -672,7 +688,7 @@ pub(super) fn handle_hold(
 ) -> Result<serde_json::Value, ErrorBody> {
     let requested = TicketState::Held;
     let previous = state
-        .store
+        .local_work_state
         .set_ticket_hold(&args.ticket, requested, state.clock.now_ms())
         .map_err(|error| match error {
             StoreError::TicketNotFound { .. } => not_found(&error.to_string()),
@@ -696,7 +712,7 @@ pub(super) fn handle_ready(
 ) -> Result<serde_json::Value, ErrorBody> {
     let requested = TicketState::Ready;
     let previous = state
-        .store
+        .local_work_state
         .set_ticket_hold(&args.ticket, requested, state.clock.now_ms())
         .map_err(|error| match error {
             StoreError::TicketNotFound { .. } => not_found(&error.to_string()),
@@ -719,8 +735,20 @@ pub(super) fn handle_retry(
     args: &crate::protocol::TicketReferenceArgs,
 ) -> Result<serde_json::Value, ErrorBody> {
     let previous = state
-        .store
-        .retry_ticket(&args.ticket, state.clock.now_ms())
+        .local_work_state
+        .retry_ticket(
+            &args.ticket,
+            state.clock.now_ms(),
+            |transaction, ticket_id, now_ms| {
+                crate::run_store::runs::tx::mark_ticket_runs_cleanup_eligible(
+                    transaction,
+                    ticket_id,
+                    RunState::Failed,
+                    now_ms,
+                )?;
+                Ok(())
+            },
+        )
         .map_err(|error| match error {
             StoreError::TicketNotFound { .. } => not_found(&error.to_string()),
             StoreError::TicketStateConflict { .. } => conflict(&error.to_string()),
@@ -745,7 +773,7 @@ pub(super) fn handle_wait(
     let resolved = resolve_run(state, &args.run)?;
     let run = &resolved.run;
     let terminal = is_terminal(&run.state);
-    let vendor_error = lookup(state, |store| store.vendor_error_for_run(&run.id))?;
+    let vendor_error = run_lookup(state, |run_store| run_store.vendor_error_for_run(&run.id))?;
     Ok(json!({
         "id": run.id,
         "alias": resolved.alias,
@@ -832,7 +860,7 @@ pub(super) fn handle_logs(
 /// before flow snapshots existed has nothing to validate against; there the
 /// name is matched literally rather than refused.
 fn stage_filter(
-    run: &crate::store::RunRecord,
+    run: &RunRecord,
     requested: &str,
 ) -> Result<crate::run_log::StageFilter, ErrorBody> {
     let literal = crate::run_log::StageFilter {
@@ -890,13 +918,13 @@ pub(super) fn handle_events(
         Some(reference) => Some(resolve_event_scope(state, reference)?),
         None => None,
     };
-    let latest = lookup(state, |store| store.latest_event_sequence())?;
+    let latest = run_lookup(state, RunStore::latest_event_sequence)?;
     let after = match (args.after, args.tail) {
         (Some(after), _) => after,
         (None, Some(tail)) => latest.saturating_sub(i64::from(tail)),
         (None, None) => 0,
     };
-    let scanned = lookup(state, |store| store.events_after(after, limit))?;
+    let scanned = run_lookup(state, |run_store| run_store.events_after(after, limit))?;
     // The cursor tracks rows *scanned*, not rows emitted. A scoped watcher
     // whose page matches nothing must still advance, or every poll would
     // rescan the feed from the same cursor forever.
@@ -936,7 +964,7 @@ enum EventScope {
 }
 
 impl EventScope {
-    fn matches(&self, event: &crate::store::EventRecord) -> bool {
+    fn matches(&self, event: &EventRecord) -> bool {
         match self {
             Self::Ticket(ticket_id) => event.ticket_id.as_deref() == Some(ticket_id),
             Self::Run(run_id) => event.run_id.as_deref() == Some(run_id),
@@ -957,10 +985,12 @@ fn resolve_event_scope(state: &DispatcherState, reference: &str) -> Result<Event
         OperatorReference::Ticket(ticket) => EventScope::Ticket(ticket.id),
         OperatorReference::Run(run) => EventScope::Run(run.id),
         OperatorReference::Project(project) => EventScope::Project(
-            lookup(state, |store| store.tickets_for_project(&project.id))?
-                .into_iter()
-                .map(|ticket| ticket.id)
-                .collect(),
+            local_lookup(state, |work_state| {
+                work_state.tickets_for_project(&project.id)
+            })?
+            .into_iter()
+            .map(|ticket| ticket.id)
+            .collect(),
         ),
         OperatorReference::Matches(tickets) => {
             EventScope::Matches(tickets.into_iter().map(|ticket| ticket.id).collect())
@@ -987,13 +1017,13 @@ pub(super) fn handle_cancel(
 
     // Intent must be durable before any signal: if the daemon dies between
     // the kill and the exit event, recovery still reads the cancellation.
-    lookup(state, |store| {
-        store.record_cancel_requested(&run.id, state.clock.now_ms())
+    run_lookup(state, |run_store| {
+        run_store.record_cancel_requested(&run.id, state.clock.now_ms())
     })?;
     state.cancelling.insert(run.id.clone());
 
     if run.state == "aftercare" {
-        let rows = lookup(state, |store| store.run_evidence(&run.id))?;
+        let rows = run_lookup(state, |run_store| run_store.run_evidence(&run.id))?;
         if let Some(identity) =
             aftercare_process_identity(&rows, None).map_err(|error| internal(&error))?
         {
@@ -1080,7 +1110,7 @@ pub(super) fn handle_stop(
 fn active_run_aliases(state: &DispatcherState) -> Result<Vec<(String, String)>, ErrorBody> {
     let mut active = Vec::new();
     for run_id in &state.active {
-        let alias = lookup(state, |store| store.run(run_id))?
+        let alias = run_lookup(state, |run_store| run_store.run(run_id))?
             .map(|run| crate::run_ref::alias(&run.ticket_id, run.attempt))
             .unwrap_or_else(|| crate::run_ref::short(run_id).to_owned());
         active.push((run_id.clone(), alias));
@@ -1091,6 +1121,139 @@ fn active_run_aliases(state: &DispatcherState) -> Result<Vec<(String, String)>, 
 
 fn aliases_of(active: &[(String, String)]) -> Vec<&str> {
     active.iter().map(|(_, alias)| alias.as_str()).collect()
+}
+
+fn index_projects(
+    root: &Path,
+    project_dir: &Path,
+    work_state: &LocalSqlite,
+    now_ms: i64,
+    project_prefix: &str,
+) -> Result<Vec<String>, String> {
+    let directory = root.join(project_dir);
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("{}: {error}", directory.display())),
+    };
+
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|error| format!("{}: {error}", directory.display()))?
+            .path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("md") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+
+    struct ProjectFile {
+        path: PathBuf,
+        content: String,
+        stem: String,
+        frontmatter: Frontmatter,
+    }
+
+    let mut projects = Vec::new();
+    for path in paths {
+        let content =
+            fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let stem = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let Ok(frontmatter) = frontmatter::parse(&content) else {
+            continue;
+        };
+        projects.push(ProjectFile {
+            path,
+            content,
+            stem,
+            frontmatter,
+        });
+    }
+
+    let mut ids: Vec<String> = projects
+        .iter()
+        .filter_map(|project| project.frontmatter.id.clone())
+        .collect();
+    let mut indexed = Vec::with_capacity(projects.len());
+    for project in projects {
+        let id = match project.frontmatter.id {
+            Some(id) => id,
+            None => {
+                let id = next_id(project_prefix, ids.iter().map(String::as_str))
+                    .map_err(|error| error.to_string())?;
+                let updated = frontmatter::stamp_id(&project.content, &id)
+                    .map_err(|error| format!("{}: {error}", project.path.display()))?;
+                fs::write(
+                    &project.path,
+                    updated.expect("idless project always needs an ID stamp"),
+                )
+                .map_err(|error| format!("{}: {error}", project.path.display()))?;
+                ids.push(id.clone());
+                id
+            }
+        };
+        let title = project.frontmatter.title.unwrap_or(project.stem);
+        let relative = project
+            .path
+            .strip_prefix(root)
+            .unwrap_or(&project.path)
+            .to_string_lossy()
+            .into_owned();
+        work_state
+            .upsert_local_project(&id, &relative, &title, now_ms)
+            .map_err(|error| error.to_string())?;
+        indexed.push(id);
+    }
+    Ok(indexed)
+}
+
+fn drop_reindex_runs(
+    transaction: &rusqlite::Transaction<'_>,
+    stale_tickets: &[String],
+    doomed_activations: &BTreeSet<String>,
+) -> Result<usize, StoreError> {
+    let mut doomed_runs = BTreeSet::new();
+    for ticket_id in stale_tickets {
+        doomed_runs.extend(crate::run_store::runs::tx::ids_for_ticket(
+            transaction,
+            ticket_id,
+        )?);
+    }
+    for activation_id in doomed_activations {
+        doomed_runs.extend(crate::run_store::runs::tx::ids_for_activation(
+            transaction,
+            activation_id,
+        )?);
+    }
+
+    let mut rows_dropped = 0;
+    for run_id in &doomed_runs {
+        crate::run_store::limits::tx::detach_cooldowns_from_run(transaction, run_id)?;
+        rows_dropped += crate::work_state::local::tx::delete_lease(transaction, run_id)?;
+        rows_dropped += crate::run_store::evidence::tx::delete_for_run(transaction, run_id)?;
+        rows_dropped +=
+            crate::run_store::limits::tx::delete_budget_reservation_for_run(transaction, run_id)?;
+        rows_dropped += crate::run_store::runs::tx::delete_notes_for_run(transaction, run_id)?;
+        rows_dropped += crate::run_store::runs::tx::delete(transaction, run_id)?;
+    }
+    Ok(rows_dropped)
+}
+
+fn mark_reindex_runs_cleanup_eligible(
+    transaction: &rusqlite::Transaction<'_>,
+    ticket_id: &str,
+    now_ms: i64,
+) -> Result<(), StoreError> {
+    crate::run_store::runs::tx::mark_failed_or_review_runs_cleanup_eligible(
+        transaction,
+        ticket_id,
+        now_ms,
+    )?;
+    Ok(())
 }
 
 pub(super) fn handle_reindex(state: &mut DispatcherState) -> Result<serde_json::Value, ErrorBody> {
@@ -1106,7 +1269,7 @@ pub(super) fn handle_reindex(state: &mut DispatcherState) -> Result<serde_json::
     let project_ids = index_projects(
         &state.root,
         &state.project_dir,
-        &state.store,
+        &state.local_work_state,
         now_ms,
         &state.project_prefix,
     )
@@ -1115,7 +1278,7 @@ pub(super) fn handle_reindex(state: &mut DispatcherState) -> Result<serde_json::
         .local_work_state
         .sync_from_source(
             &state.root,
-            state.ticket_source.as_ref(),
+            &state.ticket_source,
             &state.worktree_dir,
             now_ms,
             &state.ticket_prefix,
@@ -1123,8 +1286,8 @@ pub(super) fn handle_reindex(state: &mut DispatcherState) -> Result<serde_json::
             state.agent.as_ref(),
             &state.flows,
             &state.default_flow,
-            crate::coordination::drop_reindex_runs,
-            crate::coordination::mark_reindex_runs_cleanup_eligible,
+            drop_reindex_runs,
+            mark_reindex_runs_cleanup_eligible,
         )
         .map_err(|error| internal(&format!("cannot reindex tickets: {error}")))
 }
@@ -1134,13 +1297,13 @@ pub(super) fn handle_reindex(state: &mut DispatcherState) -> Result<serde_json::
 /// reference selected the latest of several runs, so the caller can say which
 /// attempts it passed over.
 pub(super) struct ResolvedRun {
-    pub(super) run: crate::store::RunRecord,
+    pub(super) run: RunRecord,
     pub(super) alias: String,
     pub(super) earlier_attempts: Vec<i64>,
 }
 
 impl ResolvedRun {
-    fn only(run: crate::store::RunRecord) -> Self {
+    fn only(run: RunRecord) -> Self {
         Self {
             alias: crate::run_ref::alias(&run.ticket_id, run.attempt),
             run,
@@ -1177,18 +1340,18 @@ pub(super) fn resolve_run(
     state: &DispatcherState,
     reference: &str,
 ) -> Result<ResolvedRun, ErrorBody> {
-    if let Some(run) = lookup(state, |store| store.run(reference))? {
+    if let Some(run) = run_lookup(state, |run_store| run_store.run(reference))? {
         return Ok(ResolvedRun::only(run));
     }
     if let Some((ticket_id, attempt)) = crate::run_ref::parse_alias(reference)
-        && let Some(run) = lookup(state, |store| {
-            store.run_for_ticket_attempt(ticket_id, attempt)
+        && let Some(run) = run_lookup(state, |run_store| {
+            run_store.run_for_ticket_attempt(ticket_id, attempt)
         })?
     {
         return Ok(ResolvedRun::only(run));
     }
     if let Some(ticket_id) = ticket_id_for(state, reference)? {
-        let mut runs = lookup(state, |store| store.runs_for_ticket(&ticket_id))?;
+        let mut runs = run_lookup(state, |run_store| run_store.runs_for_ticket(&ticket_id))?;
         if runs.is_empty() {
             return Err(not_found(&format!(
                 "ticket `{ticket_id}` has no runs yet; start one with `sloop run {ticket_id}`"
@@ -1203,7 +1366,7 @@ pub(super) fn resolve_run(
         });
     }
     if let Some(prefix) = crate::run_ref::as_id_prefix(reference) {
-        let mut candidates = lookup(state, |store| store.runs_with_id_prefix(&prefix))?;
+        let mut candidates = run_lookup(state, |run_store| run_store.runs_with_id_prefix(&prefix))?;
         if candidates.len() == 1 {
             return Ok(ResolvedRun::only(candidates.remove(0)));
         }
@@ -1215,15 +1378,18 @@ pub(super) fn resolve_run(
 }
 
 fn ticket_id_for(state: &DispatcherState, reference: &str) -> Result<Option<String>, ErrorBody> {
-    if let Some(ticket) = lookup(state, |store| store.ticket(reference))? {
+    if let Some(ticket) = local_lookup(state, |work_state| work_state.ticket(reference))? {
         return Ok(Some(ticket.id));
     }
-    Ok(lookup(state, |store| store.ticket_by_name(reference))?.map(|ticket| ticket.id))
+    Ok(
+        local_lookup(state, |work_state| work_state.ticket_by_name(reference))?
+            .map(|ticket| ticket.id),
+    )
 }
 
 /// Git's ambiguous-object error, in Sloop's terms: name the candidates so the
 /// operator can retype one character more rather than guess.
-fn ambiguous_run_prefix(reference: &str, candidates: &[crate::store::RunRecord]) -> ErrorBody {
+fn ambiguous_run_prefix(reference: &str, candidates: &[RunRecord]) -> ErrorBody {
     let listed = candidates
         .iter()
         .map(|run| {
@@ -1250,12 +1416,33 @@ fn run_not_found(run: &str) -> ErrorBody {
     ))
 }
 
-pub(super) fn lookup<T>(
+pub(super) fn local_lookup<T>(
     state: &DispatcherState,
-    query: impl FnOnce(&Store) -> Result<T, StoreError>,
+    query: impl FnOnce(&LocalSqlite) -> Result<T, StoreError>,
 ) -> Result<T, ErrorBody> {
-    query(&state.store).map_err(|error| {
+    query(&state.local_work_state).map_err(|error| {
         mark_storage_full(state, &error);
         internal(&error.to_string())
     })
+}
+
+pub(super) fn run_lookup<T>(
+    state: &DispatcherState,
+    query: impl FnOnce(&RunStore) -> Result<T, StoreError>,
+) -> Result<T, ErrorBody> {
+    query(&state.run_store).map_err(|error| {
+        mark_storage_full(state, &error);
+        internal(&error.to_string())
+    })
+}
+
+pub(super) fn mark_storage_full(state: &DispatcherState, error: &StoreError) {
+    if error.is_disk_full() && !state.storage_full.replace(true) {
+        state.log.emit_with_fields(
+            LogLevel::Error,
+            "sloop::dispatcher",
+            "storage_full",
+            json!({"error": error.to_string()}),
+        );
+    }
 }

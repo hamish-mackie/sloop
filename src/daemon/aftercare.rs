@@ -8,7 +8,7 @@ use serde_json::json;
 
 use crate::clock::Clock;
 use crate::config::{AgentConfig, RunningHours, expand_agent_cmd};
-use crate::coordination::{Coordination, Exit, ExitDenial, RunExit, RunStart, Start, StartDenial};
+use crate::db::StoreError;
 use crate::domain::ticket::TicketSnapshot;
 use crate::flow::{
     Flow, OnFail, Reported, Stage, StageEvidence, StageKind, Step, Verdict, VerdictPolicy,
@@ -16,13 +16,16 @@ use crate::flow::{
 };
 use crate::logging::{LogLevel, OperationalLog};
 use crate::outcome::{ExitClass, MergeOutcome, classify_exit};
+use crate::run_store::{
+    Exit, ExitDenial, RunExit, RunStart, RunState, RunStore, StageRecord, Start, StartDenial,
+};
 use crate::runner::local::{process_start_time, run_exec_stage, wait_for_test_hook};
 use crate::runner::{
     AgentProcessCheckpoint, ExecLaunch, ExecProcessCheckpoint, ExecutionEvidence, ProcessIdentity,
     RunnerError, StageExecution, StageHooks, StageOrder, WorkerCredentials,
 };
-use crate::store::{RunState, StageRecord, Store, StoreError};
 use crate::vendor_error::VendorErrorMatch;
+use crate::work_state::local::LocalSqlite;
 
 use super::recovery::{
     MergeProcessCheckpoint, PersistedProcessStop, inspect_interrupted_merge,
@@ -32,13 +35,13 @@ use super::recovery::{
 static MERGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(super) struct StoreStageHooks<'a> {
-    store: &'a Store,
+    run_store: &'a RunStore,
     log: &'a OperationalLog,
 }
 
 impl<'a> StoreStageHooks<'a> {
-    pub(super) fn new(store: &'a Store, log: &'a OperationalLog) -> Self {
-        Self { store, log }
+    pub(super) fn new(run_store: &'a RunStore, log: &'a OperationalLog) -> Self {
+        Self { run_store, log }
     }
 }
 
@@ -46,7 +49,7 @@ impl StageHooks for StoreStageHooks<'_> {
     type Error = StoreError;
 
     fn cancellation_requested(&self, run_id: &str) -> bool {
-        aftercare_cancelled(self.store, run_id, self.log)
+        aftercare_cancelled(self.run_store, run_id, self.log)
     }
 
     fn record_agent_process(&self, checkpoint: &AgentProcessCheckpoint) -> Result<(), Self::Error> {
@@ -62,7 +65,7 @@ impl StageHooks for StoreStageHooks<'_> {
             worker_token: &checkpoint.worker.token,
             worker_socket_path: &worker_socket_path,
         };
-        match Coordination::start(self.store, &start, checkpoint.started_at_ms)? {
+        match self.run_store.start(&start, checkpoint.started_at_ms)? {
             Start::Granted => Ok(()),
             // The launch raced a rollback or a recovery that already closed
             // the run. Surfacing it as the same conflict error keeps the
@@ -76,7 +79,7 @@ impl StageHooks for StoreStageHooks<'_> {
     }
 
     fn record_exec_process(&self, checkpoint: &ExecProcessCheckpoint) -> Result<(), Self::Error> {
-        self.store.record_aftercare_evidence(
+        self.run_store.record_aftercare_evidence(
             &checkpoint.run_id,
             "aftercare_process",
             &json!({
@@ -116,7 +119,7 @@ pub(super) fn gather_exit_evidence(
     capture_complete: bool,
     vendor_error: Option<&VendorErrorMatch>,
     cooldown_until_ms: Option<i64>,
-    mut checkpoint_store: Option<&mut Store>,
+    checkpoint_stores: Option<(&RunStore, &LocalSqlite)>,
     repair: Option<&RepairContext>,
     operational_log: &OperationalLog,
 ) -> Option<(Vec<String>, bool, bool, Option<MergeOutcome>)> {
@@ -124,7 +127,7 @@ pub(super) fn gather_exit_evidence(
     let commit_observation_complete = commit_observation.is_ok();
     let commits = commit_observation.unwrap_or_default();
     wait_for_test_hook("before-agent-exit-checkpoint");
-    let checkpointed = if let Some(store) = checkpoint_store.as_deref_mut() {
+    let checkpointed = if let Some((run_store, _)) = checkpoint_stores {
         let exit = RunExit {
             run_id,
             exit_code,
@@ -134,7 +137,7 @@ pub(super) fn gather_exit_evidence(
             vendor_error,
             cooldown_until_ms,
         };
-        match Coordination::new(store).record_exit(&exit, clock.now_ms()) {
+        match run_store.record_exit(&exit, clock.now_ms()) {
             Ok(Exit::Granted) => true,
             Ok(Exit::Denied(ExitDenial::AlreadyClaimed { state })) => {
                 operational_log.emit_with_fields(
@@ -165,13 +168,12 @@ pub(super) fn gather_exit_evidence(
     // checkpoint, preserve the run branch for review rather than performing
     // an action that recovery could no longer prove or resume.
     if !checkpointed
-        || checkpoint_store
-            .as_deref()
-            .is_some_and(|store| aftercare_cancelled(store, run_id, operational_log))
+        || checkpoint_stores
+            .is_some_and(|(run_store, _)| aftercare_cancelled(run_store, run_id, operational_log))
     {
         return Some((commits, commit_observation_complete, false, None));
     }
-    let store = checkpoint_store.as_deref()?;
+    let (run_store, local_work_state) = checkpoint_stores?;
     match drive_flow(
         root,
         worktree,
@@ -185,7 +187,8 @@ pub(super) fn gather_exit_evidence(
         commit_observation_complete,
         output_path,
         clock,
-        store,
+        run_store,
+        local_work_state,
         run_id,
         repair,
         operational_log,
@@ -208,8 +211,12 @@ pub(super) fn gather_exit_evidence(
     }
 }
 
-pub(super) fn aftercare_cancelled(store: &Store, run_id: &str, log: &OperationalLog) -> bool {
-    match store.cancellation_requested(run_id) {
+pub(super) fn aftercare_cancelled(
+    run_store: &RunStore,
+    run_id: &str,
+    log: &OperationalLog,
+) -> bool {
+    match run_store.cancellation_requested(run_id) {
         Ok(cancelled) => cancelled,
         Err(error) => {
             log.emit_with_fields(
@@ -247,7 +254,7 @@ fn execute_stage_order(
     cmd: &[String],
     output_path: &Path,
     clock: &dyn Clock,
-    store: &Store,
+    run_store: &RunStore,
     run_id: &str,
     log: &OperationalLog,
     worker: Option<&WorkerCredentials>,
@@ -264,7 +271,7 @@ fn execute_stage_order(
         branch: branch.into(),
         output_path: output_path.into(),
     };
-    let hooks = StoreStageHooks::new(store, log);
+    let hooks = StoreStageHooks::new(run_store, log);
     let evidence = match run_exec_stage(&order, &hooks, clock) {
         Ok(evidence) => evidence,
         Err(failure) => {
@@ -321,7 +328,7 @@ pub(super) fn attempt_merge(
     branch: &str,
     branch_unchanged: bool,
     stage: &str,
-    checkpoint_store: &Store,
+    run_store: &RunStore,
     run_id: &str,
     clock: &dyn Clock,
     operational_log: &OperationalLog,
@@ -386,7 +393,7 @@ pub(super) fn attempt_merge(
         completed_target: None,
     };
     if let Err(error) = record_merge_process_checkpoint(
-        checkpoint_store,
+        run_store,
         run_id,
         stage,
         pid,
@@ -407,7 +414,7 @@ pub(super) fn attempt_merge(
         return MergeOutcome::Diverged;
     }
     wait_for_test_hook(&format!("after-aftercare-process-checkpoint-{stage}"));
-    if aftercare_cancelled(checkpoint_store, run_id, operational_log) {
+    if aftercare_cancelled(run_store, run_id, operational_log) {
         unsafe {
             libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
         }
@@ -430,7 +437,7 @@ pub(super) fn attempt_merge(
                     ..checkpoint
                 };
                 if let Err(error) = record_merge_process_checkpoint(
-                    checkpoint_store,
+                    run_store,
                     run_id,
                     stage,
                     pid,
@@ -522,10 +529,11 @@ fn resolve_repair_target(ctx: &RepairContext, on_fail: &OnFail) -> String {
 /// Whether a repair spawn for `target` clears the same gates a normal spawn
 /// would: running hours, the per-target cooldown, and capacity. Budget
 /// reservations are not yet enforced for any spawn, so that gate is open. A
-/// store read error closes the gate rather than risk an ungated spawn.
+/// database read error closes the gate rather than risk an ungated spawn.
 fn repair_gates_open(
     ctx: &RepairContext,
-    store: &Store,
+    run_store: &RunStore,
+    local_work_state: &LocalSqlite,
     target: &str,
     clock: &dyn Clock,
     now_ms: i64,
@@ -537,13 +545,13 @@ fn repair_gates_open(
     if !hours_open {
         return false;
     }
-    match store.active_cooldown_for_target(target, now_ms) {
+    match run_store.active_cooldown_for_target(target, now_ms) {
         Ok(None) => {}
         _ => return false,
     }
     // The repair runs inside an already-leased run, so that run's own lease is
-    // counted here; an over-subscribed store still closes the gate.
-    matches!(store.active_lease_count(), Ok(count) if count <= ctx.max_parallel_tasks)
+    // counted here; an over-subscribed database still closes the gate.
+    matches!(local_work_state.active_lease_count(), Ok(count) if count <= ctx.max_parallel_tasks)
 }
 
 /// Repair attempts already consumed for `stage`, recovered from durable
@@ -619,7 +627,7 @@ fn run_repair_agent(
     target: &str,
     worktree: &Path,
     output_path: &Path,
-    store: &Store,
+    run_store: &RunStore,
     run_id: &str,
     stage: &str,
     attempt: u32,
@@ -657,7 +665,7 @@ fn run_repair_agent(
         "repair_agent_spawned",
         json!({"run_id": run_id, "stage": stage, "attempt": attempt, "target": target}),
     );
-    let hooks = StoreStageHooks::new(store, log);
+    let hooks = StoreStageHooks::new(run_store, log);
     let evidence = match run_exec_stage(&order, &hooks, clock) {
         Ok(evidence) => evidence,
         Err(failure) => failure.evidence,
@@ -681,13 +689,14 @@ pub(super) fn drive_flow(
     commit_observation_complete: bool,
     output_path: &Path,
     clock: &dyn Clock,
-    store: &Store,
+    run_store: &RunStore,
+    local_work_state: &LocalSqlite,
     run_id: &str,
     repair: Option<&RepairContext>,
     log: &OperationalLog,
 ) -> Result<FlowRunResult, String> {
     let flow = flow_with_implicit_test(bound_flow, test_cmd)?;
-    let rows = store
+    let rows = run_store
         .aftercare_stages(run_id)
         .map_err(|error| error.to_string())?;
     let mut evidence = rows
@@ -722,12 +731,12 @@ pub(super) fn drive_flow(
                 }
             })
     });
-    let interrupted = store
+    let interrupted = run_store
         .run_evidence(run_id)
         .map_err(|error| error.to_string())?;
 
     loop {
-        if aftercare_cancelled(store, run_id, log) {
+        if aftercare_cancelled(run_store, run_id, log) {
             return Ok(FlowRunResult {
                 aftercare_failed: false,
                 merge,
@@ -790,7 +799,7 @@ pub(super) fn drive_flow(
             None
         };
         if interrupted_process.is_some() {
-            store
+            run_store
                 .clear_aftercare_process(run_id)
                 .map_err(|error| error.to_string())?;
         }
@@ -824,7 +833,7 @@ pub(super) fn drive_flow(
                     cmd,
                     output_path,
                     clock,
-                    store,
+                    run_store,
                     run_id,
                     log,
                     (stage.verdict == VerdictPolicy::Reported).then_some(worker),
@@ -860,7 +869,7 @@ pub(super) fn drive_flow(
                         branch,
                         commit_observation_complete && commits.is_empty(),
                         &stage.name,
-                        store,
+                        run_store,
                         run_id,
                         clock,
                         log,
@@ -900,7 +909,7 @@ pub(super) fn drive_flow(
                         cmd,
                         output_path,
                         clock,
-                        store,
+                        run_store,
                         run_id,
                         log,
                         None,
@@ -909,7 +918,7 @@ pub(super) fn drive_flow(
                 VerdictPolicy::Check { .. } => {}
             }
             let reported = if stage.verdict == VerdictPolicy::Reported {
-                reported_verdict(store, run_id, &stage.name)?
+                reported_verdict(run_store, run_id, &stage.name)?
             } else {
                 None
             };
@@ -917,7 +926,7 @@ pub(super) fn drive_flow(
                 resolve_verdict(&stage.verdict, result.verdict, reported);
             // Fill in the verdict of the re-run that followed the last repair.
             if let Some((attempt, identity, target)) = pending_repair.take() {
-                let _ = store.record_repair_attempt(
+                let _ = run_store.record_repair_attempt(
                     run_id,
                     &stage.name,
                     attempt,
@@ -940,7 +949,14 @@ pub(super) fn drive_flow(
                 && repair_used < on_fail.attempts
             {
                 let target = resolve_repair_target(ctx, on_fail);
-                if repair_gates_open(ctx, store, &target, clock, clock.now_ms()) {
+                if repair_gates_open(
+                    ctx,
+                    run_store,
+                    local_work_state,
+                    &target,
+                    clock,
+                    clock.now_ms(),
+                ) {
                     // A conflicting merge left the default checkout mid-merge.
                     // Restore it now — only because a repair will run — so the
                     // repair's integration and the retried merge start clean. An
@@ -953,7 +969,7 @@ pub(super) fn drive_flow(
                     // Record the attempt before spawning so a crash mid-repair
                     // still counts it: recovery re-runs the stage, never the
                     // repair, so the attempt is neither repeated nor lost.
-                    store
+                    run_store
                         .record_repair_attempt(
                             run_id,
                             &stage.name,
@@ -968,7 +984,7 @@ pub(super) fn drive_flow(
                         &target,
                         worktree,
                         output_path,
-                        store,
+                        run_store,
                         run_id,
                         &stage.name,
                         attempt,
@@ -1003,7 +1019,7 @@ pub(super) fn drive_flow(
             }
             break (verdict, source, reason, result);
         };
-        if let Err(error) = store.record_aftercare_stage(
+        if let Err(error) = run_store.record_aftercare_stage(
             run_id,
             &StageRecord {
                 stage_index,
@@ -1036,7 +1052,7 @@ pub(super) fn drive_flow(
                 merge,
             });
         }
-        if let Err(error) = store.clear_aftercare_process(run_id) {
+        if let Err(error) = run_store.clear_aftercare_process(run_id) {
             log.emit_with_fields(
                 LogLevel::Error,
                 "sloop::supervisor",
@@ -1077,8 +1093,12 @@ fn flow_with_implicit_test(flow: &Flow, test_cmd: Option<&[String]>) -> Result<F
     Ok(flow)
 }
 
-fn reported_verdict(store: &Store, run_id: &str, stage: &str) -> Result<Option<Reported>, String> {
-    let rows = store
+fn reported_verdict(
+    run_store: &RunStore,
+    run_id: &str,
+    stage: &str,
+) -> Result<Option<Reported>, String> {
+    let rows = run_store
         .run_evidence(run_id)
         .map_err(|error| error.to_string())?;
     let Some(data) = rows
@@ -1127,7 +1147,7 @@ pub(super) fn git_stdout(root: &Path, args: &[&str]) -> Result<String, String> {
 
 #[allow(clippy::too_many_arguments)]
 fn record_merge_process_checkpoint(
-    store: &Store,
+    run_store: &RunStore,
     run_id: &str,
     stage: &str,
     pid: u32,
@@ -1135,7 +1155,7 @@ fn record_merge_process_checkpoint(
     checkpoint: &MergeProcessCheckpoint,
     now_ms: i64,
 ) -> Result<(), StoreError> {
-    store.record_aftercare_evidence(
+    run_store.record_aftercare_evidence(
         run_id,
         "aftercare_process",
         &json!({

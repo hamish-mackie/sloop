@@ -5,7 +5,7 @@ use std::process::Command;
 
 use crate::domain::ticket::TicketState;
 use crate::reindex::ReindexError;
-use crate::store::ReindexTicket;
+use crate::work_state::local::ReindexTicket;
 
 pub(crate) fn derive_states(
     root: &Path,

@@ -10,29 +10,29 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::config::expand_agent_cmd;
+use crate::db::{Db, StoreError};
 use crate::domain::ticket::TicketSnapshot;
 use crate::domain::work::{Disposition, OwnerId, TicketRef, WorkOutcome, WorkTicket};
 use crate::flow::Flow;
 use crate::frontmatter::Frontmatter;
 use crate::ids::next_id;
 use crate::logging::{LogLevel, OperationalLog};
-use crate::run_store::RunAdmission;
+use crate::run_store::{
+    NeedsReviewBranch, RunAdmission, RunState, RunStore, WorktreeCleanupCandidate,
+};
 use crate::runner::local::{
     compose_worker_prompt, launch_agent, run_output_path, wait_for_test_hook, worker_socket_path,
 };
 use crate::runner::{AgentLaunch, RunnerError, StageExecution, StageOrder};
-use crate::store::{
-    ClaimRequest, NeedsReviewBranch, QueuedActivation, RunState, Store, TicketRecord,
-    WorktreeCleanupCandidate,
-};
 use crate::work_state::ClaimResult;
+use crate::work_state::local::{LocalSqlite, QueuedActivation};
 
 use super::aftercare::{
     RepairContext, StoreStageHooks, gather_exit_evidence, git_is_ancestor, git_stdout,
 };
 use super::dispatcher::{
     DispatcherState, RunEvent, close_worker_socket, disposition_for_outcome, mark_storage_full,
-    recover_storage, settle_pending_exits,
+    push_work_outcome, recover_storage, settle_pending_exits,
 };
 use super::recovery::{
     ProcessIdentity, classify_run_output, reconcile_run_liveness, recoverable_process_identity,
@@ -48,7 +48,7 @@ fn agent_stage_order(
     flow: &Flow,
     run_id: &str,
     attempt: i64,
-) -> Result<(StageOrder, String), RunnerError<crate::store::StoreError>> {
+) -> Result<(StageOrder, String), RunnerError<StoreError>> {
     let error = |message| RunnerError::Execution(message);
     let agent = state
         .agent
@@ -154,21 +154,24 @@ fn orphan_disposition(
 /// startup; `reindex` will share it.
 pub(super) fn reconcile_tickets(
     root: &Path,
-    store: &Store,
+    local_work_state: &LocalSqlite,
+    run_store: &RunStore,
     now_ms: i64,
     delete_missing_after_ms: i64,
 ) -> Result<(), DaemonError> {
-    for ticket in store.local_ticket_files().map_err(DaemonError::Store)? {
+    for ticket in local_work_state
+        .local_ticket_files()
+        .map_err(DaemonError::Store)?
+    {
         if root.join(&ticket.file_path).is_file() {
             if ticket.missing_at_ms.is_some() {
-                store
+                local_work_state
                     .clear_ticket_missing(&ticket.id, now_ms)
                     .map_err(DaemonError::Store)?;
             }
             continue;
         }
-        let is_referenced = store
-            .ticket_is_referenced(&ticket.id)
+        let is_referenced = ticket_is_referenced(local_work_state, run_store, &ticket.id)
             .map_err(DaemonError::Store)?;
         match orphan_disposition(
             ticket.missing_at_ms,
@@ -177,12 +180,12 @@ pub(super) fn reconcile_tickets(
             delete_missing_after_ms,
         ) {
             OrphanDisposition::MarkMissing => {
-                store
+                local_work_state
                     .mark_ticket_missing(&ticket.id, now_ms)
                     .map_err(DaemonError::Store)?;
             }
             OrphanDisposition::Delete => {
-                store
+                local_work_state
                     .delete_ticket(&ticket.id)
                     .map_err(DaemonError::Store)?;
             }
@@ -192,12 +195,21 @@ pub(super) fn reconcile_tickets(
     Ok(())
 }
 
+fn ticket_is_referenced(
+    local_work_state: &LocalSqlite,
+    run_store: &RunStore,
+    ticket_id: &str,
+) -> Result<bool, StoreError> {
+    Ok(run_store.ticket_is_referenced(ticket_id)?
+        || local_work_state.ticket_has_work_references(ticket_id)?)
+}
+
 /// Indexes committed project Markdown files into the store so ticket membership
 /// can be validated. Runs at startup; `reindex` will share it.
 pub(super) fn index_projects(
     root: &Path,
     project_dir: &Path,
-    store: &Store,
+    local_work_state: &LocalSqlite,
     now_ms: i64,
     project_prefix: &str,
 ) -> Result<Vec<String>, DaemonError> {
@@ -295,7 +307,7 @@ pub(super) fn index_projects(
             .unwrap_or(&project.path)
             .to_string_lossy()
             .into_owned();
-        store
+        local_work_state
             .upsert_local_project(&id, &relative, &title, now_ms)
             .map_err(DaemonError::Store)?;
         indexed.push(id);
@@ -361,7 +373,7 @@ async fn release_unrecorded_claim(
 /// Keeps `expires_at_ms` truthful for every run this daemon supervises, so a
 /// run outliving the initial TTL no longer executes on an expired lease.
 async fn renew_supervised_leases(state: &mut DispatcherState, log: &OperationalLog) {
-    let runs = match state.store.recoverable_runs() {
+    let runs = match state.run_store.recoverable_runs() {
         Ok(runs) => runs,
         Err(error) => {
             log.emit_with_fields(
@@ -381,7 +393,7 @@ async fn renew_supervised_leases(state: &mut DispatcherState, log: &OperationalL
         if !renews_lease(run.state, supervised, recoverable_process_identity(&run)) {
             continue;
         }
-        let ticket = match state.store.ticket(&run.ticket_id) {
+        let ticket = match state.local_work_state.ticket(&run.ticket_id) {
             Ok(Some(ticket)) => TicketRef {
                 id: ticket.id,
                 source: ticket.source,
@@ -453,7 +465,7 @@ pub(super) async fn reconcile(
     {
         return;
     }
-    let activations = match state.store.dispatchable_activations(now_ms) {
+    let activations = match state.local_work_state.dispatchable_activations(now_ms) {
         Ok(activations) => activations,
         Err(error) => {
             log.emit_with_fields(
@@ -482,11 +494,16 @@ pub(super) async fn reconcile(
         if state.active.len() >= state.max_agents {
             break;
         }
-        let Some(ticket_id) = eligible_ticket(&state.store, &activation, now_ms) else {
+        let Some(ticket_id) = eligible_ticket(
+            &state.local_work_state,
+            &state.run_store,
+            &activation,
+            now_ms,
+        ) else {
             continue;
         };
 
-        let ticket_record = match state.store.ticket(&ticket_id) {
+        let ticket_record = match state.local_work_state.ticket(&ticket_id) {
             Ok(Some(ticket)) => ticket,
             Ok(None) => {
                 log.emit_with_fields(
@@ -603,29 +620,16 @@ pub(super) async fn reconcile(
         let flow_json = serde_json::to_string(&flow).expect("flow snapshots serialize to JSON");
         let ticket_json =
             serde_json::to_string(&ticket_snapshot).expect("ticket snapshots serialize to JSON");
-        let claim = ClaimRequest {
+        let admission = RunAdmission {
             ticket_id: &ticket_id,
             run_id: &run_id,
             activation_id,
-            owner_id: &owner.0,
-            lease_ms: DEFAULT_LEASE_MS,
             flow_json: &flow_json,
             ticket_json: &ticket_json,
-            next_activation_eligible_at_ms: None,
         };
-        let claimed = match state.run_store.insert_claimed_run(
-            &RunAdmission {
-                run_id: claim.run_id,
-                activation_id: claim.activation_id,
-                ticket_id: claim.ticket_id,
-                flow_json: claim.flow_json,
-                ticket_json: claim.ticket_json,
-            },
-            now_ms,
-        ) {
+        let claimed = match state.run_store.insert_claimed_run(&admission, now_ms) {
             Ok(claimed) => claimed,
             Err(error) => {
-                let error = crate::store::StoreError::from(error);
                 mark_storage_full(state, &error);
                 release_unrecorded_claim(state, &ticket_ref, &owner, log).await;
                 log.emit_with_fields(
@@ -650,7 +654,7 @@ pub(super) async fn reconcile(
                 let worktree = order.worktree.clone();
                 let branch = order.branch.clone();
                 let output_path = order.output_path.clone();
-                let hooks = StoreStageHooks::new(&state.store, log);
+                let hooks = StoreStageHooks::new(&state.run_store, log);
                 launch_agent(order, &hooks, state.clock.as_ref())
                     .map(|launched| (launched, target, worktree, branch, output_path))
             },
@@ -733,8 +737,11 @@ pub(super) async fn reconcile(
                         .as_ref()
                         .filter(|error| error.class.requires_cooldown())
                         .map(|_| clock.now_ms() + VENDOR_COOLDOWN_MS);
-                    let mut checkpoint_store = match Store::open(&db_path, clock.now_ms()) {
-                        Ok(store) => Some(store),
+                    let checkpoint_stores = match Db::open(&db_path, clock.now_ms()) {
+                        Ok(db) => Some((
+                            RunStore::from_db(db.clone()),
+                            LocalSqlite::from_db_with_clock(db, clock.clone()),
+                        )),
                         Err(error) => {
                             supervisor_log.emit_with_fields(
                                 LogLevel::Error,
@@ -760,7 +767,9 @@ pub(super) async fn reconcile(
                             capture_complete,
                             vendor_error.as_ref(),
                             cooldown_until_ms,
-                            checkpoint_store.as_mut(),
+                            checkpoint_stores
+                                .as_ref()
+                                .map(|(run_store, local_work_state)| (run_store, local_work_state)),
                             repair.as_ref(),
                             &supervisor_log,
                         )
@@ -859,7 +868,7 @@ pub(super) async fn reconcile(
 /// evidence. Squash- and rebase-merges rewrite the commits and are invisible to
 /// ancestry, so they still require `sloop reindex`.
 async fn reconcile_external_merges(state: &mut DispatcherState, log: &OperationalLog) {
-    let branches = match state.store.needs_review_branches() {
+    let branches = match state.run_store.needs_review_branches() {
         Ok(branches) => branches,
         Err(error) => {
             log.emit_with_fields(
@@ -959,7 +968,7 @@ async fn release_external_merge(
     outcome: WorkOutcome,
     log: &OperationalLog,
 ) -> bool {
-    let ticket = match state.store.ticket(&branch.ticket_id) {
+    let ticket = match state.local_work_state.ticket(&branch.ticket_id) {
         Ok(Some(ticket)) => TicketRef {
             id: ticket.id,
             source: ticket.source,
@@ -988,14 +997,7 @@ async fn release_external_merge(
         );
         return false;
     }
-    if let Err(error) = state.work_state.push_outcome(&outcome).await {
-        log.emit_with_fields(
-            LogLevel::Warn,
-            "sloop::dispatcher",
-            "work_outcome_push_failed",
-            json!({"ticket_id": branch.ticket_id, "run_id": branch.run_id, "error": error.to_string()}),
-        );
-    }
+    push_work_outcome(state, outcome, log, "sloop::dispatcher");
     true
 }
 
@@ -1015,7 +1017,7 @@ fn reconcile_worktree_cleanup(state: &mut DispatcherState, log: &OperationalLog)
     let Some(retention_ms) = state.worktree_retention_ms else {
         return;
     };
-    let candidates = match state.store.worktree_cleanup_candidates() {
+    let candidates = match state.run_store.worktree_cleanup_candidates() {
         Ok(candidates) => candidates,
         Err(error) => {
             log.emit_with_fields(
@@ -1058,7 +1060,7 @@ fn reconcile_worktree_cleanup(state: &mut DispatcherState, log: &OperationalLog)
             continue;
         }
         match state
-            .store
+            .run_store
             .mark_run_worktree_cleaned(&candidate, state.clock.now_ms())
         {
             Ok(true) => log.emit_with_fields(
@@ -1144,9 +1146,9 @@ pub(super) fn running_hours_open(state: &DispatcherState, now_ms: i64) -> bool {
 
 pub(super) fn next_dispatch_deadline(state: &DispatcherState) -> Option<i64> {
     let now_ms = state.clock.now_ms();
-    let cooldown_deadline = state.store.next_active_cooldown(now_ms).ok().flatten();
+    let cooldown_deadline = state.run_store.next_active_cooldown(now_ms).ok().flatten();
     let next_eligible = state
-        .store
+        .local_work_state
         .next_activation_eligible_at_ms(now_ms)
         .ok()
         .flatten();
@@ -1159,7 +1161,7 @@ pub(super) fn next_dispatch_deadline(state: &DispatcherState) -> Option<i64> {
         }
         let opening = hours.next_opening_ms(state.clock.as_ref(), now_ms);
         let has_due_demand = state
-            .store
+            .local_work_state
             .dispatchable_activations(now_ms)
             .is_ok_and(|activations| !activations.is_empty());
         if has_due_demand || next_eligible.is_some_and(|deadline| deadline <= opening) {
@@ -1170,7 +1172,7 @@ pub(super) fn next_dispatch_deadline(state: &DispatcherState) -> Option<i64> {
     };
     let cleanup_deadline = state.worktree_retention_ms.and_then(|retention_ms| {
         state
-            .store
+            .run_store
             .next_worktree_cleanup_at_ms(retention_ms, now_ms)
             .ok()
             .flatten()
@@ -1181,12 +1183,21 @@ pub(super) fn next_dispatch_deadline(state: &DispatcherState) -> Option<i64> {
         .min()
 }
 
-fn eligible_ticket(store: &Store, activation: &QueuedActivation, now_ms: i64) -> Option<String> {
+fn eligible_ticket(
+    local_work_state: &LocalSqlite,
+    run_store: &RunStore,
+    activation: &QueuedActivation,
+    now_ms: i64,
+) -> Option<String> {
     match &activation.ticket_id {
-        Some(ticket) if store.ticket_is_dispatchable(ticket).unwrap_or(false) => {
-            let record = store.ticket(ticket).ok().flatten()?;
+        Some(ticket)
+            if local_work_state
+                .ticket_is_dispatchable(ticket)
+                .unwrap_or(false) =>
+        {
+            let record = local_work_state.ticket(ticket).ok().flatten()?;
             let target = record.target.as_deref()?;
-            store
+            run_store
                 .active_cooldown_for_target(target, now_ms)
                 .ok()
                 .flatten()
@@ -1194,36 +1205,11 @@ fn eligible_ticket(store: &Store, activation: &QueuedActivation, now_ms: i64) ->
                 .then(|| ticket.clone())
         }
         Some(_) => None,
-        None => store.select_ready_ticket(activation, now_ms).ok().flatten(),
+        None => local_work_state
+            .select_ready_ticket(activation.project_id.as_deref(), &activation.id, now_ms)
+            .ok()
+            .flatten(),
     }
-}
-
-pub(super) fn bound_flow(
-    store: &Store,
-    flows: &BTreeMap<String, Flow>,
-    ticket_id: &str,
-) -> Result<Flow, String> {
-    let ticket = store
-        .ticket(ticket_id)
-        .map_err(|error| format!("cannot read ticket `{ticket_id}`: {error}"))?
-        .ok_or_else(|| format!("ticket `{ticket_id}` no longer exists"))?;
-    bound_flow_for_ticket(flows, &ticket)
-}
-
-fn bound_flow_for_ticket(
-    flows: &BTreeMap<String, Flow>,
-    ticket: &TicketRecord,
-) -> Result<Flow, String> {
-    let flow_name = ticket
-        .flow
-        .as_ref()
-        .ok_or_else(|| format!("ticket `{}` has no bound flow", ticket.id))?;
-    flows.get(flow_name).cloned().ok_or_else(|| {
-        format!(
-            "ticket `{}` names unknown bound flow `{flow_name}`",
-            ticket.id
-        )
-    })
 }
 
 fn bound_flow_for_work_ticket(
@@ -1254,8 +1240,10 @@ mod tests {
         ProcessIdentity, RunState, index_projects, orphan_disposition, reconcile_tickets,
         renews_lease, worktree_cleanup_due,
     };
+    use crate::db::Db;
     use crate::domain::ticket::TicketState;
-    use crate::store::Store;
+    use crate::run_store::RunStore;
+    use crate::work_state::local::LocalSqlite;
 
     #[test]
     fn only_runs_verified_alive_this_pass_renew_their_lease() {
@@ -1319,8 +1307,10 @@ mod tests {
         let tickets = root.path().join(".agents/sloop/tickets");
         fs::create_dir_all(&tickets).unwrap();
         fs::write(tickets.join("present.md"), "# Present\n").unwrap();
-        let store = Store::open(&root.path().join("sloop.db"), 1_000).unwrap();
-        store
+        let db = Db::open(&root.path().join("sloop.db"), 1_000).unwrap();
+        let local_work_state = LocalSqlite::from_db(db.clone());
+        let run_store = RunStore::from_db(db);
+        local_work_state
             .insert_local_project(
                 "default",
                 ".agents/sloop/projects/default.md",
@@ -1329,7 +1319,7 @@ mod tests {
             )
             .unwrap();
         let insert = |id: &str, file: &str, blocked_by: &[String]| {
-            store
+            local_work_state
                 .insert_local_ticket(
                     id,
                     "default",
@@ -1353,8 +1343,8 @@ mod tests {
         fs::write(tickets.join("dependent.md"), "# Dependent\n").unwrap();
 
         let window = 100;
-        let stamps = |store: &Store| -> Vec<(String, Option<i64>)> {
-            store
+        let stamps = |local_work_state: &LocalSqlite| -> Vec<(String, Option<i64>)> {
+            local_work_state
                 .local_ticket_files()
                 .unwrap()
                 .into_iter()
@@ -1363,9 +1353,9 @@ mod tests {
         };
 
         // First pass stamps the two tickets whose files are gone.
-        reconcile_tickets(root.path(), &store, 2_000, window).unwrap();
+        reconcile_tickets(root.path(), &local_work_state, &run_store, 2_000, window).unwrap();
         assert_eq!(
-            stamps(&store),
+            stamps(&local_work_state),
             vec![
                 ("T1".into(), None),
                 ("T2".into(), Some(2_000)),
@@ -1375,14 +1365,14 @@ mod tests {
         );
 
         // Within the window nothing is deleted and stamps keep their origin.
-        reconcile_tickets(root.path(), &store, 2_050, window).unwrap();
-        assert_eq!(stamps(&store)[1], ("T2".into(), Some(2_000)));
+        reconcile_tickets(root.path(), &local_work_state, &run_store, 2_050, window).unwrap();
+        assert_eq!(stamps(&local_work_state)[1], ("T2".into(), Some(2_000)));
 
         // Past the window the unreferenced orphan is deleted; T3 survives
         // because T4 still names it as a blocker.
-        reconcile_tickets(root.path(), &store, 2_100, window).unwrap();
+        reconcile_tickets(root.path(), &local_work_state, &run_store, 2_100, window).unwrap();
         assert_eq!(
-            stamps(&store),
+            stamps(&local_work_state),
             vec![
                 ("T1".into(), None),
                 ("T3".into(), Some(2_000)),
@@ -1392,8 +1382,8 @@ mod tests {
 
         // The file coming back clears the stamp even after the window.
         fs::write(tickets.join("blocked-gone.md"), "# Returned\n").unwrap();
-        reconcile_tickets(root.path(), &store, 3_000, window).unwrap();
-        assert_eq!(stamps(&store)[1], ("T3".into(), None));
+        reconcile_tickets(root.path(), &local_work_state, &run_store, 3_000, window).unwrap();
+        assert_eq!(stamps(&local_work_state)[1], ("T3".into(), None));
     }
 
     #[test]
@@ -1408,12 +1398,13 @@ mod tests {
             "---\nid: PROJ-7\ntitle: Explicit\n---\n",
         )
         .unwrap();
-        let store = Store::open(&root.path().join("sloop.db"), 1_000).unwrap();
+        let local_work_state =
+            LocalSqlite::from_db(Db::open(&root.path().join("sloop.db"), 1_000).unwrap());
 
         index_projects(
             root.path(),
             std::path::Path::new(".agents/sloop/projects"),
-            &store,
+            &local_work_state,
             1_000,
             "PROJ",
         )

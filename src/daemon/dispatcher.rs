@@ -11,19 +11,18 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::clock::{Clock, next_local_minute_ms};
 use crate::config::{AgentConfig, RunningHours, parse_local_time};
-use crate::domain::work::{Disposition, TicketRef};
+use crate::db::StoreError;
+use crate::domain::work::{Disposition, TicketRef, WorkOutcome};
 use crate::flow::Flow;
 use crate::logging::{LogLevel, OperationalLog};
 use crate::outcome::{MergeOutcome, RunEvidence, classify_exit, derive_outcome};
 use crate::protocol::{ErrorBody, ErrorCode, Request, RequestId, ResponseEnvelope};
 use crate::run_ref::RunIdSource;
-use crate::run_store::RunStore;
+use crate::run_store::{CooldownUpdate, EvidenceRecord, RunStore};
 use crate::runner::local::worker_socket_path;
-use crate::sources::TicketSource;
-use crate::store::{CooldownUpdate, EvidenceRecord, Store, StoreError};
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
 use crate::work_state::local::LocalSqlite;
-use crate::work_state::{SourceError, WorkState};
+use crate::work_state::{SourceError, TicketFeeder, WorkState};
 
 use super::commands::{
     handle_cancel, handle_events, handle_hold, handle_list, handle_logs, handle_operator_show,
@@ -84,7 +83,7 @@ pub(super) struct DispatcherState {
     pub(super) root: PathBuf,
     pub(super) project_dir: PathBuf,
     pub(super) ticket_dir: PathBuf,
-    pub(super) ticket_source: Arc<dyn TicketSource>,
+    pub(super) ticket_source: TicketFeeder,
     pub(super) work_state_author_enabled: bool,
     pub(super) worktree_dir: PathBuf,
     pub(super) worktree_retention_ms: Option<i64>,
@@ -92,9 +91,8 @@ pub(super) struct DispatcherState {
     pub(super) runtime_dir: PathBuf,
     pub(super) socket: PathBuf,
     pub(super) daemon_log: PathBuf,
-    pub(super) store: Store,
     pub(super) local_work_state: LocalSqlite,
-    pub(super) work_state: Box<dyn WorkState>,
+    pub(super) work_state: Arc<dyn WorkState>,
     pub(super) run_store: RunStore,
     /// `SQLITE_FULL` is a dispatcher gate. The daemon retains active and
     /// pending run evidence in memory until a committed probe succeeds.
@@ -268,7 +266,7 @@ pub(super) async fn settle_pending_exits(state: &mut DispatcherState, log: &Oper
             continue;
         };
         match try_settle_run_exit(state, &event, log).await {
-            Ok((ticket_id, outcome, applied)) => {
+            Ok((_ticket_id, outcome, _applied)) => {
                 state.cancelling.remove(&run_id);
                 state.active.remove(&run_id);
                 state.supervised.remove(&run_id);
@@ -281,20 +279,6 @@ pub(super) async fn settle_pending_exits(state: &mut DispatcherState, log: &Oper
                     "run_exited",
                     json!({"run_id": run_id, "outcome": outcome.as_str()}),
                 );
-                if applied {
-                    let ticket_source = state.ticket_source.clone();
-                    let report_log = log.clone();
-                    tokio::task::spawn_blocking(move || {
-                        if let Err(error) = ticket_source.report(&ticket_id, &outcome) {
-                            report_log.emit_with_fields(
-                                LogLevel::Warn,
-                                "sloop::dispatcher",
-                                "ticket_source_report_failed",
-                                json!({"ticket_id": ticket_id, "outcome": outcome.as_str(), "error": error.to_string()}),
-                            );
-                        }
-                    });
-                }
             }
             Err(SettleError::Store(error)) => {
                 let disk_full = error.is_disk_full();
@@ -354,7 +338,7 @@ async fn try_settle_run_exit(
     } = event;
 
     let cancelled =
-        state.cancelling.contains(run_id) || state.store.cancellation_requested(run_id)?;
+        state.cancelling.contains(run_id) || state.run_store.cancellation_requested(run_id)?;
     let evidence = RunEvidence {
         cancelled,
         exit: classify_exit(*exit_code),
@@ -431,12 +415,13 @@ async fn try_settle_run_exit(
         state.clock.now_ms(),
     )?;
     let ticket_id = recorded.work.ticket_id.clone();
-    let ticket = state
-        .store
-        .ticket(&ticket_id)?
-        .ok_or_else(|| StoreError::TicketNotFound {
-            ticket_id: ticket_id.clone(),
-        })?;
+    let ticket =
+        state
+            .local_work_state
+            .ticket(&ticket_id)?
+            .ok_or_else(|| StoreError::TicketNotFound {
+                ticket_id: ticket_id.clone(),
+            })?;
     let ticket_ref = TicketRef {
         id: ticket.id,
         source: ticket.source,
@@ -451,15 +436,33 @@ async fn try_settle_run_exit(
         )
         .await
         .map_err(SettleError::WorkState)?;
-    if let Err(error) = state.work_state.push_outcome(&recorded.work).await {
-        log.emit_with_fields(
-            LogLevel::Warn,
-            "sloop::dispatcher",
-            "work_outcome_push_failed",
-            json!({"run_id": run_id, "ticket_id": ticket_id, "error": error.to_string()}),
-        );
-    }
+    push_work_outcome(state, recorded.work.clone(), log, "sloop::dispatcher");
     Ok((ticket_id, recorded.work.verdict, applied))
+}
+
+pub(super) fn push_work_outcome(
+    state: &DispatcherState,
+    outcome: WorkOutcome,
+    log: &OperationalLog,
+    target: &'static str,
+) {
+    let work_state = state.work_state.clone();
+    let log = log.clone();
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = runtime.block_on(work_state.push_outcome(&outcome)) {
+            log.emit_with_fields(
+                LogLevel::Warn,
+                target,
+                "work_outcome_push_failed",
+                json!({
+                    "run_id": outcome.owner.0,
+                    "ticket_id": outcome.ticket_id,
+                    "error": error.to_string(),
+                }),
+            );
+        }
+    });
 }
 
 pub(super) fn disposition_for_outcome(
@@ -511,7 +514,7 @@ pub(super) fn recover_storage(state: &DispatcherState, now_ms: i64) -> bool {
     if !state.storage_full.get() {
         return true;
     }
-    match state.store.probe_writable(now_ms) {
+    match state.run_store.probe_writable(now_ms) {
         Ok(()) => {
             state.storage_full.set(false);
             state
@@ -551,7 +554,7 @@ async fn dispatch(
         Request::Restart(_) => {
             let active_runs = state.active.len();
             let changed = match state
-                .store
+                .run_store
                 .begin_restart_draining(active_runs, state.clock.now_ms())
             {
                 Ok(changed) => changed,
@@ -612,7 +615,7 @@ async fn dispatch(
             match crate::post::handle(
                 &state.root,
                 &state.ticket_dir,
-                &state.store,
+                &state.local_work_state,
                 &args,
                 now_ms,
                 at_eligible_ms,
@@ -654,7 +657,7 @@ async fn dispatch(
             Err(error) => return ResponseEnvelope::failure(Some(id), error),
         },
         Request::Pause(_) => {
-            if let Err(error) = state.store.set_paused(true, state.clock.now_ms()) {
+            if let Err(error) = state.run_store.set_paused(true, state.clock.now_ms()) {
                 mark_storage_full(state, &error);
                 return ResponseEnvelope::failure(
                     Some(id),
@@ -665,7 +668,7 @@ async fn dispatch(
             json!({"paused": true})
         }
         Request::Resume(_) => {
-            let cancelled_restart = match state.store.resume_scheduler(state.clock.now_ms()) {
+            let cancelled_restart = match state.run_store.resume_scheduler(state.clock.now_ms()) {
                 Ok(cancelled) => cancelled,
                 Err(error) => {
                     mark_storage_full(state, &error);

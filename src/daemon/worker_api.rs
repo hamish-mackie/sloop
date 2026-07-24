@@ -7,8 +7,10 @@ use crate::flow::{Flow, VerdictPolicy};
 use crate::protocol::{ErrorBody, Request, RequestId, ResponseEnvelope, VerdictArgs, VerdictValue};
 use crate::vendor_error::VendorErrorMatch;
 
-use super::commands::lookup;
-use super::dispatcher::{DispatcherState, conflict, internal, mark_storage_full, unauthorized};
+use crate::work_state::local::TicketRecord;
+
+use super::commands::{local_lookup, mark_storage_full, run_lookup};
+use super::dispatcher::{DispatcherState, conflict, internal, unauthorized};
 
 /// Serves a worker verb after proving the caller holds the run's token.
 /// Everything an agent can reach flows through here: reads and writes are
@@ -59,13 +61,13 @@ pub(super) fn dispatch_worker(
 /// ticket body from its committed file, the isolated workspace, and the
 /// evidence-based definition of done.
 fn handle_brief(state: &DispatcherState, run_id: &str) -> Result<serde_json::Value, ErrorBody> {
-    let run = lookup(state, |store| store.run(run_id))?
+    let run = run_lookup(state, |run_store| run_store.run(run_id))?
         .ok_or_else(|| internal("the run for this token no longer exists"))?;
     let ticket = match run.ticket_json.as_deref() {
         Some(snapshot) => serde_json::from_str::<TicketSnapshot>(snapshot)
             .map_err(|error| internal(&format!("the run's ticket snapshot is invalid: {error}")))?,
         None => {
-            let ticket = lookup(state, |store| store.ticket(&run.ticket_id))?
+            let ticket = local_lookup(state, |work_state| work_state.ticket(&run.ticket_id))?
                 .ok_or_else(|| internal("the ticket for this run no longer exists"))?;
             let body = ticket.body.unwrap_or_else(|| {
                 ticket
@@ -119,12 +121,12 @@ fn handle_show(
     run_id: &str,
     reference: &str,
 ) -> Result<serde_json::Value, ErrorBody> {
-    let run = lookup(state, |store| store.run(run_id))?
+    let run = run_lookup(state, |run_store| run_store.run(run_id))?
         .ok_or_else(|| internal("the run for this token no longer exists"))?;
     if reference != run.ticket_id {
         return Err(unauthorized("workers may only show their own run's ticket"));
     }
-    let ticket = lookup(state, |store| store.ticket(&run.ticket_id))?
+    let ticket = local_lookup(state, |work_state| work_state.ticket(&run.ticket_id))?
         .ok_or_else(|| internal("the ticket for this run no longer exists"))?;
     let vendor_error = current_ticket_vendor_error(state, &ticket)?;
     Ok(ticket_show(reference, &ticket, vendor_error.as_ref()))
@@ -132,7 +134,7 @@ fn handle_show(
 
 pub(super) fn ticket_show(
     reference: &str,
-    ticket: &crate::store::TicketRecord,
+    ticket: &TicketRecord,
     vendor_error: Option<&VendorErrorMatch>,
 ) -> serde_json::Value {
     json!({
@@ -157,17 +159,17 @@ pub(super) fn ticket_show(
 
 pub(super) fn current_ticket_vendor_error(
     state: &DispatcherState,
-    ticket: &crate::store::TicketRecord,
+    ticket: &TicketRecord,
 ) -> Result<Option<VendorErrorMatch>, ErrorBody> {
-    let vendor_error = lookup(state, |store| {
-        store.latest_vendor_error_for_ticket(&ticket.id)
+    let vendor_error = run_lookup(state, |run_store| {
+        run_store.latest_vendor_error_for_ticket(&ticket.id)
     })?;
     if ticket.state != "ready" {
         return Ok(vendor_error);
     }
     let cooldown_active = match ticket.target.as_deref() {
-        Some(target) => lookup(state, |store| {
-            store.active_cooldown_for_target(target, state.clock.now_ms())
+        Some(target) => run_lookup(state, |run_store| {
+            run_store.active_cooldown_for_target(target, state.clock.now_ms())
         })?
         .is_some(),
         None => false,
@@ -182,10 +184,10 @@ fn handle_note(
     run_id: &str,
     text: &str,
 ) -> Result<serde_json::Value, ErrorBody> {
-    let ordinal = lookup(state, |store| store.next_note_ordinal())?;
+    let ordinal = run_lookup(state, |run_store| run_store.next_note_ordinal())?;
     let note_id = format!("N{ordinal}");
     state
-        .store
+        .run_store
         .insert_note(&note_id, run_id, text, state.clock.now_ms())
         .map_err(|error| {
             mark_storage_full(state, &error);
@@ -199,7 +201,7 @@ fn handle_verdict(
     run_id: &str,
     args: &VerdictArgs,
 ) -> Result<serde_json::Value, ErrorBody> {
-    let run = lookup(state, |store| store.run(run_id))?
+    let run = run_lookup(state, |run_store| run_store.run(run_id))?
         .ok_or_else(|| internal("the run for this token no longer exists"))?;
     let snapshot = run
         .flow_json
@@ -214,7 +216,7 @@ fn handle_verdict(
             .map(|stage| stage.name.clone())
             .ok_or_else(|| internal("the run's flow has no first stage"))?,
         "aftercare" => {
-            let rows = lookup(state, |store| store.run_evidence(run_id))?;
+            let rows = run_lookup(state, |run_store| run_store.run_evidence(run_id))?;
             rows.iter()
                 .find(|(kind, _)| kind == "aftercare_process")
                 .and_then(|(_, data)| serde_json::from_str::<serde_json::Value>(data).ok())
@@ -239,7 +241,7 @@ fn handle_verdict(
         VerdictValue::Fail => "fail",
     };
     let inserted = state
-        .store
+        .run_store
         .record_stage_verdict(
             run_id,
             &stage_name,

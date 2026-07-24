@@ -12,6 +12,7 @@ use rusqlite::{Transaction, TransactionBehavior};
 use serde_json::{Value, json};
 
 use crate::config::{AgentConfig, expand_agent_cmd};
+use crate::db::StoreError;
 use crate::domain::ticket::TicketState;
 use crate::domain::work::{ExecutionHints, SourceVersion, TicketRef, WorkTicket, WorkTicketState};
 use crate::flow::Flow;
@@ -19,8 +20,9 @@ use crate::frontmatter::{self, FrontmatterError};
 use crate::ids::{IdError, next_id};
 use crate::protocol::{PostActivation, PostArgs};
 use crate::run_store;
-use crate::store::{ActivationKind, NewActivation, Store, StoreError};
-use crate::work_state::local::{self, LocalTicketWrite};
+use crate::work_state::local::{
+    self, ActivationKind, LocalSqlite, LocalTicketWrite, NewActivation,
+};
 use crate::work_state::{SourceError, WorkStateAuthor};
 
 #[derive(Clone, Copy)]
@@ -94,7 +96,7 @@ struct MarkdownWorkStateAuthor<'a> {
     root: &'a Path,
     file_path: &'a str,
     worktree: &'a str,
-    store: &'a Store,
+    work_state: &'a LocalSqlite,
     original_content: &'a str,
     final_content: &'a str,
     original_version: SourceVersion,
@@ -138,7 +140,7 @@ impl MarkdownWorkStateAuthor<'_> {
                 message: format!("cannot stage {}: {error}", self.file_path),
             })?;
         self.ensure_source_version(expected)?;
-        let db = self.store.db();
+        let db = self.work_state.db();
         let mut connection = db.lock();
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -232,7 +234,7 @@ impl WorkStateAuthor for MarkdownWorkStateAuthor<'_> {
 pub async fn handle(
     root: &Path,
     ticket_dir: &Path,
-    store: &Store,
+    work_state: &LocalSqlite,
     args: &PostArgs,
     now_ms: i64,
     at_eligible_ms: Option<i64>,
@@ -272,7 +274,7 @@ pub async fn handle(
         (None, Some(requested)) => requested.to_owned(),
         (None, None) => "default".to_owned(),
     };
-    if !store.project_exists(&project)? {
+    if !work_state.project_exists(&project)? {
         return Err(PostError::UnknownProject(project));
     }
 
@@ -323,7 +325,7 @@ pub async fn handle(
 
     let (ticket_id, existing) = match stamped.id.as_deref() {
         Some(id) => {
-            if let Some(existing) = store.ticket(id)? {
+            if let Some(existing) = work_state.ticket(id)? {
                 if existing.file_path.as_deref() != Some(relative_str.as_str()) {
                     return Err(PostError::TicketIdTaken {
                         id: id.to_owned(),
@@ -342,7 +344,7 @@ pub async fn handle(
                 (id.to_owned(), None)
             }
         }
-        None => match store.ticket_by_file(&relative_str)? {
+        None => match work_state.ticket_by_file(&relative_str)? {
             Some(existing) => {
                 if existing.project_id != project {
                     return Err(PostError::ProjectConflict {
@@ -353,18 +355,18 @@ pub async fn handle(
                 }
                 (existing.id.clone(), Some(existing))
             }
-            None => (allocate_ticket_id(store, ticket_prefix)?, None),
+            None => (allocate_ticket_id(work_state, ticket_prefix)?, None),
         },
     };
     for blocker in &stamped.blocked_by {
-        if blocker != &ticket_id && store.ticket(blocker)?.is_none() {
+        if blocker != &ticket_id && work_state.ticket(blocker)?.is_none() {
             return Err(PostError::UnknownBlockedBy {
                 ticket: ticket_id.clone(),
                 blocker: blocker.clone(),
             });
         }
     }
-    let mut dependencies = store.ticket_dependencies()?;
+    let mut dependencies = work_state.ticket_dependencies()?;
     dependencies.insert(ticket_id.clone(), stamped.blocked_by.clone());
     if let Some(chain) = crate::domain::graph::find_cycle(&dependencies) {
         return Err(PostError::DependencyCycle(chain));
@@ -432,7 +434,7 @@ pub async fn handle(
         root,
         file_path: &relative_str,
         worktree: &worktree,
-        store,
+        work_state,
         original_content: &content,
         final_content: &final_content,
         original_version: source_version(&content),
@@ -453,7 +455,7 @@ pub async fn handle(
         author.post(&work_ticket).await?;
     }
     let activation = author.activation_result();
-    let ticket = store
+    let ticket = work_state
         .ticket(&work_ticket.id)?
         .expect("registered ticket still exists");
 
@@ -601,8 +603,8 @@ fn source_version(content: &str) -> SourceVersion {
     SourceVersion(format!("{hash:016x}"))
 }
 
-fn allocate_ticket_id(store: &Store, prefix: &str) -> Result<String, PostError> {
-    let ids = store.ticket_ids()?;
+fn allocate_ticket_id(work_state: &LocalSqlite, prefix: &str) -> Result<String, PostError> {
+    let ids = work_state.ticket_ids()?;
     next_id(prefix, ids.iter().map(String::as_str)).map_err(PostError::IdAllocation)
 }
 
@@ -844,16 +846,17 @@ mod tests {
         MarkdownWorkStateAuthor, PostError, handle as handle_with_directory, source_version,
     };
     use crate::config::{AgentConfig, AgentTarget};
+    use crate::db::Db;
     use crate::domain::work::{ExecutionHints, TicketRef, WorkTicket, WorkTicketState};
     use crate::flow::{Flow, Stage, StageKind, VerdictPolicy};
     use crate::protocol::{PostActivation, PostArgs};
-    use crate::store::Store;
+    use crate::work_state::local::LocalSqlite;
     use crate::work_state::{SourceError, WorkStateAuthor};
 
-    fn world() -> (tempfile::TempDir, Store) {
+    fn world() -> (tempfile::TempDir, LocalSqlite) {
         let root = tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".agents/sloop/tickets")).unwrap();
-        let store = Store::open(&root.path().join("sloop.db"), 1_000).unwrap();
+        let store = LocalSqlite::from_db(Db::open(&root.path().join("sloop.db"), 1_000).unwrap());
         store
             .upsert_local_project(
                 "default",
@@ -868,7 +871,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn handle(
         root: &std::path::Path,
-        store: &Store,
+        store: &LocalSqlite,
         args: &PostArgs,
         now_ms: i64,
         ticket_prefix: &str,
@@ -894,7 +897,7 @@ mod tests {
 
     fn handle_at(
         root: &std::path::Path,
-        store: &Store,
+        store: &LocalSqlite,
         args: &PostArgs,
         now_ms: i64,
         at_eligible_ms: i64,
@@ -1058,7 +1061,7 @@ mod tests {
             root: root.path(),
             file_path: relative,
             worktree: "cas",
-            store: &store,
+            work_state: &store,
             original_content: &original,
             final_content: &replacement,
             original_version: expected.clone(),
@@ -1452,7 +1455,8 @@ mod tests {
 
         // A fresh store with no rows of its own must recover the flow binding
         // purely from the committed frontmatter that the first post stamped.
-        let fresh_store = Store::open(&root.path().join("fresh.db"), 3_000).unwrap();
+        let fresh_store =
+            LocalSqlite::from_db(Db::open(&root.path().join("fresh.db"), 3_000).unwrap());
         fresh_store
             .upsert_local_project(
                 "default",

@@ -1,7 +1,6 @@
 pub mod cli;
 pub mod clock;
 pub mod config;
-pub mod coordination;
 pub mod daemon;
 pub mod db;
 pub mod domain;
@@ -23,7 +22,6 @@ pub mod run_ref;
 pub mod run_store;
 pub mod runner;
 pub mod sources;
-pub mod store;
 pub mod templates;
 pub mod vendor_error;
 pub mod work_state;

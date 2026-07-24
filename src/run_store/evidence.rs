@@ -1,6 +1,7 @@
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use super::RunStore;
+use super::{ProjectCommitEvidence, RunStore};
+use crate::db::StoreError;
 
 /// One appended `run_evidence` row: a kind plus kind-specific JSON facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,7 +301,7 @@ fn cancellation_requested(connection: &Connection, run_id: &str) -> rusqlite::Re
 fn commit_evidence_for_project(
     connection: &Connection,
     project_id: &str,
-) -> rusqlite::Result<Vec<(String, String, String)>> {
+) -> rusqlite::Result<Vec<ProjectCommitEvidence>> {
     let mut statement = connection.prepare(
         "SELECT r.id, r.ticket_id, e.data_json
          FROM run_evidence e
@@ -311,7 +312,11 @@ fn commit_evidence_for_project(
     )?;
     statement
         .query_map(params![project_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            Ok(ProjectCommitEvidence {
+                run_id: row.get(0)?,
+                ticket_id: row.get(1)?,
+                data_json: row.get(2)?,
+            })
         })?
         .collect::<Result<Vec<_>, _>>()
 }
@@ -360,14 +365,14 @@ impl RunStore {
         &self,
         run_id: &str,
         stage: &StageRecord,
-    ) -> rusqlite::Result<()> {
+    ) -> Result<(), StoreError> {
         self.write(TransactionBehavior::Deferred, |transaction| {
             tx::record_aftercare_stage(transaction, run_id, stage)
         })
     }
 
-    pub(crate) fn aftercare_stages(&self, run_id: &str) -> rusqlite::Result<Vec<StageRecord>> {
-        aftercare_stages(&self.db.lock(), run_id)
+    pub(crate) fn aftercare_stages(&self, run_id: &str) -> Result<Vec<StageRecord>, StoreError> {
+        aftercare_stages(&self.db.lock(), run_id).map_err(StoreError::from)
     }
 
     pub(crate) fn record_aftercare_evidence(
@@ -376,13 +381,13 @@ impl RunStore {
         kind: &str,
         data_json: &str,
         now_ms: i64,
-    ) -> rusqlite::Result<()> {
+    ) -> Result<(), StoreError> {
         self.write(TransactionBehavior::Deferred, |transaction| {
             tx::record_aftercare_evidence(transaction, run_id, kind, data_json, now_ms)
         })
     }
 
-    pub(crate) fn clear_aftercare_process(&self, run_id: &str) -> rusqlite::Result<()> {
+    pub(crate) fn clear_aftercare_process(&self, run_id: &str) -> Result<(), StoreError> {
         self.write(TransactionBehavior::Deferred, |transaction| {
             tx::clear_aftercare_process(transaction, run_id)
         })
@@ -392,14 +397,14 @@ impl RunStore {
         &self,
         run_id: &str,
         now_ms: i64,
-    ) -> rusqlite::Result<()> {
+    ) -> Result<(), StoreError> {
         self.write(TransactionBehavior::Deferred, |transaction| {
             tx::record_cancel_requested(transaction, run_id, now_ms)
         })
     }
 
-    pub(crate) fn cancellation_requested(&self, run_id: &str) -> rusqlite::Result<bool> {
-        cancellation_requested(&self.db.lock(), run_id)
+    pub(crate) fn cancellation_requested(&self, run_id: &str) -> Result<bool, StoreError> {
+        cancellation_requested(&self.db.lock(), run_id).map_err(StoreError::from)
     }
 
     pub(crate) fn record_stage_verdict(
@@ -409,7 +414,7 @@ impl RunStore {
         verdict: &str,
         reason: Option<&str>,
         now_ms: i64,
-    ) -> rusqlite::Result<bool> {
+    ) -> Result<bool, StoreError> {
         self.write(TransactionBehavior::Deferred, |transaction| {
             tx::record_stage_verdict(transaction, run_id, stage, verdict, reason, now_ms)
         })
@@ -418,23 +423,28 @@ impl RunStore {
     pub(crate) fn commit_evidence_for_project(
         &self,
         project_id: &str,
-    ) -> rusqlite::Result<Vec<(String, String, String)>> {
-        commit_evidence_for_project(&self.db.lock(), project_id)
+    ) -> Result<Vec<ProjectCommitEvidence>, StoreError> {
+        commit_evidence_for_project(&self.db.lock(), project_id).map_err(StoreError::from)
     }
 
-    pub(crate) fn run_evidence(&self, run_id: &str) -> rusqlite::Result<Vec<(String, String)>> {
-        run_evidence(&self.db.lock(), run_id)
+    pub(crate) fn run_evidence(&self, run_id: &str) -> Result<Vec<(String, String)>, StoreError> {
+        run_evidence(&self.db.lock(), run_id).map_err(StoreError::from)
     }
 
-    pub(crate) fn vendor_error_for_run(&self, run_id: &str) -> rusqlite::Result<Option<String>> {
-        vendor_error_for_run(&self.db.lock(), run_id)
+    pub(crate) fn vendor_error_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::vendor_error::VendorErrorMatch>, StoreError> {
+        let data = vendor_error_for_run(&self.db.lock(), run_id)?;
+        Ok(data.and_then(|data| serde_json::from_str(&data).ok()))
     }
 
     pub(crate) fn latest_vendor_error_for_ticket(
         &self,
         ticket_id: &str,
-    ) -> rusqlite::Result<Option<String>> {
-        latest_vendor_error_for_ticket(&self.db.lock(), ticket_id)
+    ) -> Result<Option<crate::vendor_error::VendorErrorMatch>, StoreError> {
+        let data = latest_vendor_error_for_ticket(&self.db.lock(), ticket_id)?;
+        Ok(data.and_then(|data| serde_json::from_str(&data).ok()))
     }
 
     pub(crate) fn record_repair_attempt(
@@ -444,7 +454,7 @@ impl RunStore {
         attempt: u32,
         data_json: &str,
         now_ms: i64,
-    ) -> rusqlite::Result<()> {
+    ) -> Result<(), StoreError> {
         self.write(TransactionBehavior::Deferred, |transaction| {
             tx::record_repair_attempt(transaction, run_id, stage, attempt, data_json, now_ms)
         })
@@ -455,91 +465,32 @@ impl RunStore {
 mod tests {
     use tempfile::tempdir;
 
-    use crate::coordination::{Coordination, RunStart, Start};
-    use crate::domain::ticket::TicketState;
+    use crate::db::StoreError;
     use crate::outcome::Outcome;
-    use crate::store::{
-        ActivationKind, ClaimRequest, ExitClaim, NewActivation, RunState, Store, StoreError,
-        claim_for_test,
+    use crate::run_store::test_support::{claim_run, open_seeded, settle_run};
+    use crate::run_store::{
+        Exit, ExitClaim, ExitDenial, RunExit, RunStart, RunState, RunStore, Start,
     };
+    use crate::vendor_error::{VendorErrorClass, VendorErrorMatch};
 
-    fn open_seeded(path: &std::path::Path) -> Store {
-        let store = Store::open(path, 1_000).unwrap();
-        store
-            .insert_local_project(
-                "default",
-                ".agents/sloop/projects/default.md",
-                "Default",
-                1_000,
-            )
-            .unwrap();
-        store
-            .insert_local_ticket(
-                "T1",
-                "default",
-                ".agents/sloop/tickets/t1.md",
-                "Ticket one",
-                &[],
-                "sloop/T1",
-                Some("claude"),
-                Some("sonnet"),
-                Some("medium"),
-                "default",
-                TicketState::Ready,
-                1_000,
-            )
-            .unwrap();
-        store
-            .insert_activation(
-                &NewActivation {
-                    id: "A1",
-                    kind: ActivationKind::Immediate,
-                    ticket_id: Some("T1"),
-                    project_id: None,
-                    eligible_at_ms: None,
-                    interval_ms: None,
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-    }
-
-    fn claim_t1<'a>(run_id: &'a str) -> ClaimRequest<'a> {
-        ClaimRequest {
-            ticket_id: "T1",
-            run_id,
-            activation_id: "A1",
-            owner_id: "daemon-1",
-            lease_ms: 60_000,
-            next_activation_eligible_at_ms: None,
-            flow_json: "{}",
-            ticket_json: "{}",
-        }
-    }
-
-    fn claim_run(store: &Store, claim: &ClaimRequest<'_>, now_ms: i64) {
-        claim_for_test(store, claim, now_ms);
-    }
-
-    fn running_r1(store: &mut Store) {
-        claim_run(store, &claim_t1("R1"), 2_000);
+    fn running_r1(store: &RunStore) {
+        claim_run(store, "R1", "{}", "{}", 2_000);
         assert_eq!(
-            Coordination::start(
-                store,
-                &RunStart {
-                    run_id: "R1",
-                    branch: "branch",
-                    worktree_path: "/worktree",
-                    pid: 123,
-                    pid_start_time: Some(456),
-                    process_group_id: 123,
-                    worker_token: "token",
-                    worker_socket_path: "/runtime/R1.sock",
-                },
-                2_100,
-            )
-            .unwrap(),
+            store
+                .start(
+                    &RunStart {
+                        run_id: "R1",
+                        branch: "branch",
+                        worktree_path: "/worktree",
+                        pid: 123,
+                        pid_start_time: Some(456),
+                        process_group_id: 123,
+                        worker_token: "token",
+                        worker_socket_path: "/runtime/R1.sock",
+                    },
+                    2_100,
+                )
+                .unwrap(),
             Start::Granted
         );
     }
@@ -547,20 +498,23 @@ mod tests {
     #[test]
     fn agent_exit_and_aftercare_results_are_checkpointed_idempotently() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        running_r1(&mut store);
+        let store = open_seeded(&directory.path().join("sloop.db"));
+        running_r1(&store);
 
-        store
-            .record_agent_exit(
-                "R1",
-                Some(0),
-                true,
-                r#"{"count":1,"oids":["abc"]}"#,
-                None,
-                None,
-                2_200,
-            )
-            .unwrap();
+        assert_eq!(
+            store
+                .record_agent_exit(
+                    "R1",
+                    Some(0),
+                    true,
+                    r#"{"count":1,"oids":["abc"]}"#,
+                    None,
+                    None,
+                    2_200,
+                )
+                .unwrap(),
+            ExitClaim::Claimed
+        );
         store
             .record_aftercare_evidence(
                 "R1",
@@ -598,34 +552,28 @@ mod tests {
     #[test]
     fn agent_exit_checkpoint_is_an_exclusive_ownership_handoff() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        running_r1(&mut store);
+        let store = open_seeded(&directory.path().join("sloop.db"));
+        running_r1(&store);
 
-        let first = store
-            .record_agent_exit(
-                "R1",
-                Some(0),
-                true,
-                r#"{"oids":["abc"]}"#,
-                None,
-                None,
-                2_200,
-            )
-            .unwrap();
-        assert_eq!(first, ExitClaim::Claimed);
+        let exit = RunExit {
+            run_id: "R1",
+            exit_code: Some(0),
+            capture_complete: true,
+            commits_json: r#"{"oids":["abc"]}"#,
+            vendor_error: None,
+            cooldown_until_ms: None,
+        };
+        assert_eq!(store.record_exit(&exit, 2_200).unwrap(), Exit::Granted);
         assert_eq!(store.run("R1").unwrap().unwrap().state, "aftercare");
         let evidence = store.run_evidence("R1").unwrap();
         assert!(evidence.iter().any(|(kind, _)| kind == "exit_classified"));
         assert!(evidence.iter().any(|(kind, _)| kind == "commits_observed"));
 
-        let second = store
-            .record_agent_exit("R1", Some(1), false, r#"{"oids":[]}"#, None, None, 2_300)
-            .unwrap();
         assert_eq!(
-            second,
-            ExitClaim::AlreadyClaimed {
-                state: "aftercare".into()
-            }
+            store.record_exit(&exit, 2_300).unwrap(),
+            Exit::Denied(ExitDenial::AlreadyClaimed {
+                state: "aftercare".into(),
+            })
         );
         let run = store.run("R1").unwrap().unwrap();
         assert_eq!(run.state, "aftercare");
@@ -636,11 +584,9 @@ mod tests {
     #[test]
     fn agent_exit_checkpoint_reports_terminal_and_missing_runs() {
         let directory = tempdir().unwrap();
-        let mut store = open_seeded(&directory.path().join("sloop.db"));
-        running_r1(&mut store);
-        store
-            .settle_for_test("R1", Some(0), Outcome::Merged, &[], None, 2_200)
-            .unwrap();
+        let store = open_seeded(&directory.path().join("sloop.db"));
+        running_r1(&store);
+        settle_run(&store, "R1", Some(0), Outcome::Merged, &[], None, 2_200);
 
         let claim = store
             .record_agent_exit(
@@ -671,5 +617,44 @@ mod tests {
             2_300,
         );
         assert!(matches!(missing, Err(StoreError::RunNotFound { .. })));
+    }
+
+    #[test]
+    fn run_store_deserializes_vendor_errors_and_returns_typed_project_evidence() {
+        let directory = tempdir().unwrap();
+        let store = open_seeded(&directory.path().join("sloop.db"));
+        running_r1(&store);
+        let vendor_error = VendorErrorMatch {
+            class: VendorErrorClass::RateLimited,
+            vendor: "claude".into(),
+            rule_id: "capacity".into(),
+            diagnostic: "try later".into(),
+        };
+
+        store
+            .record_agent_exit(
+                "R1",
+                Some(1),
+                true,
+                r#"{"oids":["abc"]}"#,
+                Some(&vendor_error),
+                Some(9_000),
+                2_200,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.vendor_error_for_run("R1").unwrap(),
+            Some(vendor_error.clone())
+        );
+        assert_eq!(
+            store.latest_vendor_error_for_ticket("T1").unwrap(),
+            Some(vendor_error)
+        );
+        let records = store.commit_evidence_for_project("default").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].run_id, "R1");
+        assert_eq!(records[0].ticket_id, "T1");
+        assert_eq!(records[0].data_json, r#"{"oids":["abc"]}"#);
     }
 }
