@@ -32,6 +32,7 @@ worktree_retention: 7d
 
 scheduler:
   max_parallel_tasks: 2
+  stall_report_after: 10m
   running_hours:
     start: "22:00"
     end: "06:00"
@@ -67,6 +68,9 @@ ids:
 
 - `max_parallel_tasks` — how many agents may be alive at once. This is a
   hard spawn gate; queued work waits for a free slot.
+- `stall_report_after` — how long a running agent stage may produce no output
+  before Sloop emits a warning and marks it in `show`. The default is `10m`;
+  output resuming starts a new silence episode. The duration must be positive.
 - `running_hours` — a local-time window in which agents may be spawned. It
   may cross midnight (`22:00`–`06:00` means overnight). Work queued outside
   the window waits for the next opening; agents already running when the

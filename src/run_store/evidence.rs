@@ -1,4 +1,5 @@
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 
 use super::{ProjectCommitEvidence, RunStore};
 use crate::db::StoreError;
@@ -24,10 +25,19 @@ pub struct StageRecord {
     pub reason: Option<String>,
 }
 
+/// Durable watchdog intent, recorded before the agent process group is killed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputStallEvidence {
+    pub stage: String,
+    pub last_output_at_ms: i64,
+    pub threshold_ms: i64,
+    pub last_output_sequence: Option<u64>,
+}
+
 pub(crate) mod tx {
     use rusqlite::{Transaction, params};
 
-    use super::{EvidenceRecord, StageRecord};
+    use super::{EvidenceRecord, OutputStallEvidence, StageRecord};
 
     pub(crate) fn delete_for_run(
         transaction: &Transaction<'_>,
@@ -190,6 +200,23 @@ pub(crate) mod tx {
         Ok(())
     }
 
+    pub(crate) fn record_output_stall(
+        transaction: &Transaction<'_>,
+        run_id: &str,
+        evidence: &OutputStallEvidence,
+        now_ms: i64,
+    ) -> rusqlite::Result<bool> {
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO run_evidence
+                 (run_id, kind, observed_at_ms, dedupe_key, data_json)
+             SELECT id, 'output_stall', ?2, 'output_stall:' || id, ?3
+             FROM runs
+             WHERE id = ?1 AND state = 'running' AND exited_at_ms IS NULL",
+            params![run_id, now_ms, serde_json::to_string(evidence).unwrap()],
+        )?;
+        Ok(inserted == 1)
+    }
+
     pub(crate) fn record_stage_verdict(
         transaction: &Transaction<'_>,
         run_id: &str,
@@ -296,6 +323,22 @@ fn cancellation_requested(connection: &Connection, run_id: &str) -> rusqlite::Re
         )
         .optional()?;
     Ok(found.is_some())
+}
+
+fn output_stall(
+    connection: &Connection,
+    run_id: &str,
+) -> rusqlite::Result<Option<OutputStallEvidence>> {
+    let data = connection
+        .query_row(
+            "SELECT data_json FROM run_evidence
+             WHERE run_id = ?1 AND kind = 'output_stall'
+             ORDER BY sequence DESC LIMIT 1",
+            params![run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(data.and_then(|data| serde_json::from_str(&data).ok()))
 }
 
 fn commit_evidence_for_project(
@@ -405,6 +448,24 @@ impl RunStore {
 
     pub(crate) fn cancellation_requested(&self, run_id: &str) -> Result<bool, StoreError> {
         cancellation_requested(&self.db.lock(), run_id).map_err(StoreError::from)
+    }
+
+    pub(crate) fn record_output_stall(
+        &self,
+        run_id: &str,
+        evidence: &OutputStallEvidence,
+        now_ms: i64,
+    ) -> Result<bool, StoreError> {
+        self.write(TransactionBehavior::Immediate, |transaction| {
+            tx::record_output_stall(transaction, run_id, evidence, now_ms)
+        })
+    }
+
+    pub(crate) fn output_stall(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<OutputStallEvidence>, StoreError> {
+        output_stall(&self.db.lock(), run_id).map_err(StoreError::from)
     }
 
     pub(crate) fn record_stage_verdict(

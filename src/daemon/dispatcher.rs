@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use serde_json::json;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::clock::{Clock, next_local_minute_ms};
 use crate::config::{AgentConfig, RunningHours, parse_local_time};
@@ -73,6 +73,8 @@ pub(super) struct DispatcherState {
     pub(super) restart_acknowledged: bool,
     pub(super) restart_signalled: bool,
     pub(super) max_agents: usize,
+    pub(super) stall_report_after_ms: i64,
+    pub(super) stall_after_ms: i64,
     pub(super) ticket_prefix: String,
     pub(super) project_prefix: String,
     pub(super) running_hours: Option<RunningHours>,
@@ -114,6 +116,8 @@ pub(super) struct DispatcherState {
     /// Run IDs whose cancellation was requested but whose exit has not been
     /// resolved yet; mirrors the durable `cancel_requested` evidence.
     pub(super) cancelling: HashSet<String>,
+    /// Run IDs with durable output-stall intent awaiting final settlement.
+    pub(super) stalling: HashSet<String>,
     /// Tokens issued to live runs; a worker request must present its run's
     /// token exactly. Entries die with the run.
     pub(super) worker_tokens: HashMap<String, String>,
@@ -123,6 +127,12 @@ pub(super) struct DispatcherState {
     /// Exit evidence remains here until its atomic store transaction commits.
     /// The dispatcher retries these records on every reconciliation pass.
     pub(super) pending_exits: HashMap<String, RunEvent>,
+    /// Last output sequence warned for each run. A different sequence is a
+    /// later silence episode and may warn again.
+    pub(super) reported_stalls: HashMap<String, Option<u64>>,
+    /// Output pumps notify the dispatcher after a durable append so its one
+    /// existing deadline can be recomputed without a polling loop.
+    pub(super) output_notify: Arc<Notify>,
     /// The dispatcher's own request channel, cloned into each worker
     /// accept loop so every request funnels through the single owner.
     pub(super) requests_tx: mpsc::Sender<DispatcherMessage>,
@@ -175,6 +185,7 @@ pub(super) async fn run_dispatcher(
     loop {
         let deadline = next_dispatch_deadline(&state);
         let clock = state.clock.clone();
+        let output_notify = state.output_notify.clone();
         tokio::select! {
             message = requests.recv() => {
                 let Some(message) = message else { break };
@@ -205,6 +216,7 @@ pub(super) async fn run_dispatcher(
             () = wait_for_deadline(clock, deadline) => {
                 log.emit(LogLevel::Info, "sloop::dispatcher", "timer_fired");
             }
+            () = output_notify.notified() => {}
             // Wall-clock is deliberate: this is a liveness probe, not
             // decision logic, so the manual test clock must not gate it.
             _ = liveness_tick.tick() => {
@@ -268,10 +280,12 @@ pub(super) async fn settle_pending_exits(state: &mut DispatcherState, log: &Oper
         match try_settle_run_exit(state, &event, log).await {
             Ok((_ticket_id, outcome, _applied)) => {
                 state.cancelling.remove(&run_id);
+                state.stalling.remove(&run_id);
                 state.active.remove(&run_id);
                 state.supervised.remove(&run_id);
                 state.suspected_dead.remove(&run_id);
                 state.recovering.remove(&run_id);
+                state.reported_stalls.remove(&run_id);
                 close_worker_socket(state, &run_id);
                 log.emit_with_fields(
                     LogLevel::Info,
@@ -339,8 +353,10 @@ async fn try_settle_run_exit(
 
     let cancelled =
         state.cancelling.contains(run_id) || state.run_store.cancellation_requested(run_id)?;
+    let stalled = state.stalling.contains(run_id) || state.run_store.output_stall(run_id)?.is_some();
     let evidence = RunEvidence {
         cancelled,
+        stalled,
         exit: classify_exit(*exit_code),
         vendor_error: vendor_error.as_ref().map(|error| error.class),
         commit_count: commit_observation_complete.then_some(commits.len()),
@@ -349,6 +365,7 @@ async fn try_settle_run_exit(
     };
     let outcome = if *recovery == Some(RecoveryClassification::Orphaned)
         && !cancelled
+        && !stalled
         && vendor_error.is_none()
     {
         crate::outcome::Outcome::Orphaned
@@ -399,7 +416,7 @@ async fn try_settle_run_exit(
     }
     let cooldown = vendor_error
         .as_ref()
-        .filter(|error| error.class.requires_cooldown() && !cancelled)
+        .filter(|error| error.class.requires_cooldown() && !cancelled && !stalled)
         .and_then(|error| cooldown_until_ms.map(|until_ms| (error, until_ms)))
         .map(|(error, until_ms)| CooldownUpdate {
             target,

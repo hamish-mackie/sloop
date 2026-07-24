@@ -9,6 +9,7 @@
 mod support;
 
 use std::fs;
+use std::time::Duration;
 
 use serde_json::Value;
 use support::{FakeAgent, World, wait_until, wait_until_slow};
@@ -105,6 +106,133 @@ fn stage<'a>(stages: &'a Value, name: &str) -> &'a Value {
         .iter()
         .find(|entry| entry["stage"] == name)
         .unwrap_or_else(|| panic!("no stage `{name}` in {stages}"))
+}
+
+fn stalled_events(world: &World) -> Vec<Value> {
+    fs::read_to_string(world.daemon_log())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| record["event"] == "run_output_stalled")
+        .collect()
+}
+
+#[test]
+fn output_staleness_warns_once_per_silence_episode_and_marks_show() {
+    let world = World::configured();
+    world.configure_fake_agent_with_stall_report_after(
+        FakeAgent::new()
+            .output("initial output\n")
+            .block_until_released("first-silence")
+            .output("resumed output\n")
+            .block_until_released("second-silence")
+            .exit(0),
+        "5m",
+    );
+    world.commit_all("initial");
+    world.start_daemon();
+    let ticket = post(&world, "stalled-output.md");
+    assert!(world.sloop(&["run", &ticket]).status.success());
+    wait_until("the first silence starts", || {
+        world.fake_agent_reached("first-silence")
+    });
+    let run_id = world.run_id(1);
+    let alias = world.run_alias(1);
+    wait_until("initial output is captured", || {
+        String::from_utf8_lossy(&world.sloop_plain(&["logs", &alias]).stdout)
+            .contains("initial output")
+    });
+
+    world.tick(Duration::from_secs(4 * 60));
+    assert!(stalled_events(&world).is_empty());
+    assert!(!show_text(&world, &alias).contains("no output"));
+
+    world.tick(Duration::from_secs(61));
+    wait_until("the first stall warning is emitted", || {
+        stalled_events(&world).len() == 1
+    });
+    let events = stalled_events(&world);
+    assert_eq!(events[0]["level"], "warn");
+    assert_eq!(events[0]["fields"]["run_id"], run_id);
+    assert_eq!(events[0]["fields"]["ticket_id"], ticket);
+    assert_eq!(events[0]["fields"]["stage"], "build");
+    assert!(events[0]["fields"]["silent_for_ms"].as_i64().unwrap() >= 300_000);
+    assert!(show_text(&world, &alias).contains("no output 5m1s"));
+    assert!(
+        String::from_utf8_lossy(&world.sloop_plain(&["show"]).stdout).contains("no output 5m1s")
+    );
+    assert_eq!(
+        stage(&show(&world, &alias)["stages"], "build")["silent_for_ms"],
+        301_000
+    );
+    assert_eq!(stalled_events(&world).len(), 1);
+
+    world.release("first-silence");
+    wait_until("the second silence starts", || {
+        world.fake_agent_reached("second-silence")
+    });
+    wait_until("resumed output resets the marker", || {
+        !show_text(&world, &alias).contains("no output")
+    });
+
+    world.tick(Duration::from_secs(301));
+    wait_until("the later silence warns again", || {
+        stalled_events(&world).len() == 2
+    });
+    assert!(show_text(&world, &alias).contains("no output 5m1s"));
+
+    world.release("second-silence");
+    wait_until_slow("the run settles", || world.run_state(&run_id) == "merged");
+}
+
+#[test]
+fn restart_measures_silence_from_the_last_real_output() {
+    let world = World::configured();
+    world.configure_fake_agent_with_stall_report_after(
+        FakeAgent::new()
+            .output("before restart\n")
+            .block_until_released("restart-silence")
+            .exit(0),
+        "5m",
+    );
+    world.commit_all("initial");
+    let daemon_pid = world.start_daemon()["data"]["pid"].as_u64().unwrap() as u32;
+    let ticket = post(&world, "restart-stalled-output.md");
+    assert!(world.sloop(&["run", &ticket]).status.success());
+    wait_until("the restart silence starts", || {
+        world.fake_agent_reached("restart-silence")
+    });
+    let run_id = world.run_id(1);
+    let alias = world.run_alias(1);
+    wait_until("output before restart is captured", || {
+        String::from_utf8_lossy(&world.sloop_plain(&["logs", &alias]).stdout)
+            .contains("before restart")
+    });
+
+    world.tick(Duration::from_secs(4 * 60));
+    world.kill_daemon(daemon_pid);
+    world.tick(Duration::from_secs(61));
+    let restarted_pid = world.start_daemon()["data"]["pid"].as_u64().unwrap() as u32;
+
+    wait_until("the restarted daemon reports the existing silence", || {
+        stalled_events(&world).len() == 1
+    });
+    let event = stalled_events(&world).remove(0);
+    assert_eq!(event["fields"]["run_id"], run_id);
+    assert!(event["fields"]["silent_for_ms"].as_i64().unwrap() >= 300_000);
+    assert!(show_text(&world, &alias).contains("no output 5m1s"));
+
+    world.kill_daemon(restarted_pid);
+    world.start_daemon();
+    wait_until("the warning episode is restored after restart", || {
+        show_text(&world, &alias).contains("no output 5m1s")
+    });
+    assert_eq!(stalled_events(&world).len(), 1);
+
+    world.release("restart-silence");
+    wait_until_slow("the recovered run settles", || {
+        !["claimed", "running", "aftercare"].contains(&world.run_state(&run_id).as_str())
+    });
 }
 
 #[test]

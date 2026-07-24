@@ -2,6 +2,10 @@ version: 1
 worktree_dir: .worktrees
 worktree_retention: 7d
 
+scheduler:
+  stall_report_after: 10m
+  stall_after: 2h
+
 agent:
   default_target: claude
   targets:

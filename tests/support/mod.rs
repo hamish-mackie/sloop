@@ -21,6 +21,7 @@ enum FakeAgentMove {
     Commit(String),
     Exit(i32),
     Note(String),
+    Output(String),
     Sleep(Duration),
 }
 
@@ -47,6 +48,11 @@ impl FakeAgent {
 
     pub fn note(mut self, text: &str) -> Self {
         self.moves.push(FakeAgentMove::Note(text.to_owned()));
+        self
+    }
+
+    pub fn output(mut self, text: &str) -> Self {
+        self.moves.push(FakeAgentMove::Output(text.to_owned()));
         self
     }
 
@@ -119,6 +125,38 @@ impl World {
         agent: FakeAgent,
         max_parallel_tasks: usize,
     ) {
+        self.configure_fake_agent_with_scheduler(agent, max_parallel_tasks, None, None);
+    }
+
+    pub fn configure_fake_agent_with_stall_report_after(
+        &self,
+        agent: FakeAgent,
+        stall_report_after: &str,
+    ) {
+        self.configure_fake_agent_with_scheduler(agent, 1, Some(stall_report_after), None);
+    }
+
+    pub fn configure_fake_agent_with_stall_thresholds(
+        &self,
+        agent: FakeAgent,
+        stall_report_after: &str,
+        stall_after: &str,
+    ) {
+        self.configure_fake_agent_with_scheduler(
+            agent,
+            1,
+            Some(stall_report_after),
+            Some(stall_after),
+        );
+    }
+
+    fn configure_fake_agent_with_scheduler(
+        &self,
+        agent: FakeAgent,
+        max_parallel_tasks: usize,
+        stall_report_after: Option<&str>,
+        stall_after: Option<&str>,
+    ) {
         let flow_directory = self.root().join(".agents/sloop/flows");
         fs::create_dir_all(&flow_directory).expect("create flow directory");
         fs::write(
@@ -155,6 +193,10 @@ impl World {
                     shell_quote(env!("CARGO_BIN_EXE_sloop")),
                     shell_quote(&text),
                 )),
+                FakeAgentMove::Output(text) => body.push_str(&format!(
+                    "printf %s {}\n",
+                    shell_quote(&text),
+                )),
                 FakeAgentMove::Sleep(duration) => {
                     body.push_str(&format!("sleep {}\n", duration.as_secs_f64()));
                 }
@@ -165,7 +207,9 @@ impl World {
         fs::write(
             self.root().join(".agents/sloop/config.yaml"),
             format!(
-                "version: 1\nscheduler:\n  max_parallel_tasks: {max_parallel_tasks}\nagent:\n  default_target: fake\n  targets:\n    fake:\n      cmd: [\"sh\", {}, \"{{prompt}}\"]\n",
+                "version: 1\nscheduler:\n  max_parallel_tasks: {max_parallel_tasks}\n{}{}agent:\n  default_target: fake\n  targets:\n    fake:\n      cmd: [\"sh\", {}, \"{{prompt}}\"]\n",
+                stall_report_after.map_or_else(String::new, |duration| format!("  stall_report_after: {duration}\n")),
+                stall_after.map_or_else(String::new, |duration| format!("  stall_after: {duration}\n")),
                 serde_json::to_string(&script.to_string_lossy()).expect("serialize fake-agent path"),
             ),
         )

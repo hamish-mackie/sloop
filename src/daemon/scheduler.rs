@@ -17,8 +17,10 @@ use crate::flow::Flow;
 use crate::frontmatter::Frontmatter;
 use crate::ids::next_id;
 use crate::logging::{LogLevel, OperationalLog};
+use crate::run_log::output_staleness;
 use crate::run_store::{
-    NeedsReviewBranch, RunAdmission, RunState, RunStore, WorktreeCleanupCandidate,
+    NeedsReviewBranch, OutputStallEvidence, RunAdmission, RunState, RunStore,
+    WorktreeCleanupCandidate,
 };
 use crate::runner::local::{
     compose_worker_prompt, launch_agent, run_output_path, wait_for_test_hook, worker_socket_path,
@@ -36,6 +38,7 @@ use super::dispatcher::{
 };
 use super::recovery::{
     ProcessIdentity, classify_run_output, reconcile_run_liveness, recoverable_process_identity,
+    stop_agent_process_group,
 };
 use super::server::{DaemonError, serve_worker_socket};
 
@@ -448,6 +451,8 @@ pub(super) async fn reconcile(
         return;
     }
     settle_pending_exits(state, log).await;
+    reconcile_output_stalls(state, log);
+    reconcile_stall_watchdog(state, log);
     // Settling externally merged review branches is independent of the dispatch
     // gates below: it releases blocked dependents even while paused, at
     // capacity, or outside running hours.
@@ -655,8 +660,14 @@ pub(super) async fn reconcile(
                 let branch = order.branch.clone();
                 let output_path = order.output_path.clone();
                 let hooks = StoreStageHooks::new(&state.run_store, log);
-                launch_agent(order, &hooks, state.clock.as_ref())
-                    .map(|launched| (launched, target, worktree, branch, output_path))
+                let notify = state.output_notify.clone();
+                launch_agent(
+                    order,
+                    &hooks,
+                    state.clock.clone(),
+                    std::sync::Arc::new(move || notify.notify_one()),
+                )
+                .map(|launched| (launched, target, worktree, branch, output_path))
             },
         );
         match launch {
@@ -1177,10 +1188,223 @@ pub(super) fn next_dispatch_deadline(state: &DispatcherState) -> Option<i64> {
             .ok()
             .flatten()
     });
-    [hours_deadline, cooldown_deadline, cleanup_deadline]
+    let stall_report_deadline = next_output_stall_deadline(state, state.stall_report_after_ms);
+    let stall_kill_deadline = next_output_stall_deadline(state, state.stall_after_ms);
+    [
+        hours_deadline,
+        cooldown_deadline,
+        cleanup_deadline,
+        stall_report_deadline,
+        stall_kill_deadline,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
+fn supervised_running_runs(
+    state: &DispatcherState,
+) -> impl Iterator<Item = crate::run_store::RunRecord> + '_ {
+    state
+        .run_store
+        .recoverable_runs()
+        .unwrap_or_default()
         .into_iter()
-        .flatten()
+        .filter(|run| run.state == RunState::Running)
+        .filter(|run| state.supervised.contains(&run.id))
+        .filter(|run| !state.cancelling.contains(&run.id))
+        .filter(|run| !state.stalling.contains(&run.id))
+        .filter(|run| !state.suspected_dead.contains(&run.id))
+        .filter(|run| !state.recovering.contains(&run.id))
+        .filter(|run| !state.pending_exits.contains_key(&run.id))
+        .filter_map(|run| state.run_store.run(&run.id).ok().flatten())
+}
+
+pub(super) fn running_output_staleness(
+    state: &DispatcherState,
+    run: &crate::run_store::RunRecord,
+    now_ms: i64,
+) -> Option<crate::run_log::OutputStaleness> {
+    running_output_staleness_after(state, run, now_ms, state.stall_report_after_ms)
+}
+
+fn running_output_staleness_after(
+    state: &DispatcherState,
+    run: &crate::run_store::RunRecord,
+    now_ms: i64,
+    threshold_ms: i64,
+) -> Option<crate::run_log::OutputStaleness> {
+    let started_at_ms = state
+        .run_store
+        .run_timelines(&[run.id.as_str()])
+        .ok()?
+        .remove(&run.id)?
+        .started_at_ms?;
+    output_staleness(
+        &run_output_path(&state.state_dir, &run.id),
+        started_at_ms,
+        now_ms,
+        threshold_ms,
+    )
+    .ok()
+}
+
+fn next_output_stall_deadline(state: &DispatcherState, threshold_ms: i64) -> Option<i64> {
+    let now_ms = state.clock.now_ms();
+    supervised_running_runs(state)
+        .filter_map(|run| running_output_staleness_after(state, &run, now_ms, threshold_ms))
+        .filter(|staleness| !staleness.stalled)
+        .map(|staleness| staleness.deadline_ms)
         .min()
+}
+
+fn agent_stage(run: &crate::run_store::RunRecord) -> String {
+    run.flow_json
+        .as_deref()
+        .and_then(|snapshot| serde_json::from_str::<Flow>(snapshot).ok())
+        .and_then(|flow| {
+            flow.stages
+                .into_iter()
+                .find(|stage| matches!(stage.kind, crate::flow::StageKind::Agent))
+        })
+        .map_or_else(|| "agent".to_owned(), |stage| stage.name)
+}
+
+fn reconcile_output_stalls(state: &mut DispatcherState, log: &OperationalLog) {
+    let now_ms = state.clock.now_ms();
+    let running = supervised_running_runs(state).collect::<Vec<_>>();
+    for run in running {
+        let Some(staleness) = running_output_staleness(state, &run, now_ms) else {
+            continue;
+        };
+        if !staleness.stalled
+            || state.reported_stalls.get(&run.id) == Some(&staleness.last_sequence)
+        {
+            continue;
+        }
+        let stage = agent_stage(&run);
+        log.emit_with_fields(
+            LogLevel::Warn,
+            "sloop::dispatcher",
+            "run_output_stalled",
+            json!({
+                "run_id": run.id,
+                "ticket_id": run.ticket_id,
+                "stage": stage,
+                "silent_for_ms": staleness.silent_for_ms,
+                "last_output_sequence": staleness.last_sequence,
+            }),
+        );
+        state
+            .reported_stalls
+            .insert(run.id, staleness.last_sequence);
+    }
+}
+
+fn reconcile_stall_watchdog(state: &mut DispatcherState, log: &OperationalLog) {
+    let now_ms = state.clock.now_ms();
+    let running = supervised_running_runs(state).collect::<Vec<_>>();
+    for run in running {
+        let Some(staleness) =
+            running_output_staleness_after(state, &run, now_ms, state.stall_after_ms)
+        else {
+            continue;
+        };
+        if !staleness.stalled {
+            continue;
+        }
+        let evidence = OutputStallEvidence {
+            stage: agent_stage(&run),
+            last_output_at_ms: staleness.last_output_at_ms,
+            threshold_ms: state.stall_after_ms,
+            last_output_sequence: staleness.last_sequence,
+        };
+        let recorded = match state.run_store.record_output_stall(&run.id, &evidence, now_ms) {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                mark_storage_full(state, &error);
+                log.emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::dispatcher",
+                    "output_stall_persist_failed",
+                    json!({"run_id": run.id, "error": error.to_string()}),
+                );
+                continue;
+            }
+        };
+        if !recorded
+            && !state
+                .run_store
+                .output_stall(&run.id)
+                .is_ok_and(|evidence| evidence.is_some())
+        {
+            continue;
+        }
+        state.stalling.insert(run.id.clone());
+        log.emit_with_fields(
+            LogLevel::Warn,
+            "sloop::dispatcher",
+            "run_output_stall_terminated",
+            json!({
+                "run_id": run.id,
+                "ticket_id": run.ticket_id,
+                "stage": evidence.stage,
+                "last_output_at_ms": evidence.last_output_at_ms,
+                "threshold_ms": evidence.threshold_ms,
+            }),
+        );
+        if let Err(error) =
+            stop_agent_process_group(run.pid, run.pid_start_time, run.process_group_id)
+        {
+            log.emit_with_fields(
+                LogLevel::Error,
+                "sloop::dispatcher",
+                "output_stall_signal_refused",
+                json!({"run_id": run.id, "error": error}),
+            );
+        }
+    }
+}
+
+/// Restores warning episode markers from the append-only operational log.
+/// This keeps a daemon restart from warning twice for unchanged output while
+/// requiring no runtime schema change.
+pub(super) fn restore_reported_output_stalls(state: &mut DispatcherState) {
+    let active = state
+        .run_store
+        .recoverable_runs()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|run| run.id)
+        .collect::<std::collections::HashSet<_>>();
+    let contents = match fs::read_to_string(&state.daemon_log) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(_) => return,
+    };
+    for line in contents.lines() {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if record["event"] != "run_output_stalled" {
+            continue;
+        }
+        let Some(fields) = record["fields"].as_object() else {
+            continue;
+        };
+        let (Some(run_id), Some(sequence)) = (
+            fields.get("run_id").and_then(serde_json::Value::as_str),
+            fields.get("last_output_sequence"),
+        ) else {
+            continue;
+        };
+        if !active.contains(run_id) {
+            continue;
+        }
+        state
+            .reported_stalls
+            .insert(run_id.to_owned(), sequence.as_u64());
+    }
 }
 
 fn eligible_ticket(

@@ -40,6 +40,12 @@ scheduler:
   # How many agents may be alive at once. A hard spawn gate: queued work
   # waits for a free slot. Must be greater than zero.
   max_parallel_tasks: 1
+  # Warn and mark a running agent stage after this long without output.
+  # Output resuming starts a new silence episode. Must be positive.
+  stall_report_after: 10m
+  # Kill and fail a running agent stage after this long without output.
+  # Must be greater than stall_report_after. Aftercare stages are unaffected.
+  stall_after: 2h
   # A local-time window in which agents may be spawned. Both values are
   # HH:MM, must differ, and may cross midnight (22:00-06:00 is overnight).
   # The start is inclusive and the end exclusive. Work queued outside the

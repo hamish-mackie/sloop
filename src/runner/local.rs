@@ -4,6 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_TOKEN;
@@ -76,7 +77,8 @@ impl LaunchedAgent {
 pub fn launch_agent<H: StageHooks>(
     order: StageOrder,
     hooks: &H,
-    clock: &dyn Clock,
+    clock: Arc<dyn Clock>,
+    output_observer: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<LaunchedAgent, RunnerError<H::Error>> {
     let StageExecution::Agent(launch) = &order.execution else {
         return Err(RunnerError::Execution(
@@ -143,6 +145,8 @@ pub fn launch_agent<H: StageHooks>(
             OutputSource::Agent,
             Some(order.stage.clone()),
             OutputStream::Stdout,
+            Some(clock.clone()),
+            Some(output_observer.clone()),
         ),
         spawn_output_reader(
             child.stderr.take().expect("stderr was piped"),
@@ -150,6 +154,8 @@ pub fn launch_agent<H: StageHooks>(
             OutputSource::Agent,
             Some(order.stage.clone()),
             OutputStream::Stderr,
+            Some(clock.clone()),
+            Some(output_observer),
         ),
     ];
 
@@ -293,6 +299,8 @@ pub fn run_exec_stage<H: StageHooks>(
             OutputSource::Aftercare,
             Some(order.stage.clone()),
             OutputStream::Stdout,
+            None,
+            None,
         ),
         spawn_output_reader(
             child.stderr.take().expect("stderr was piped"),
@@ -300,6 +308,8 @@ pub fn run_exec_stage<H: StageHooks>(
             OutputSource::Aftercare,
             Some(order.stage.clone()),
             OutputStream::Stderr,
+            None,
+            None,
         ),
     ];
     if order.stage == "test" {
@@ -398,6 +408,8 @@ fn spawn_output_reader(
     source: OutputSource,
     stage: Option<String>,
     stream: OutputStream,
+    clock: Option<Arc<dyn Clock>>,
+    output_observer: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> std::thread::JoinHandle<bool> {
     std::thread::spawn(move || {
         let mut pipe = pipe;
@@ -406,11 +418,21 @@ fn spawn_output_reader(
             match pipe.read(&mut buffer) {
                 Ok(0) => return true,
                 Ok(read) => {
-                    if log
-                        .append(source, stage.as_deref(), stream, &buffer[..read])
-                        .is_err()
-                    {
+                    let appended = match clock.as_ref() {
+                        Some(clock) => log.append_at(
+                            clock.now_ms(),
+                            source,
+                            stage.as_deref(),
+                            stream,
+                            &buffer[..read],
+                        ),
+                        None => log.append(source, stage.as_deref(), stream, &buffer[..read]),
+                    };
+                    if appended.is_err() {
                         return false;
+                    }
+                    if let Some(observer) = &output_observer {
+                        observer();
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,

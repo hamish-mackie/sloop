@@ -10,7 +10,7 @@
 
 use serde_json::{Value, json};
 
-use crate::run_store::{RunRecord, RunTimeline, StageRecord};
+use crate::run_store::{OutputStallEvidence, RunRecord, RunTimeline, StageRecord};
 
 use super::commands::run_lookup;
 use super::dispatcher::DispatcherState;
@@ -46,6 +46,7 @@ struct Stage {
     exit_code: Option<i32>,
     verdict_source: Option<String>,
     reason: Option<String>,
+    silent_for_ms: Option<i64>,
 }
 
 impl Stage {
@@ -60,6 +61,7 @@ impl Stage {
             "exit_code": self.exit_code,
             "verdict_source": self.verdict_source,
             "reason": self.reason,
+            "silent_for_ms": self.silent_for_ms,
         })
     }
 
@@ -77,6 +79,7 @@ pub(super) struct RunHistory {
     state: String,
     exit_code: Option<i64>,
     commits: usize,
+    stall: Option<OutputStallEvidence>,
 }
 
 /// Reads the history of several runs at once. The ticket view needs one row
@@ -113,11 +116,31 @@ fn history_with_timeline(
 ) -> Result<RunHistory, ErrorBody> {
     let recorded = run_lookup(state, |run_store| run_store.aftercare_stages(&run.id))?;
     let evidence = run_lookup(state, |run_store| run_store.run_evidence(&run.id))?;
+    let stall = evidence.iter().rev().find_map(|(kind, data)| {
+        (kind == "output_stall")
+            .then(|| serde_json::from_str::<OutputStallEvidence>(data).ok())
+            .flatten()
+    });
+    let mut stages = stages(run, &recorded, &evidence, is_terminal(&run.state));
+    if run.state == "running"
+        && state.supervised.contains(&run.id)
+        && !state.cancelling.contains(&run.id)
+        && !state.suspected_dead.contains(&run.id)
+        && !state.recovering.contains(&run.id)
+        && !state.pending_exits.contains_key(&run.id)
+        && let Some(staleness) =
+            super::scheduler::running_output_staleness(state, run, state.clock.now_ms())
+        && staleness.stalled
+        && let Some(stage) = stages.iter_mut().find(|stage| stage.state == "running")
+    {
+        stage.silent_for_ms = Some(staleness.silent_for_ms);
+    }
     Ok(RunHistory {
-        stages: stages(run, &recorded, &evidence, is_terminal(&run.state)),
+        stages,
         state: run.state.clone(),
         exit_code: run.exit_code,
         commits: observed_commits(&evidence),
+        stall,
         timeline,
     })
 }
@@ -133,7 +156,13 @@ impl RunHistory {
     pub(super) fn strip_json(&self) -> Vec<Value> {
         self.stages
             .iter()
-            .map(|stage| json!({"stage": stage.name, "state": stage.state}))
+            .map(|stage| {
+                json!({
+                    "stage": stage.name,
+                    "state": stage.state,
+                    "silent_for_ms": stage.silent_for_ms,
+                })
+            })
             .collect()
     }
 
@@ -151,6 +180,12 @@ impl RunHistory {
     pub(super) fn derived_reason(&self) -> Option<String> {
         if self.state == "merged" || !is_terminal(&self.state) {
             return None;
+        }
+        if let Some(stall) = &self.stall {
+            return Some(format!(
+                "stalled: no output for {}",
+                format_duration(stall.threshold_ms)
+            ));
         }
         let Some(failed) = self.stages.iter().find(|stage| stage.state == "failed") else {
             return Some(format!(
@@ -189,6 +224,25 @@ impl RunHistory {
     /// callers surface it under a label that cannot.
     pub(super) fn agent_exit_code(&self) -> Option<i64> {
         self.exit_code
+    }
+
+    pub(super) fn stalled(&self) -> bool {
+        self.stall.is_some()
+    }
+
+    fn stall_json(&self) -> Value {
+        json!(self.stall)
+    }
+}
+
+fn format_duration(milliseconds: i64) -> String {
+    let seconds = milliseconds / 1_000;
+    match (seconds / 3_600, (seconds % 3_600) / 60, seconds % 60) {
+        (0, 0, seconds) => format!("{seconds}s"),
+        (0, minutes, 0) => format!("{minutes}m"),
+        (0, minutes, seconds) => format!("{minutes}m{seconds}s"),
+        (hours, 0, _) => format!("{hours}h"),
+        (hours, minutes, _) => format!("{hours}h{minutes}m"),
     }
 }
 
@@ -249,6 +303,7 @@ fn stages(
                     exit_code: None,
                     verdict_source: None,
                     reason: None,
+                    silent_for_ms: None,
                 };
             };
             Stage {
@@ -263,6 +318,7 @@ fn stages(
                 exit_code: row.exit_code,
                 verdict_source: Some(row.verdict_source.clone()),
                 reason: row.reason.clone(),
+                silent_for_ms: None,
                 name,
             }
         })
@@ -310,6 +366,7 @@ pub(super) fn run_summary_json(run: &RunRecord, history: &RunHistory) -> Value {
         "started_at_ms": history.timeline.started_at_ms.or(history.timeline.claimed_at_ms),
         "finished_at_ms": history.timeline.finished_at_ms,
         "reason": history.derived_reason(),
+        "stall": history.stall_json(),
         "stages": history.strip_json(),
     })
 }
@@ -320,5 +377,6 @@ pub(super) fn extend_run_detail(value: &mut Value, history: &RunHistory) {
     value["started_at_ms"] = json!(history.timeline.started_at_ms);
     value["finished_at_ms"] = json!(history.timeline.finished_at_ms);
     value["agent_exit_code"] = json!(history.agent_exit_code());
+    value["stall"] = history.stall_json();
     value["stages"] = json!(history.stages_json());
 }

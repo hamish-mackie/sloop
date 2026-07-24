@@ -42,6 +42,8 @@ pub enum MergeOutcome {
 pub struct RunEvidence {
     /// An operator recorded cancellation intent before the exit was handled.
     pub cancelled: bool,
+    /// The output watchdog recorded termination intent before process exit.
+    pub stalled: bool,
     pub exit: ExitClass,
     /// A rejection recognized from the adapter's captured output.
     pub vendor_error: Option<VendorErrorClass>,
@@ -103,6 +105,9 @@ pub fn derive_outcome(evidence: &RunEvidence) -> Outcome {
     if evidence.cancelled {
         return Outcome::Cancelled;
     }
+    if evidence.stalled {
+        return Outcome::Failed;
+    }
     if let Some(class) = evidence.vendor_error {
         return if class.requires_cooldown() {
             Outcome::RateLimited
@@ -129,6 +134,7 @@ mod tests {
     fn evidence() -> RunEvidence {
         RunEvidence {
             cancelled: false,
+            stalled: false,
             exit: ExitClass::Success,
             vendor_error: None,
             commit_count: Some(0),
@@ -202,6 +208,7 @@ mod tests {
     fn cancellation_wins_over_every_other_reading() {
         let outcome = derive_outcome(&RunEvidence {
             cancelled: true,
+            stalled: true,
             exit: ExitClass::KilledBySignal,
             vendor_error: None,
             commit_count: Some(5),
@@ -209,6 +216,16 @@ mod tests {
             merge: Some(MergeOutcome::Merged),
         });
         assert_eq!(outcome, Outcome::Cancelled);
+    }
+
+    #[test]
+    fn output_stall_fails_before_vendor_classification() {
+        let outcome = derive_outcome(&RunEvidence {
+            stalled: true,
+            vendor_error: Some(VendorErrorClass::RateLimited),
+            ..evidence()
+        });
+        assert_eq!(outcome, Outcome::Failed);
     }
 
     #[test]

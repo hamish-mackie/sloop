@@ -734,6 +734,10 @@ pub(super) fn drive_flow(
     let interrupted = run_store
         .run_evidence(run_id)
         .map_err(|error| error.to_string())?;
+    let watchdog_stalled = run_store
+        .output_stall(run_id)
+        .map_err(|error| error.to_string())?
+        .is_some();
 
     loop {
         if aftercare_cancelled(run_store, run_id, log) {
@@ -814,7 +818,8 @@ pub(super) fn drive_flow(
                 StageKind::Agent => {
                     let now = clock.now_ms();
                     StageResult {
-                        verdict: if !vendor_rejected
+                        verdict: if !watchdog_stalled
+                            && !vendor_rejected
                             && classify_exit(exit_code) == ExitClass::Success
                         {
                             Verdict::Pass
