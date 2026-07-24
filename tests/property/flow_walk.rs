@@ -2,7 +2,7 @@
 
 use proptest::prelude::*;
 use sloop::flow::{
-    Flow, Reported, StageEvidence, Step, Verdict, VerdictPolicy, VerdictSource, next_step,
+    Actor, Builtin, Check, Flow, Reported, StageEvidence, Step, Verdict, VerdictSource, next_step,
     resolve_verdict,
 };
 
@@ -112,9 +112,9 @@ proptest! {
         policy_choice in 0..3usize,
     ) {
         let policy = [
-            VerdictPolicy::Exit,
-            VerdictPolicy::Commits,
-            VerdictPolicy::Check { cmd: vec!["true".into()] },
+            Check::None,
+            Check::Actor(Actor::Builtin(Builtin::Commits)),
+            Check::Actor(Actor::Exec { cmd: vec!["true".into()] }),
         ][policy_choice].clone();
         let report = reported.map(|(verdict, reason)| Reported { verdict, reason });
         prop_assert_eq!(
@@ -131,7 +131,7 @@ proptest! {
         reported in prop::option::of((verdict(), prop::option::of("[ -~]{0,20}"))),
     ) {
         let report = reported.clone().map(|(verdict, reason)| Reported { verdict, reason });
-        let (verdict, source, reason) = resolve_verdict(&VerdictPolicy::Reported, exit, report);
+        let (verdict, source, reason) = resolve_verdict(&Check::Reported, exit, report);
         prop_assert_eq!(source, VerdictSource::Reported);
         match reported {
             Some((expected, expected_reason)) => {

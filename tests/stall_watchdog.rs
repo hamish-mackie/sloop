@@ -22,7 +22,7 @@ fn configure_process_tree_agent(world: &World) {
     fs::create_dir_all(&flow_directory).unwrap();
     fs::write(
         flow_directory.join("default.yaml"),
-        "stages:\n  - { name: build, kind: agent, verdict: exit }\n  - { name: merge, kind: merge }\n",
+        "stages:\n  - { name: build, kind: agent, verdict: { check: ['true'] } }\n  - { name: merge, kind: merge }\n",
     )
     .unwrap();
     let script = world.root().join("fake-agent.sh");

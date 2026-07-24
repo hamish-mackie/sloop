@@ -158,9 +158,9 @@ mod tests {
             .find(|stage| stage.name == "review")
             .expect("default flow has a review stage");
 
-        assert_eq!(review.verdict, crate::flow::VerdictPolicy::Reported);
-        let crate::flow::StageKind::Exec { cmd } = &review.kind else {
-            panic!("review stage must be an exec stage: {:?}", review.kind);
+        assert_eq!(review.result_check, crate::flow::Check::Reported);
+        let crate::flow::Actor::Exec { cmd } = &review.action else {
+            panic!("review stage must be an exec stage: {:?}", review.action);
         };
         // Bare `claude --print` cannot run any command, so it could never call
         // `sloop verdict`; the tool allowance is load-bearing, not decorative.

@@ -16,20 +16,21 @@ use support::{FakeAgent, World, wait_until, wait_until_slow};
 
 /// build -> test -> merge, where `test` is an `exec` stage that always passes.
 const FLOW_PASSING_TEST: &str = "stages:
-  - { name: build, kind: agent, verdict: exit }
+  - { name: build, kind: agent, verdict: { check: ['true'] } }
   - { name: test, kind: exec, cmd: [\"true\"] }
   - { name: merge, kind: merge }
 ";
 
 /// The same flow with a `test` stage that always fails.
 const FLOW_FAILING_TEST: &str = "stages:
-  - { name: build, kind: agent, verdict: exit }
+  - { name: build, kind: agent, verdict: { check: ['true'] } }
   - { name: test, kind: exec, cmd: [\"false\"] }
   - { name: merge, kind: merge }
 ";
 
 /// A single-stage flow, for cases that never need a run at all.
-const FLOW_AGENT_ONLY: &str = "stages:\n  - { name: build, kind: agent, verdict: exit }\n";
+const FLOW_AGENT_ONLY: &str =
+    "stages:\n  - { name: build, kind: agent, verdict: { check: ['true'] } }\n";
 
 fn configure(world: &World, stages: &str, script_body: &str) {
     let flow_directory = world.root().join(".agents/sloop/flows");

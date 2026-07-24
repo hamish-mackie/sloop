@@ -1,7 +1,7 @@
 //! `flow::parse` must survive any committed flow file, however damaged.
 
 use proptest::prelude::*;
-use sloop::flow::StageKind;
+use sloop::flow::{Actor, Builtin};
 
 use crate::support::splice;
 
@@ -25,9 +25,12 @@ proptest! {
             let names: std::collections::HashSet<_> =
                 flow.stages.iter().map(|stage| &stage.name).collect();
             prop_assert_eq!(names.len(), flow.stages.len());
-            prop_assert_eq!(flow.stages.first().map(|s| &s.kind), Some(&StageKind::Agent));
+            prop_assert_eq!(flow.stages.first().map(|s| &s.action), Some(&Actor::Agent));
             for stage in &flow.stages[..flow.stages.len() - 1] {
-                prop_assert!(stage.kind != StageKind::Merge, "merge stage must be last");
+                prop_assert!(
+                    stage.action != Actor::Builtin(Builtin::Merge),
+                    "merge stage must be last"
+                );
             }
         }
     }

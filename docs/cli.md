@@ -344,6 +344,6 @@ a ticket's state, and claims like "done" carry no weight. Notes appear in
 ### sloop verdict pass|fail [--reason <TEXT>]
 
 Report the current stage's verdict when, and only when, that stage declares
-`verdict: reported`. The first report is persisted and final; a second report
+`result_check: reported`. The first report is persisted and final; a second report
 is rejected. A reported stage that exits without calling this command fails
 with `no verdict reported`.

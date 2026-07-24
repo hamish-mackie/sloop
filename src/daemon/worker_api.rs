@@ -3,7 +3,7 @@ use std::fs;
 use serde_json::json;
 
 use crate::domain::ticket::TicketSnapshot;
-use crate::flow::{Flow, VerdictPolicy};
+use crate::flow::{Check, Flow};
 use crate::protocol::{ErrorBody, Request, RequestId, ResponseEnvelope, VerdictArgs, VerdictValue};
 use crate::vendor_error::VendorErrorMatch;
 
@@ -230,7 +230,7 @@ fn handle_verdict(
         .iter()
         .find(|stage| stage.name == stage_name)
         .ok_or_else(|| internal("the executing stage is not in the run's flow snapshot"))?;
-    if stage.verdict != VerdictPolicy::Reported {
+    if stage.result_check != Check::Reported {
         return Err(unauthorized(&format!(
             "stage `{stage_name}` does not use the reported verdict policy"
         )));

@@ -35,9 +35,9 @@ fn init_scaffolds_the_default_flow_and_review_prompt() {
     let output = world.sloop(&["init"]);
     assert!(output.status.success());
     let flow = fs::read_to_string(world.root().join(".agents/sloop/flows/default.yaml")).unwrap();
-    assert!(flow.contains("kind: agent"));
-    assert!(flow.contains("kind: exec"));
-    assert!(flow.contains("kind: merge"));
+    assert!(flow.contains("action: agent"));
+    assert!(flow.contains("exec:"));
+    assert!(flow.contains("builtin: merge"));
     assert!(flow.contains(".agents/sloop/prompts/review.md"));
     assert!(
         world

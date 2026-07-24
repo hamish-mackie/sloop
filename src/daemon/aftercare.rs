@@ -11,7 +11,7 @@ use crate::config::{AgentConfig, RunningHours, expand_agent_cmd};
 use crate::db::StoreError;
 use crate::domain::ticket::TicketSnapshot;
 use crate::flow::{
-    Flow, OnFail, Reported, Stage, StageEvidence, StageKind, Step, Verdict, VerdictPolicy,
+    Actor, Builtin, Check, FailAction, Flow, OnFail, Reported, Stage, StageEvidence, Step, Verdict,
     VerdictSource, next_step, resolve_verdict,
 };
 use crate::logging::{LogLevel, OperationalLog};
@@ -717,7 +717,7 @@ pub(super) fn drive_flow(
         })
         .collect::<Vec<_>>();
     let mut merge = flow.stages.iter().find_map(|stage| {
-        if stage.kind != StageKind::Merge {
+        if stage.action != Actor::Builtin(Builtin::Merge) {
             return None;
         }
         evidence
@@ -784,7 +784,7 @@ pub(super) fn drive_flow(
             );
         }
         let mut merge_recovery = if let Some((identity, _)) = &interrupted_process
-            && stage.kind == StageKind::Merge
+            && stage.action == Actor::Builtin(Builtin::Merge)
             && identity.merge.is_some()
         {
             match inspect_interrupted_merge(root, branch, identity) {
@@ -814,8 +814,8 @@ pub(super) fn drive_flow(
         let mut repair_used = repair_attempts_used(&interrupted, &stage.name);
         let mut pending_repair: Option<(u32, ProcessIdentity, String)> = None;
         let (verdict, source, reason, result) = loop {
-            let mut result = match &stage.kind {
-                StageKind::Agent => {
+            let mut result = match &stage.action {
+                Actor::Agent => {
                     let now = clock.now_ms();
                     StageResult {
                         verdict: if !watchdog_stalled
@@ -831,7 +831,7 @@ pub(super) fn drive_flow(
                         finished_at_ms: now,
                     }
                 }
-                StageKind::Exec { cmd } => execute_stage_order(
+                Actor::Exec { cmd } => execute_stage_order(
                     worktree,
                     branch,
                     &stage.name,
@@ -841,9 +841,20 @@ pub(super) fn drive_flow(
                     run_store,
                     run_id,
                     log,
-                    (stage.verdict == VerdictPolicy::Reported).then_some(worker),
+                    (stage.result_check == Check::Reported).then_some(worker),
                 ),
-                StageKind::Merge
+                // `Commits` never reaches here: parsing refuses it as an
+                // action, so the only builtin that acts is `Merge`.
+                Actor::Builtin(Builtin::Commits) => {
+                    let now = clock.now_ms();
+                    StageResult {
+                        verdict: Verdict::Fail,
+                        exit_code: Some(1),
+                        started_at_ms: now,
+                        finished_at_ms: now,
+                    }
+                }
+                Actor::Builtin(Builtin::Merge)
                     if merge_recovery == Some(super::recovery::MergeRecovery::AlreadyCompleted) =>
                 {
                     let now = clock.now_ms();
@@ -855,7 +866,7 @@ pub(super) fn drive_flow(
                         finished_at_ms: now,
                     }
                 }
-                StageKind::Merge
+                Actor::Builtin(Builtin::Merge)
                     if merge_recovery == Some(super::recovery::MergeRecovery::UnsafePartial) =>
                 {
                     let now = clock.now_ms();
@@ -867,7 +878,7 @@ pub(super) fn drive_flow(
                         finished_at_ms: now,
                     }
                 }
-                StageKind::Merge => {
+                Actor::Builtin(Builtin::Merge) => {
                     let started_at_ms = clock.now_ms();
                     let outcome = attempt_merge(
                         root,
@@ -896,9 +907,9 @@ pub(super) fn drive_flow(
                     }
                 }
             };
-            match &stage.verdict {
-                VerdictPolicy::Exit | VerdictPolicy::Reported => {}
-                VerdictPolicy::Commits => {
+            match &stage.result_check {
+                Check::None | Check::Reported => {}
+                Check::Actor(Actor::Builtin(Builtin::Commits)) => {
                     if result.verdict != Verdict::Pass
                         || !commit_observation_complete
                         || commits.is_empty()
@@ -906,7 +917,7 @@ pub(super) fn drive_flow(
                         result.verdict = Verdict::Fail;
                     }
                 }
-                VerdictPolicy::Check { cmd } if result.verdict == Verdict::Pass => {
+                Check::Actor(Actor::Exec { cmd }) if result.verdict == Verdict::Pass => {
                     result = execute_stage_order(
                         worktree,
                         branch,
@@ -920,15 +931,21 @@ pub(super) fn drive_flow(
                         None,
                     );
                 }
-                VerdictPolicy::Check { .. } => {}
+                Check::Actor(Actor::Exec { .. }) => {}
+                // Parsing refuses an agent judge and the merge builtin as a
+                // check, so neither can reach a run. Fail closed rather than
+                // pass a stage nothing actually judged.
+                Check::Actor(Actor::Agent) | Check::Actor(Actor::Builtin(Builtin::Merge)) => {
+                    result.verdict = Verdict::Fail;
+                }
             }
-            let reported = if stage.verdict == VerdictPolicy::Reported {
+            let reported = if stage.result_check == Check::Reported {
                 reported_verdict(run_store, run_id, &stage.name)?
             } else {
                 None
             };
             let (verdict, source, reason) =
-                resolve_verdict(&stage.verdict, result.verdict, reported);
+                resolve_verdict(&stage.result_check, result.verdict, reported);
             // Fill in the verdict of the re-run that followed the last repair.
             if let Some((attempt, identity, target)) = pending_repair.take() {
                 let _ = run_store.record_repair_attempt(
@@ -967,7 +984,7 @@ pub(super) fn drive_flow(
                     // repair's integration and the retried merge start clean. An
                     // exhausted merge that never reaches here keeps the conflict
                     // for review, exactly as today.
-                    if stage.kind == StageKind::Merge {
+                    if stage.action == Actor::Builtin(Builtin::Merge) {
                         abort_conflicted_merge(root);
                     }
                     let attempt = repair_used + 1;
@@ -1089,8 +1106,9 @@ fn flow_with_implicit_test(flow: &Flow, test_cmd: Option<&[String]>) -> Result<F
             1,
             Stage {
                 name: "test".into(),
-                kind: StageKind::Exec { cmd: cmd.to_vec() },
-                verdict: VerdictPolicy::Exit,
+                action: Actor::Exec { cmd: cmd.to_vec() },
+                result_check: Check::None,
+                fail_action: FailAction::Halt,
                 on_fail: None,
             },
         );

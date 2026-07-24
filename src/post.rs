@@ -848,7 +848,7 @@ mod tests {
     use crate::config::{AgentConfig, AgentTarget};
     use crate::db::Db;
     use crate::domain::work::{ExecutionHints, TicketRef, WorkTicket, WorkTicketState};
-    use crate::flow::{Flow, Stage, StageKind, VerdictPolicy};
+    use crate::flow::{Actor, Builtin, Check, FailAction, Flow, Stage};
     use crate::protocol::{PostActivation, PostArgs};
     use crate::work_state::local::LocalSqlite;
     use crate::work_state::{SourceError, WorkStateAuthor};
@@ -935,8 +935,9 @@ mod tests {
                     name: "default".into(),
                     stages: vec![Stage {
                         name: "build".into(),
-                        kind: StageKind::Agent,
-                        verdict: VerdictPolicy::Commits,
+                        action: Actor::Agent,
+                        result_check: Check::Actor(Actor::Builtin(Builtin::Commits)),
+                        fail_action: FailAction::Halt,
                         on_fail: None,
                     }],
                 },
@@ -947,8 +948,9 @@ mod tests {
                     name: "release".into(),
                     stages: vec![Stage {
                         name: "build".into(),
-                        kind: StageKind::Agent,
-                        verdict: VerdictPolicy::Commits,
+                        action: Actor::Agent,
+                        result_check: Check::Actor(Actor::Builtin(Builtin::Commits)),
+                        fail_action: FailAction::Halt,
                         on_fail: None,
                     }],
                 },

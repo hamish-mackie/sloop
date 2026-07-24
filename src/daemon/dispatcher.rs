@@ -353,7 +353,8 @@ async fn try_settle_run_exit(
 
     let cancelled =
         state.cancelling.contains(run_id) || state.run_store.cancellation_requested(run_id)?;
-    let stalled = state.stalling.contains(run_id) || state.run_store.output_stall(run_id)?.is_some();
+    let stalled =
+        state.stalling.contains(run_id) || state.run_store.output_stall(run_id)?.is_some();
     let evidence = RunEvidence {
         cancelled,
         stalled,

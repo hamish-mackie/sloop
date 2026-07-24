@@ -118,38 +118,35 @@ mod tests {
             .collect();
         assert_eq!(names, ["build", "test", "lint", "review", "merge"]);
 
-        // One example of every stage kind and every verdict policy, which is
-        // the whole point of this template.
+        // One example of every action and every result check, which is the
+        // whole point of this template.
+        use crate::flow::{Actor, Builtin, Check};
+        assert!(flow.stages.iter().any(|stage| stage.action == Actor::Agent));
         assert!(
             flow.stages
                 .iter()
-                .any(|stage| stage.kind == crate::flow::StageKind::Agent)
+                .any(|stage| stage.action == Actor::Builtin(Builtin::Merge))
         );
         assert!(
             flow.stages
                 .iter()
-                .any(|stage| stage.kind == crate::flow::StageKind::Merge)
+                .any(|stage| matches!(stage.action, Actor::Exec { .. }))
         );
-        assert!(
-            flow.stages
-                .iter()
-                .any(|stage| matches!(stage.kind, crate::flow::StageKind::Exec { .. }))
-        );
-        for policy in [
-            crate::flow::VerdictPolicy::Commits,
-            crate::flow::VerdictPolicy::Exit,
-            crate::flow::VerdictPolicy::Reported,
+        for check in [
+            Check::Actor(Actor::Builtin(Builtin::Commits)),
+            Check::None,
+            Check::Reported,
         ] {
             assert!(
-                flow.stages.iter().any(|stage| stage.verdict == policy),
-                "no stage demonstrates {policy:?}"
+                flow.stages.iter().any(|stage| stage.result_check == check),
+                "no stage demonstrates {check:?}"
             );
         }
         assert!(
             flow.stages
                 .iter()
-                .any(|stage| matches!(stage.verdict, crate::flow::VerdictPolicy::Check { .. })),
-            "no stage demonstrates a check verdict"
+                .any(|stage| matches!(stage.result_check, Check::Actor(Actor::Exec { .. }))),
+            "no stage demonstrates an exec result check"
         );
 
         // `on_fail` is shown on both stage kinds that accept it.

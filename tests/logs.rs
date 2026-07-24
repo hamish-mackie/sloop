@@ -132,7 +132,7 @@ fn logs_for_a_missing_run_names_the_run_id_shape() {
 
 /// The stage names an operator reads in a flow are the names `--stage`
 /// accepts, for the agent stage as much as for exec stages.
-const MULTI_STAGE_FLOW: &str = "  - { name: build, kind: agent, verdict: exit }\n  - { name: check, kind: exec, cmd: [\"sh\", \"-c\", \"echo exec stage speaking\"] }\n  - { name: merge, kind: merge }\n";
+const MULTI_STAGE_FLOW: &str = "  - { name: build, kind: agent, verdict: { check: ['true'] } }\n  - { name: check, kind: exec, cmd: [\"sh\", \"-c\", \"echo exec stage speaking\"] }\n  - { name: merge, kind: merge }\n";
 
 fn settled_multi_stage_run(world: &World, ticket: &str) -> String {
     configure_flow(

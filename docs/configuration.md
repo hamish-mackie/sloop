@@ -213,58 +213,81 @@ tickets. It never bypasses gates or jumps the queue.
 
 ## Flows
 
-`sloop template flow` prints a template exercising every stage kind, every
-verdict policy, and `on_fail`, with the structural rules spelled out in
-comments. `sloop init` scaffolds a smaller working
-`.agents/sloop/flows/default.yaml`:
+`sloop template flow` prints a template exercising every action, every result
+check, and `on_fail`, with the structural rules spelled out in comments.
+`sloop init` scaffolds a smaller working `.agents/sloop/flows/default.yaml`:
 
 ```yaml
 stages:
   - name: build
-    kind: agent
+    action: agent
+    result_check: { builtin: commits }
   - name: review
-    kind: exec
-    verdict: reported
-    cmd:
-      - claude
-      - --print
-      - --allowedTools
-      - Bash
-      - --
-      - "Read .agents/sloop/prompts/review.md and follow its instructions."
+    result_check: reported
+    action:
+      exec:
+        - claude
+        - --print
+        - --allowedTools
+        - Bash
+        - --
+        - "Read .agents/sloop/prompts/review.md and follow its instructions."
   - name: merge
-    kind: merge
+    action: { builtin: merge }
+    result_check: none
 ```
 
-The review stage ships as `verdict: reported`: the reviewer must call
+The review stage ships as `result_check: reported`: the reviewer must call
 `sloop verdict pass|fail --reason <text>` exactly once, and a stage that ends
 without one fails with `no verdict reported`. Under the exec default,
-`verdict: exit`, a reviewer that always exits 0 would approve every run.
+`result_check: none`, a reviewer that always exits 0 would approve every run.
 
 The filename is the flow name. Tickets bind to a flow at post time with
 `flow: <name>` in frontmatter or `sloop post --flow <name>`; the binding is
 validated against the flow files that exist.
 
-The first stage must be the flow's only `agent` stage. Sloop then executes
-`exec` commands in the run worktree; an optional final `merge` stage applies
-the branch using Sloop's merge policy. Every non-merge stage has one verdict
-policy:
+Each stage is an `action` — the work, never trusted to grade itself — and a
+`result_check` that judges it. The actions are:
 
-- `verdict: exit` passes when the stage process exits 0.
-- `verdict: commits` passes when the process exits 0 and Sloop observes at
-  least one new run-branch commit.
-- `verdict: { check: ["argv", "..."] }` requires the stage process to exit 0,
-  then runs the check command in the worktree and uses its exit code.
-- `verdict: reported` requires the process to call
+- `action: agent` spawns the ticket's agent target in the run worktree,
+  prompted by the ticket body. The first stage must be the flow's only agent
+  action.
+- `action: { exec: ["argv", "..."] }` runs an argv (no shell) in the run
+  worktree.
+- `action: { builtin: merge }` applies the branch using Sloop's merge policy.
+  At most one, and it must be last.
+
+The checks are:
+
+- `result_check: none` passes when the action exits 0.
+- `result_check: { builtin: commits }` passes when the action exits 0 and Sloop
+  observes at least one new run-branch commit.
+- `result_check: { exec: ["argv", "..."] }` requires the action to exit 0, then
+  runs the check command in the worktree and uses its exit code.
+- `result_check: reported` requires the action to call
   `sloop verdict pass|fail [--reason <text>]`; no report is a failure, and the
   first report is final.
 
-The default is `commits` for `agent` and `exit` for `exec`. Merge stages cannot
-declare a verdict because the merge result is their verdict. `kind: build`
-remains accepted as a deprecated alias for `kind: agent`.
+The default is the commits builtin for `agent` and `none` for everything else.
+An agent action may not use `result_check: none` — grading itself by exiting
+cleanly grades nothing. A merge action must use `result_check: none` because
+the merge result *is* its verdict, and the merge builtin may never be a check.
 
-A configured `aftercare.test_cmd` is inserted as an implicit `exit` stage named
-`test` immediately after the `agent`, before the flow's own `exec` stages.
+`fail_action` says what the walk does with a failure. Only `fail` — halt, the
+default — is supported today; `continue` and
+`{ return_to: <stage>, attempts: N }` parse but are rejected until the walk
+supports them.
+
+The older grammar still parses, as sugar for exactly the same stages:
+`kind: agent` (or the deprecated `kind: build`) is `action: agent`,
+`kind: exec` with `cmd:` is `action: { exec: [...] }`, `kind: merge` is
+`action: { builtin: merge }`, and `verdict: exit | commits | { check: [...] } |
+reported` are the four checks above in order. The two spellings may not be
+mixed on one stage.
+
+A configured `aftercare.test_cmd` is inserted as an implicit `result_check:
+none` stage named `test` immediately after the agent action, before the flow's
+own `exec` stages.
 
 ### Repairing a failed stage with `on_fail`
 
@@ -272,15 +295,14 @@ By default a failing `exec` stage ends the run and a conflicted `merge` stage
 parks the ticket in `needs_review`. Both often stem from mechanical problems an
 agent could fix in place — a test that broke after the build, or a run branch
 that conflicts with the default branch because other work merged first. An
-optional `on_fail` block on an `exec` or `merge` stage attaches a repair agent:
+optional `on_fail` block on any non-agent stage attaches a repair agent:
 
 ```yaml
 stages:
   - name: build
-    kind: agent
+    action: agent
   - name: test
-    kind: exec
-    cmd: [cargo, test, --all-targets]
+    action: { exec: [cargo, test, --all-targets] }
     on_fail:
       agent: "Tests are failing in this worktree. Fix them without weakening assertions, then commit."
       attempts: 2      # optional, default 1, at most 3
@@ -288,14 +310,14 @@ stages:
       model: haiku     # optional, defaults to the ticket's model
       effort: low      # optional, defaults to the ticket's effort
   - name: merge
-    kind: merge
+    action: { builtin: merge }
 ```
 
 When the stage fails, Sloop spawns the repair agent in the run worktree with the
 configured prompt, and when it exits — however it exits — re-runs the original
-stage and re-applies the stage's own verdict policy. The retried run is the only
+stage and re-applies the stage's own result check. The retried run is the only
 evidence: the repair agent never reports a verdict, and `on_fail` cannot change a
-stage's verdict, command, or ordering. `attempts` allows up to that many
+stage's check, action, or ordering. `attempts` allows up to that many
 repair-then-retry cycles (capped at 3); when they run out the outcome is exactly
 today's — an exhausted `exec` stage ends the run `failed`, an exhausted `merge`
 stage parks `needs_review` with the branch preserved.

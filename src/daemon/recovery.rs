@@ -209,7 +209,7 @@ fn agent_stage(run: &RecoverableRun) -> String {
         .and_then(|flow| {
             flow.stages
                 .into_iter()
-                .find(|stage| matches!(stage.kind, crate::flow::StageKind::Agent))
+                .find(|stage| stage.action == crate::flow::Actor::Agent)
         })
         .map_or_else(|| "agent".to_owned(), |stage| stage.name)
 }

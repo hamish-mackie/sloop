@@ -96,7 +96,7 @@ fn agent_stage_order(
     let stage = flow
         .stages
         .iter()
-        .find(|stage| matches!(stage.kind, crate::flow::StageKind::Agent))
+        .find(|stage| stage.action == crate::flow::Actor::Agent)
         .map_or_else(|| "agent".into(), |stage| stage.name.clone());
     let environment = vec![
         (OsString::from("SLOOP_RUN_ID"), OsString::from(run_id)),
@@ -1265,7 +1265,7 @@ fn agent_stage(run: &crate::run_store::RunRecord) -> String {
         .and_then(|flow| {
             flow.stages
                 .into_iter()
-                .find(|stage| matches!(stage.kind, crate::flow::StageKind::Agent))
+                .find(|stage| stage.action == crate::flow::Actor::Agent)
         })
         .map_or_else(|| "agent".to_owned(), |stage| stage.name)
 }
@@ -1319,7 +1319,10 @@ fn reconcile_stall_watchdog(state: &mut DispatcherState, log: &OperationalLog) {
             threshold_ms: state.stall_after_ms,
             last_output_sequence: staleness.last_sequence,
         };
-        let recorded = match state.run_store.record_output_stall(&run.id, &evidence, now_ms) {
+        let recorded = match state
+            .run_store
+            .record_output_stall(&run.id, &evidence, now_ms)
+        {
             Ok(recorded) => recorded,
             Err(error) => {
                 mark_storage_full(state, &error);

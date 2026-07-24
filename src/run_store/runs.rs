@@ -1040,7 +1040,7 @@ mod tests {
     use super::{RunState, RunStore};
     use crate::db::{Db, SCHEMA_VERSION, StoreError};
     use crate::domain::ticket::TicketSnapshot;
-    use crate::flow::{Flow, Stage, StageKind, VerdictPolicy};
+    use crate::flow::{Actor, Builtin, Check, FailAction, Flow, Stage};
     use crate::outcome::Outcome;
     use crate::run_store::test_support::{abort_run, claim_run, open_seeded, settle_run};
     use crate::run_store::{RunAdmission, RunStart, Start, StartDenial};
@@ -1142,16 +1142,18 @@ mod tests {
             stages: vec![
                 Stage {
                     name: "build".into(),
-                    kind: StageKind::Agent,
-                    verdict: VerdictPolicy::Commits,
+                    action: Actor::Agent,
+                    result_check: Check::Actor(Actor::Builtin(Builtin::Commits)),
+                    fail_action: FailAction::Halt,
                     on_fail: None,
                 },
                 Stage {
                     name: "check".into(),
-                    kind: StageKind::Exec {
+                    action: Actor::Exec {
                         cmd: vec!["cargo".into(), "test".into()],
                     },
-                    verdict: VerdictPolicy::Exit,
+                    result_check: Check::None,
+                    fail_action: FailAction::Halt,
                     on_fail: None,
                 },
             ],

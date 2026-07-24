@@ -3,10 +3,11 @@
 //! The generator mirrors the validation rules in `flow::parse`: the first
 //! stage is the only agent stage, at most one merge stage and only in last
 //! position, exec stages carry a non-empty `cmd`, merge stages define no
-//! verdict, and agent stages define no `on_fail`.
+//! verdict, agent stages define no `on_fail`, and an agent stage never
+//! writes `verdict: exit` because an agent may not go unjudged.
 
 use proptest::prelude::*;
-use sloop::flow::{Flow, OnFail, Stage, StageKind, VerdictPolicy};
+use sloop::flow::{Actor, Builtin, Check, FailAction, Flow, OnFail, Stage};
 
 /// A stage's verdict as written in YAML, `None` meaning "omitted".
 #[derive(Debug, Clone)]
@@ -19,16 +20,16 @@ pub enum WrittenVerdict {
 }
 
 impl WrittenVerdict {
-    fn expected(&self, kind: &StageKind) -> VerdictPolicy {
+    fn expected(&self, action: &Actor) -> Check {
         match self {
-            Self::Omitted => match kind {
-                StageKind::Agent => VerdictPolicy::Commits,
-                StageKind::Exec { .. } | StageKind::Merge => VerdictPolicy::Exit,
+            Self::Omitted => match action {
+                Actor::Agent => Check::Actor(Actor::Builtin(Builtin::Commits)),
+                Actor::Exec { .. } | Actor::Builtin(_) => Check::None,
             },
-            Self::Exit => VerdictPolicy::Exit,
-            Self::Commits => VerdictPolicy::Commits,
-            Self::Reported => VerdictPolicy::Reported,
-            Self::Check(cmd) => VerdictPolicy::Check { cmd: cmd.clone() },
+            Self::Exit => Check::None,
+            Self::Commits => Check::Actor(Actor::Builtin(Builtin::Commits)),
+            Self::Reported => Check::Reported,
+            Self::Check(cmd) => Check::Actor(Actor::Exec { cmd: cmd.clone() }),
         }
     }
 }
@@ -74,8 +75,19 @@ fn on_fail() -> impl Strategy<Value = Option<OnFail>> {
     )
 }
 
+/// Every verdict an agent stage may write. `exit` is excluded: it maps to
+/// `Check::None`, and an agent that grades itself by exiting is rejected.
+fn agent_verdict() -> impl Strategy<Value = WrittenVerdict> {
+    prop_oneof![
+        Just(WrittenVerdict::Omitted),
+        Just(WrittenVerdict::Commits),
+        Just(WrittenVerdict::Reported),
+        command().prop_map(WrittenVerdict::Check),
+    ]
+}
+
 fn agent_stage() -> impl Strategy<Value = WrittenStage> {
-    verdict().prop_map(|verdict| WrittenStage {
+    agent_verdict().prop_map(|verdict| WrittenStage {
         kind_word: "agent",
         cmd: None,
         verdict,
@@ -154,19 +166,20 @@ fn render_stage(name: &str, stage: &WrittenStage, indent: &str) -> String {
 }
 
 fn expected_stage(name: &str, stage: &WrittenStage) -> Stage {
-    let kind = match stage.kind_word {
-        "agent" => StageKind::Agent,
-        "merge" => StageKind::Merge,
-        "exec" => StageKind::Exec {
+    let action = match stage.kind_word {
+        "agent" => Actor::Agent,
+        "merge" => Actor::Builtin(Builtin::Merge),
+        "exec" => Actor::Exec {
             cmd: stage.cmd.clone().expect("exec stages carry a cmd"),
         },
         other => unreachable!("generator produced kind {other}"),
     };
-    let verdict = stage.verdict.expected(&kind);
+    let result_check = stage.verdict.expected(&action);
     Stage {
         name: name.to_owned(),
-        kind,
-        verdict,
+        action,
+        result_check,
+        fail_action: FailAction::Halt,
         on_fail: stage.on_fail.clone(),
     }
 }

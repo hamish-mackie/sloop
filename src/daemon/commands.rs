@@ -897,7 +897,7 @@ fn stage_filter(
     let first_agent = flow
         .stages
         .iter()
-        .find(|stage| matches!(stage.kind, crate::flow::StageKind::Agent));
+        .find(|stage| stage.action == crate::flow::Actor::Agent);
     Ok(crate::run_log::StageFilter {
         agent_fallback: first_agent.is_some_and(|stage| stage.name == requested),
         ..literal
