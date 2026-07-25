@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-rc.1] - 2026-07-25
+
 ### Added
 
 - `result_check: { panel: {...} }` puts 2 to 5 independent reviewers on a stage
