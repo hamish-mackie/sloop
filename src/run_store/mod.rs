@@ -681,13 +681,24 @@ pub(crate) mod test_support {
                  VALUES
                      ('T1', 'default', '.agents/sloop/tickets/t1.md', 'local', NULL,
                       'ready', 0, '', 'Ticket one', 'sloop/T1', 'claude', 'sonnet',
-                      'medium', 'default', '', 1000, 1000);
-                 INSERT INTO triggers
-                     (id, kind, state, ticket_id, project_id, eligible_at_ms, interval_ms,
-                      created_at_ms, updated_at_ms)
-                 VALUES ('TR1', 'immediate', 'queued', 'T1', NULL, NULL, NULL, 1000, 1000);",
+                      'medium', 'default', '', 1000, 1000);",
             )
             .unwrap();
+        // The trigger goes in through its own module even here: the fixture
+        // borrows the concept, it does not own a second copy of its SQL.
+        crate::work_state::trigger::insert(
+            &db.lock(),
+            &crate::work_state::trigger::NewTrigger {
+                id: "TR1",
+                kind: crate::domain::trigger::TriggerKind::Immediate,
+                ticket_id: Some("T1"),
+                project_id: None,
+                eligible_at_ms: None,
+                interval_ms: None,
+            },
+            1_000,
+        )
+        .unwrap();
         RunStore::from_db(db)
     }
 

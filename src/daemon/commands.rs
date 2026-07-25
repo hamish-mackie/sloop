@@ -11,13 +11,15 @@ use crate::clock::{format_timestamp, next_local_minute_ms};
 use crate::config::parse_local_time;
 use crate::db::StoreError;
 use crate::domain::ticket::TicketState;
+use crate::domain::trigger::TriggerKind;
 use crate::frontmatter::{self, Frontmatter};
-use crate::ids::{TRIGGER_ID_PREFIX, next_id};
+use crate::ids::next_id;
 use crate::logging::LogLevel;
 use crate::protocol::{ErrorBody, ListArgs, ShowArgs};
 use crate::run_store::{EventRecord, RunRecord, RunState, RunStore};
 use crate::runner::local::run_output_path;
-use crate::work_state::local::{LocalSqlite, NewTrigger, ProjectRecord, TicketRecord, TriggerKind};
+use crate::work_state::local::{LocalSqlite, ProjectRecord, TicketRecord};
+use crate::work_state::trigger::{Duplicates, EnqueueRequest};
 
 use super::dispatcher::{
     DispatcherState, LOGS_PAGE_LIMIT, LOGS_TAIL_LIMIT, conflict, internal, invalid_arguments,
@@ -657,28 +659,26 @@ pub(super) fn handle_run(
             )
         }
     };
-    let trigger_id = format!(
-        "{TRIGGER_ID_PREFIX}{}",
-        local_lookup(state, LocalSqlite::next_trigger_ordinal)?
-    );
-    local_lookup(state, |work_state| {
-        work_state.insert_trigger(
-            &NewTrigger {
-                id: &trigger_id,
+    // `Duplicates::Allow`: two `sloop run` invocations are two requests for
+    // work, unlike a repost, which absorbs into the trigger already queued.
+    // The verb mints the id and writes every `--only` filter with the row, so a
+    // crash mid-write cannot leave a restricted run behind as an unrestricted
+    // one.
+    let trigger_id = local_lookup(state, |work_state| {
+        work_state.enqueue_trigger(
+            &EnqueueRequest {
                 kind,
                 ticket_id: args.ticket.as_deref(),
                 project_id: args.project.as_deref(),
                 eligible_at_ms,
                 interval_ms,
+                filters: &args.only,
+                duplicates: Duplicates::Allow,
             },
             now_ms,
         )
-    })?;
-    for only in &args.only {
-        local_lookup(state, |work_state| {
-            work_state.insert_trigger_filter(&trigger_id, only)
-        })?;
-    }
+    })?
+    .id;
 
     let mut trigger = json!({
         "id": trigger_id,

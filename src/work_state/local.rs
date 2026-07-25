@@ -13,6 +13,7 @@ use crate::clock::{Clock, SystemClock};
 use crate::config::{AgentConfig, expand_agent_cmd};
 use crate::db::{Db, StoreError};
 use crate::domain::ticket::TicketState;
+use crate::domain::trigger as domain_trigger;
 use crate::domain::work::{
     Disposition, ExecutionHints, OwnerId, SourceVersion, TicketRef, WorkOutcome, WorkTicket,
     WorkTicketState,
@@ -22,6 +23,7 @@ use crate::frontmatter;
 use crate::ids::next_id;
 use crate::reindex::ReindexError;
 use crate::work_state::exec::ExecTicketSource;
+use crate::work_state::trigger;
 use crate::work_state::{
     ActiveClaim, ClaimResult, ClaimStrength, SourceError, TicketFeeder, WorkState,
 };
@@ -31,54 +33,6 @@ const TICKET_RECORD_SELECT: &str =
             target, model, effort, flow, attempts, body, held_reason, created_at_ms, updated_at_ms
      FROM tickets";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TriggerKind {
-    Immediate,
-    Auto,
-    At,
-    Every,
-    Overnight,
-}
-
-impl TriggerKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Immediate => "immediate",
-            Self::Auto => "auto",
-            Self::At => "at",
-            Self::Every => "every",
-            Self::Overnight => "overnight",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TriggerState {
-    Queued,
-    Completed,
-    Cancelled,
-}
-
-impl TriggerState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Queued => "queued",
-            Self::Completed => "completed",
-            Self::Cancelled => "cancelled",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewTrigger<'a> {
-    pub id: &'a str,
-    pub kind: TriggerKind,
-    pub ticket_id: Option<&'a str>,
-    pub project_id: Option<&'a str>,
-    pub eligible_at_ms: Option<i64>,
-    pub interval_ms: Option<i64>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClaimTransaction<'a> {
     pub(crate) ticket_id: &'a str,
@@ -86,17 +40,6 @@ pub(crate) struct ClaimTransaction<'a> {
     pub(crate) trigger_id: &'a str,
     pub(crate) owner_id: &'a str,
     pub(crate) lease_ms: i64,
-    pub(crate) next_trigger_eligible_at_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueuedTrigger {
-    pub id: String,
-    pub kind: String,
-    pub ticket_id: Option<String>,
-    pub project_id: Option<String>,
-    pub eligible_at_ms: Option<i64>,
-    pub interval_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -279,87 +222,6 @@ pub(crate) mod tx {
         Ok(())
     }
 
-    pub(crate) fn queued_ticket_trigger(
-        transaction: &Transaction<'_>,
-        ticket_id: &str,
-        kind: TriggerKind,
-    ) -> rusqlite::Result<Option<String>> {
-        transaction
-            .query_row(
-                "SELECT id FROM triggers
-                 WHERE ticket_id = ?1 AND kind = ?2 AND state = 'queued'
-                 ORDER BY created_at_ms LIMIT 1",
-                params![ticket_id, kind.as_str()],
-                |row| row.get(0),
-            )
-            .optional()
-    }
-
-    pub(crate) fn reschedule_trigger(
-        transaction: &Transaction<'_>,
-        id: &str,
-        eligible_at_ms: i64,
-        now_ms: i64,
-    ) -> rusqlite::Result<()> {
-        transaction.execute(
-            "UPDATE triggers
-             SET eligible_at_ms = ?2, updated_at_ms = ?3
-             WHERE id = ?1 AND state = 'queued'",
-            params![id, eligible_at_ms, now_ms],
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn insert_trigger(
-        transaction: &Transaction<'_>,
-        trigger: &NewTrigger<'_>,
-        now_ms: i64,
-    ) -> rusqlite::Result<()> {
-        transaction.execute(
-            "INSERT INTO triggers
-                 (id, kind, state, ticket_id, project_id, eligible_at_ms, interval_ms,
-                  created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-            params![
-                trigger.id,
-                trigger.kind.as_str(),
-                TriggerState::Queued.as_str(),
-                trigger.ticket_id,
-                trigger.project_id,
-                trigger.eligible_at_ms,
-                trigger.interval_ms,
-                now_ms,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn advance_trigger(
-        transaction: &Transaction<'_>,
-        claim: &ClaimTransaction<'_>,
-        now_ms: i64,
-    ) -> Result<(), StoreError> {
-        let trigger_changed = match claim.next_trigger_eligible_at_ms {
-            Some(eligible_at_ms) => transaction.execute(
-                "UPDATE triggers
-                 SET eligible_at_ms = ?2, updated_at_ms = ?3
-                 WHERE id = ?1 AND state = 'queued' AND kind = 'every'",
-                params![claim.trigger_id, eligible_at_ms, now_ms],
-            )?,
-            None => transaction.execute(
-                "UPDATE triggers SET state = 'completed', updated_at_ms = ?2
-                 WHERE id = ?1 AND state = 'queued' AND kind != 'every'",
-                params![claim.trigger_id, now_ms],
-            )?,
-        };
-        if trigger_changed != 1 {
-            return Err(StoreError::TriggerNotQueued {
-                trigger_id: claim.trigger_id.into(),
-            });
-        }
-        Ok(())
-    }
-
     pub(crate) fn insert_lease(
         transaction: &Transaction<'_>,
         claim: &ClaimTransaction<'_>,
@@ -386,42 +248,6 @@ pub(crate) mod tx {
         run_id: &str,
     ) -> rusqlite::Result<usize> {
         transaction.execute("DELETE FROM leases WHERE run_id = ?1", params![run_id])
-    }
-
-    pub(crate) fn requeue_trigger(
-        transaction: &Transaction<'_>,
-        trigger_id: &str,
-        now_ms: i64,
-    ) -> rusqlite::Result<usize> {
-        transaction.execute(
-            "UPDATE triggers SET state = 'queued', updated_at_ms = ?2 WHERE id = ?1",
-            params![trigger_id, now_ms],
-        )
-    }
-
-    /// Retires the triggers pinned to a ticket that has just settled to
-    /// `merged`. A pinned trigger resolves through `ticket_is_dispatchable`,
-    /// which demands `state = 'ready'`, and a merged ticket never returns
-    /// there: leaving it queued is demand that can never be met but is still
-    /// counted. Running this in the settle transaction means the trigger
-    /// dies at the instant the ticket merges, with no window where the two
-    /// disagree.
-    ///
-    /// Kind is deliberately not consulted. An `every` trigger pinned to a
-    /// merged ticket is as unfireable as a `once`; its rearm arithmetic in
-    /// `advance_trigger` is untouched and simply has nothing left to rearm.
-    /// An unpinned trigger is demand for whatever is ready, so it is out of
-    /// scope by construction — the `ticket_id` match excludes it.
-    pub(crate) fn complete_ticket_triggers(
-        transaction: &Transaction<'_>,
-        ticket_id: &str,
-        now_ms: i64,
-    ) -> rusqlite::Result<usize> {
-        transaction.execute(
-            "UPDATE triggers SET state = 'completed', updated_at_ms = ?2
-             WHERE ticket_id = ?1 AND state = 'queued'",
-            params![ticket_id, now_ms],
-        )
     }
 
     pub(crate) fn replace_ticket_blockers(
@@ -572,201 +398,6 @@ impl LocalSqlite {
             i64::MIN => None,
             timestamp => Some(timestamp),
         }
-    }
-
-    pub fn insert_trigger(&self, trigger: &NewTrigger<'_>, now_ms: i64) -> Result<(), StoreError> {
-        self.db.lock().execute(
-            "INSERT INTO triggers
-                 (id, kind, state, ticket_id, project_id, eligible_at_ms, interval_ms,
-                  created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-            params![
-                trigger.id,
-                trigger.kind.as_str(),
-                TriggerState::Queued.as_str(),
-                trigger.ticket_id,
-                trigger.project_id,
-                trigger.eligible_at_ms,
-                trigger.interval_ms,
-                now_ms,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn insert_trigger_filter(
-        &self,
-        trigger_id: &str,
-        ticket_id: &str,
-    ) -> Result<(), StoreError> {
-        self.db.lock().execute(
-            "INSERT OR IGNORE INTO trigger_filters (trigger_id, ticket_id) VALUES (?1, ?2)",
-            params![trigger_id, ticket_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn queued_triggers(&self) -> Result<Vec<QueuedTrigger>, StoreError> {
-        let connection = self.db.lock();
-        let mut statement = connection.prepare(
-            "SELECT id, kind, ticket_id, project_id, eligible_at_ms, interval_ms
-             FROM triggers WHERE state = 'queued'
-             ORDER BY created_at_ms, id",
-        )?;
-        let triggers = statement
-            .query_map([], |row| {
-                Ok(QueuedTrigger {
-                    id: row.get(0)?,
-                    kind: row.get(1)?,
-                    ticket_id: row.get(2)?,
-                    project_id: row.get(3)?,
-                    eligible_at_ms: row.get(4)?,
-                    interval_ms: row.get(5)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(triggers)
-    }
-
-    /// Whether any queued trigger could select this ticket: the reporting
-    /// mirror of the claim path's selection, asked per ticket rather than as
-    /// "does the queue hold anything at all".
-    pub fn has_claimable_trigger(&self, ticket_id: &str, now_ms: i64) -> Result<bool, StoreError> {
-        let connection = self.db.lock();
-        Ok(Self::claimable_trigger_on(&connection, ticket_id, now_ms)?.is_some())
-    }
-
-    pub fn dispatchable_triggers(&self, now_ms: i64) -> Result<Vec<QueuedTrigger>, StoreError> {
-        let connection = self.db.lock();
-        let mut statement = connection.prepare(
-            "SELECT id, kind, ticket_id, project_id, eligible_at_ms, interval_ms
-             FROM triggers
-             WHERE state = 'queued'
-               AND (kind IN ('immediate', 'auto') OR eligible_at_ms <= ?1)
-             ORDER BY created_at_ms, id",
-        )?;
-        let triggers = statement
-            .query_map(params![now_ms], |row| {
-                Ok(QueuedTrigger {
-                    id: row.get(0)?,
-                    kind: row.get(1)?,
-                    ticket_id: row.get(2)?,
-                    project_id: row.get(3)?,
-                    eligible_at_ms: row.get(4)?,
-                    interval_ms: row.get(5)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(triggers)
-    }
-
-    /// Retires triggers left queued against a ticket that merged before the
-    /// settle path knew to retire them. The rule in `tx::complete_ticket_triggers`
-    /// only applies from the next settlement onwards, and a merged ticket never
-    /// settles again, so anything already stranded needs this one-off sweep.
-    ///
-    /// Returns the `(trigger_id, ticket_id)` pairs it completed, so the
-    /// caller can report a startup mutation rather than perform it silently. A
-    /// database with nothing stranded selects no rows and writes nothing, which
-    /// makes repeated runs free.
-    pub fn complete_merged_ticket_triggers(
-        &self,
-        now_ms: i64,
-    ) -> Result<Vec<(String, String)>, StoreError> {
-        let mut connection = self.db.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let stranded = {
-            let mut statement = transaction.prepare(
-                "SELECT tr.id, tr.ticket_id
-                 FROM triggers tr
-                 JOIN tickets t ON t.id = tr.ticket_id
-                 WHERE tr.state = 'queued' AND t.state = 'merged'
-                 ORDER BY tr.created_at_ms, tr.id",
-            )?;
-            statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<Result<Vec<(String, String)>, _>>()?
-        };
-        if stranded.is_empty() {
-            return Ok(Vec::new());
-        }
-        transaction.execute(
-            "UPDATE triggers SET state = 'completed', updated_at_ms = ?1
-             WHERE state = 'queued'
-               AND ticket_id IN (SELECT id FROM tickets WHERE state = 'merged')",
-            params![now_ms],
-        )?;
-        transaction.commit()?;
-        Ok(stranded)
-    }
-
-    pub fn next_trigger_eligible_at_ms(&self, now_ms: i64) -> Result<Option<i64>, StoreError> {
-        self.db
-            .lock()
-            .query_row(
-                "SELECT MIN(eligible_at_ms) FROM triggers
-                 WHERE state = 'queued' AND eligible_at_ms > ?1",
-                params![now_ms],
-                |row| row.get(0),
-            )
-            .map_err(StoreError::from)
-    }
-
-    pub fn queued_ticket_trigger(
-        &self,
-        ticket_id: &str,
-        kind: TriggerKind,
-    ) -> Result<Option<String>, StoreError> {
-        self.db
-            .lock()
-            .query_row(
-                "SELECT id FROM triggers
-                 WHERE ticket_id = ?1 AND kind = ?2 AND state = 'queued'
-                 ORDER BY created_at_ms LIMIT 1",
-                params![ticket_id, kind.as_str()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(StoreError::from)
-    }
-
-    pub fn reschedule_trigger(
-        &self,
-        id: &str,
-        eligible_at_ms: i64,
-        now_ms: i64,
-    ) -> Result<(), StoreError> {
-        self.db.lock().execute(
-            "UPDATE triggers
-             SET eligible_at_ms = ?2, updated_at_ms = ?3
-             WHERE id = ?1 AND state = 'queued'",
-            params![id, eligible_at_ms, now_ms],
-        )?;
-        Ok(())
-    }
-
-    pub fn next_trigger_ordinal(&self) -> Result<i64, StoreError> {
-        let mut connection = self.db.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let reserved: i64 = transaction.query_row(
-            "SELECT next_ordinal FROM id_counters WHERE kind = 'trigger'",
-            [],
-            |row| row.get(0),
-        )?;
-        // `SUBSTR` skips the two-character `TR` prefix; see
-        // `run_store::tx::reserve_ordinal`, which does the same for `notes`.
-        let existing: i64 = transaction.query_row(
-            "SELECT COALESCE(MAX(CAST(SUBSTR(id, 3) AS INTEGER)), 0) + 1 FROM triggers",
-            [],
-            |row| row.get(0),
-        )?;
-        let ordinal = reserved.max(existing);
-        transaction.execute(
-            "UPDATE id_counters SET next_ordinal = ?1 WHERE kind = 'trigger'",
-            params![ordinal + 1],
-        )?;
-        transaction.commit()?;
-        Ok(ordinal)
     }
 
     pub fn insert_local_project(
@@ -1221,52 +852,15 @@ impl LocalSqlite {
                 .collect::<Vec<_>>()
         };
 
-        let mut doomed_triggers = BTreeSet::new();
-        for ticket_id in &stale_tickets {
-            let mut statement =
-                transaction.prepare("SELECT id FROM triggers WHERE ticket_id = ?1")?;
-            doomed_triggers.extend(
-                statement
-                    .query_map(params![ticket_id], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
-        }
-        for project_id in &stale_projects {
-            let triggers = {
-                let mut statement =
-                    transaction.prepare("SELECT id, state FROM triggers WHERE project_id = ?1")?;
-                statement
-                    .query_map(params![project_id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?
-            };
-            for (trigger_id, trigger_state) in triggers {
-                if trigger_state == "queued" {
-                    doomed_triggers.insert(trigger_id);
-                } else {
-                    transaction.execute(
-                        "UPDATE triggers SET project_id = NULL WHERE id = ?1",
-                        params![trigger_id],
-                    )?;
-                }
-            }
-        }
+        // Which triggers a deletion kills, and which merely lose their scope,
+        // is a trigger lifecycle rule; this path names it rather than
+        // reimplementing it.
+        let plan = trigger::deletion_plan(&transaction, &stale_tickets, &stale_projects)?;
 
-        let mut rows_dropped = drop_runs(&transaction, &stale_tickets, &doomed_triggers)?;
-        for trigger_id in &doomed_triggers {
-            rows_dropped += transaction.execute(
-                "DELETE FROM trigger_filters WHERE trigger_id = ?1",
-                params![trigger_id],
-            )?;
-            rows_dropped +=
-                transaction.execute("DELETE FROM triggers WHERE id = ?1", params![trigger_id])?;
-        }
+        let mut rows_dropped = drop_runs(&transaction, &stale_tickets, &plan.doomed)?;
+        rows_dropped += trigger::apply_deletion(&transaction, &plan)?;
         for ticket_id in &stale_tickets {
-            rows_dropped += transaction.execute(
-                "DELETE FROM trigger_filters WHERE ticket_id = ?1",
-                params![ticket_id],
-            )?;
+            rows_dropped += trigger::delete_filters_for_ticket(&transaction, ticket_id)?;
             rows_dropped += transaction.execute(
                 "DELETE FROM leases WHERE ticket_id = ?1",
                 params![ticket_id],
@@ -1529,23 +1123,23 @@ impl LocalSqlite {
         self.db
             .lock()
             .query_row(
-                "SELECT t.id FROM tickets t
-                 WHERE t.state = 'ready'
-                   AND t.missing_at_ms IS NULL
-                   AND (?1 IS NULL OR t.project_id = ?1)
-                   AND NOT EXISTS (SELECT 1 FROM ticket_blockers b
-                                   JOIN tickets bt ON bt.id = b.blocker_id
-                                   WHERE b.ticket_id = t.id
-                                     AND bt.state != 'merged')
-                    AND (NOT EXISTS (SELECT 1 FROM trigger_filters f
-                                    WHERE f.trigger_id = ?2)
-                        OR EXISTS (SELECT 1 FROM trigger_filters f
-                                    WHERE f.trigger_id = ?2 AND f.ticket_id = t.id))
-                   AND NOT EXISTS (SELECT 1 FROM cooldowns c
-                                   WHERE c.key = 'agent_target:' || t.target
-                                     AND c.until_ms > ?3)
-                  ORDER BY t.created_at_ms, t.id
-                  LIMIT 1",
+                &format!(
+                    "SELECT t.id FROM tickets t
+                     WHERE t.state = 'ready'
+                       AND t.missing_at_ms IS NULL
+                       AND (?1 IS NULL OR t.project_id = ?1)
+                       AND NOT EXISTS (SELECT 1 FROM ticket_blockers b
+                                       JOIN tickets bt ON bt.id = b.blocker_id
+                                       WHERE b.ticket_id = t.id
+                                         AND bt.state != 'merged')
+                       AND {passes_filters}
+                       AND NOT EXISTS (SELECT 1 FROM cooldowns c
+                                       WHERE c.key = 'agent_target:' || t.target
+                                         AND c.until_ms > ?3)
+                      ORDER BY t.created_at_ms, t.id
+                      LIMIT 1",
+                    passes_filters = trigger::passes_filters("?2"),
+                ),
                 params![project_id, trigger_id, now_ms],
                 |row| row.get(0),
             )
@@ -1871,72 +1465,6 @@ impl LocalSqlite {
         }
         Ok(ticket)
     }
-
-    /// Shared by the claim path, which asks inside its transaction, and by
-    /// `has_claimable_trigger`, which asks read-only. `Transaction` derefs
-    /// to `Connection`, so one statement serves both.
-    fn claimable_trigger_on(
-        connection: &Connection,
-        ticket_id: &str,
-        now_ms: i64,
-    ) -> Result<Option<QueuedTrigger>, StoreError> {
-        connection
-            .query_row(
-                "SELECT tr.id, tr.kind, tr.ticket_id, tr.project_id, tr.eligible_at_ms, tr.interval_ms
-                 FROM triggers tr
-                 JOIN tickets t ON t.id = ?1
-                 WHERE tr.state = 'queued'
-                   AND (tr.kind IN ('immediate', 'auto') OR tr.eligible_at_ms <= ?2)
-                   AND (tr.ticket_id = t.id
-                        OR (tr.ticket_id IS NULL
-                            AND (tr.project_id IS NULL OR tr.project_id = t.project_id)))
-                   AND (NOT EXISTS (SELECT 1 FROM trigger_filters f
-                                    WHERE f.trigger_id = tr.id)
-                        OR EXISTS (SELECT 1 FROM trigger_filters f
-                                   WHERE f.trigger_id = tr.id AND f.ticket_id = t.id))
-                 ORDER BY tr.created_at_ms, tr.id
-                 LIMIT 1",
-                params![ticket_id, now_ms],
-                |row| {
-                    Ok(QueuedTrigger {
-                        id: row.get(0)?,
-                        kind: row.get(1)?,
-                        ticket_id: row.get(2)?,
-                        project_id: row.get(3)?,
-                        eligible_at_ms: row.get(4)?,
-                        interval_ms: row.get(5)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(StoreError::from)
-    }
-
-    fn trigger_for_release_on(
-        transaction: &Transaction<'_>,
-        ticket_id: &str,
-    ) -> Result<Option<String>, StoreError> {
-        transaction
-            .query_row(
-                "SELECT tr.id
-                 FROM triggers tr
-                 JOIN tickets t ON t.id = ?1
-                 WHERE (tr.state = 'completed' OR (tr.state = 'queued' AND tr.kind = 'every'))
-                   AND (tr.ticket_id = t.id
-                        OR (tr.ticket_id IS NULL
-                            AND (tr.project_id IS NULL OR tr.project_id = t.project_id)))
-                   AND (NOT EXISTS (SELECT 1 FROM trigger_filters f
-                                    WHERE f.trigger_id = tr.id)
-                        OR EXISTS (SELECT 1 FROM trigger_filters f
-                                   WHERE f.trigger_id = tr.id AND f.ticket_id = t.id))
-                 ORDER BY tr.updated_at_ms DESC, tr.created_at_ms, tr.id
-                 LIMIT 1",
-                params![ticket_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(StoreError::from)
-    }
 }
 
 fn source_error(error: StoreError) -> SourceError {
@@ -1973,15 +1501,6 @@ fn lease_ms(ttl: Duration) -> Result<i64, SourceError> {
     i64::try_from(ttl.as_millis()).map_err(|_| SourceError::Rejected {
         message: "lease duration is outside the supported range".into(),
     })
-}
-
-fn rearm_every_at(eligible_at_ms: i64, interval_ms: i64, now_ms: i64) -> Option<i64> {
-    if interval_ms <= 0 || eligible_at_ms > now_ms {
-        return None;
-    }
-    let missed = now_ms.checked_sub(eligible_at_ms)?.div_euclid(interval_ms);
-    let steps = missed.checked_add(1)?;
-    eligible_at_ms.checked_add(interval_ms.checked_mul(steps)?)
 }
 
 fn work_ticket(
@@ -2131,22 +1650,22 @@ impl WorkState for LocalSqlite {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(StoreError::from)
                 .map_err(source_error)?;
-            let Some(trigger) = Self::claimable_trigger_on(&transaction, &ticket.id, now_ms)
-                .map_err(source_error)?
+            let Some(trigger) =
+                trigger::claimable_on(&transaction, &ticket.id, now_ms).map_err(source_error)?
             else {
                 return Ok(ClaimResult::Lost { held_by: None });
             };
-            let next_trigger_eligible_at_ms = if trigger.kind == "every" {
-                match (trigger.eligible_at_ms, trigger.interval_ms) {
-                    (Some(eligible_at_ms), Some(interval_ms)) => {
-                        rearm_every_at(eligible_at_ms, interval_ms, now_ms)
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            if trigger.kind == "every" && next_trigger_eligible_at_ms.is_none() {
+            // The domain decides what firing this trigger does; storage only
+            // persists it, under guards that let exactly one claimer win.
+            let effects = domain_trigger::step(
+                &mut domain_trigger::Trigger::from(&trigger),
+                domain_trigger::Event::Fired,
+                now_ms,
+            );
+            if effects
+                .iter()
+                .any(|effect| matches!(effect, domain_trigger::Effect::Fault(_)))
+            {
                 return Err(SourceError::Corrupt {
                     message: format!("recurring trigger `{}` has an invalid cadence", trigger.id),
                 });
@@ -2158,7 +1677,6 @@ impl WorkState for LocalSqlite {
                 trigger_id: &trigger.id,
                 owner_id: &stored_owner,
                 lease_ms,
-                next_trigger_eligible_at_ms,
             };
 
             match tx::claim_ticket(&transaction, &claim, now_ms) {
@@ -2178,7 +1696,7 @@ impl WorkState for LocalSqlite {
                 }
                 Err(error) => return Err(source_error(error)),
             }
-            tx::advance_trigger(&transaction, &claim, now_ms).map_err(source_error)?;
+            trigger::consume(&transaction, &trigger.id, &effects, now_ms).map_err(source_error)?;
             tx::insert_lease(&transaction, &claim, now_ms).map_err(source_error)?;
             let record = Self::ticket_on(&transaction, &ticket.id)
                 .map_err(source_error)?
@@ -2311,8 +1829,7 @@ impl WorkState for LocalSqlite {
                         .map_err(StoreError::from)
                         .map_err(source_error)?;
                     if changed == 1 {
-                        tx::complete_ticket_triggers(&transaction, &ticket.id, now_ms)
-                            .map_err(StoreError::from)
+                        trigger::complete_for_ticket(&transaction, &ticket.id, now_ms)
                             .map_err(source_error)?;
                     }
                     transaction
@@ -2341,8 +1858,7 @@ impl WorkState for LocalSqlite {
                         .map_err(StoreError::from)
                         .map_err(source_error)?;
                 if changed == 1 {
-                    tx::complete_ticket_triggers(&transaction, &ticket.id, now_ms)
-                        .map_err(StoreError::from)
+                    trigger::complete_for_ticket(&transaction, &ticket.id, now_ms)
                         .map_err(source_error)?;
                 }
                 changed
@@ -2354,24 +1870,32 @@ impl WorkState for LocalSqlite {
                 if let Some(eligible_at_ms) = not_before_ms {
                     let trigger_id = match claimed_trigger_id {
                         Some(trigger_id) => trigger_id,
-                        None => Self::trigger_for_release_on(&transaction, &ticket.id)
+                        None => trigger::for_release(&transaction, &ticket.id)
                             .map_err(source_error)?
                             .ok_or_else(|| SourceError::Corrupt {
                                 message: format!("ticket `{}` has no trigger to retry", ticket.id),
                             })?,
                     };
-                    tx::requeue_trigger(&transaction, &trigger_id, now_ms)
-                        .map_err(StoreError::from)
-                        .map_err(source_error)?;
-                    transaction
-                        .execute(
-                            "UPDATE triggers
-                             SET eligible_at_ms = ?2, updated_at_ms = ?3
-                             WHERE id = ?1 AND state = 'queued'",
-                            params![trigger_id, eligible_at_ms, now_ms],
-                        )
-                        .map_err(StoreError::from)
-                        .map_err(source_error)?;
+                    // The retry's cooldown is the trigger's new eligibility, so
+                    // the requeue and the re-timing are one transition rather
+                    // than a requeue followed by a raw update that happened to
+                    // duplicate `reschedule`.
+                    let mut facts = trigger::facts(&transaction, &trigger_id)
+                        .map_err(source_error)?
+                        .ok_or_else(|| SourceError::Corrupt {
+                            message: format!("trigger `{trigger_id}` no longer exists"),
+                        })?;
+                    let effects = domain_trigger::step(
+                        &mut facts,
+                        domain_trigger::Event::Requeued { eligible_at_ms },
+                        now_ms,
+                    );
+                    for effect in effects {
+                        if let domain_trigger::Effect::Requeue { eligible_at_ms } = effect {
+                            trigger::requeue(&transaction, &trigger_id, eligible_at_ms, now_ms)
+                                .map_err(source_error)?;
+                        }
+                    }
                 }
                 changed
             }
@@ -2445,9 +1969,10 @@ mod tests {
     use crate::outcome::Outcome;
     use crate::work_state::{ClaimResult, TicketFeeder, WorkState};
 
-    use super::{
-        ClaimTransaction, LocalSqlite, NewTrigger, QueuedTrigger, ReindexTicket, TriggerKind,
-    };
+    use crate::domain::trigger::{Effect, TriggerKind};
+    use crate::work_state::trigger::{self, NewTrigger, QueuedTrigger};
+
+    use super::{ClaimTransaction, LocalSqlite, ReindexTicket};
 
     fn open_seeded(path: &std::path::Path) -> LocalSqlite {
         let store = LocalSqlite::from_db(Db::open(path, 1_000).unwrap());
@@ -2528,7 +2053,7 @@ mod tests {
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .unwrap();
             super::tx::claim_ticket(&transaction, claim, now_ms).unwrap();
-            super::tx::advance_trigger(&transaction, claim, now_ms).unwrap();
+            trigger::consume(&transaction, claim.trigger_id, &[Effect::Complete], now_ms).unwrap();
             super::tx::insert_lease(&transaction, claim, now_ms).unwrap();
             transaction.commit().unwrap();
         }
@@ -2620,9 +2145,9 @@ mod tests {
             .unwrap();
         local
             .insert_trigger(
-                &super::NewTrigger {
+                &NewTrigger {
                     id: "TR1",
-                    kind: super::TriggerKind::Immediate,
+                    kind: TriggerKind::Immediate,
                     ticket_id: Some("T1"),
                     project_id: None,
                     eligible_at_ms: None,
@@ -2696,7 +2221,6 @@ mod tests {
                 trigger_id: "TR1",
                 owner_id: "R1",
                 lease_ms: 60_000,
-                next_trigger_eligible_at_ms: None,
             },
             2_000,
         );
@@ -3154,7 +2678,6 @@ mod tests {
             trigger_id: "TR1",
             owner_id: "daemon-1",
             lease_ms: 60_000,
-            next_trigger_eligible_at_ms: None,
         }
     }
 
@@ -3291,7 +2814,7 @@ mod tests {
             .unwrap();
         let unpinned = QueuedTrigger {
             id: "TR2".into(),
-            kind: "immediate".into(),
+            kind: TriggerKind::Immediate,
             ticket_id: None,
             project_id: None,
             eligible_at_ms: None,
@@ -3348,7 +2871,7 @@ mod tests {
             .unwrap();
         let trigger = QueuedTrigger {
             id: "TR2".into(),
-            kind: "immediate".into(),
+            kind: TriggerKind::Immediate,
             ticket_id: None,
             project_id: None,
             eligible_at_ms: None,
@@ -3398,7 +2921,7 @@ mod tests {
 
         let trigger = QueuedTrigger {
             id: "TR1".into(),
-            kind: "immediate".into(),
+            kind: TriggerKind::Immediate,
             ticket_id: None,
             project_id: None,
             eligible_at_ms: None,
@@ -3421,7 +2944,7 @@ mod tests {
         store.mark_ticket_missing("T1", 2_000).unwrap();
         let trigger = QueuedTrigger {
             id: "TR1".into(),
-            kind: "immediate".into(),
+            kind: TriggerKind::Immediate,
             ticket_id: None,
             project_id: None,
             eligible_at_ms: None,
@@ -3464,7 +2987,7 @@ mod tests {
             .unwrap();
         let trigger = QueuedTrigger {
             id: "TR1".into(),
-            kind: "immediate".into(),
+            kind: TriggerKind::Immediate,
             ticket_id: None,
             project_id: None,
             eligible_at_ms: None,
@@ -3770,12 +3293,14 @@ mod tests {
                 .unwrap();
             local.insert_trigger_filter("TR2", "T2").unwrap();
             insert_queued_trigger(&local, "TR3", TriggerKind::Auto, Some("T2"), None);
+            // TR3 is the only trigger pinned to T2, so retiring T2's demand
+            // settles exactly it.
+            trigger::complete_for_ticket(&local.db.lock(), "T2", 1_150).unwrap();
             local
                 .db
                 .lock()
                 .execute_batch(
-                    "UPDATE triggers SET state = 'completed' WHERE id = 'TR3';
-                     INSERT INTO runs
+                    "INSERT INTO runs
                          (id, trigger_id, ticket_id, state, attempt, flow_json, ticket_json,
                           created_at_ms, updated_at_ms)
                      VALUES ('R1', 'TR1', 'T1', 'claimed', 1, '{}', '{}', 1200, 1200);
@@ -3805,7 +3330,7 @@ mod tests {
             ["TR1", "TR2"]
         );
         let recurring = &queued[1];
-        assert_eq!(recurring.kind, "every");
+        assert_eq!(recurring.kind, TriggerKind::Every);
         assert_eq!(recurring.project_id.as_deref(), Some("default"));
         assert_eq!(recurring.eligible_at_ms, Some(5_000));
         assert_eq!(recurring.interval_ms, Some(60_000));
@@ -3870,6 +3395,23 @@ mod tests {
         // The counter row came across under its new key, and the high-water
         // mark still reads an ordinal out of the two-letter prefix: reading
         // `TR3` as anything but 3 would hand out a colliding id.
-        assert_eq!(local.next_trigger_ordinal().unwrap(), 4);
+        assert_eq!(
+            local
+                .enqueue_trigger(
+                    &trigger::EnqueueRequest {
+                        kind: TriggerKind::Immediate,
+                        ticket_id: None,
+                        project_id: None,
+                        eligible_at_ms: None,
+                        interval_ms: None,
+                        filters: &[],
+                        duplicates: trigger::Duplicates::Allow,
+                    },
+                    2_000,
+                )
+                .unwrap()
+                .id,
+            "TR4"
+        );
     }
 }

@@ -22,7 +22,8 @@ use crate::run_store::{
 };
 use crate::runner::local::{run_output_path, wait_for_test_hook};
 use crate::work_state::ClaimResult;
-use crate::work_state::local::{LocalSqlite, QueuedTrigger};
+use crate::work_state::local::LocalSqlite;
+use crate::work_state::trigger::QueuedTrigger;
 
 use super::dispatcher::{
     DispatcherState, RunEvent, close_worker_socket, disposition_for_outcome, mark_storage_full,

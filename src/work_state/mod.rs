@@ -18,6 +18,7 @@ use crate::frontmatter::Frontmatter;
 pub(crate) mod exec;
 pub mod local;
 pub(crate) mod markdown;
+pub mod trigger;
 
 use exec::ExecTicketSource;
 use markdown::MarkdownTicketSource;

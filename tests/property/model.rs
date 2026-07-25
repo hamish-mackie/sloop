@@ -20,9 +20,10 @@ use proptest::prelude::*;
 use rusqlite::Connection;
 use sloop::db::StoreError;
 use sloop::domain::ticket::TicketState;
+use sloop::domain::trigger::TriggerKind;
 use sloop::outcome::Outcome;
 use sloop::run_store::{Exit, RunAdmission, RunExit, RunStart, Start};
-use sloop::work_state::local::{NewTrigger, TriggerKind};
+use sloop::work_state::trigger::NewTrigger;
 use tempfile::TempDir;
 
 use crate::TestStore;

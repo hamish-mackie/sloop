@@ -2,4 +2,5 @@
 
 pub mod graph;
 pub mod ticket;
+pub mod trigger;
 pub mod work;

@@ -14,13 +14,14 @@ use serde_json::{Value, json};
 use crate::config::{AgentConfig, expand_agent_cmd};
 use crate::db::StoreError;
 use crate::domain::ticket::TicketState;
+use crate::domain::trigger::TriggerKind;
 use crate::domain::work::{ExecutionHints, SourceVersion, TicketRef, WorkTicket, WorkTicketState};
 use crate::flow::Flow;
 use crate::frontmatter::{self, FrontmatterError};
-use crate::ids::{IdError, TRIGGER_ID_PREFIX, next_id};
+use crate::ids::{IdError, next_id};
 use crate::protocol::{PostArgs, PostTrigger};
-use crate::run_store;
-use crate::work_state::local::{self, LocalSqlite, LocalTicketWrite, NewTrigger, TriggerKind};
+use crate::work_state::local::{self, LocalSqlite, LocalTicketWrite};
+use crate::work_state::trigger::{self, Duplicates, EnqueueRequest};
 use crate::work_state::{SourceError, WorkStateAuthor};
 
 #[derive(Clone, Copy)]
@@ -562,13 +563,14 @@ pub(crate) fn parse_ticket_frontmatter(
     }
 }
 
-/// Reuses an existing queued trigger of the same kind so reposting cannot
-/// enqueue duplicate work. Ticket registration, counter reservation, and this
-/// queue operation share one transaction.
+/// Queues the demand a post asked for, inside the transaction that registers
+/// the ticket. `Duplicates::Reuse` is what makes reposting idempotent: an
+/// existing queued trigger of the same kind absorbs the request instead of
+/// piling a second one behind it.
 ///
-/// `request` is `None` for a settled ticket, which is what keeps the reschedule
-/// branch below from re-timing a stale `--at` trigger onto one: the caller
-/// decides eligibility, this function only carries it out.
+/// `request` is `None` for a settled ticket, which is what keeps the reuse
+/// branch from re-timing a stale `--at` trigger onto one: the caller decides
+/// eligibility, this function only carries it out.
 fn queue_trigger_transaction(
     transaction: &Transaction<'_>,
     ticket_id: &str,
@@ -578,36 +580,20 @@ fn queue_trigger_transaction(
     let Some(request) = request else {
         return Ok(Value::Null);
     };
-    let id = match local::tx::queued_ticket_trigger(transaction, ticket_id, request.kind)? {
-        Some(id) => {
-            if let Some(eligible_at_ms) = request.eligible_at_ms {
-                local::tx::reschedule_trigger(transaction, &id, eligible_at_ms, now_ms)?;
-            }
-            id
-        }
-        None => {
-            let ordinal = run_store::tx::reserve_ordinal(
-                transaction,
-                "trigger",
-                "triggers",
-                TRIGGER_ID_PREFIX,
-            )?;
-            let id = format!("{TRIGGER_ID_PREFIX}{ordinal}");
-            local::tx::insert_trigger(
-                transaction,
-                &NewTrigger {
-                    id: &id,
-                    kind: request.kind,
-                    ticket_id: Some(ticket_id),
-                    project_id: None,
-                    eligible_at_ms: request.eligible_at_ms,
-                    interval_ms: None,
-                },
-                now_ms,
-            )?;
-            id
-        }
-    };
+    let id = trigger::enqueue(
+        transaction,
+        &EnqueueRequest {
+            kind: request.kind,
+            ticket_id: Some(ticket_id),
+            project_id: None,
+            eligible_at_ms: request.eligible_at_ms,
+            interval_ms: None,
+            filters: &[],
+            duplicates: Duplicates::Reuse,
+        },
+        now_ms,
+    )?
+    .id;
     let mut trigger = json!({
         "id": id,
         "kind": request.kind.as_str(),
