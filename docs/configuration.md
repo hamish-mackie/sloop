@@ -246,7 +246,8 @@ repository has no flow file at all.
 Every stage is an `action` that does the work, a `result_check` that judges it,
 and a `fail_action` that says what a failure does to the walk. The walk runs
 stages in order, records one evidence row per execution, and halts on the first
-failure unless a `fail_action` says otherwise. The first two parts are below;
+failure unless a `fail_action` says otherwise. A flow must define at least one
+stage; an empty list is a parse error. The first two parts are below;
 `fail_action` has [a section of its own](#fail_action-what-a-failure-does-to-the-walk)
 and defaults to `fail`.
 

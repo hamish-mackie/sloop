@@ -64,6 +64,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to start the ticket again with `sloop run` once its flow file is in the
   current grammar.
 
+### Fixed
+
+- A flow file that defines no stages is refused at parse time. Letting an agent
+  action sit in any position retired the "the first stage must be an agent
+  stage" rule, and with it the only thing that had ruled out an empty `stages:`
+  list; such a file loaded, and a ticket posted to it walked straight to
+  `complete` having run nothing. It is now a config-load error like any other
+  invalid flow.
+
 ## [0.4.0-rc.1] - 2026-07-25
 
 ### Added

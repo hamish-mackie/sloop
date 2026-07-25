@@ -1,7 +1,7 @@
 //! `flow::parse` must survive any committed flow file, however damaged.
 
 use proptest::prelude::*;
-use sloop::flow::{Actor, Builtin};
+use sloop::flow::{Actor, Builtin, FailAction};
 
 use crate::support::splice;
 
@@ -19,18 +19,27 @@ proptest! {
         (1..200usize).prop_map(|depth| "a:\n".repeat(depth)),
     ]) {
         if let Ok(flow) = sloop::flow::parse("fuzz", &contents) {
-            // Whatever parses must have survived validation: stage names are
-            // unique, the walk starts at the only agent stage, and a merge
-            // stage can only be last.
-            let names: std::collections::HashSet<_> =
-                flow.stages.iter().map(|stage| &stage.name).collect();
-            prop_assert_eq!(names.len(), flow.stages.len());
-            prop_assert_eq!(flow.stages.first().map(|s| &s.action), Some(&Actor::Agent));
-            for stage in &flow.stages[..flow.stages.len() - 1] {
+            // Whatever parses must have survived validation: there is at least
+            // one stage, stage names are unique, a merge stage can only be
+            // last, and every backward edge names a stage before its own.
+            // Nothing constrains where an agent action sits — one driver walks
+            // every stage alike, so any position and any count is legal.
+            prop_assert!(!flow.stages.is_empty());
+            let names: Vec<_> = flow.stages.iter().map(|stage| &stage.name).collect();
+            let unique: std::collections::HashSet<_> = names.iter().collect();
+            prop_assert_eq!(unique.len(), flow.stages.len());
+            for (index, stage) in flow.stages.iter().enumerate() {
                 prop_assert!(
-                    stage.action != Actor::Builtin(Builtin::Merge),
+                    stage.action != Actor::Builtin(Builtin::Merge)
+                        || index == flow.stages.len() - 1,
                     "merge stage must be last"
                 );
+                if let FailAction::ReturnTo { stage: target, .. } = &stage.fail_action {
+                    prop_assert!(
+                        names[..index].contains(&target),
+                        "return_to must name an earlier stage"
+                    );
+                }
             }
         }
     }

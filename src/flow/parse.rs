@@ -324,6 +324,14 @@ fn validate_stage(stage: &str, action: &Actor, result_check: &Check) -> Result<(
 /// one driver walks every stage the same way, so an agent action is legal in
 /// any position and any number of times, each with its own supervised process.
 fn validate_order(stages: &[Stage]) -> Result<(), String> {
+    // A stageless flow walks straight to complete, so a ticket posted to one
+    // would finish having done nothing. The rule that used to rule this out
+    // was "the first stage must be an agent stage", which went with the
+    // single-agent-stage restriction; the emptiness half of it still holds.
+    if stages.is_empty() {
+        return Err("flow must define at least one stage".into());
+    }
+
     let merge = Actor::Builtin(Builtin::Merge);
     let sync = Actor::Builtin(Builtin::Sync);
     let merge_count = stages.iter().filter(|stage| stage.action == merge).count();
@@ -783,6 +791,16 @@ mod tests {
         ] {
             let error = error(yaml);
             assert!(error.contains(needle), "{error}");
+        }
+    }
+
+    /// Both spellings of "no stages at all" are refused at parse time rather
+    /// than posted to and walked straight to complete.
+    #[test]
+    fn a_stageless_flow_is_rejected() {
+        for yaml in ["[]\n", "stages: []\n"] {
+            let error = error(yaml);
+            assert!(error.contains("must define at least one stage"), "{error}");
         }
     }
 
