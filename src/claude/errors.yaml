@@ -1,14 +1,29 @@
 version: 1
 vendor: claude
+# `claude --output-format stream-json` emits one JSON record per line, and the
+# stream carries both directions: the vendor's own messages *and* every file
+# the agent read back through a tool. Without framing the classifier cannot
+# tell them apart, so an agent reading a fixture that quotes a rejection reads
+# as the vendor issuing one.
+framing: ndjson
 rules:
   - id: claude.rate-limit.usage-limit
     class: rate_limited
     diagnostic: Claude usage limit reached
     match:
-      # No stream constraint: `claude --output-format stream-json` reports
-      # vendor rejections as synthetic assistant messages on stdout, so a
-      # stderr-only rule is unreachable for this target.
+      # No stream constraint: the vendor's refusal arrives on stdout as a
+      # synthetic assistant message, so a stderr-only rule is unreachable here.
       #
+      # Only the vendor authors these two records. `is_api_error_message` marks
+      # the synthetic message; the result record's `is_error` is the vendor's
+      # own top-level verdict on the run. Predicates read top-level fields, so
+      # a rejection quoted inside a tool result — an escaped string in some
+      # other record's field — never satisfies either. Lines that are not JSON
+      # stay eligible, which keeps the buffered `--print` form classifying.
+      record_any_of:
+        - is_api_error_message: true
+        - type: result
+          is_error: true
       # Signatures are conjunctive, so the one signature has to be the wording
       # every limit shares. Claude qualifies the noun per limit window
       # ("your limit", "your session limit", "your weekly limit"); the phrase

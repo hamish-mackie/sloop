@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 const SCHEMA_VERSION: u32 = 1;
 
@@ -112,11 +113,31 @@ impl VendorErrorClassifier {
                         raw.id
                     )));
                 }
+                if !raw.conditions.record_any_of.is_empty() && catalog.framing.is_none() {
+                    return Err(CatalogError(format!(
+                        "vendor error rule `{}` selects records, but the {expected_vendor} \
+                         catalog declares no framing",
+                        raw.id
+                    )));
+                }
+                if raw
+                    .conditions
+                    .record_any_of
+                    .iter()
+                    .any(|predicate| predicate.is_empty())
+                {
+                    return Err(CatalogError(format!(
+                        "vendor error rule `{}` has an empty record predicate, which would \
+                         select every record",
+                        raw.id
+                    )));
+                }
                 rules.push(Rule {
                     vendor: catalog.vendor.clone(),
                     id: raw.id,
                     class: raw.class,
                     diagnostic: raw.diagnostic,
+                    framing: catalog.framing,
                     conditions: raw.conditions,
                 });
             }
@@ -137,6 +158,7 @@ impl VendorErrorClassifier {
     }
 
     pub fn scanner(&self, exit_status: Option<i32>) -> VendorErrorScanner<'_> {
+        let framed = self.rules.iter().any(|rule| rule.framing.is_some());
         VendorErrorScanner {
             classifier: self,
             exit_status,
@@ -148,6 +170,7 @@ impl VendorErrorClassifier {
                     stderr: ConditionState::new(&rule.conditions),
                 })
                 .collect(),
+            pending: framed.then(PendingLines::default),
         }
     }
 }
@@ -156,6 +179,23 @@ pub struct VendorErrorScanner<'a> {
     classifier: &'a VendorErrorClassifier,
     exit_status: Option<i32>,
     states: Vec<RuleStates>,
+    /// Partial trailing line per stream, kept only when some rule is framed.
+    pending: Option<PendingLines>,
+}
+
+#[derive(Default)]
+struct PendingLines {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl PendingLines {
+    fn get_mut(&mut self, stream: Stream) -> &mut Vec<u8> {
+        match stream {
+            Stream::Stdout => &mut self.stdout,
+            Stream::Stderr => &mut self.stderr,
+        }
+    }
 }
 
 impl VendorErrorScanner<'_> {
@@ -168,14 +208,75 @@ impl VendorErrorScanner<'_> {
     }
 
     fn feed(&mut self, stream: Stream, bytes: &[u8]) {
+        self.feed_rules(stream, bytes, |rule| rule.framing.is_none(), None);
+        if self.pending.is_none() {
+            return;
+        }
+        let mut lines = Vec::new();
+        let buffer = self
+            .pending
+            .as_mut()
+            .expect("checked above")
+            .get_mut(stream);
+        buffer.extend_from_slice(bytes);
+        while let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
+            let mut line: Vec<u8> = buffer.drain(..=index).collect();
+            line.pop();
+            lines.push(line);
+        }
+        for line in lines {
+            self.feed_framed_line(stream, &line);
+        }
+    }
+
+    /// Feed one framed record to the rules allowed to read it.
+    fn feed_framed_line(&mut self, stream: Stream, line: &[u8]) {
+        let record = serde_json::from_slice::<JsonMap<String, JsonValue>>(line).ok();
+        self.feed_rules(
+            stream,
+            line,
+            |rule| rule.framing.is_some(),
+            Some(record.as_ref()),
+        );
+    }
+
+    fn feed_rules(
+        &mut self,
+        stream: Stream,
+        bytes: &[u8],
+        selects: impl Fn(&Rule) -> bool,
+        record: Option<Option<&JsonMap<String, JsonValue>>>,
+    ) {
         for (rule, states) in self.classifier.rules.iter().zip(&mut self.states) {
-            if rule.conditions.stream.is_none() || rule.conditions.stream == Some(stream) {
-                states.get_mut(stream).feed(&rule.conditions, bytes, false);
+            if !selects(rule) {
+                continue;
             }
+            if rule.conditions.stream.is_some() && rule.conditions.stream != Some(stream) {
+                continue;
+            }
+            if let Some(record) = record
+                && !rule.record_eligible(record)
+            {
+                continue;
+            }
+            states.get_mut(stream).feed(&rule.conditions, bytes, false);
         }
     }
 
     pub fn finish(mut self) -> Option<VendorErrorMatch> {
+        if self.pending.is_some() {
+            for stream in [Stream::Stdout, Stream::Stderr] {
+                let rest = std::mem::take(
+                    self.pending
+                        .as_mut()
+                        .expect("checked above")
+                        .get_mut(stream),
+                );
+                if !rest.is_empty() {
+                    self.feed_framed_line(stream, &rest);
+                }
+            }
+        }
         for (rule, states) in self.classifier.rules.iter().zip(&mut self.states) {
             if !rule.matches_exit(self.exit_status) {
                 continue;
@@ -216,7 +317,23 @@ impl std::error::Error for CatalogError {}
 struct Catalog {
     version: u32,
     vendor: String,
+    #[serde(default)]
+    framing: Option<Framing>,
     rules: Vec<RawRule>,
+}
+
+/// How a target frames its output.
+///
+/// Without this the classifier sees one undifferentiated byte stream, so an
+/// agent that merely *reads* a file containing a vendor's rejection wording
+/// looks identical to the vendor rejecting the request. Declaring the framing
+/// lets a rule say which records the vendor itself authored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Framing {
+    /// One JSON object per line. Lines that do not parse are plain text and
+    /// stay eligible, so buffered output classifies exactly as before.
+    Ndjson,
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,6 +352,7 @@ struct Rule {
     id: String,
     class: VendorErrorClass,
     diagnostic: String,
+    framing: Option<Framing>,
     conditions: MatchConditions,
 }
 
@@ -243,6 +361,26 @@ impl Rule {
         self.conditions
             .exit_status
             .is_none_or(|expected| exit_status == Some(expected))
+    }
+
+    /// Whether one framed record's bytes may be classified by this rule.
+    ///
+    /// `record` is `None` for a line that is not a JSON object, which is plain
+    /// text rather than a stream record and stays eligible. Predicates compare
+    /// against *top-level* fields only: that is what separates the vendor
+    /// speaking from an agent quoting it, because a quoted rejection arrives
+    /// as an escaped string inside some other record's field, never as fields
+    /// of the enclosing record.
+    fn record_eligible(&self, record: Option<&JsonMap<String, JsonValue>>) -> bool {
+        let Some(record) = record else {
+            return true;
+        };
+        self.conditions.record_any_of.is_empty()
+            || self.conditions.record_any_of.iter().any(|predicate| {
+                predicate
+                    .iter()
+                    .all(|(field, expected)| record.get(field) == Some(expected))
+            })
     }
 }
 
@@ -257,6 +395,11 @@ struct MatchConditions {
     status_code: Option<u16>,
     #[serde(default)]
     error_code: Option<String>,
+    /// Top-level field predicates selecting the records this rule may read.
+    /// Empty means every record; otherwise any one predicate matching is
+    /// enough, and all of that predicate's fields must be equal.
+    #[serde(default)]
+    record_any_of: Vec<JsonMap<String, JsonValue>>,
     message_signatures: Vec<String>,
 }
 
@@ -488,6 +631,112 @@ rules:
                 .classify(Some(1), b"error: could not compile `sloop`", b"")
                 .is_none()
         );
+    }
+
+    /// The vendor's own verdict record, which accompanies the synthetic
+    /// message above and carries the same wording as its whole result.
+    const CLAUDE_LIMIT_RESULT: &str = r#"{"type":"result","subtype":"success","is_error":true,"num_turns":49,"result":"You've hit your session limit · resets 12:50pm (Australia/Sydney)"}"#;
+
+    /// Records a *successful* run produces when its agent works on this file.
+    /// Each quotes the limit wording; none of them is the vendor speaking.
+    /// Shapes and nesting are taken from runs that were wrongly discarded.
+    const AGENT_QUOTING_THE_LIMIT: &[&str] = &[
+        // Reading a file whose fixtures contain a verbatim rejection. The
+        // escaped payload carries `is_api_error_message` and an `error` field,
+        // but as string content, not as fields of this record.
+        r##"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"const CLAUDE_SESSION_LIMIT_STDOUT: &str = r#\"{\"type\":\"assistant\",\"message\":{\"content\":[{\"text\":\"You've hit your session limit\"}]},\"error\":\"rate_limit\",\"is_api_error_message\":true}\"#;"}]}}"##,
+        // Searching for the wording.
+        r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5","content":[{"type":"tool_use","id":"toolu_02","name":"Bash","input":{"command":"rg -n \"You've hit your\" src/","description":"Find the limit signature"}}]}}"#,
+        // Explaining the wording in prose.
+        r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"The catalog matches on \"You've hit your\", which the repository also contains."}]}}"#,
+        // Reporting on the work, in a run that succeeded.
+        r#"{"type":"result","subtype":"success","is_error":false,"num_turns":113,"result":"Done. The rule keys on \"You've hit your\" and now also checks record structure."}"#,
+    ];
+
+    /// The bug this guards: an agent that reads a rejection is not a rejection.
+    ///
+    /// Both runs that provoked this classified as rate limited, were discarded
+    /// despite exiting cleanly with work committed, and put the whole target
+    /// into cooldown. Every match they produced was tool traffic.
+    #[test]
+    fn an_agent_reading_or_quoting_a_limit_is_not_a_limit() {
+        let classifier = VendorErrorClassifier::built_in().unwrap();
+        for record in AGENT_QUOTING_THE_LIMIT {
+            let stdout = format!("{record}\n");
+            assert!(
+                classifier
+                    .classify(Some(0), stdout.as_bytes(), b"")
+                    .is_none(),
+                "agent-authored record classified as a vendor rejection: {record}"
+            );
+        }
+
+        // A whole run's worth of them, interleaved and split across chunk
+        // boundaries that fall inside records, still classifies as clean.
+        let transcript = format!("{}\n", AGENT_QUOTING_THE_LIMIT.join("\n"));
+        let mut scanner = classifier.scanner(Some(0));
+        for chunk in transcript.as_bytes().chunks(17) {
+            scanner.feed_stdout(chunk);
+        }
+        assert!(scanner.finish().is_none());
+    }
+
+    /// The vendor's records still classify, including when the run exits 0 and
+    /// when the transcript around them is full of agent quotations.
+    #[test]
+    fn a_vendor_authored_limit_still_classifies_among_agent_traffic() {
+        let classifier = VendorErrorClassifier::built_in().unwrap();
+        for genuine in [CLAUDE_SESSION_LIMIT_STDOUT, CLAUDE_LIMIT_RESULT] {
+            let matched = classifier
+                .classify(Some(0), format!("{genuine}\n").as_bytes(), b"")
+                .expect("a vendor-authored limit classifies");
+            assert_eq!(matched.rule_id, "claude.rate-limit.usage-limit");
+
+            let mut transcript = AGENT_QUOTING_THE_LIMIT.join("\n");
+            transcript.push('\n');
+            transcript.push_str(genuine);
+            assert!(
+                classifier
+                    .classify(Some(0), transcript.as_bytes(), b"")
+                    .is_some(),
+                "a real limit was masked by surrounding agent traffic"
+            );
+        }
+    }
+
+    /// Targets that do not stream JSON emit the rejection as a bare line, and
+    /// unframed catalogs keep scanning the whole stream.
+    #[test]
+    fn unframed_output_and_catalogs_are_unaffected_by_framing() {
+        let classifier = VendorErrorClassifier::built_in().unwrap();
+        let plain = b"You've hit your session limit \xc2\xb7 resets 12am (UTC)".as_slice();
+        assert!(classifier.classify(Some(1), plain, b"").is_some());
+        assert!(classifier.classify(Some(1), b"", plain).is_some());
+
+        // An unframed catalog's conditions may still be spread across lines.
+        let opencode = b"UnknownError:\nUnexpected server error. Check server logs for details.";
+        assert!(classifier.classify(Some(1), b"", opencode).is_some());
+    }
+
+    #[test]
+    fn schema_validation_rejects_record_predicates_without_framing() {
+        let selecting = VALID.replace(
+            "      message_signatures:",
+            "      record_any_of:\n        - is_api_error_message: true\n      message_signatures:",
+        );
+        let error = VendorErrorClassifier::from_yaml(&[("test", &selecting)])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("declares no framing"), "{error}");
+
+        let framed = format!("framing: ndjson\n{selecting}");
+        assert!(VendorErrorClassifier::from_yaml(&[("test", &framed)]).is_ok());
+
+        let empty = framed.replace("- is_api_error_message: true", "- {}");
+        let error = VendorErrorClassifier::from_yaml(&[("test", &empty)])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("empty record predicate"), "{error}");
     }
 
     #[test]
