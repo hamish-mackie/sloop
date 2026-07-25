@@ -1,0 +1,51 @@
+# The merge train. Bind a ticket to it with `flow: train` or
+# `sloop post --flow train`; the `default` flow is untouched and still what
+# a ticket gets when it names none.
+#
+# The problem it solves: what lands on the default branch is not the run
+# branch, it is the *merge* of the two — a tree no stage ever tested. While
+# a run is in flight the default branch keeps moving, so by the time the
+# merge stage runs, the thing every earlier stage judged may no longer be
+# the thing about to be integrated.
+#
+# The train closes that gap with ordinary stages. `sync` integrates the
+# default branch into the run branch, `verify` tests the tree that produces,
+# and the merge is `ff_only` — a fast-forward, which can only succeed while
+# the default branch is still the one `sync` integrated. If it moved in
+# between, the fast-forward is impossible, the stage fails without touching
+# anything, and `return_to: sync` runs the train around again.
+stages:
+  - name: build
+    # An agent action takes its prompt from the ticket, never from here.
+    action: agent
+    result_check: { builtin: commits }
+    fail_action: fail
+
+  # Merges the default branch into the run branch, inside the run worktree.
+  # Passes when that commits cleanly or there was nothing to integrate;
+  # fails on a conflict, leaving no in-progress merge behind, so the stage
+  # this returns to starts from a clean tree. The conflict itself lands in
+  # the run log, and so in the re-entered agent's prompt.
+  - name: sync
+    action: { builtin: sync }
+    result_check: none
+    fail_action: { return_to: build, attempts: 1 }
+
+  # Everything that decides whether the work is good runs *after* the sync,
+  # because the merged tree is the one that will land. Replace this command
+  # with your own; `sloop init` fills in `flow.test_cmd` from config.yaml
+  # when you have one configured.
+  - name: verify
+    action: { exec: {test_cmd} }
+    result_check: none
+    fail_action: { return_to: build, attempts: 1 }
+
+  # `ff_only` refuses the merge commit that would otherwise paper over a
+  # default branch that moved. `result_check: none` is not a shortcut: the
+  # merge is the one irreversible act in the flow, and nothing that runs
+  # after it could un-take it, so its own outcome is the only verdict it
+  # can honestly carry.
+  - name: merge
+    action: { builtin: merge, ff_only: true }
+    result_check: none
+    fail_action: { return_to: sync, attempts: 3 }

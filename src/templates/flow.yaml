@@ -13,6 +13,8 @@
 #                                 ticket body
 #       { exec: [argv, ...] }     an argv (no shell) in the run worktree
 #       { builtin: merge }        Sloop's merge policy
+#       { builtin: sync }         merges the default branch into the run
+#                                 branch, inside the run worktree
 #   - `result_check`: what decides the stage's verdict.
 #       none                      the action's own exit status: 0 passes
 #       reported                  the action must call `sloop verdict`
@@ -34,6 +36,10 @@
 #   - At most one `{ builtin: merge }` action, and it must be last. It must
 #     use `result_check: none` — the merge result is the verdict — and the
 #     merge builtin may never be a check.
+#   - Any number of `{ builtin: sync }` actions, anywhere before the merge.
+#     Same rules otherwise: `result_check: none`, never a check.
+#   - `ff_only` is only meaningful on the merge stage, and writing it on any
+#     other action is an error rather than an ignored key.
 #   - Stage names must be unique.
 #   - `return_to` must name an earlier stage, `attempts` must be 1..=3, and
 #     the worst case a flow's budgets imply may not exceed 32 executions.
@@ -130,12 +136,37 @@ stages:
     #   does — would approve every run.
     result_check: reported
 
+  # ---- the sync builtin ------------------------------------------------
+  # Merges the default branch into the run branch, inside the run worktree;
+  # the shared default-branch checkout is only ever read. Passes when the
+  # merge commits or there was nothing to integrate, and fails on a
+  # conflict — leaving no in-progress merge behind, so the `return_to`
+  # target starts from a clean tree. Any number, anywhere before the merge.
+  #
+  # Placed here it is only half the pattern: stages *after* a sync judge
+  # the tree that will actually land, so a sync belongs before them rather
+  # than after. See the `train` flow `sloop init` writes beside this one
+  # for the whole shape, including the `ff_only` merge that makes the
+  # verified tree provably the one that lands.
+  - name: sync
+    action: { builtin: sync }
+    result_check: none
+    fail_action: { return_to: build, attempts: 1 }
+
   # ---- the merge builtin -----------------------------------------------
   # Applies the run branch to the default branch using Sloop's merge
   # policy. Optional, at most one, and must be last. A flow without one
   # leaves the branch for a human to integrate.
   - name: merge
     action: { builtin: merge }
+    # ff_only: true
+    #   Refuses the merge commit: the default branch either fast-forwards
+    #   to the run branch or the stage fails, having touched nothing. Pair
+    #   it with an earlier `sync` — the fast-forward can only succeed while
+    #   the default branch is still the one that sync integrated, which is
+    #   what makes the verified tree provably the tree that lands. Absent,
+    #   the merge policy is exactly as it was.
+    #
     # Only `none` is allowed here. A conflicted merge parks the ticket in
     # `needs_review` with the branch preserved, unless an `on_fail` repair
     # resolves it first: for a merge stage the repair agent's job is to

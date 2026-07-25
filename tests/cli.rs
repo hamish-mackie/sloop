@@ -47,6 +47,39 @@ fn init_scaffolds_the_default_flow_and_review_prompt() {
     );
 }
 
+/// The train ships beside the default flow, not instead of it, and a fresh
+/// repository gets a file the loader accepts — a scaffolded flow that does not
+/// parse would take the whole repository's configuration down with it.
+#[test]
+fn init_materializes_the_train_flow_beside_the_default_one() {
+    let world = World::new();
+
+    let output = world.sloop(&["init"]);
+    assert!(
+        output.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let train = fs::read_to_string(world.root().join(".agents/sloop/flows/train.yaml")).unwrap();
+    assert!(train.contains("builtin: sync"), "{train}");
+    assert!(train.contains("ff_only: true"), "{train}");
+    assert!(train.contains("return_to: sync"), "{train}");
+    assert!(
+        world
+            .root()
+            .join(".agents/sloop/flows/default.yaml")
+            .is_file()
+    );
+
+    // The daemon validates every flow in the repository at startup, so it
+    // coming up is the loader accepting what `init` just wrote.
+    world.commit_all("scaffold");
+    world.start_daemon();
+    let flows = World::json_stdout(&world.sloop(&["status"]))["data"].clone();
+    assert!(flows.is_object(), "{flows}");
+}
+
 #[test]
 fn invalid_flow_prevents_daemon_startup_with_a_named_error() {
     let world = World::configured();

@@ -116,7 +116,7 @@ mod tests {
             .iter()
             .map(|stage| stage.name.as_str())
             .collect();
-        assert_eq!(names, ["build", "test", "lint", "review", "merge"]);
+        assert_eq!(names, ["build", "test", "lint", "review", "sync", "merge"]);
 
         // One example of every action and every result check, which is the
         // whole point of this template.
@@ -126,6 +126,11 @@ mod tests {
             flow.stages
                 .iter()
                 .any(|stage| stage.action == Actor::Builtin(Builtin::Merge))
+        );
+        assert!(
+            flow.stages
+                .iter()
+                .any(|stage| stage.action == Actor::Builtin(Builtin::Sync))
         );
         assert!(
             flow.stages
@@ -222,6 +227,6 @@ mod tests {
 
         // Loading also validates every `on_fail.target` against the config's
         // agent targets, which a flow template naming a target must satisfy.
-        assert_eq!(config.flows["default"].stages.len(), 5);
+        assert_eq!(config.flows["default"].stages.len(), 6);
     }
 }

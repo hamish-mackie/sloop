@@ -180,6 +180,7 @@ fn expected_stage(name: &str, stage: &WrittenStage) -> Stage {
         action,
         result_check,
         fail_action: FailAction::Halt,
+        ff_only: false,
         on_fail: stage.on_fail.clone(),
     }
 }

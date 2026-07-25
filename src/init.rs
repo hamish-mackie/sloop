@@ -6,7 +6,17 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_CONFIG: &str = include_str!("defaults/config.yaml");
 pub const DEFAULT_PROJECT: &str = include_str!("defaults/projects/default.md");
 pub const DEFAULT_FLOW: &str = include_str!("defaults/flows/default.yaml");
+/// The merge-train flow, materialized beside `default` rather than in place of
+/// it. Its `verify` stage is a `{test_cmd}` placeholder that
+/// [`render_train_flow`] fills in, so the shipped copy is not a flow file until
+/// it has been rendered.
+pub const TRAIN_FLOW_TEMPLATE: &str = include_str!("defaults/flows/train.yaml");
 pub const DEFAULT_REVIEW_PROMPT: &str = include_str!("defaults/prompts/review.md");
+
+/// The verify command the train flow falls back to when the repository has
+/// configured none. Named here rather than buried in the template so the
+/// fallback is one thing to find and change.
+const FALLBACK_TEST_CMD: [&str; 2] = ["cargo", "test"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitOutcome {
@@ -47,6 +57,15 @@ pub fn init(root: &Path) -> Result<InitOutcome, InitError> {
         DEFAULT_FLOW,
         &mut outcome,
     )?;
+    // Read back rather than assumed: `init` is idempotent and is routinely run
+    // in a repository that already has a config, so the train's verify stage
+    // can name the test command that repository actually uses.
+    ensure_file(
+        root,
+        ".agents/sloop/flows/train.yaml",
+        &render_train_flow(configured_test_cmd(root).as_deref()),
+        &mut outcome,
+    )?;
     ensure_directory(root, ".agents/sloop/prompts", &mut outcome, true)?;
     ensure_file(
         root,
@@ -56,6 +75,42 @@ pub fn init(root: &Path) -> Result<InitOutcome, InitError> {
     )?;
 
     Ok(outcome)
+}
+
+/// Fills the train template's `verify` command in. A JSON array is a YAML flow
+/// sequence, so serializing the argv is also how it is quoted.
+pub fn render_train_flow(test_cmd: Option<&[String]>) -> String {
+    let fallback: Vec<String> = FALLBACK_TEST_CMD
+        .iter()
+        .map(|part| (*part).into())
+        .collect();
+    let cmd = test_cmd.filter(|cmd| !cmd.is_empty()).unwrap_or(&fallback);
+    let rendered = serde_json::to_string(cmd).expect("an argv of strings serializes");
+    TRAIN_FLOW_TEMPLATE.replace("{test_cmd}", &rendered)
+}
+
+/// The repository's `flow.test_cmd`, read straight from the config file rather
+/// than through `Config::load`. Loading validates the whole repository —
+/// flows, agent targets, projects — and `init` runs precisely when those are
+/// not all in place yet, so a config it cannot fully validate must still be
+/// allowed to answer this one question.
+fn configured_test_cmd(root: &Path) -> Option<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct ConfigFile {
+        flow: Option<FlowSection>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct FlowSection {
+        test_cmd: Option<Vec<String>>,
+    }
+
+    let contents = fs::read_to_string(root.join(".agents/sloop/config.yaml")).ok()?;
+    serde_yaml::from_str::<ConfigFile>(&contents)
+        .ok()?
+        .flow?
+        .test_cmd
+        .filter(|cmd| !cmd.is_empty())
 }
 
 fn ensure_directory(
@@ -133,7 +188,89 @@ impl std::error::Error for InitError {}
 mod tests {
     use tempfile::tempdir;
 
-    use super::{DEFAULT_CONFIG, DEFAULT_FLOW, DEFAULT_REVIEW_PROMPT, InitError, init};
+    use super::{
+        DEFAULT_CONFIG, DEFAULT_FLOW, DEFAULT_REVIEW_PROMPT, InitError, init, render_train_flow,
+    };
+
+    /// The shipped train is the pattern the docs describe, so what it parses
+    /// into is the claim: verification after the sync, a fast-forward-only
+    /// merge, and a backward edge from that merge to the sync it depends on.
+    #[test]
+    fn the_embedded_train_flow_parses_into_the_merge_train() {
+        let rendered = render_train_flow(None);
+        let flow = crate::flow::parse("train", &rendered).expect("train flow must parse");
+
+        let names: Vec<&str> = flow
+            .stages
+            .iter()
+            .map(|stage| stage.name.as_str())
+            .collect();
+        assert_eq!(names, ["build", "sync", "verify", "merge"]);
+
+        assert_eq!(
+            flow.stages[1].action,
+            crate::flow::Actor::Builtin(crate::flow::Builtin::Sync)
+        );
+        // Verification is after the sync, not before it: the point of the
+        // flow is that the tested tree is the tree that lands.
+        assert_eq!(
+            flow.stages[2].action,
+            crate::flow::Actor::Exec {
+                cmd: vec!["cargo".into(), "test".into()],
+            }
+        );
+        assert!(flow.stages[3].ff_only, "the merge stage must be ff_only");
+        assert_eq!(
+            flow.stages[3].fail_action,
+            crate::flow::FailAction::ReturnTo {
+                stage: "sync".into(),
+                attempts: 3,
+            }
+        );
+        // The irreversible stage carries no second opinion, on principle.
+        assert_eq!(flow.stages[3].result_check, crate::flow::Check::None);
+    }
+
+    /// A repository that already says how it runs its tests should not be
+    /// handed `cargo test` regardless.
+    #[test]
+    fn the_train_flow_takes_the_repositorys_configured_test_command() {
+        let rendered = render_train_flow(Some(&["just".to_owned(), "test all".to_owned()]));
+        let flow = crate::flow::parse("train", &rendered).expect("train flow must parse");
+
+        assert_eq!(
+            flow.stages[2].action,
+            crate::flow::Actor::Exec {
+                cmd: vec!["just".into(), "test all".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn init_materializes_the_train_flow_beside_the_default_one() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".agents/sloop")).unwrap();
+        std::fs::write(
+            root.path().join(".agents/sloop/config.yaml"),
+            "version: 1\nflow:\n  test_cmd: [make, check]\n",
+        )
+        .unwrap();
+
+        init(root.path()).unwrap();
+
+        let default =
+            std::fs::read_to_string(root.path().join(".agents/sloop/flows/default.yaml")).unwrap();
+        assert_eq!(default, DEFAULT_FLOW, "the default flow is not replaced");
+        let train =
+            std::fs::read_to_string(root.path().join(".agents/sloop/flows/train.yaml")).unwrap();
+        let flow = crate::flow::parse("train", &train).expect("materialized train flow parses");
+        assert_eq!(
+            flow.stages[2].action,
+            crate::flow::Actor::Exec {
+                cmd: vec!["make".into(), "check".into()],
+            }
+        );
+    }
 
     #[test]
     fn embedded_default_flow_parses() {
@@ -198,6 +335,7 @@ mod tests {
                 ".agents/sloop/tickets",
                 ".agents/sloop/flows",
                 ".agents/sloop/flows/default.yaml",
+                ".agents/sloop/flows/train.yaml",
                 ".agents/sloop/prompts",
                 ".agents/sloop/prompts/review.md",
             ]
