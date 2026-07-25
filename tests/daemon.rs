@@ -204,7 +204,7 @@ fn idle_restart_self_execs_and_reacquires_the_socket_and_lock() {
 }
 
 #[test]
-fn restart_drains_active_aftercare_before_resuming_the_queue() {
+fn restart_drains_active_stages_before_resuming_the_queue() {
     let world = World::configured();
     world.configure_fake_agent(
         FakeAgent::new()

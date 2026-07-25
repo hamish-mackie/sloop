@@ -1,9 +1,9 @@
 # Sloop Documentation
 
 Sloop is a job scheduler for coding agents. It runs each ticket in its own
-Git worktree, judges the result from process exit and aftercare evidence, and
+Git worktree, judges the result from process exit and stage evidence, and
 merges work that passes. Commit presence never gates successful work; it only
-decides whether failed aftercare left work that needs human review.
+decides whether a halted flow left work that needs human review.
 
 Start here:
 

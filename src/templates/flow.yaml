@@ -24,8 +24,8 @@
 #     walk supports them.
 #
 # Structural rules the parser enforces:
-#   - The first stage must be an `agent` action, and it is the only one
-#     allowed: additional agent stages are rejected.
+#   - Any stage may be an `agent` action, in any position and any number of
+#     times. Each gets its own supervised process and worker credentials.
 #   - An `agent` action may not use `result_check: none`. An agent that
 #     grades itself by exiting cleanly grades nothing.
 #   - At most one `{ builtin: merge }` action, and it must be last. It must
@@ -39,7 +39,7 @@
 stages:
   # ---- an agent action -------------------------------------------------
   # Spawns the ticket's agent target in the run worktree with the ticket
-  # body as its brief. Exactly one, always first.
+  # body as its brief. Any number, in any position.
   - name: build
     action: agent
     # result_check: { builtin: commits }
@@ -51,7 +51,7 @@ stages:
 
   # ---- an exec action --------------------------------------------------
   # Runs an argv (no shell) in the run worktree. Any number of these, in
-  # order, between the agent stage and the merge stage.
+  # order, before the merge stage.
   - name: test
     action: { exec: [cargo, test, --all-targets] }
     # result_check: none
@@ -136,7 +136,6 @@ stages:
 #   verdict: reported         ->  result_check: reported
 # The two spellings may not be mixed on one stage.
 #
-# A configured `aftercare.test_cmd` in config.yaml is inserted as an
-# implicit `result_check: none` stage named `test` right after the agent
-# stage, so it cannot be combined with a flow that already has a stage
-# named `test`.
+# A configured `flow.test_cmd` in config.yaml is inserted as an implicit
+# `result_check: none` stage named `test` at index 1, so it cannot be
+# combined with a flow that already has a stage named `test`.

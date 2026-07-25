@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -9,8 +8,7 @@ use std::time::Duration;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use crate::config::expand_agent_cmd;
-use crate::db::{Db, StoreError};
+use crate::db::StoreError;
 use crate::domain::ticket::TicketSnapshot;
 use crate::domain::work::{Disposition, OwnerId, TicketRef, WorkOutcome, WorkTicket};
 use crate::flow::Flow;
@@ -22,111 +20,23 @@ use crate::run_store::{
     NeedsReviewBranch, OutputStallEvidence, RunAdmission, RunState, RunStore,
     WorktreeCleanupCandidate,
 };
-use crate::runner::local::{
-    compose_worker_prompt, launch_agent, run_output_path, wait_for_test_hook, worker_socket_path,
-};
-use crate::runner::{AgentLaunch, RunnerError, StageExecution, StageOrder};
+use crate::runner::local::{run_output_path, wait_for_test_hook};
 use crate::work_state::ClaimResult;
 use crate::work_state::local::{LocalSqlite, QueuedActivation};
 
-use super::aftercare::{
-    RepairContext, StoreStageHooks, gather_exit_evidence, git_is_ancestor, git_stdout,
-};
 use super::dispatcher::{
     DispatcherState, RunEvent, close_worker_socket, disposition_for_outcome, mark_storage_full,
     push_work_outcome, recover_storage, settle_pending_exits,
 };
+use super::driver::{DriverEnvironment, DriverPlan, git_is_ancestor, git_stdout, start_driver};
 use super::recovery::{
-    ProcessIdentity, classify_run_output, reconcile_run_liveness, recoverable_process_identity,
+    ProcessIdentity, executing_stage, reconcile_run_liveness, recoverable_process_identity,
     stop_agent_process_group,
 };
-use super::server::{DaemonError, serve_worker_socket};
+use super::server::DaemonError;
 
 pub(super) const DEFAULT_LEASE_MS: i64 = 10 * 60 * 1000;
 pub(super) const VENDOR_COOLDOWN_MS: i64 = 5 * 60 * 1000;
-
-fn agent_stage_order(
-    state: &DispatcherState,
-    ticket: &WorkTicket,
-    flow: &Flow,
-    run_id: &str,
-    attempt: i64,
-) -> Result<(StageOrder, String), RunnerError<StoreError>> {
-    let error = |message| RunnerError::Execution(message);
-    let agent = state
-        .agent
-        .as_ref()
-        .ok_or_else(|| error("no agent targets configured".into()))?;
-    let target = ticket.hints.target.as_deref().ok_or_else(|| {
-        error(format!(
-            "ticket `{}` does not specify an agent target",
-            ticket.id
-        ))
-    })?;
-    let template = agent.targets.get(target).ok_or_else(|| {
-        error(format!(
-            "ticket `{}` names unknown agent target `{target}`",
-            ticket.id
-        ))
-    })?;
-    let prompt = compose_worker_prompt(&state.root).map_err(error)?;
-    let argv = expand_agent_cmd(
-        template,
-        ticket.hints.model.as_deref(),
-        ticket.hints.effort.as_deref(),
-        &prompt,
-    )
-    .map_err(|message| error(format!("ticket `{}` {message}", ticket.id)))?;
-    let executable = std::env::current_exe()
-        .map_err(|source| error(format!("cannot locate sloop executable: {source}")))?;
-    let executable_dir = executable
-        .parent()
-        .ok_or_else(|| error("sloop executable has no parent directory".into()))?;
-    let mut path_entries = vec![executable_dir.to_path_buf()];
-    if let Some(path) = std::env::var_os("PATH") {
-        path_entries.extend(std::env::split_paths(&path));
-    }
-    let path = std::env::join_paths(path_entries)
-        .map_err(|source| error(format!("cannot construct agent PATH: {source}")))?;
-    // Paths and branches carry the short id: filesystem names are internal
-    // plumbing, and a 32-character suffix would drown the readable part.
-    let short_id = crate::run_ref::short(run_id);
-    let branch = format!("sloop/{}-a{attempt}-{short_id}", ticket.id);
-    let worktree = state.worktree_dir.join(short_id);
-    let stage = flow
-        .stages
-        .iter()
-        .find(|stage| stage.action == crate::flow::Actor::Agent)
-        .map_or_else(|| "agent".into(), |stage| stage.name.clone());
-    let environment = vec![
-        (OsString::from("SLOOP_RUN_ID"), OsString::from(run_id)),
-        (
-            OsString::from("SLOOP_TICKET_ID"),
-            OsString::from(&ticket.id),
-        ),
-        (
-            OsString::from("SLOOP_BIN"),
-            executable.as_os_str().to_owned(),
-        ),
-        (OsString::from("PATH"), path),
-    ];
-    Ok((
-        StageOrder {
-            run_id: run_id.into(),
-            stage,
-            execution: StageExecution::Agent(AgentLaunch {
-                argv,
-                environment,
-                repository: state.root.clone(),
-                worker_socket_path: worker_socket_path(&state.runtime_dir, run_id),
-            }),
-            worktree,
-            branch,
-            output_path: run_output_path(&state.state_dir, run_id),
-        },
-        target.into(),
-    ))
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OrphanDisposition {
@@ -334,9 +244,9 @@ pub(super) fn renews_lease(
     if run_state.is_terminal() {
         return false;
     }
-    if run_state == RunState::Aftercare {
-        // An aftercare run has no agent process left to identify. The daemon
-        // driving its flow stages is the liveness evidence, the same reading
+    if run_state == RunState::Driving {
+        // A driving run has no agent process left to identify. The driver
+        // walking its stages is the liveness evidence, the same reading
         // run-liveness reconciliation takes.
         return supervised;
     }
@@ -654,221 +564,120 @@ pub(super) async fn reconcile(
                 continue;
             }
         };
-        let launch = agent_stage_order(state, &ticket, &flow, &run_id, claimed.attempt).and_then(
-            |(order, target)| {
-                let worktree = order.worktree.clone();
-                let branch = order.branch.clone();
-                let output_path = order.output_path.clone();
-                let hooks = StoreStageHooks::new(&state.run_store, log);
-                let notify = state.output_notify.clone();
-                launch_agent(
-                    order,
-                    &hooks,
-                    state.clock.clone(),
-                    std::sync::Arc::new(move || notify.notify_one()),
-                )
-                .map(|launched| (launched, target, worktree, branch, output_path))
-            },
+        // Admission ends here. Everything after it — the workspace, every
+        // stage, the merge, and the settlement event — belongs to the run's
+        // driver, which owns the run from this moment until it settles.
+        let target = ticket
+            .hints
+            .target
+            .clone()
+            .or_else(|| {
+                state
+                    .agent
+                    .as_ref()
+                    .map(|agent| agent.default_target.clone())
+            })
+            .unwrap_or_default();
+        // Paths and branches carry the short id: filesystem names are internal
+        // plumbing, and a 32-character suffix would drown the readable part.
+        let short_id = crate::run_ref::short(&run_id);
+        let plan = DriverPlan {
+            run_id: run_id.clone(),
+            ticket_id: ticket_id.clone(),
+            target,
+            branch: format!("sloop/{}-a{}-{short_id}", ticket.id, claimed.attempt),
+            worktree: state.worktree_dir.join(short_id),
+            flow,
+            ticket: Some(ticket_snapshot),
+            recovery: None,
+        };
+        state.active.insert(run_id.clone());
+        state.supervised.insert(run_id.clone());
+        start_driver(DriverEnvironment::from_state(state), plan, events.clone());
+        log.emit_with_fields(
+            LogLevel::Info,
+            "sloop::dispatcher",
+            "run_dispatched",
+            json!({"run_id": run_id, "ticket_id": ticket_id, "attempt": claimed.attempt}),
         );
-        match launch {
-            Ok((mut launched, target, worktree, branch, output_path)) => {
-                state.active.insert(run_id.clone());
-                let events = events.clone();
-                let exited_run = run_id.clone();
-                let root = state.root.clone();
-                let test_cmd = state.aftercare_test_cmd.clone();
-                let clock = state.clock.clone();
-                let classifier = state.classifier.clone();
-                let supervisor_log = log.clone();
-                let state_dir = state.state_dir.clone();
-                let db_path = state.state_dir.join("sloop.db");
-                let worker = launched.worker().clone();
-                let repair = state.agent.as_ref().map(|agent| {
-                    RepairContext::new(
-                        agent.clone(),
-                        &ticket_snapshot,
-                        state.running_hours.clone(),
-                        state.max_agents,
+    }
+}
+
+/// Undoes an admission whose driver could not open the run's workspace. Nothing
+/// of the run was recorded, so the claim rolls back and the ticket is queued
+/// again — exactly what a failed spawn did when the dispatcher owned it.
+pub(super) async fn roll_back_admission(
+    state: &mut DispatcherState,
+    run_id: &str,
+    ticket_id: &str,
+    error: &str,
+    log: &OperationalLog,
+) {
+    state.active.remove(run_id);
+    state.supervised.remove(run_id);
+    match state
+        .run_store
+        .abort(run_id, ticket_id, state.clock.now_ms())
+    {
+        Ok(_) => {
+            let ticket = match state.local_work_state.ticket(ticket_id) {
+                Ok(Some(ticket)) => Some(TicketRef {
+                    id: ticket.id,
+                    source: ticket.source,
+                    source_ref: ticket.source_ref,
+                }),
+                Ok(None) => None,
+                Err(store_error) => {
+                    mark_storage_full(state, &store_error);
+                    None
+                }
+            };
+            if let Some(ticket) = ticket
+                && let Err(release_error) = state
+                    .work_state
+                    .release(
+                        &ticket,
+                        &OwnerId(run_id.to_owned()),
+                        Disposition::Retry {
+                            not_before_ms: Some(state.clock.now_ms()),
+                        },
                     )
-                });
-                state
-                    .worker_tokens
-                    .insert(run_id.clone(), worker.token.clone());
-                state
-                    .worker_socket_paths
-                    .insert(run_id.clone(), worker.socket.clone());
-                let accept_loop = tokio::spawn(serve_worker_socket(
-                    launched.take_worker_listener(),
-                    run_id.clone(),
-                    state.requests_tx.clone(),
-                    state.log.clone(),
-                ));
-                state.worker_listeners.insert(run_id.clone(), accept_loop);
-                state.supervised.insert(run_id.clone());
-                let pid = launched.process().pid;
-                tokio::task::spawn_blocking(move || {
-                    let completion = launched.wait(clock.as_ref());
-                    let exit_code = completion.evidence.exit_code;
-                    if let Some(error) = completion.wait_error {
-                        supervisor_log.emit_with_fields(
-                            LogLevel::Error,
-                            "sloop::supervisor",
-                            "agent_wait_failed",
-                            json!({"run_id": exited_run, "error": error}),
-                        );
-                    }
-                    if completion.evidence.stragglers_killed {
-                        supervisor_log.emit_with_fields(
-                            LogLevel::Info,
-                            "sloop::supervisor",
-                            "stragglers_killed",
-                            json!({"run_id": exited_run, "process_group_id": pid}),
-                        );
-                    }
-                    let mut capture_complete = completion.evidence.output_capture_complete;
-                    let vendor_error = match classify_run_output(
-                        &classifier,
-                        &state_dir,
-                        &exited_run,
-                        exit_code,
-                    ) {
-                        Ok(classification) => classification,
-                        Err(error) => {
-                            capture_complete = false;
-                            supervisor_log.emit_with_fields(
-                                LogLevel::Error,
-                                "sloop::supervisor",
-                                "vendor_error_classification_failed",
-                                json!({"run_id": exited_run, "error": error}),
-                            );
-                            None
-                        }
-                    };
-                    let cooldown_until_ms = vendor_error
-                        .as_ref()
-                        .filter(|error| error.class.requires_cooldown())
-                        .map(|_| clock.now_ms() + VENDOR_COOLDOWN_MS);
-                    let checkpoint_stores = match Db::open(&db_path, clock.now_ms()) {
-                        Ok(db) => Some((
-                            RunStore::from_db(db.clone()),
-                            LocalSqlite::from_db_with_clock(db, clock.clone()),
-                        )),
-                        Err(error) => {
-                            supervisor_log.emit_with_fields(
-                                LogLevel::Error,
-                                "sloop::supervisor",
-                                "aftercare_checkpoint_open_failed",
-                                json!({"run_id": exited_run, "error": error.to_string()}),
-                            );
-                            None
-                        }
-                    };
-                    let Some((commits, commit_observation_complete, aftercare_failed, merge)) =
-                        gather_exit_evidence(
-                            &exited_run,
-                            &root,
-                            &worktree,
-                            &branch,
-                            &flow,
-                            &worker,
-                            test_cmd.as_deref(),
-                            clock.as_ref(),
-                            &output_path,
-                            exit_code,
-                            capture_complete,
-                            vendor_error.as_ref(),
-                            cooldown_until_ms,
-                            checkpoint_stores
-                                .as_ref()
-                                .map(|(run_store, local_work_state)| (run_store, local_work_state)),
-                            repair.as_ref(),
-                            &supervisor_log,
-                        )
-                    else {
-                        return;
-                    };
-                    let _ = events.blocking_send(RunEvent::Exited {
-                        run_id: exited_run,
-                        target,
-                        exit_code,
-                        capture_complete,
-                        commits,
-                        commit_observation_complete,
-                        aftercare_failed,
-                        merge,
-                        vendor_error,
-                        cooldown_until_ms,
-                        recovery: None,
-                    });
-                });
-                log.emit_with_fields(
-                    LogLevel::Info,
-                    "sloop::dispatcher",
-                    "run_started",
-                    json!({"run_id": run_id, "ticket_id": ticket_id, "pid": pid}),
-                );
-            }
-            Err(error) => {
-                if let RunnerError::Hook(store_error) = &error {
-                    mark_storage_full(state, store_error);
-                }
-                match state
-                    .run_store
-                    .abort(&run_id, &ticket_id, state.clock.now_ms())
-                {
-                    Ok(_) => {
-                        if let Err(abort_error) = state
-                            .work_state
-                            .release(
-                                &ticket_ref,
-                                &owner,
-                                Disposition::Retry {
-                                    not_before_ms: Some(state.clock.now_ms()),
-                                },
-                            )
-                            .await
-                        {
-                            log.emit_with_fields(
-                                LogLevel::Error,
-                                "sloop::dispatcher",
-                                "claim_release_failed",
-                                json!({
-                                    "run_id": run_id,
-                                    "ticket_id": ticket_id,
-                                    "error": abort_error.to_string(),
-                                }),
-                            );
-                        }
-                    }
-                    Err(abort_error) => {
-                        mark_storage_full(state, &abort_error);
-                        log.emit_with_fields(
-                            LogLevel::Error,
-                            "sloop::dispatcher",
-                            "claim_abort_failed",
-                            json!({
-                                "run_id": run_id,
-                                "ticket_id": ticket_id,
-                                "error": abort_error.to_string(),
-                            }),
-                        );
-                    }
-                }
-                // A launch can fail after the worker socket was bound.
-                close_worker_socket(state, &run_id);
+                    .await
+            {
                 log.emit_with_fields(
                     LogLevel::Error,
                     "sloop::dispatcher",
-                    "run_launch_failed",
+                    "claim_release_failed",
                     json!({
                         "run_id": run_id,
                         "ticket_id": ticket_id,
-                        "error": error.to_string(),
+                        "error": release_error.to_string(),
                     }),
                 );
             }
         }
+        Err(abort_error) => {
+            mark_storage_full(state, &abort_error);
+            log.emit_with_fields(
+                LogLevel::Error,
+                "sloop::dispatcher",
+                "claim_abort_failed",
+                json!({
+                    "run_id": run_id,
+                    "ticket_id": ticket_id,
+                    "error": abort_error.to_string(),
+                }),
+            );
+        }
     }
+    // A driver can fail after the worker socket was bound.
+    close_worker_socket(state, run_id);
+    log.emit_with_fields(
+        LogLevel::Error,
+        "sloop::dispatcher",
+        "run_launch_failed",
+        json!({"run_id": run_id, "ticket_id": ticket_id, "error": error}),
+    );
 }
 
 /// Notices review branches an operator merged into the default branch by hand.
@@ -1258,18 +1067,6 @@ fn next_output_stall_deadline(state: &DispatcherState, threshold_ms: i64) -> Opt
         .min()
 }
 
-fn agent_stage(run: &crate::run_store::RunRecord) -> String {
-    run.flow_json
-        .as_deref()
-        .and_then(|snapshot| serde_json::from_str::<Flow>(snapshot).ok())
-        .and_then(|flow| {
-            flow.stages
-                .into_iter()
-                .find(|stage| stage.action == crate::flow::Actor::Agent)
-        })
-        .map_or_else(|| "agent".to_owned(), |stage| stage.name)
-}
-
 fn reconcile_output_stalls(state: &mut DispatcherState, log: &OperationalLog) {
     let now_ms = state.clock.now_ms();
     let running = supervised_running_runs(state).collect::<Vec<_>>();
@@ -1282,7 +1079,7 @@ fn reconcile_output_stalls(state: &mut DispatcherState, log: &OperationalLog) {
         {
             continue;
         }
-        let stage = agent_stage(&run);
+        let stage = executing_stage(&state.run_store, &run.id, run.flow_json.as_deref());
         log.emit_with_fields(
             LogLevel::Warn,
             "sloop::dispatcher",
@@ -1314,7 +1111,7 @@ fn reconcile_stall_watchdog(state: &mut DispatcherState, log: &OperationalLog) {
             continue;
         }
         let evidence = OutputStallEvidence {
-            stage: agent_stage(&run),
+            stage: executing_stage(&state.run_store, &run.id, run.flow_json.as_deref()),
             last_output_at_ms: staleness.last_output_at_ms,
             threshold_ms: state.stall_after_ms,
             last_output_sequence: staleness.last_sequence,
@@ -1494,15 +1291,15 @@ mod tests {
             true,
             ProcessIdentity::GoneOrReused
         ));
-        // Aftercare has no agent process left; the daemon driving it is the
-        // liveness evidence, so supervision alone decides.
+        // A driving run has no agent process left; the driver walking it is
+        // the liveness evidence, so supervision alone decides.
         assert!(renews_lease(
-            RunState::Aftercare,
+            RunState::Driving,
             true,
             ProcessIdentity::GoneOrReused
         ));
         assert!(!renews_lease(
-            RunState::Aftercare,
+            RunState::Driving,
             false,
             ProcessIdentity::GoneOrReused
         ));

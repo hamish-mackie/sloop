@@ -1298,7 +1298,7 @@ mod tests {
                 "run": "R1",
                 "entries": [
                     {"timestamp": "2026-07-17T12:34:56Z", "source": "agent", "stage": null, "text": "hello"},
-                    {"timestamp": "2026-07-17T12:34:57Z", "source": "aftercare", "stage": "test", "bytes_b64": "AAE="}
+                    {"timestamp": "2026-07-17T12:34:57Z", "source": "stage", "stage": "test", "bytes_b64": "AAE="}
                 ],
                 "next_cursor": 2,
                 "complete": true
@@ -1309,7 +1309,7 @@ mod tests {
         assert_eq!(
             text,
             "[2026-07-17T12:34:56Z] [agent] hello\n\
-             [2026-07-17T12:34:57Z] [aftercare:test] <binary output>\n"
+             [2026-07-17T12:34:57Z] [stage:test] <binary output>\n"
         );
     }
 }

@@ -90,7 +90,7 @@ fn handle_brief(state: &DispatcherState, run_id: &str) -> Result<serde_json::Val
     };
 
     let mut definition_of_done = vec!["Commit your work to the run branch".to_owned()];
-    if state.aftercare_test_cmd.is_some() {
+    if state.flow_test_cmd.is_some() {
         definition_of_done.push("The configured test command passes".to_owned());
     }
 
@@ -209,22 +209,19 @@ fn handle_verdict(
         .ok_or_else(|| internal("the run has no flow snapshot"))?;
     let flow: Flow = serde_json::from_str(snapshot)
         .map_err(|error| internal(&format!("the run's flow snapshot is invalid: {error}")))?;
-    let stage_name = match run.state.as_str() {
-        "running" => flow
-            .stages
-            .first()
-            .map(|stage| stage.name.clone())
-            .ok_or_else(|| internal("the run's flow has no first stage"))?,
-        "aftercare" => {
-            let rows = run_lookup(state, |run_store| run_store.run_evidence(run_id))?;
-            rows.iter()
-                .find(|(kind, _)| kind == "aftercare_process")
-                .and_then(|(_, data)| serde_json::from_str::<serde_json::Value>(data).ok())
-                .and_then(|data| data["stage"].as_str().map(str::to_owned))
-                .ok_or_else(|| conflict("the run has no stage process currently executing"))?
-        }
-        _ => return Err(conflict("the run has no stage currently executing")),
-    };
+    // The executing stage is whatever the driver last checkpointed a process
+    // for — one answer, whatever kind of stage it is and wherever it sits in
+    // the flow. A worker can only ever report for the stage it is running.
+    if !matches!(run.state.as_str(), "running" | "driving") {
+        return Err(conflict("the run has no stage currently executing"));
+    }
+    let rows = run_lookup(state, |run_store| run_store.run_evidence(run_id))?;
+    let stage_name = rows
+        .iter()
+        .find(|(kind, _)| kind == super::driver::STAGE_PROCESS)
+        .and_then(|(_, data)| serde_json::from_str::<serde_json::Value>(data).ok())
+        .and_then(|data| data["stage"].as_str().map(str::to_owned))
+        .ok_or_else(|| conflict("the run has no stage process currently executing"))?;
     let stage = flow
         .stages
         .iter()

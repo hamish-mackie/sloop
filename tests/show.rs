@@ -232,7 +232,7 @@ fn restart_measures_silence_from_the_last_real_output() {
 
     world.release("restart-silence");
     wait_until_slow("the recovered run settles", || {
-        !["claimed", "running", "aftercare"].contains(&world.run_state(&run_id).as_str())
+        !["claimed", "running", "stage"].contains(&world.run_state(&run_id).as_str())
     });
 }
 

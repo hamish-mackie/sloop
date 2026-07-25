@@ -197,7 +197,7 @@ mod tests {
 
     /// The flow and config templates are meant to be dropped into the same
     /// repository, so the stage `test` the flow declares must not collide
-    /// with an `aftercare.test_cmd` the config template leaves enabled.
+    /// with a `flow.test_cmd` the config template leaves enabled.
     #[test]
     fn the_flow_and_config_templates_coexist() {
         let root = tempdir().unwrap();

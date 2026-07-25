@@ -10,7 +10,7 @@ use std::time::Duration;
 use support::{World, process_alive, wait_until};
 
 /// Writes a scripted fake agent and a repository config pointing at it, with
-/// an optional aftercare test command. The agent script is committed before
+/// an optional flow test command. The agent script is committed before
 /// the daemon starts so worktrees branch from a clean default branch.
 fn configure(world: &World, agent_body: &str, test_cmd: Option<&str>) {
     let script = world.root().join("fake-agent.sh");
@@ -22,14 +22,14 @@ fn configure(world: &World, agent_body: &str, test_cmd: Option<&str>) {
     )
     .expect("write default test flow");
 
-    let aftercare = match test_cmd {
-        Some(cmd) => format!("aftercare:\n  test_cmd: [\"sh\", \"-c\", \"{cmd}\"]\n"),
+    let flow_test = match test_cmd {
+        Some(cmd) => format!("flow:\n  test_cmd: [\"sh\", \"-c\", \"{cmd}\"]\n"),
         None => String::new(),
     };
     fs::write(
         world.root().join(".agents/sloop/config.yaml"),
         format!(
-            "version: 1\nscheduler:\n  max_parallel_tasks: 1\nagent:\n  default_target: fake\n  targets:\n    fake:\n      cmd: [\"sh\", \"{}\", \"{{prompt}}\"]\n{aftercare}",
+            "version: 1\nscheduler:\n  max_parallel_tasks: 1\nagent:\n  default_target: fake\n  targets:\n    fake:\n      cmd: [\"sh\", \"{}\", \"{{prompt}}\"]\n{flow_test}",
             script.display()
         ),
     )
@@ -81,16 +81,16 @@ fn write_flow(world: &World, contents: &str) {
 
 /// The resolved stage verdicts a run recorded, in log order. Rows carrying no
 /// verdict are an execution's action, answered for by the check row behind it.
-fn aftercare_stages(world: &World, position: usize) -> Vec<(i64, String, String, String)> {
+fn stage_runs(world: &World, position: usize) -> Vec<(i64, String, String, String)> {
     let run_id = world.run_id(position);
     let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
     let mut statement = connection
         .prepare(
             "SELECT stage_index, stage, state, evidence_json
-             FROM aftercare_stages
+             FROM stage_runs
              WHERE run_id = ?1 AND state IS NOT NULL ORDER BY seq",
         )
-        .expect("prepare aftercare stage query");
+        .expect("prepare stage query");
     statement
         .query_map([&run_id], |row| {
             let evidence: String = row.get(3)?;
@@ -102,9 +102,9 @@ fn aftercare_stages(world: &World, position: usize) -> Vec<(i64, String, String,
                 evidence["output"].as_str().unwrap_or_default().to_owned(),
             ))
         })
-        .expect("query aftercare stages")
+        .expect("query stages")
         .collect::<Result<Vec<_>, _>>()
-        .expect("read aftercare stages")
+        .expect("read stages")
 }
 
 /// The run's whole stage-evidence log as stored, keyed the way the walk reads
@@ -118,7 +118,7 @@ fn stage_log(
     let mut statement = connection
         .prepare(
             "SELECT seq, stage_index, stage, attempt, phase, state
-             FROM aftercare_stages WHERE run_id = ?1 ORDER BY seq",
+             FROM stage_runs WHERE run_id = ?1 ORDER BY seq",
         )
         .expect("prepare stage log query");
     statement
@@ -137,18 +137,18 @@ fn stage_log(
         .expect("read stage log")
 }
 
-fn aftercare_stage_evidence(world: &World, position: usize, stage: &str) -> serde_json::Value {
+fn stage_evidence(world: &World, position: usize, stage: &str) -> serde_json::Value {
     let run_id = world.run_id(position);
     let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
     let evidence: String = connection
         .query_row(
-            "SELECT evidence_json FROM aftercare_stages
+            "SELECT evidence_json FROM stage_runs
              WHERE run_id = ?1 AND stage = ?2 AND state IS NOT NULL
              ORDER BY seq DESC LIMIT 1",
             [run_id.as_str(), stage],
             |row| row.get(0),
         )
-        .expect("read aftercare stage evidence");
+        .expect("read stage evidence");
     serde_json::from_str(&evidence).expect("stage evidence is JSON")
 }
 
@@ -160,7 +160,7 @@ fn default_branch_has(world: &World, file: &str) -> bool {
 
 fn read_process_ids(path: PathBuf) -> Vec<u32> {
     fs::read_to_string(path)
-        .expect("read aftercare process IDs")
+        .expect("read stage process IDs")
         .split_whitespace()
         .map(|pid| pid.parse().expect("process ID is an integer"))
         .collect()
@@ -168,7 +168,7 @@ fn read_process_ids(path: PathBuf) -> Vec<u32> {
 
 fn wait_for_processes_to_exit(process_ids: Vec<u32>) {
     for pid in process_ids {
-        wait_until(&format!("aftercare process {pid} exits"), || {
+        wait_until(&format!("stage process {pid} exits"), || {
             !process_alive(pid)
         });
     }
@@ -235,7 +235,7 @@ fn committed_work_with_passing_tests_is_merged() {
     });
     assert!(default_branch_has(&world, "work.txt"));
 
-    // The aftercare test stage's output is captured evidence.
+    // The implicit test stage's output is captured evidence.
     let output = world.sloop(&["logs", &world.run_id(1)]);
     assert!(output.status.success());
     let entries = World::json_stdout(&output)["data"]["entries"].clone();
@@ -244,8 +244,8 @@ fn committed_work_with_passing_tests_is_merged() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|entry| entry["source"] == "aftercare" && entry["stage"] == "test"),
-        "no aftercare records in {entries}"
+            .any(|entry| entry["source"] == "stage" && entry["stage"] == "test"),
+        "no stage records in {entries}"
     );
 }
 
@@ -294,7 +294,7 @@ fn flow_executes_in_order_and_records_one_row_per_stage() {
 
     wait_until("the flow merges", || tickets(&world)["merged"] == 1);
     assert!(default_branch_has(&world, "work.txt"));
-    let stages = aftercare_stages(&world, 1);
+    let stages = stage_runs(&world, 1);
     assert_eq!(
         stages
             .iter()
@@ -350,7 +350,7 @@ fn flow_executes_in_order_and_records_one_row_per_stage() {
     assert!(
         entries
             .iter()
-            .any(|entry| entry["source"] == "aftercare" && entry["stage"] == "check")
+            .any(|entry| entry["source"] == "stage" && entry["stage"] == "check")
     );
 }
 
@@ -371,7 +371,7 @@ fn failed_exec_halts_before_merge_and_preserves_commits_for_review() {
     });
     assert!(!default_branch_has(&world, "work.txt"));
     assert_eq!(
-        aftercare_stages(&world, 1)
+        stage_runs(&world, 1)
             .into_iter()
             .map(|(_, name, state, _)| (name, state))
             .collect::<Vec<_>>(),
@@ -410,7 +410,7 @@ fn check_verdict_uses_the_check_commands_exit() {
         tickets(&failing)["needs_review"] == 1
     });
     assert_eq!(
-        aftercare_stages(&failing, 1)
+        stage_runs(&failing, 1)
             .into_iter()
             .map(|(_, name, state, _)| (name, state))
             .collect::<Vec<_>>(),
@@ -518,7 +518,7 @@ fn reported_stage_without_a_report_fails_with_a_reason() {
     wait_until("the unreported stage needs review", || {
         tickets(&world)["needs_review"] == 1
     });
-    let evidence = aftercare_stage_evidence(&world, 1, "review");
+    let evidence = stage_evidence(&world, 1, "review");
     assert_eq!(evidence["verdict_source"], "reported");
     assert_eq!(evidence["reason"], "no verdict reported");
 }
@@ -559,11 +559,11 @@ fn a_reported_review_gates_the_merge_in_both_directions() {
     });
     assert_eq!(tickets(&failing)["merged"], 0);
     assert!(!default_branch_has(&failing, "work.txt"));
-    let evidence = aftercare_stage_evidence(&failing, 1, "review");
+    let evidence = stage_evidence(&failing, 1, "review");
     assert_eq!(evidence["verdict_source"], "reported");
     assert_eq!(evidence["reason"], "scripted fail");
     assert_eq!(
-        aftercare_stages(&failing, 1)
+        stage_runs(&failing, 1)
             .into_iter()
             .map(|(_, name, state, _)| (name, state))
             .collect::<Vec<_>>(),
@@ -585,7 +585,7 @@ fn a_reported_review_gates_the_merge_in_both_directions() {
     });
     assert!(default_branch_has(&passing, "work.txt"));
     assert_eq!(
-        aftercare_stage_evidence(&passing, 1, "review")["reason"],
+        stage_evidence(&passing, 1, "review")["reason"],
         "scripted pass"
     );
 }
@@ -628,8 +628,8 @@ fn stage_evidence_write_failure_does_not_strand_active_accounting() {
     let connection = rusqlite::Connection::open(world.db_path()).unwrap();
     connection
         .execute_batch(
-            "CREATE TRIGGER reject_aftercare_stage
-             BEFORE INSERT ON aftercare_stages
+            "CREATE TRIGGER reject_stage_row
+             BEFORE INSERT ON stage_runs
              BEGIN SELECT RAISE(FAIL, 'stage write denied'); END;",
         )
         .unwrap();
@@ -656,7 +656,7 @@ fn merge_success_survives_merge_stage_evidence_failure() {
     connection
         .execute_batch(
             "CREATE TRIGGER reject_merge_stage
-             BEFORE INSERT ON aftercare_stages
+             BEFORE INSERT ON stage_runs
              WHEN NEW.stage = 'merge'
              BEGIN SELECT RAISE(FAIL, 'merge stage write denied'); END;",
         )
@@ -669,7 +669,7 @@ fn merge_success_survives_merge_stage_evidence_failure() {
     );
     assert!(default_branch_has(&world, "work.txt"));
     assert_eq!(
-        aftercare_stages(&world, 1)
+        stage_runs(&world, 1)
             .into_iter()
             .map(|(_, stage, _, _)| stage)
             .collect::<Vec<_>>(),
@@ -678,7 +678,7 @@ fn merge_success_survives_merge_stage_evidence_failure() {
 }
 
 #[test]
-fn incomplete_commit_observation_keeps_failed_aftercare_for_review() {
+fn incomplete_commit_observation_keeps_a_failed_later_stage_for_review() {
     let world = World::configured();
     configure(
         &world,
@@ -727,7 +727,7 @@ fn exec_stage_order_comes_from_the_flow_file() {
 
 #[test]
 fn restart_between_exec_stages_skips_the_completed_stage() {
-    const HOOK: &str = "after-aftercare-stage-first";
+    const HOOK: &str = "after-stage-first";
 
     let world = World::configured();
     configure(&world, COMMITTING_AGENT, None);
@@ -765,7 +765,7 @@ fn restart_between_exec_stages_skips_the_completed_stage() {
         tickets(&world)["merged"] == 1
     });
     assert_eq!(fs::read_to_string(invocations).unwrap(), "12");
-    assert_eq!(aftercare_stages(&world, 1).len(), 4);
+    assert_eq!(stage_runs(&world, 1).len(), 4);
     // Recovery folded the log and stood where it left off: four executions in
     // the order they ran, no stage repeated.
     assert_eq!(
@@ -782,15 +782,16 @@ fn restart_between_exec_stages_skips_the_completed_stage() {
     );
 }
 
-/// Rewrites the run's stage rows into the shape they had before the table
-/// became a log — no `seq`, no `phase`, a verdict on every row — and puts the
-/// schema version back, so the next open has a genuine pre-migration database
-/// to migrate.
+/// Rewrites the run into the shape it had two schema versions ago: stage rows
+/// with no `seq` and no `phase` in a table named after the regime that wrote
+/// them, a run state named after that regime, and its process checkpoint under
+/// the old evidence kind. Putting the schema version back makes the next open a
+/// genuine pre-migration database.
 fn plant_old_stage_shape(world: &World) {
     let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
     connection
         .execute_batch(
-            "CREATE TABLE old_aftercare_stages (
+            "CREATE TABLE aftercare_stages (
                  run_id          TEXT NOT NULL REFERENCES runs(id),
                  stage_index     INTEGER NOT NULL,
                  stage           TEXT NOT NULL,
@@ -802,14 +803,18 @@ fn plant_old_stage_shape(world: &World) {
                  evidence_json   TEXT,
                  PRIMARY KEY (run_id, stage_index, attempt)
              );
-             INSERT INTO old_aftercare_stages
+             INSERT INTO aftercare_stages
                  (run_id, stage_index, stage, state, attempt, started_at_ms,
                   finished_at_ms, exit_code, evidence_json)
              SELECT run_id, stage_index, stage, state, attempt, started_at_ms,
                     finished_at_ms, exit_code, evidence_json
-             FROM aftercare_stages WHERE state IS NOT NULL;
-             DROP TABLE aftercare_stages;
-             ALTER TABLE old_aftercare_stages RENAME TO aftercare_stages;
+             FROM stage_runs WHERE state IS NOT NULL;
+             DROP TABLE stage_runs;
+             UPDATE runs SET state = 'aftercare' WHERE state = 'driving';
+             UPDATE run_evidence
+                SET kind = 'aftercare_process',
+                    dedupe_key = 'settlement:' || run_id || ':aftercare_process'
+              WHERE kind = 'stage_process';
              PRAGMA user_version = 13;",
         )
         .expect("plant pre-log stage rows");
@@ -821,7 +826,7 @@ fn plant_old_stage_shape(world: &World) {
 /// the fold that replays them stands exactly where it stood before.
 #[test]
 fn a_run_planted_in_the_old_stage_shape_migrates_and_resumes_where_it_stood() {
-    const HOOK: &str = "after-aftercare-stage-first";
+    const HOOK: &str = "after-stage-first";
 
     let world = World::configured();
     configure(&world, COMMITTING_AGENT, None);
@@ -918,7 +923,7 @@ fn cancel_kills_a_custom_exec_process_group_and_preserves_the_worktree() {
     wait_until("the custom stage is checkpointed", || {
         process_ids.is_file()
             && world
-                .run_evidence(&world.run_id(1), "aftercare_process")
+                .run_evidence(&world.run_id(1), "stage_process")
                 .is_some()
     });
     let process_ids = read_process_ids(process_ids);
@@ -933,7 +938,7 @@ fn cancel_kills_a_custom_exec_process_group_and_preserves_the_worktree() {
 }
 
 #[test]
-fn cancel_never_signals_a_recycled_aftercare_process_group() {
+fn cancel_never_signals_a_recycled_stage_process_group() {
     let world = World::configured();
     configure(&world, COMMITTING_AGENT, None);
     let process_ids = world.root().join("recycled-stage-processes");
@@ -946,11 +951,11 @@ fn cancel_never_signals_a_recycled_aftercare_process_group() {
     );
     world.commit_all("initial");
     world.start_daemon();
-    post_and_run(&world, "recycled-aftercare-pgid.md");
+    post_and_run(&world, "recycled-stage-pgid.md");
     wait_until("the custom stage is checkpointed", || {
         process_ids.is_file()
             && world
-                .run_evidence(&world.run_id(1), "aftercare_process")
+                .run_evidence(&world.run_id(1), "stage_process")
                 .is_some()
     });
     let original_processes = read_process_ids(process_ids);
@@ -960,7 +965,7 @@ fn cancel_never_signals_a_recycled_aftercare_process_group() {
     connection
         .execute(
             "UPDATE run_evidence SET data_json = ?1
-             WHERE run_id = ?2 AND kind = 'aftercare_process'",
+             WHERE run_id = ?2 AND kind = 'stage_process'",
             [
                 serde_json::json!({
                     "stage": "wait",
@@ -1015,7 +1020,7 @@ fn exec_stage_exit_kills_pipe_holding_stragglers() {
 
 #[test]
 fn recovery_does_not_signal_a_group_after_the_recorded_leader_exits() {
-    const HOOK: &str = "after-aftercare-process-checkpoint-wait";
+    const HOOK: &str = "after-stage-process-checkpoint-wait";
 
     let world = World::configured();
     configure(&world, COMMITTING_AGENT, None);
@@ -1034,7 +1039,7 @@ fn recovery_does_not_signal_a_group_after_the_recorded_leader_exits() {
     wait_until("the exec checkpoint is durable", || {
         world.test_hook_reached(HOOK)
             && world
-                .run_evidence(&world.run_id(1), "aftercare_process")
+                .run_evidence(&world.run_id(1), "stage_process")
                 .is_some()
             && process_ids.is_file()
     });
@@ -1057,7 +1062,7 @@ fn recovery_does_not_signal_a_group_after_the_recorded_leader_exits() {
     assert!(
         fs::read_to_string(world.daemon_log())
             .unwrap()
-            .contains("stale_aftercare_group_not_signalled")
+            .contains("stale_stage_group_not_signalled")
     );
     unsafe {
         libc::kill(first_processes[1] as libc::pid_t, libc::SIGKILL);
@@ -1076,7 +1081,7 @@ fn recovery_preserves_partial_merge_state_and_fails_for_review() {
     wait_until("the first merge reaches its hook", || {
         fixture.started.is_file()
             && world
-                .run_evidence(&world.run_id(1), "aftercare_process")
+                .run_evidence(&world.run_id(1), "stage_process")
                 .is_some()
     });
 
@@ -1130,7 +1135,7 @@ fn recovery_settles_a_completed_uncheckpointed_merge_idempotently() {
         world.test_hook_reached(HOOK)
             && default_branch_has(&world, "work.txt")
             && world
-                .run_evidence(&world.run_id(1), "aftercare_process")
+                .run_evidence(&world.run_id(1), "stage_process")
                 .is_some()
     });
 
@@ -1142,7 +1147,7 @@ fn recovery_settles_a_completed_uncheckpointed_merge_idempotently() {
     });
     assert!(default_branch_has(&world, "work.txt"));
     assert_eq!(
-        aftercare_stages(&world, 1)
+        stage_runs(&world, 1)
             .into_iter()
             .map(|(_, stage, state, _)| (stage, state))
             .collect::<Vec<_>>(),
@@ -1172,7 +1177,7 @@ fn recovery_does_not_reapply_a_completed_merge_after_target_reset() {
     wait_until("the merge completes before target reset", || {
         world.test_hook_reached(HOOK)
             && world
-                .run_evidence(&world.run_id(1), "aftercare_process")
+                .run_evidence(&world.run_id(1), "stage_process")
                 .is_some_and(|evidence| evidence["merge"]["completed_target"].is_string())
     });
 
@@ -1216,7 +1221,7 @@ fn recovery_does_not_reapply_a_completed_merge_after_target_moves() {
     wait_until("the merge completes before target move", || {
         world.test_hook_reached(HOOK)
             && world
-                .run_evidence(&world.run_id(1), "aftercare_process")
+                .run_evidence(&world.run_id(1), "stage_process")
                 .is_some_and(|evidence| evidence["merge"]["completed_target"].is_string())
     });
 
@@ -1284,7 +1289,7 @@ fn recovery_does_not_reapply_a_completed_merge_after_target_moves() {
 
 #[test]
 fn recovery_does_not_merge_an_advanced_run_branch() {
-    const HOOK: &str = "after-aftercare-process-checkpoint-merge";
+    const HOOK: &str = "after-stage-process-checkpoint-merge";
 
     let world = World::configured();
     world.arm_test_hook(HOOK);
@@ -1301,7 +1306,7 @@ fn recovery_does_not_merge_an_advanced_run_branch() {
     wait_until("the blocked merge has its baseline checkpoint", || {
         world.test_hook_reached(HOOK)
             && world
-                .run_evidence(&world.run_id(1), "aftercare_process")
+                .run_evidence(&world.run_id(1), "stage_process")
                 .is_some_and(|evidence| evidence["merge"]["branch_tip"].is_string())
     });
 
@@ -1376,12 +1381,12 @@ fn recovery_preserves_conflicted_and_unrelated_operator_edits_after_merge_exit()
     wait_until("the failed merge exits with owned conflict state", || {
         world.test_hook_reached(HOOK)
             && world
-                .run_evidence(&world.run_id(1), "aftercare_process")
+                .run_evidence(&world.run_id(1), "stage_process")
                 .is_some()
             && world.root().join(".git/MERGE_HEAD").is_file()
     });
     let merge_pid = world
-        .run_evidence(&world.run_id(1), "aftercare_process")
+        .run_evidence(&world.run_id(1), "stage_process")
         .unwrap()["pid"]
         .as_u64()
         .unwrap() as u32;
@@ -1463,11 +1468,11 @@ fn recovery_preserves_operator_changes_made_during_an_interrupted_merge() {
     wait_until("the merge reaches its hook", || {
         fixture.started.is_file()
             && world
-                .run_evidence(&world.run_id(1), "aftercare_process")
+                .run_evidence(&world.run_id(1), "stage_process")
                 .is_some()
     });
     let merge_pid = world
-        .run_evidence(&world.run_id(1), "aftercare_process")
+        .run_evidence(&world.run_id(1), "stage_process")
         .unwrap()["pid"]
         .as_u64()
         .unwrap() as u32;
@@ -1516,11 +1521,11 @@ fn recovery_preserves_unrelated_merge_state() {
     wait_until("the merge reaches its hook", || {
         fixture.started.is_file()
             && world
-                .run_evidence(&world.run_id(1), "aftercare_process")
+                .run_evidence(&world.run_id(1), "stage_process")
                 .is_some()
     });
     let merge_pid = world
-        .run_evidence(&world.run_id(1), "aftercare_process")
+        .run_evidence(&world.run_id(1), "stage_process")
         .unwrap()["pid"]
         .as_u64()
         .unwrap() as u32;
@@ -1583,11 +1588,11 @@ fn recovery_never_removes_an_unowned_index_lock() {
     wait_until("the merge reaches its hook", || {
         fixture.started.is_file()
             && world
-                .run_evidence(&world.run_id(1), "aftercare_process")
+                .run_evidence(&world.run_id(1), "stage_process")
                 .is_some()
     });
     let merge_pid = world
-        .run_evidence(&world.run_id(1), "aftercare_process")
+        .run_evidence(&world.run_id(1), "stage_process")
         .unwrap()["pid"]
         .as_u64()
         .unwrap() as u32;
@@ -1625,7 +1630,7 @@ fn recovery_never_removes_an_unowned_index_lock() {
 
 #[test]
 fn cancellation_at_arbitrary_exec_startup_kills_the_stage_group() {
-    const HOOK: &str = "before-aftercare-process-checkpoint-wait";
+    const HOOK: &str = "before-stage-process-checkpoint-wait";
 
     let world = World::configured();
     configure(&world, COMMITTING_AGENT, None);
@@ -1646,7 +1651,7 @@ fn cancellation_at_arbitrary_exec_startup_kills_the_stage_group() {
     });
     assert!(
         world
-            .run_evidence(&world.run_id(1), "aftercare_process")
+            .run_evidence(&world.run_id(1), "stage_process")
             .is_none()
     );
 
@@ -1661,7 +1666,7 @@ fn cancellation_at_arbitrary_exec_startup_kills_the_stage_group() {
 }
 
 #[test]
-fn restart_reruns_an_interrupted_aftercare_stage_and_then_merges() {
+fn restart_reruns_an_interrupted_stage_and_then_merges() {
     let world = World::configured();
     let started = world.root().join("test-started");
     let release = world.root().join("test-release");
@@ -1679,7 +1684,7 @@ fn restart_reruns_an_interrupted_aftercare_stage_and_then_merges() {
     let daemon_pid = world.start_daemon()["data"]["pid"]
         .as_u64()
         .expect("daemon pid") as u32;
-    post_and_run(&world, "recover-aftercare.md");
+    post_and_run(&world, "recover-stage.md");
     wait_until("the first test invocation starts", || started.is_file());
 
     world.kill_daemon(daemon_pid);
@@ -1689,7 +1694,7 @@ fn restart_reruns_an_interrupted_aftercare_stage_and_then_merges() {
     });
     fs::write(&release, "").expect("release interrupted test");
 
-    wait_until("recovered aftercare merges the work", || {
+    wait_until("the resumed driver merges the work", || {
         tickets(&world)["merged"] == 1
     });
     assert!(finished.is_file());
@@ -1701,7 +1706,7 @@ fn restart_reruns_an_interrupted_aftercare_stage_and_then_merges() {
 }
 
 #[test]
-fn cancel_stops_an_active_aftercare_process_and_releases_the_ticket() {
+fn cancel_stops_an_active_stage_process_and_releases_the_ticket() {
     let world = World::configured();
     let process_ids = world.root().join("cancel-test-processes");
     let test_cmd = format!(
@@ -1711,18 +1716,18 @@ fn cancel_stops_an_active_aftercare_process_and_releases_the_ticket() {
     configure(&world, COMMITTING_AGENT, Some(&test_cmd));
     world.commit_all("initial");
     world.start_daemon();
-    post_and_run(&world, "cancel-aftercare.md");
-    wait_until("the aftercare process checkpoint is durable", || {
+    post_and_run(&world, "cancel-stage.md");
+    wait_until("the stage process checkpoint is durable", || {
         process_ids.is_file()
             && world
-                .run_evidence(&world.run_id(1), "aftercare_process")
+                .run_evidence(&world.run_id(1), "stage_process")
                 .is_some()
     });
     let process_ids = read_process_ids(process_ids);
 
     let cancelled = world.sloop(&["cancel", &world.run_id(1)]);
     assert!(cancelled.status.success());
-    wait_until("cancelled aftercare settles", || {
+    wait_until("the cancelled run settles", || {
         let counts = tickets(&world);
         counts["ready"] == 1 && counts["claimed"] == 0
     });
@@ -1734,7 +1739,7 @@ fn cancel_stops_an_active_aftercare_process_and_releases_the_ticket() {
 }
 
 #[test]
-fn cancellation_before_the_test_process_checkpoint_stops_aftercare() {
+fn cancellation_before_the_test_process_checkpoint_stops_the_walk() {
     const HOOK: &str = "before-test-process-checkpoint";
 
     let world = World::configured();
@@ -1753,7 +1758,7 @@ fn cancellation_before_the_test_process_checkpoint_stops_aftercare() {
     });
     assert!(
         world
-            .run_evidence(&world.run_id(1), "aftercare_process")
+            .run_evidence(&world.run_id(1), "stage_process")
             .is_none()
     );
 
@@ -1766,13 +1771,13 @@ fn cancellation_before_the_test_process_checkpoint_stops_aftercare() {
     );
     assert!(
         world
-            .run_evidence(&world.run_id(1), "aftercare_process")
+            .run_evidence(&world.run_id(1), "stage_process")
             .is_none()
     );
     let process_ids = read_process_ids(process_ids);
     world.release_test_hook(HOOK);
 
-    wait_until("cancelled aftercare settles", || {
+    wait_until("the cancelled run settles", || {
         let counts = tickets(&world);
         counts["ready"] == 1 && counts["claimed"] == 0
     });
@@ -1782,7 +1787,7 @@ fn cancellation_before_the_test_process_checkpoint_stops_aftercare() {
     );
     assert!(
         world
-            .run_evidence(&world.run_id(1), "aftercare_process")
+            .run_evidence(&world.run_id(1), "stage_process")
             .is_none()
     );
     wait_for_processes_to_exit(process_ids);
@@ -2073,7 +2078,7 @@ fn straggler_group_members_are_killed_and_the_run_still_settles() {
 }
 
 #[test]
-fn authentication_and_configuration_rejections_fail_without_aftercare() {
+fn authentication_and_configuration_rejections_fail_without_later_stages() {
     let cases = [
         (
             "auth.md",
@@ -2091,18 +2096,18 @@ fn authentication_and_configuration_rejections_fail_without_aftercare() {
 
     for (ticket_name, body, class, rule_id) in cases {
         let world = World::configured();
-        let aftercare_marker = world.root().join("aftercare-ran");
+        let stage_marker = world.root().join("later-stage-ran");
         configure(
             &world,
             body,
-            Some(&format!("touch {}", aftercare_marker.display())),
+            Some(&format!("touch {}", stage_marker.display())),
         );
         world.commit_all("initial");
         world.start_daemon();
         let ticket = post_and_run(&world, ticket_name);
 
         wait_until("the rejected run fails", || tickets(&world)["failed"] == 1);
-        assert!(!aftercare_marker.exists());
+        assert!(!stage_marker.exists());
         let evidence = world
             .run_evidence(&world.run_id(1), "vendor_error_classified")
             .expect("vendor classification evidence");
@@ -2228,7 +2233,7 @@ fn cooldown_and_automatic_retry_survive_a_daemon_restart() {
 #[test]
 fn a_recognized_rejection_with_commits_never_tests_or_merges_the_work() {
     let world = World::configured();
-    let aftercare_marker = world.root().join("rejected-aftercare");
+    let stage_marker = world.root().join("rejected-later-stage");
     configure(
         &world,
         concat!(
@@ -2238,7 +2243,7 @@ fn a_recognized_rejection_with_commits_never_tests_or_merges_the_work() {
             "printf '%s\n' 'Unexpected server error. Check server logs for details.' >&2\n",
             "exit 0\n",
         ),
-        Some(&format!("touch {}", aftercare_marker.display())),
+        Some(&format!("touch {}", stage_marker.display())),
     );
     world.commit_all("initial");
     world.start_daemon();
@@ -2247,7 +2252,7 @@ fn a_recognized_rejection_with_commits_never_tests_or_merges_the_work() {
     wait_until("the rejected ticket is released under a cooldown", || {
         tickets(&world)["ready"] == 1
     });
-    assert!(!aftercare_marker.exists());
+    assert!(!stage_marker.exists());
     assert!(!world.root().join("rejected-work.txt").exists());
     assert_eq!(
         world
@@ -2256,7 +2261,7 @@ fn a_recognized_rejection_with_commits_never_tests_or_merges_the_work() {
         "unknown_rejection"
     );
     assert_eq!(
-        aftercare_stages(&world, 1)
+        stage_runs(&world, 1)
             .into_iter()
             .map(|(_, stage, state, _)| (stage, state))
             .collect::<Vec<_>>(),
@@ -2406,4 +2411,234 @@ fn recovery_preserves_the_checkpointed_cooldown_deadline() {
         run_count, 1,
         "recovery must not dispatch before the deadline"
     );
+}
+
+/// An agent that commits on its first invocation and reports a verdict on
+/// every later one, recording the worker token it was handed each time. Both
+/// agent stages of a flow run this same script, so the files it leaves behind
+/// say how many times it ran and under which credentials.
+const REVIEWING_AGENT: &str = concat!(
+    "root=\"$(dirname \"$0\")\"\n",
+    "count=$(cat \"$root/agent-invocations\" 2>/dev/null || echo 0)\n",
+    "count=$((count + 1))\n",
+    "printf '%s' \"$count\" > \"$root/agent-invocations\"\n",
+    "printf '%s\\n' \"$SLOOP_TOKEN\" >> \"$root/agent-tokens\"\n",
+    "if [ \"$count\" = 1 ]; then\n",
+    "  echo done > work.txt\n",
+    "  git add work.txt\n",
+    "  git -c user.name=agent -c user.email=agent@example.invalid commit --quiet -m 'agent work'\n",
+    "else\n",
+    "  echo reviewing\n",
+    "  \"$SLOOP_BIN\" --json verdict pass --reason reviewed > /dev/null\n",
+    "fi\n",
+    "exit 0\n",
+);
+
+fn lines_of(path: PathBuf) -> Vec<String> {
+    fs::read_to_string(path)
+        .expect("read agent record")
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Two agent stages in one flow: the driver runs each as its own supervised
+/// process, and each gets credentials of its own. The review stage's reported
+/// verdict is proof that its token authenticated for *its* stage — the first
+/// agent's token could not have carried it, because the token it was issued is
+/// no longer the run's.
+#[test]
+fn a_two_agent_flow_supervises_both_stages_with_separate_worker_tokens() {
+    let world = World::configured();
+    configure(&world, REVIEWING_AGENT, None);
+    write_flow(
+        &world,
+        "stages:\n  - { name: build, kind: agent }\n  - { name: review, kind: agent, verdict: reported }\n  - { name: merge, kind: merge }\n",
+    );
+    world.commit_all("initial");
+    world.start_daemon();
+    post_and_run(&world, "two-agents.md");
+
+    wait_until("the two-agent flow merges", || {
+        tickets(&world)["merged"] == 1
+    });
+    assert!(default_branch_has(&world, "work.txt"));
+    assert_eq!(
+        fs::read_to_string(world.root().join("agent-invocations")).unwrap(),
+        "2",
+        "both agent stages must run"
+    );
+
+    let tokens = lines_of(world.root().join("agent-tokens"));
+    assert_eq!(tokens.len(), 2, "one token per agent stage: {tokens:?}");
+    assert!(tokens.iter().all(|token| !token.is_empty()));
+    assert_ne!(
+        tokens[0], tokens[1],
+        "each agent stage is scoped to its own worker token"
+    );
+
+    assert_eq!(
+        stage_runs(&world, 1)
+            .into_iter()
+            .map(|(_, name, state, _)| (name, state))
+            .collect::<Vec<_>>(),
+        [
+            ("build".into(), "passed".into()),
+            ("review".into(), "passed".into()),
+            ("merge".into(), "passed".into()),
+        ]
+    );
+    let review = stage_evidence(&world, 1, "review");
+    assert_eq!(review["verdict_source"], "reported");
+    assert_eq!(review["reason"], "reviewed");
+
+    // The review agent's output is captured under its own stage, which only a
+    // supervised process produces.
+    let logs = world.sloop(&["logs", &world.run_id(1)]);
+    let entries = World::json_stdout(&logs)["data"]["entries"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["source"] == "agent" && entry["stage"] == "review"),
+        "no supervised review-stage output in {entries:?}"
+    );
+}
+
+/// An agent stage need not open a flow. One that follows an exec stage is
+/// launched by the same driver loop, in the same worktree, with a worker token
+/// that authenticates — which the note it records proves.
+#[test]
+fn an_agent_stage_after_an_exec_stage_runs_supervised_with_its_own_token() {
+    let world = World::configured();
+    let prepared = world.root().join("prepared");
+    let agent = format!(
+        "test -f {prepared}\n\"$SLOOP_BIN\" --json note 'agent reporting' > /dev/null\n{COMMITTING_AGENT}",
+        prepared = prepared.display(),
+    );
+    configure(&world, &agent, None);
+    write_flow(
+        &world,
+        &format!(
+            "stages:\n  - {{ name: prepare, kind: exec, cmd: [\"sh\", \"-c\", \"printf ready > {}\"] }}\n  - {{ name: build, kind: agent }}\n  - {{ name: merge, kind: merge }}\n",
+            prepared.display(),
+        ),
+    );
+    world.commit_all("initial");
+    world.start_daemon();
+    post_and_run(&world, "agent-second.md");
+
+    wait_until("the flow with a trailing agent merges", || {
+        tickets(&world)["merged"] == 1
+    });
+    assert!(default_branch_has(&world, "work.txt"));
+    assert_eq!(
+        stage_runs(&world, 1)
+            .into_iter()
+            .map(|(index, name, state, _)| (index, name, state))
+            .collect::<Vec<_>>(),
+        [
+            (0, "prepare".into(), "passed".into()),
+            (1, "build".into(), "passed".into()),
+            (2, "merge".into(), "passed".into()),
+        ]
+    );
+    // The note only lands if the agent's token authenticated on its run's
+    // worker socket.
+    assert_eq!(world.run_note_count(&world.run_id(1)), 1);
+}
+
+/// Resumption does not depend on where the walk stood. A daemon killed while
+/// the *first* stage of a flow was executing — a position that used to belong
+/// to the dispatcher rather than to any resumable regime — comes back, replays
+/// the log, and finishes the flow.
+#[test]
+fn restart_during_the_first_stage_resumes_the_flow() {
+    const HOOK: &str = "after-stage-process-checkpoint-open";
+
+    let world = World::configured();
+    configure(&world, COMMITTING_AGENT, None);
+    world.arm_test_hook(HOOK);
+    let invocations = world.root().join("open-invocations");
+    write_flow(
+        &world,
+        &format!(
+            "stages:\n  - {{ name: open, kind: exec, cmd: [\"sh\", \"-c\", \"printf x >> {}\"] }}\n  - {{ name: build, kind: agent }}\n  - {{ name: merge, kind: merge }}\n",
+            invocations.display(),
+        ),
+    );
+    world.commit_all("initial");
+    let daemon_pid = world.start_daemon()["data"]["pid"].as_u64().unwrap() as u32;
+    post_and_run(&world, "restart-first-stage.md");
+    wait_until("the first stage reaches its checkpoint gate", || {
+        world.test_hook_reached(HOOK)
+    });
+    assert_eq!(world.run_state(&world.run_id(1)), "driving");
+
+    world.kill_daemon(daemon_pid);
+    world.release_test_hook(HOOK);
+    world.start_daemon();
+
+    wait_until("the resumed driver finishes the flow", || {
+        tickets(&world)["merged"] == 1
+    });
+    assert!(default_branch_has(&world, "work.txt"));
+    assert_eq!(
+        stage_runs(&world, 1)
+            .into_iter()
+            .map(|(_, name, state, _)| (name, state))
+            .collect::<Vec<_>>(),
+        [
+            ("open".into(), "passed".into()),
+            ("build".into(), "passed".into()),
+            ("merge".into(), "passed".into()),
+        ]
+    );
+}
+
+/// Cancellation kills whatever stage is executing, wherever it sits. Here the
+/// agent is the *second* stage, so nothing about the kill can lean on the agent
+/// being the run's opening move.
+#[test]
+fn cancel_kills_an_agent_stage_process_group_in_a_later_position() {
+    let world = World::configured();
+    let process_ids = world.root().join("late-agent-processes");
+    let agent = format!(
+        "sleep 1000 & printf '%s %s' $$ $! > {process_ids}; wait\n",
+        process_ids = process_ids.display(),
+    );
+    configure(&world, &agent, None);
+    write_flow(
+        &world,
+        "stages:\n  - { name: prepare, kind: exec, cmd: [\"true\"] }\n  - { name: build, kind: agent }\n  - { name: merge, kind: merge }\n",
+    );
+    world.commit_all("initial");
+    world.start_daemon();
+    post_and_run(&world, "cancel-late-agent.md");
+
+    wait_until("the later agent stage is executing", || {
+        process_ids.is_file()
+            && world
+                .run_evidence(&world.run_id(1), "stage_process")
+                .is_some_and(|evidence| evidence["stage"] == "build")
+    });
+    let process_ids = read_process_ids(process_ids);
+
+    let cancelled = world.sloop(&["cancel", &world.run_id(1)]);
+    assert!(
+        cancelled.status.success(),
+        "cancel failed: {}",
+        String::from_utf8_lossy(&cancelled.stderr)
+    );
+    wait_until("the cancelled run settles", || {
+        let counts = tickets(&world);
+        counts["ready"] == 1 && counts["claimed"] == 0
+    });
+    assert_eq!(
+        world.wait_snapshot(&world.run_id(1))["data"]["state"],
+        "cancelled"
+    );
+    wait_for_processes_to_exit(process_ids);
 }

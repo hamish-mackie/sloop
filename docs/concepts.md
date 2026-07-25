@@ -25,35 +25,38 @@ Sloop's socket API.
    own — it records which daemon process holds the ticket, and the database
    itself permits at most one lease per ticket. Workers never hold or see
    leases; a worker gets a scoped token for its own run instead.
-4. **Dispatch.** Ticket → branch → fresh Git worktree → agent, spawned as a
-   supervised child process group with its worker socket and token in the
-   environment.
-5. **Run.** Output is captured continuously to the run log; the agent can
+4. **Admission.** Ticket → branch → fresh Git worktree → a driver that owns
+   the run from here until it settles.
+5. **The walk.** The driver executes the ticket's bound flow one stage at a
+   time. An agent stage — in any position, any number of times — is spawned as
+   a supervised child process group with its own worker socket and token in the
+   environment. Output is captured continuously to the run log; an agent can
    read its assignment with `sloop brief` at any time.
-6. **Aftercare.** After the agent exits, Sloop gathers evidence, executes the
-   ticket's bound flow stages in order, and merges the work if they pass.
+6. **Settlement.** When the walk completes or halts, Sloop derives the run's
+   outcome from the evidence every stage left behind.
 
 Merged run worktrees and run branches remain inspectable for the configured
 retention period, then periodic reconciliation removes them. Failed and
 `needs_review` worktrees remain as evidence until their ticket is resolved;
 run output and recorded evidence are retained when cleanup removes Git state.
 
-One async dispatcher task owns every spawn decision. Socket handlers and
-run supervisors send it requests; they never spawn anything themselves.
+One async dispatcher task owns every admission decision. Socket handlers and
+run drivers send it requests; they never admit anything themselves.
 That single ownership — not politeness between callers — is what makes
 gate-then-claim atomic.
 
-## Outcomes come from process and aftercare evidence
+## Outcomes come from process and stage evidence
 
 Sloop never trusts what the agent says in free-form output or notes. It derives
 the outcome from process, Git, check, merge, and policy-gated report evidence:
 
 - **Exit 0, flow stages pass** → the run branch merges.
 - **Exit 0, default agent policy, no commits** → the ticket needs review.
-- **Exit 0, aftercare fails with commits** → the branch is kept for human review.
-- **Exit 0, aftercare fails with known no commits** → the ticket fails.
-- **Exit 0, aftercare fails while commit evidence is incomplete** → the branch
-  is conservatively kept for human review.
+- **Exit 0, a later stage fails with commits** → the branch is kept for human
+  review.
+- **Exit 0, a later stage fails with known no commits** → the ticket fails.
+- **Exit 0, a later stage fails while commit evidence is incomplete** → the
+  branch is conservatively kept for human review.
 - **Nonzero exit** → the ticket fails, regardless of commit count.
 - **The vendor rejects authentication or configuration** → the ticket fails
   with a safe diagnostic.
@@ -124,8 +127,9 @@ live agent. At startup, every in-flight run is classified:
 - Process dead before its exit was checkpointed → release the ticket and keep
   its branch and worktree for autopsy. Commit count does not change this
   classification.
-- Daemon died mid-aftercare → aftercare stages are individually evidenced,
-  so the interrupted stage is re-run idempotently.
+- Daemon died mid-walk → every stage is individually evidenced, so the driver
+  replays the log and re-runs the interrupted stage idempotently, wherever in
+  the flow it sits.
 
 Recovery is driven entirely by that process identity, never by how old a
 lease is. Expiry is a report, not an authority: the daemon renews the lease
@@ -146,8 +150,9 @@ If SQLite reports that its storage is full, the daemon keeps active and
 finished runs reserved, blocks new dispatch, and reports the storage gate in
 `sloop show`. It periodically attempts a small committed
 write; after space becomes available, pending outcomes settle and dispatch
-resumes automatically. If the pre-aftercare checkpoint could not be written,
-Sloop skips side-effecting aftercare and preserves the run branch for review.
+resumes automatically. If the agent's exit checkpoint could not be written,
+Sloop stops the walk before any side-effecting stage and preserves the run
+branch for review.
 
 ## Files versus runtime state
 

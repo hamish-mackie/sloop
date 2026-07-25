@@ -23,10 +23,10 @@ const TICKET_STATES_HELP: &str = "Ticket states:
   ready         Eligible for dispatch once a run is queued and gates are open.
   held          Prevented from running by an operator; release with `sloop ready`.
   blocked       Waiting for every ticket in `blocked_by` to be merged.
-  claimed       Owned by an active run, including aftercare or recovery.
+  claimed       Owned by an active run, including recovery.
   merged        Terminal: completed work was integrated into the default branch.
   failed        Terminal: the agent exited unsuccessfully; requeue with `sloop retry`.
-  needs_review  Terminal: aftercare could not merge the run; inspect manually.";
+  needs_review  Terminal: the run could not be merged; inspect manually.";
 
 const SHOW_LONG_ABOUT: &str =
     "Show the daemon, tickets, runs, and projects - sloop's one read verb.

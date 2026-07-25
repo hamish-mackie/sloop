@@ -18,24 +18,25 @@ use crate::run_log::{OutputStream, output_staleness};
 use crate::run_store::{
     Exit, ExitDenial, OutputStallEvidence, RecoverableRun, RunExit, RunState, RunStore,
 };
-use crate::runner::WorkerCredentials;
 use crate::runner::local::{
     process_start_time, run_output_path, wait_for_test_hook, worker_socket_path,
 };
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
-use crate::work_state::local::LocalSqlite;
 
-use super::aftercare::{
-    RepairContext, aftercare_cancelled, drive_flow, git_index_lock_path, git_index_matches_head,
-    git_is_ancestor, git_stdout, shared_checkout_has_git_operation, try_commits_on_branch,
-};
 use super::dispatcher::{DispatcherState, RunEvent, disposition_for_outcome, push_work_outcome};
+use super::driver::{
+    DriverEnvironment, DriverPlan, STAGE_PROCESS, git_index_lock_path, git_index_matches_head,
+    git_is_ancestor, git_stdout, shared_checkout_has_git_operation, start_driver,
+    try_commits_on_branch,
+};
 use super::scheduler::{DEFAULT_LEASE_MS, VENDOR_COOLDOWN_MS};
 use super::server::{DaemonError, serve_worker_socket};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RecoveryClassification {
-    Aftercare,
+    /// A restarted daemon replayed the run's evidence log and resumed its
+    /// driver at the derived step.
+    Resumed,
     Orphaned,
 }
 
@@ -85,7 +86,7 @@ pub(super) async fn recover_inflight_runs(
                 && staleness.stalled
             {
                 let evidence = OutputStallEvidence {
-                    stage: agent_stage(&run),
+                    stage: executing_stage(&state.run_store, &run.id, run.flow_json.as_deref()),
                     last_output_at_ms: staleness.last_output_at_ms,
                     threshold_ms: state.stall_after_ms,
                     last_output_sequence: staleness.last_sequence,
@@ -183,8 +184,13 @@ pub(super) async fn recover_inflight_runs(
             }
             ProcessIdentity::GoneOrReused => {
                 state.recovering.insert(run.id.clone());
-                if run.state == RunState::Aftercare {
-                    if let Err(error) = restore_worker_socket(state, &run) {
+                if run.state == RunState::Driving {
+                    // A run whose flow has not reached an agent stage yet has
+                    // no credentials to restore; its driver mints them when a
+                    // stage needs them.
+                    if run.worker_token.is_some()
+                        && let Err(error) = restore_worker_socket(state, &run)
+                    {
                         log.emit_with_fields(
                             LogLevel::Error,
                             "sloop::recovery",
@@ -192,7 +198,7 @@ pub(super) async fn recover_inflight_runs(
                             json!({"run_id": run.id, "error": error}),
                         );
                     }
-                    spawn_aftercare_recovery(state, events.clone(), run, log.clone())?;
+                    resume_run_driver(state, events.clone(), run)?;
                 } else {
                     spawn_dead_run_recovery(state, events.clone(), run, log.clone());
                 }
@@ -202,9 +208,25 @@ pub(super) async fn recover_inflight_runs(
     Ok(())
 }
 
-fn agent_stage(run: &RecoverableRun) -> String {
-    run.flow_json
-        .as_deref()
+/// The stage a run is executing right now, read from the process checkpoint the
+/// driver writes for every stage. A run between stages has none, so the flow's
+/// first agent stage stands in — that is the only stage the output watchdog can
+/// be waiting on.
+pub(super) fn executing_stage(
+    run_store: &RunStore,
+    run_id: &str,
+    flow_json: Option<&str>,
+) -> String {
+    if let Ok(rows) = run_store.run_evidence(run_id)
+        && let Some(stage) = rows
+            .iter()
+            .find(|(kind, _)| kind == STAGE_PROCESS)
+            .and_then(|(_, data)| serde_json::from_str::<serde_json::Value>(data).ok())
+            .and_then(|data| data["stage"].as_str().map(str::to_owned))
+    {
+        return stage;
+    }
+    flow_json
         .and_then(|snapshot| serde_json::from_str::<Flow>(snapshot).ok())
         .and_then(|flow| {
             flow.stages
@@ -472,7 +494,7 @@ pub(super) fn recovered_exit_event(
         capture_complete: false,
         commits,
         commit_observation_complete: true,
-        aftercare_failed: false,
+        halt: None,
         merge: None,
         vendor_error,
         cooldown_until_ms,
@@ -480,31 +502,18 @@ pub(super) fn recovered_exit_event(
     })
 }
 
-/// Rebuilds the repair context for a resumed run from its snapshotted ticket
-/// and the live spawn gates. Absent when no agent is configured or the ticket
-/// snapshot is missing, which simply disables repair on resume.
-fn repair_context(state: &DispatcherState, run: &RecoverableRun) -> Option<RepairContext> {
-    let agent = state.agent.as_ref()?;
-    let ticket = run.ticket_json.as_deref().and_then(|json| {
-        serde_json::from_str::<crate::domain::ticket::TicketSnapshot>(json).ok()
-    })?;
-    Some(RepairContext::new(
-        agent.clone(),
-        &ticket,
-        state.running_hours.clone(),
-        state.max_agents,
-    ))
-}
-
-pub(super) fn spawn_aftercare_recovery(
+/// Resumes a run whose daemon died: replays its evidence log and restarts its
+/// driver at the derived step.
+///
+/// Nothing here depends on how far the run got. The driver re-derives its own
+/// position from the log, stops whatever process the previous daemon left
+/// behind, and carries on — so a run interrupted in its first stage and one
+/// interrupted in its last resume through exactly the same path.
+pub(super) fn resume_run_driver(
     state: &DispatcherState,
     events: mpsc::Sender<RunEvent>,
     run: RecoverableRun,
-    log: OperationalLog,
 ) -> Result<(), DaemonError> {
-    let root = state.root.clone();
-    let state_dir = state.state_dir.clone();
-    let test_cmd = state.aftercare_test_cmd.clone();
     let flow = match run.flow_json.as_deref() {
         Some(snapshot) => serde_json::from_str::<Flow>(snapshot).map_err(|error| {
             DaemonError::InvalidResponse(format!(
@@ -537,179 +546,51 @@ pub(super) fn spawn_aftercare_recovery(
             })?
         }
     };
-    let clock = state.clock.clone();
-    let db_path = state.state_dir.join("sloop.db");
-    let shutdown = state.shutdown_flag.clone();
-    let repair = repair_context(state, &run);
-    let worker = WorkerCredentials {
-        socket: run
-            .worker_socket_path
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| worker_socket_path(&state.runtime_dir, &run.id)),
-        token: run.worker_token.clone().unwrap_or_default(),
-    };
-    tokio::task::spawn_blocking(move || {
-        while !shutdown.load(Ordering::Acquire) {
-            let result = Db::open(&db_path, clock.now_ms())
-                .map_err(|error| error.to_string())
-                .and_then(|db| {
-                    let run_store = RunStore::from_db(db.clone());
-                    let local_work_state = LocalSqlite::from_db_with_clock(db, clock.clone());
-                    resume_aftercare(
-                        &root,
-                        &state_dir,
-                        &flow,
-                        &worker,
-                        test_cmd.as_deref(),
-                        clock.as_ref(),
-                        &run_store,
-                        &local_work_state,
-                        &run,
-                        repair.as_ref(),
-                        &log,
-                    )
-                });
-            match result {
-                Ok(event) => {
-                    let _ = events.blocking_send(event);
-                    break;
-                }
-                Err(error) => {
-                    log.emit_with_fields(
-                        LogLevel::Error,
-                        "sloop::recovery",
-                        "aftercare_resume_failed",
-                        json!({"run_id": run.id, "error": error}),
-                    );
-                    std::thread::sleep(Duration::from_secs(1));
-                }
-            }
-        }
-    });
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn resume_aftercare(
-    root: &Path,
-    state_dir: &Path,
-    flow: &Flow,
-    worker: &WorkerCredentials,
-    test_cmd: Option<&[String]>,
-    clock: &dyn Clock,
-    run_store: &RunStore,
-    local_work_state: &LocalSqlite,
-    run: &RecoverableRun,
-    repair: Option<&RepairContext>,
-    log: &OperationalLog,
-) -> Result<RunEvent, String> {
-    let rows = run_store
-        .run_evidence(&run.id)
-        .map_err(|error| error.to_string())?;
-    let value = |kind: &str| {
-        rows.iter()
-            .find(|(candidate, _)| candidate == kind)
-            .and_then(|(_, data)| serde_json::from_str::<serde_json::Value>(data).ok())
-    };
-    let commit_observation = value("commits_observed")
-        .and_then(|data| {
-            data["oids"].as_array().map(|oids| {
-                let complete = data["complete"].as_bool().unwrap_or(true);
-                let commits = oids
-                    .iter()
-                    .filter_map(|oid| oid.as_str().map(str::to_owned))
-                    .collect::<Vec<_>>();
-                (commits, complete)
-            })
-        })
-        .ok_or_else(|| "the aftercare checkpoint has no valid commit evidence".to_owned())?;
-    let (commits, commit_observation_complete) = commit_observation;
-    let exit_code = run.exit_code.and_then(|code| i32::try_from(code).ok());
-    let vendor_error = value("vendor_error_classified")
-        .and_then(|data| serde_json::from_value::<VendorErrorMatch>(data).ok());
-    let cooldown_until_ms =
-        value("vendor_error_classified").and_then(|data| data["cooldown_until_ms"].as_i64());
-    let output_path = run_output_path(state_dir, &run.id);
-    if aftercare_cancelled(run_store, &run.id, log) {
-        return Ok(RunEvent::Exited {
-            run_id: run.id.clone(),
-            target: run.target.clone(),
-            exit_code,
-            capture_complete: !rows.iter().any(|(kind, _)| kind == "capture_incomplete"),
-            commits,
-            commit_observation_complete,
-            aftercare_failed: false,
-            merge: None,
-            vendor_error,
-            cooldown_until_ms,
-            recovery: Some(RecoveryClassification::Aftercare),
-        });
-    }
+    let branch = run.branch.clone().ok_or_else(|| {
+        DaemonError::InvalidResponse(format!("run `{}` has no run branch", run.id))
+    })?;
     let worktree = run
         .worktree_path
-        .as_deref()
-        .ok_or_else(|| "the aftercare checkpoint has no worktree".to_owned())?;
-    let branch = run
-        .branch
-        .as_deref()
-        .ok_or_else(|| "the aftercare checkpoint has no branch".to_owned())?;
-    let result = drive_flow(
-        root,
-        Path::new(worktree),
-        branch,
-        flow,
-        worker,
-        test_cmd,
-        exit_code,
-        vendor_error.is_some(),
-        &commits,
-        commit_observation_complete,
-        &output_path,
-        clock,
-        run_store,
-        local_work_state,
-        &run.id,
-        repair,
-        log,
-    )?;
-
-    Ok(RunEvent::Exited {
+        .clone()
+        .ok_or_else(|| DaemonError::InvalidResponse(format!("run `{}` has no worktree", run.id)))?;
+    let plan = DriverPlan {
         run_id: run.id.clone(),
+        ticket_id: run.ticket_id.clone(),
         target: run.target.clone(),
-        exit_code,
-        capture_complete: !rows.iter().any(|(kind, _)| kind == "capture_incomplete"),
-        commits,
-        commit_observation_complete,
-        aftercare_failed: result.aftercare_failed,
-        merge: result.merge,
-        vendor_error,
-        cooldown_until_ms,
-        recovery: Some(RecoveryClassification::Aftercare),
-    })
+        branch,
+        worktree: PathBuf::from(worktree),
+        flow,
+        ticket: run
+            .ticket_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok()),
+        recovery: Some(RecoveryClassification::Resumed),
+    };
+    start_driver(DriverEnvironment::from_state(state), plan, events);
+    Ok(())
 }
 
 pub(super) fn stop_interrupted_process(
     rows: &[(String, String)],
     stage: &str,
-) -> Result<Option<(AftercareProcessIdentity, PersistedProcessStop)>, String> {
-    let Some(identity) = aftercare_process_identity(rows, Some(stage))? else {
+) -> Result<Option<(StageProcessIdentity, PersistedProcessStop)>, String> {
+    let Some(identity) = stage_process_identity(rows, Some(stage))? else {
         return Ok(None);
     };
     if identity.group <= 0 {
-        return Err("the interrupted aftercare stage has an invalid process group".into());
+        return Err("the interrupted stage has an invalid process group".into());
     }
     let stopped = stop_persisted_process_group(&identity)?;
     Ok(Some((identity, stopped)))
 }
 
-pub(super) fn aftercare_process_identity(
+pub(super) fn stage_process_identity(
     rows: &[(String, String)],
     stage: Option<&str>,
-) -> Result<Option<AftercareProcessIdentity>, String> {
+) -> Result<Option<StageProcessIdentity>, String> {
     let Some(data) = rows
         .iter()
-        .find(|(candidate, _)| candidate == "aftercare_process")
+        .find(|(candidate, _)| candidate == STAGE_PROCESS)
         .and_then(|(_, data)| serde_json::from_str::<serde_json::Value>(data).ok())
     else {
         return Ok(None);
@@ -720,13 +601,13 @@ pub(super) fn aftercare_process_identity(
     let pid = data["pid"]
         .as_u64()
         .and_then(|pid| u32::try_from(pid).ok())
-        .ok_or_else(|| "the interrupted aftercare stage has no valid pid".to_owned())?;
+        .ok_or_else(|| "the interrupted stage has no valid pid".to_owned())?;
     let start_time = data["pid_start_time"]
         .as_i64()
-        .ok_or_else(|| "the interrupted aftercare stage has no valid start time".to_owned())?;
+        .ok_or_else(|| "the interrupted stage has no valid start time".to_owned())?;
     let group = data["process_group_id"]
         .as_i64()
-        .ok_or_else(|| "the interrupted aftercare stage has no valid process group".to_owned())?;
+        .ok_or_else(|| "the interrupted stage has no valid process group".to_owned())?;
     let merge = data
         .get("merge")
         .map(|merge| -> Result<_, String> {
@@ -743,7 +624,7 @@ pub(super) fn aftercare_process_identity(
             })
         })
         .transpose()?;
-    Ok(Some(AftercareProcessIdentity {
+    Ok(Some(StageProcessIdentity {
         pid,
         start_time,
         group,
@@ -757,7 +638,7 @@ pub(super) fn recoverable_process_matches(run: &RecoverableRun) -> bool {
 }
 
 /// Claims the same durable exit handoff used by the normal supervisor. A
-/// racing loser emits no settlement event and leaves aftercare to the winner.
+/// racing loser emits no settlement event and leaves the walk to the winner.
 fn claim_recovered_exit(
     db_path: &Path,
     clock: &dyn Clock,
@@ -773,7 +654,10 @@ fn claim_recovered_exit(
         vendor_error,
         cooldown_until_ms,
         ..
-    } = event;
+    } = event
+    else {
+        return Ok(false);
+    };
     let now_ms = clock.now_ms();
     let result = Db::open(db_path, now_ms)
         .map_err(StoreError::from)
@@ -853,7 +737,7 @@ pub(super) async fn reconcile_run_liveness(
         if state.recovering.contains(&run.id) {
             continue;
         }
-        if run.state == RunState::Aftercare && state.supervised.contains(&run.id) {
+        if run.state == RunState::Driving && state.supervised.contains(&run.id) {
             continue;
         }
         match recoverable_process_identity(&run) {
@@ -891,15 +775,13 @@ pub(super) async fn reconcile_run_liveness(
         }
 
         state.recovering.insert(run.id.clone());
-        if run.state == RunState::Aftercare {
-            if let Err(error) =
-                spawn_aftercare_recovery(state, events.clone(), run.clone(), log.clone())
-            {
+        if run.state == RunState::Driving {
+            if let Err(error) = resume_run_driver(state, events.clone(), run.clone()) {
                 state.recovering.remove(&run.id);
                 log.emit_with_fields(
                     LogLevel::Error,
                     "sloop::recovery",
-                    "aftercare_recovery_start_failed",
+                    "driver_resume_failed",
                     json!({"run_id": run.id, "error": error.to_string()}),
                 );
             }
@@ -911,7 +793,7 @@ pub(super) async fn reconcile_run_liveness(
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct AftercareProcessIdentity {
+pub(super) struct StageProcessIdentity {
     pub(super) pid: u32,
     pub(super) start_time: i64,
     pub(super) group: i64,
@@ -977,7 +859,7 @@ fn process_group_alive(group: i64) -> bool {
 pub(super) fn inspect_interrupted_merge(
     root: &Path,
     branch: &str,
-    identity: &AftercareProcessIdentity,
+    identity: &StageProcessIdentity,
 ) -> Result<MergeRecovery, String> {
     let checkpoint = identity
         .merge
@@ -1014,7 +896,7 @@ pub(super) fn inspect_interrupted_merge(
     Ok(MergeRecovery::UnsafePartial)
 }
 
-fn persisted_process_state(identity: &AftercareProcessIdentity) -> PersistedProcessState {
+fn persisted_process_state(identity: &StageProcessIdentity) -> PersistedProcessState {
     let observed_start_time = process_start_time(identity.pid);
     classify_persisted_process(
         identity.start_time,
@@ -1037,7 +919,7 @@ fn classify_persisted_process(
 }
 
 pub(super) fn stop_persisted_process_group(
-    identity: &AftercareProcessIdentity,
+    identity: &StageProcessIdentity,
 ) -> Result<PersistedProcessStop, String> {
     if identity.group <= 0
         || identity.group != i64::from(identity.pid)
@@ -1075,7 +957,7 @@ pub(super) fn stop_agent_process_group(
     start_time: Option<i64>,
     group: Option<i64>,
 ) -> Result<PersistedProcessStop, String> {
-    let identity = AftercareProcessIdentity {
+    let identity = StageProcessIdentity {
         pid: pid
             .and_then(|pid| u32::try_from(pid).ok())
             .ok_or_else(|| "the persisted agent PID is invalid".to_owned())?,

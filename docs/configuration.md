@@ -37,7 +37,7 @@ scheduler:
     start: "22:00"
     end: "06:00"
 
-aftercare:
+flow:
   test_cmd: ["cargo", "test"]
 
 agent:
@@ -76,12 +76,12 @@ ids:
   the window waits for the next opening; agents already running when the
   window closes are allowed to finish. Omit the key to run at any time.
 
-### aftercare
+### flow
 
-- `test_cmd` — an argv run inside the worktree after the agent exits and
-  before its work can merge. A failing command keeps the work out of your
-  branch and leaves the ticket for review. Omit it to merge after a successful
-  agent exit without another qualification step.
+- `test_cmd` — an argv run inside the worktree after the flow's first stage
+  and before its work can merge. A failing command keeps the work out of your
+  branch and leaves the ticket for review. Omit it to merge without another
+  qualification step.
 
 ### agent
 
@@ -156,7 +156,7 @@ are never inherited from user configuration.
 ## User defaults
 
 Optional defaults live at `~/.config/sloop/config.yaml`. Repository values
-override them. Only scheduler and aftercare settings may be defaulted this
+override them. Only scheduler and flow settings may be defaulted this
 way; agent targets, ID prefixes, and directory locations are always
 repository-scoped.
 
@@ -250,8 +250,8 @@ Each stage is an `action` — the work, never trusted to grade itself — and a
 `result_check` that judges it. The actions are:
 
 - `action: agent` spawns the ticket's agent target in the run worktree,
-  prompted by the ticket body. The first stage must be the flow's only agent
-  action.
+  prompted by the ticket body. Any position, any number of times; each gets its
+  own supervised process and worker credentials.
 - `action: { exec: ["argv", "..."] }` runs an argv (no shell) in the run
   worktree.
 - `action: { builtin: merge }` applies the branch using Sloop's merge policy.
@@ -285,7 +285,7 @@ The older grammar still parses, as sugar for exactly the same stages:
 reported` are the four checks above in order. The two spellings may not be
 mixed on one stage.
 
-A configured `aftercare.test_cmd` is inserted as an implicit `result_check:
+A configured `flow.test_cmd` is inserted as an implicit `result_check:
 none` stage named `test` immediately after the agent action, before the flow's
 own `exec` stages.
 

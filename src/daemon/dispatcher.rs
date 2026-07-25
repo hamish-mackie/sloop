@@ -15,10 +15,11 @@ use crate::db::StoreError;
 use crate::domain::work::{Disposition, TicketRef, WorkOutcome};
 use crate::flow::Flow;
 use crate::logging::{LogLevel, OperationalLog};
-use crate::outcome::{MergeOutcome, RunEvidence, classify_exit, derive_outcome};
+use crate::outcome::{FlowHalt, MergeOutcome, RunEvidence, classify_exit, derive_outcome};
 use crate::protocol::{ErrorBody, ErrorCode, Request, RequestId, ResponseEnvelope};
 use crate::run_ref::RunIdSource;
 use crate::run_store::{CooldownUpdate, EvidenceRecord, RunStore};
+use crate::runner::WorkerCredentials;
 use crate::runner::local::worker_socket_path;
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
 use crate::work_state::local::LocalSqlite;
@@ -31,6 +32,7 @@ use super::commands::{
 };
 use super::recovery::{RecoveryClassification, reconcile_run_liveness};
 use super::scheduler::{next_dispatch_deadline, reconcile};
+use super::server::serve_worker_socket;
 use super::worker_api::dispatch_worker;
 
 pub(super) const LOGS_PAGE_LIMIT: usize = 64;
@@ -81,7 +83,7 @@ pub(super) struct DispatcherState {
     pub(super) agent: Option<AgentConfig>,
     pub(super) flows: BTreeMap<String, Flow>,
     pub(super) default_flow: String,
-    pub(super) aftercare_test_cmd: Option<Vec<String>>,
+    pub(super) flow_test_cmd: Option<Vec<String>>,
     pub(super) root: PathBuf,
     pub(super) project_dir: PathBuf,
     pub(super) ticket_dir: PathBuf,
@@ -148,8 +150,24 @@ pub(super) struct DispatcherState {
     pub(super) shutdown_flag: Arc<AtomicBool>,
 }
 
-/// Internal dispatcher events reported by effect tasks, never by clients.
+/// Internal dispatcher events reported by drivers and recovery tasks, never by
+/// clients.
 pub(super) enum RunEvent {
+    /// A driver minted worker credentials for the stage it is about to run.
+    /// The dispatcher registers the token *before* serving the socket, so no
+    /// worker request can be answered against a token it has not yet issued.
+    WorkerReady {
+        run_id: String,
+        worker: WorkerCredentials,
+        listener: tokio::net::UnixListener,
+    },
+    /// A driver could not open its run's workspace. Nothing was recorded, so
+    /// the claim rolls back and the ticket is queued again.
+    AdmissionFailed {
+        run_id: String,
+        ticket_id: String,
+        error: String,
+    },
     Exited {
         run_id: String,
         target: String,
@@ -161,7 +179,8 @@ pub(super) enum RunEvent {
         /// metadata only; it does not determine the run's outcome.
         commits: Vec<String>,
         commit_observation_complete: bool,
-        aftercare_failed: bool,
+        /// Where the run's flow walk stopped short, if it did.
+        halt: Option<FlowHalt>,
         merge: Option<MergeOutcome>,
         vendor_error: Option<VendorErrorMatch>,
         cooldown_until_ms: Option<i64>,
@@ -262,12 +281,62 @@ async fn wait_for_deadline(clock: Arc<dyn Clock>, deadline: Option<i64>) {
 /// work source releases its claim. Cancellation intent recorded before the exit
 /// wins over every other reading.
 async fn settle_run_exit(state: &mut DispatcherState, event: RunEvent, log: &OperationalLog) {
-    let run_id = match &event {
-        RunEvent::Exited { run_id, .. } => run_id.clone(),
+    let run_id = match event {
+        RunEvent::WorkerReady {
+            run_id,
+            worker,
+            listener,
+        } => {
+            register_worker_socket(state, &run_id, &worker, listener);
+            return;
+        }
+        RunEvent::AdmissionFailed {
+            run_id,
+            ticket_id,
+            error,
+        } => {
+            super::scheduler::roll_back_admission(state, &run_id, &ticket_id, &error, log).await;
+            return;
+        }
+        RunEvent::Exited { ref run_id, .. } => run_id.clone(),
     };
     state.pending_exits.insert(run_id, event);
     if !state.storage_full.get() {
         settle_pending_exits(state, log).await;
+    }
+}
+
+/// Issues a stage's worker credentials and then, and only then, starts serving
+/// the socket they authenticate against. The ordering is the whole guarantee:
+/// a worker's connection waits in the listen backlog until the accept loop
+/// exists, and that loop exists only once the token is registered, so a request
+/// can never race its own credential.
+///
+/// A run holds at most one live worker socket, so a new one replaces the
+/// previous stage's and that stage's token stops validating.
+fn register_worker_socket(
+    state: &mut DispatcherState,
+    run_id: &str,
+    worker: &WorkerCredentials,
+    listener: tokio::net::UnixListener,
+) {
+    state
+        .worker_tokens
+        .insert(run_id.to_owned(), worker.token.clone());
+    state
+        .worker_socket_paths
+        .insert(run_id.to_owned(), worker.socket.clone());
+    let accept_loop = tokio::spawn(serve_worker_socket(
+        listener,
+        run_id.to_owned(),
+        state.requests_tx.clone(),
+        state.log.clone(),
+    ));
+    if let Some(previous) = state
+        .worker_listeners
+        .insert(run_id.to_owned(), accept_loop)
+    {
+        previous.abort();
     }
 }
 
@@ -344,12 +413,15 @@ async fn try_settle_run_exit(
         capture_complete,
         commits,
         commit_observation_complete,
-        aftercare_failed,
+        halt,
         merge,
         vendor_error,
         cooldown_until_ms,
         recovery,
-    } = event;
+    } = event
+    else {
+        unreachable!("only settlement events are queued as pending exits")
+    };
 
     let cancelled =
         state.cancelling.contains(run_id) || state.run_store.cancellation_requested(run_id)?;
@@ -361,7 +433,7 @@ async fn try_settle_run_exit(
         exit: classify_exit(*exit_code),
         vendor_error: vendor_error.as_ref().map(|error| error.class),
         commit_count: commit_observation_complete.then_some(commits.len()),
-        aftercare_failed: *aftercare_failed,
+        halt: *halt,
         merge: *merge,
     };
     let outcome = if *recovery == Some(RecoveryClassification::Orphaned)
@@ -390,7 +462,7 @@ async fn try_settle_run_exit(
             kind: "recovery_classified",
             data_json: json!({
                 "classification": match classification {
-                    RecoveryClassification::Aftercare => "aftercare",
+                    RecoveryClassification::Resumed => "resumed",
                     RecoveryClassification::Orphaned => "orphaned",
                 }
             })

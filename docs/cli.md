@@ -81,7 +81,7 @@ command does this implicitly.
 
 Ask the daemon to restart when it is safe. The command returns immediately
 with the number of active runs still draining. No new runs start during the
-drain; active runs continue through every flow and aftercare stage. When the
+drain; active runs continue through every remaining flow stage. When the
 last run settles, the daemon releases its sockets and lock, then replaces
 itself with the binary currently installed at the path from which it started.
 Queued activations remain queued and resume automatically in the replacement.
@@ -239,7 +239,7 @@ Exit codes are stable for scripting:
 
 ### sloop pause / sloop resume
 
-Stop or resume spawning. In-flight agents finish and go through aftercare.
+Stop or resume spawning. In-flight runs finish their remaining stages.
 The paused state is persisted and survives daemon restarts. Resume also
 cancels a pending `sloop daemon restart` and clears its draining state.
 

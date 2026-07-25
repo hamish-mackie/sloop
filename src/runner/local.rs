@@ -19,15 +19,13 @@ use crate::run_log::{OutputSource, OutputStream, RunLogWriter};
 
 const WORKER_BOOTSTRAP_PROMPT: &str = include_str!("../worker-instructions.md").trim_ascii();
 
-/// A launched agent whose worker socket can be registered before supervision
-/// moves to a blocking task.
+/// An agent process under supervision: spawned, checkpointed, and being
+/// drained of output until it exits.
 pub struct LaunchedAgent {
     child: Child,
     readers: Vec<std::thread::JoinHandle<bool>>,
     process: ProcessIdentity,
     started_at_ms: i64,
-    worker_listener: Option<UnixListener>,
-    worker: WorkerCredentials,
 }
 
 pub struct AgentCompletion {
@@ -38,16 +36,6 @@ pub struct AgentCompletion {
 impl LaunchedAgent {
     pub fn process(&self) -> ProcessIdentity {
         self.process
-    }
-
-    pub fn worker(&self) -> &WorkerCredentials {
-        &self.worker
-    }
-
-    pub fn take_worker_listener(&mut self) -> UnixListener {
-        self.worker_listener
-            .take()
-            .expect("worker listener is taken only once")
     }
 
     pub fn wait(mut self, clock: &dyn Clock) -> AgentCompletion {
@@ -74,6 +62,57 @@ impl LaunchedAgent {
     }
 }
 
+/// Creates the isolated workspace a run executes every one of its stages in.
+/// The driver does this once, before the first stage, because a flow need not
+/// open with an agent action.
+pub fn create_run_worktree(repository: &Path, worktree: &Path, branch: &str) -> Result<(), String> {
+    if worktree.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(
+        worktree
+            .parent()
+            .ok_or_else(|| "worktree has no parent".to_owned())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let git = Command::new("git")
+        .args(["worktree", "add", "--quiet", "-b", branch])
+        .arg(worktree)
+        .current_dir(repository)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if git.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&git.stderr).trim()
+        ))
+    }
+}
+
+/// Binds a worker socket and mints the token that authenticates against it.
+/// Returned unregistered: the caller decides who serves the socket, and no
+/// request can be answered before it does.
+pub fn mint_worker_credentials(
+    socket_path: &Path,
+) -> Result<(WorkerCredentials, UnixListener), String> {
+    let token = generate_worker_token()?;
+    fs::create_dir_all(socket_path.parent().expect("worker sockets have a parent"))
+        .map_err(|error| error.to_string())?;
+    let _ = fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path).map_err(|error| error.to_string())?;
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| error.to_string())?;
+    Ok((
+        WorkerCredentials {
+            socket: socket_path.to_path_buf(),
+            token,
+        },
+        listener,
+    ))
+}
+
 pub fn launch_agent<H: StageHooks>(
     order: StageOrder,
     hooks: &H,
@@ -89,45 +128,17 @@ pub fn launch_agent<H: StageHooks>(
         return Err(RunnerError::Execution("agent argv is empty".into()));
     };
 
-    fs::create_dir_all(
-        order
-            .worktree
-            .parent()
-            .ok_or_else(|| RunnerError::Execution("worktree has no parent".into()))?,
-    )
-    .map_err(|error| RunnerError::Execution(error.to_string()))?;
-    let git = Command::new("git")
-        .args(["worktree", "add", "--quiet", "-b", &order.branch])
-        .arg(&order.worktree)
-        .current_dir(&launch.repository)
-        .output()
-        .map_err(|error| RunnerError::Execution(error.to_string()))?;
-    if !git.status.success() {
-        return Err(RunnerError::Execution(format!(
-            "git worktree add failed: {}",
-            String::from_utf8_lossy(&git.stderr).trim()
-        )));
-    }
-
     let output_log = RunLogWriter::open(&order.output_path)
         .map_err(|error| RunnerError::Execution(error.to_string()))?;
-    let worker_token = generate_worker_token().map_err(RunnerError::Execution)?;
-    let socket_path = &launch.worker_socket_path;
-    fs::create_dir_all(socket_path.parent().expect("worker sockets have a parent"))
-        .map_err(|error| RunnerError::Execution(error.to_string()))?;
-    let _ = fs::remove_file(socket_path);
-    let worker_listener = UnixListener::bind(socket_path)
-        .map_err(|error| RunnerError::Execution(error.to_string()))?;
-    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| RunnerError::Execution(error.to_string()))?;
+    let worker = launch.worker.clone();
 
     let mut command = Command::new(program);
     command
         .args(&launch.argv[1..])
         .current_dir(&order.worktree)
         .envs(launch.environment.iter().cloned())
-        .env("SLOOP_SOCKET", socket_path)
-        .env("SLOOP_TOKEN", &worker_token)
+        .env("SLOOP_SOCKET", &worker.socket)
+        .env("SLOOP_TOKEN", &worker.token)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -166,16 +177,13 @@ pub fn launch_agent<H: StageHooks>(
         process_group_id: pid,
     };
     let started_at_ms = clock.now_ms();
-    let worker = WorkerCredentials {
-        socket: socket_path.clone(),
-        token: worker_token,
-    };
     let checkpoint = AgentProcessCheckpoint {
         run_id: order.run_id,
+        stage: order.stage,
         branch: order.branch,
         worktree: order.worktree,
         process,
-        worker: worker.clone(),
+        worker,
         started_at_ms,
     };
     if let Err(error) = hooks.record_agent_process(&checkpoint) {
@@ -192,8 +200,6 @@ pub fn launch_agent<H: StageHooks>(
         readers,
         process,
         started_at_ms,
-        worker_listener: Some(worker_listener),
-        worker,
     })
 }
 
@@ -296,7 +302,7 @@ pub fn run_exec_stage<H: StageHooks>(
         spawn_output_reader(
             child.stdout.take().expect("stdout was piped"),
             output_log.clone(),
-            OutputSource::Aftercare,
+            OutputSource::Stage,
             Some(order.stage.clone()),
             OutputStream::Stdout,
             None,
@@ -305,7 +311,7 @@ pub fn run_exec_stage<H: StageHooks>(
         spawn_output_reader(
             child.stderr.take().expect("stderr was piped"),
             output_log,
-            OutputSource::Aftercare,
+            OutputSource::Stage,
             Some(order.stage.clone()),
             OutputStream::Stderr,
             None,
@@ -315,10 +321,7 @@ pub fn run_exec_stage<H: StageHooks>(
     if order.stage == "test" {
         wait_for_test_hook("before-test-process-checkpoint");
     }
-    wait_for_test_hook(&format!(
-        "before-aftercare-process-checkpoint-{}",
-        order.stage
-    ));
+    wait_for_test_hook(&format!("before-stage-process-checkpoint-{}", order.stage));
     let checkpoint = ExecProcessCheckpoint {
         run_id: order.run_id.clone(),
         stage: order.stage.clone(),
@@ -334,10 +337,7 @@ pub fn run_exec_stage<H: StageHooks>(
         join_readers(readers);
         return Err(failed(Some(process), RunnerError::Hook(error)));
     }
-    wait_for_test_hook(&format!(
-        "after-aftercare-process-checkpoint-{}",
-        order.stage
-    ));
+    wait_for_test_hook(&format!("after-stage-process-checkpoint-{}", order.stage));
     if hooks.cancellation_requested(&order.run_id) {
         kill_process_group_if_matches(checkpoint.process);
         let _ = child.wait();

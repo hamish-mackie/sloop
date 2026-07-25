@@ -143,9 +143,9 @@ that call at all.
 The filename is the flow name. Select one with `flow: <name>` in the ticket or
 with `sloop post my-ticket.md --flow <name>`.
 
-The first stage is the supervised coding `agent`; `exec` stages run their argv
-in the run worktree, and `merge` applies the branch. Every non-merge stage has
-a verdict policy:
+An `agent` stage is a supervised coding agent — in any position, any number of
+times; `exec` stages run their argv in the run worktree, and `merge` applies
+the branch. Every non-merge stage has a verdict policy:
 
 - `commits` requires exit 0 and at least one observed commit.
 - `exit` requires exit 0.
@@ -162,12 +162,12 @@ verdict: { check: [cargo, test] }
 stops the flow before merge. To add a test gate to every flow, set:
 
 ```yaml
-aftercare:
+flow:
   test_cmd: ["cargo", "test"]
 ```
 
-This compatibility command runs as an implicit `test` stage immediately after
-the `agent` stage, before the flow's own `exec` stages.
+This command runs as an implicit `test` stage at index 1, before the flow's
+own later stages.
 
 ## Logs
 

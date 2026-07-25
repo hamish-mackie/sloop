@@ -339,7 +339,7 @@ async fn serve(
         agent: config.agent.clone(),
         flows: config.flows.clone(),
         default_flow: config.default_flow.clone(),
-        aftercare_test_cmd: config.aftercare_test_cmd.clone(),
+        flow_test_cmd: config.flow_test_cmd.clone(),
         root: repository.root.clone(),
         project_dir: config.project_dir.clone(),
         ticket_dir: config.ticket_dir.clone(),

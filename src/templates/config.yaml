@@ -44,7 +44,8 @@ scheduler:
   # Output resuming starts a new silence episode. Must be positive.
   stall_report_after: 10m
   # Kill and fail a running agent stage after this long without output.
-  # Must be greater than stall_report_after. Aftercare stages are unaffected.
+  # Must be greater than stall_report_after. Stages the daemon runs itself
+  # are unaffected.
   stall_after: 2h
   # A local-time window in which agents may be spawned. Both values are
   # HH:MM, must differ, and may cross midnight (22:00-06:00 is overnight).
@@ -119,14 +120,14 @@ ids:
   ticket_prefix: TICK
   project_prefix: PROJ
 
-# ---- aftercare ---------------------------------------------------------
-# An argv run inside the worktree after the agent exits and before its
+# ---- flow --------------------------------------------------------------
+# An argv run inside the worktree after the first stage and before the
 # work can merge. A failure keeps the work out of your branch and leaves
 # the ticket for review. It is inserted as an implicit `exit` stage named
-# `test` immediately after the agent stage, so it cannot be combined with
-# a flow that already has a stage named `test` — prefer an explicit stage
-# in the flow file (`sloop template flow`) when you need one.
-# aftercare:
+# `test` at index 1, so it cannot be combined with a flow that already has
+# a stage named `test` — prefer an explicit stage in the flow file
+# (`sloop template flow`) when you need one.
+# flow:
 #   test_cmd: [cargo, test, --all-targets]
 
 # ---- ticket sources ----------------------------------------------------
@@ -141,6 +142,6 @@ ids:
 # ---- user defaults -----------------------------------------------------
 # Optional defaults may live at ~/.config/sloop/config.yaml under a
 # `defaults:` key, and repository values override them. Only `scheduler`
-# and `aftercare` may be defaulted that way; `agent`, `sources`, `ids`,
+# and `flow` may be defaulted that way; `agent`, `sources`, `ids`,
 # and the directory keys are always repository-scoped and are rejected in
 # user configuration.

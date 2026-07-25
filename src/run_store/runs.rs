@@ -9,8 +9,12 @@ use crate::db::StoreError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
     Claimed,
+    /// A supervised agent process is alive for the run's current stage.
     Running,
-    Aftercare,
+    /// The run's driver holds it, with no agent process of its own to
+    /// identify: it is between stages, or executing one the daemon runs
+    /// itself. The driver is then the run's liveness evidence.
+    Driving,
     /// A claim rolled back before a process existed.
     Aborted,
     Merged,
@@ -22,14 +26,14 @@ pub enum RunState {
 }
 
 const NONTERMINAL_RUN_STATES: [RunState; 3] =
-    [RunState::Claimed, RunState::Running, RunState::Aftercare];
+    [RunState::Claimed, RunState::Running, RunState::Driving];
 
 impl RunState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Claimed => "claimed",
             Self::Running => "running",
-            Self::Aftercare => "aftercare",
+            Self::Driving => "driving",
             Self::Aborted => "aborted",
             Self::Merged => "merged",
             Self::Failed => "failed",
@@ -44,7 +48,7 @@ impl RunState {
         match value {
             "claimed" => Some(Self::Claimed),
             "running" => Some(Self::Running),
-            "aftercare" => Some(Self::Aftercare),
+            "driving" => Some(Self::Driving),
             "aborted" => Some(Self::Aborted),
             "merged" => Some(Self::Merged),
             "failed" => Some(Self::Failed),
@@ -77,7 +81,7 @@ impl RunState {
             Self::Cancelled => Some(Outcome::Cancelled),
             Self::RateLimited => Some(Outcome::RateLimited),
             Self::Orphaned => Some(Outcome::Orphaned),
-            Self::Claimed | Self::Running | Self::Aftercare | Self::Aborted => None,
+            Self::Claimed | Self::Running | Self::Driving | Self::Aborted => None,
         }
     }
 }
@@ -249,6 +253,36 @@ pub(crate) mod tx {
 
     use super::{RunState, WorktreeCleanupCandidate};
 
+    /// Hands a claimed run to its driver: the workspace it will execute every
+    /// stage in becomes durable before the first stage runs, so recovery can
+    /// find the branch and worktree of a run whose first stage never
+    /// checkpointed a process.
+    pub(crate) fn mark_driving(
+        transaction: &Transaction<'_>,
+        run_id: &str,
+        branch: &str,
+        worktree_path: &str,
+        now_ms: i64,
+    ) -> rusqlite::Result<usize> {
+        transaction.execute(
+            "UPDATE runs
+             SET state = ?5, branch = ?2, worktree_path = ?3,
+                 started_at_ms = ?4, updated_at_ms = ?4
+             WHERE id = ?1 AND state = ?6 AND exited_at_ms IS NULL",
+            params![
+                run_id,
+                branch,
+                worktree_path,
+                now_ms,
+                RunState::Driving.as_str(),
+                RunState::Claimed.as_str(),
+            ],
+        )
+    }
+
+    /// Records the agent process an agent stage just launched. The run may be
+    /// driving (the usual case, the driver having taken the workspace first) or
+    /// already claimed, so a launch that raced the handoff still lands.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn mark_running(
         transaction: &Transaction<'_>,
@@ -266,8 +300,9 @@ pub(crate) mod tx {
             "UPDATE runs
              SET state = ?10, branch = ?2, worktree_path = ?3, pid = ?4,
                  pid_start_time = ?5, process_group_id = ?6, worker_token = ?7,
-                 worker_socket_path = ?8, started_at_ms = ?9, updated_at_ms = ?9
-             WHERE id = ?1 AND state = ?11 AND exited_at_ms IS NULL",
+                 worker_socket_path = ?8,
+                 started_at_ms = COALESCE(started_at_ms, ?9), updated_at_ms = ?9
+             WHERE id = ?1 AND state IN (?11, ?12) AND exited_at_ms IS NULL",
             params![
                 run_id,
                 branch,
@@ -280,6 +315,7 @@ pub(crate) mod tx {
                 now_ms,
                 RunState::Running.as_str(),
                 RunState::Claimed.as_str(),
+                RunState::Driving.as_str(),
             ],
         )
     }
@@ -437,7 +473,25 @@ pub(crate) mod tx {
                 run_id,
                 exit_code,
                 now_ms,
-                RunState::Aftercare.as_str(),
+                RunState::Driving.as_str(),
+                RunState::Running.as_str(),
+            ],
+        )
+    }
+
+    pub(crate) fn release_agent(
+        transaction: &Transaction<'_>,
+        run_id: &str,
+        now_ms: i64,
+    ) -> rusqlite::Result<usize> {
+        transaction.execute(
+            "UPDATE runs
+             SET state = ?3, updated_at_ms = ?2
+             WHERE id = ?1 AND state = ?4 AND exited_at_ms IS NULL",
+            params![
+                run_id,
+                now_ms,
+                RunState::Driving.as_str(),
                 RunState::Running.as_str(),
             ],
         )
@@ -1038,7 +1092,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{RunState, RunStore};
-    use crate::db::{Db, SCHEMA_VERSION, StoreError};
+    use crate::db::{Db, LEGACY_STAGE_TABLE, SCHEMA_VERSION, StoreError};
     use crate::domain::ticket::TicketSnapshot;
     use crate::flow::{Actor, Builtin, Check, FailAction, Flow, Stage};
     use crate::outcome::Outcome;
@@ -1072,6 +1126,12 @@ mod tests {
     }
 
     fn start_run(store: &RunStore, start: &RunStart<'_>, now_ms: i64) {
+        assert_eq!(
+            store
+                .begin(start.run_id, start.branch, start.worktree_path, now_ms)
+                .unwrap(),
+            Start::Granted
+        );
         assert_eq!(store.start(start, now_ms).unwrap(), Start::Granted);
     }
 
@@ -1098,7 +1158,7 @@ mod tests {
         let states = [
             RunState::Claimed,
             RunState::Running,
-            RunState::Aftercare,
+            RunState::Driving,
             RunState::Aborted,
             RunState::Merged,
             RunState::Failed,
@@ -1121,7 +1181,7 @@ mod tests {
             assert_eq!(RunState::from(outcome).as_str(), outcome.as_str());
             assert!(RunState::from(outcome).is_terminal());
         }
-        for state in [RunState::Claimed, RunState::Running, RunState::Aftercare] {
+        for state in [RunState::Claimed, RunState::Running, RunState::Driving] {
             assert!(!state.is_terminal());
         }
         assert!(RunState::Aborted.is_terminal());
@@ -1403,6 +1463,11 @@ mod tests {
                  ALTER TABLE runs DROP COLUMN cleaned_at_ms;",
             )
             .unwrap();
+        connection
+            .execute_batch(&format!(
+                "ALTER TABLE stage_runs RENAME TO {LEGACY_STAGE_TABLE};"
+            ))
+            .unwrap();
         connection.pragma_update(None, "user_version", 3).unwrap();
         drop(connection);
 
@@ -1462,6 +1527,11 @@ mod tests {
                  ALTER TABLE runs DROP COLUMN cleaned_at_ms;",
             )
             .unwrap();
+        connection
+            .execute_batch(&format!(
+                "ALTER TABLE stage_runs RENAME TO {LEGACY_STAGE_TABLE};"
+            ))
+            .unwrap();
         connection.pragma_update(None, "user_version", 8).unwrap();
         drop(connection);
 
@@ -1495,6 +1565,11 @@ mod tests {
                  ALTER TABLE runs DROP COLUMN cleanup_eligible_at_ms;
                  ALTER TABLE runs DROP COLUMN cleaned_at_ms;",
             )
+            .unwrap();
+        connection
+            .execute_batch(&format!(
+                "ALTER TABLE stage_runs RENAME TO {LEGACY_STAGE_TABLE};"
+            ))
             .unwrap();
         connection.pragma_update(None, "user_version", 10).unwrap();
         drop(connection);
@@ -1564,12 +1639,13 @@ mod tests {
         drop(open(&path, 1_000).unwrap());
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch(
+            .execute_batch(&format!(
                 "ALTER TABLE scheduler_state DROP COLUMN draining;
                  ALTER TABLE runs DROP COLUMN cleanup_eligible_at_ms;
                  ALTER TABLE runs DROP COLUMN cleaned_at_ms;
-                 PRAGMA user_version = 11;",
-            )
+                 ALTER TABLE stage_runs RENAME TO {LEGACY_STAGE_TABLE};
+                 PRAGMA user_version = 11;"
+            ))
             .unwrap();
         drop(connection);
 

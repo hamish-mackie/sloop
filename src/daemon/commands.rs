@@ -26,7 +26,7 @@ use super::dispatcher::{
     not_found,
 };
 use super::recovery::{
-    PersistedProcessStop, aftercare_process_identity, stop_agent_process_group,
+    PersistedProcessStop, stage_process_identity, stop_agent_process_group,
     stop_persisted_process_group,
 };
 use super::scheduler::{next_dispatch_deadline, running_hours_open};
@@ -1013,7 +1013,7 @@ pub(super) fn handle_cancel(
 ) -> Result<serde_json::Value, ErrorBody> {
     let resolved = resolve_run(state, &args.run)?;
     let run = resolved.run.clone();
-    if !matches!(run.state.as_str(), "running" | "aftercare") || run.exited_at_ms.is_some() {
+    if !matches!(run.state.as_str(), "running" | "driving") || run.exited_at_ms.is_some() {
         return Err(conflict(&format!(
             "run `{}` is `{}` and cannot be cancelled",
             resolved.alias, run.state
@@ -1027,45 +1027,49 @@ pub(super) fn handle_cancel(
     })?;
     state.cancelling.insert(run.id.clone());
 
-    if run.state == "aftercare" {
-        let rows = run_lookup(state, |run_store| run_store.run_evidence(&run.id))?;
-        if let Some(identity) =
-            aftercare_process_identity(&rows, None).map_err(|error| internal(&error))?
-        {
+    // Whatever stage is executing checkpointed its process group, wherever it
+    // sits in the flow, so one reading kills it. A run between stages has no
+    // process at all; its driver reads the intent above and stops there.
+    let rows = run_lookup(state, |run_store| run_store.run_evidence(&run.id))?;
+    let identity = stage_process_identity(&rows, None).map_err(|error| internal(&error))?;
+    match identity {
+        Some(identity) => {
             if identity.group <= 0 {
-                return Err(internal(
-                    "the active aftercare stage has an invalid process group",
-                ));
+                return Err(internal("the executing stage has an invalid process group"));
             }
             match stop_persisted_process_group(&identity) {
                 Ok(PersistedProcessStop::LeaderMissing) => state.log.emit_with_fields(
                     LogLevel::Info,
-                    "sloop::supervisor",
-                    "stale_aftercare_group_not_signalled",
+                    "sloop::driver",
+                    "stale_stage_group_not_signalled",
                     json!({"run_id": run.id, "process_group_id": identity.group}),
                 ),
                 Ok(PersistedProcessStop::StoppedOriginal) => {}
                 Err(error) => {
                     state.log.emit_with_fields(
                         LogLevel::Error,
-                        "sloop::supervisor",
-                        "aftercare_cancel_signal_refused",
+                        "sloop::driver",
+                        "stage_cancel_signal_refused",
                         json!({"run_id": run.id, "error": error}),
                     );
                 }
             }
         }
-    } else {
-        if let Err(error) =
-            stop_agent_process_group(run.pid, run.pid_start_time, run.process_group_id)
-        {
-            state.log.emit_with_fields(
-                LogLevel::Error,
-                "sloop::supervisor",
-                "agent_cancel_signal_refused",
-                json!({"run_id": run.id, "error": error}),
-            );
+        // A run whose stage process predates the uniform checkpoint, or whose
+        // agent was recorded on the run row alone, still has its group there.
+        None if run.state == "running" => {
+            if let Err(error) =
+                stop_agent_process_group(run.pid, run.pid_start_time, run.process_group_id)
+            {
+                state.log.emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::driver",
+                    "agent_cancel_signal_refused",
+                    json!({"run_id": run.id, "error": error}),
+                );
+            }
         }
+        None => {}
     }
 
     Ok(json!({

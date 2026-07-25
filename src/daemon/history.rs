@@ -1,6 +1,6 @@
 //! Run and stage history, projected for `show`.
 //!
-//! Everything here is a read: `runs`, `events`, `aftercare_stages`, and
+//! Everything here is a read: `runs`, `events`, `stage_runs`, and
 //! `run_evidence` already hold a complete account of how every run reached its
 //! outcome, and nothing rendered below is written back. The point of the module
 //! is that the account is *derived from that evidence* rather than from
@@ -254,7 +254,7 @@ fn format_duration(milliseconds: i64) -> String {
 /// `pending`, or — for the stage a live run is sitting in — `running`.
 ///
 /// Recorded rows for stages the snapshot does not name (the implicit `test`
-/// stage that `aftercare.test_cmd` splices in at index 1) are inserted at their
+/// stage that `flow.test_cmd` splices in at index 1) are inserted at their
 /// recorded index, which is where the flow driver actually put them.
 fn stages(
     run: &RunRecord,

@@ -29,8 +29,10 @@ pub enum StageExecution {
 pub struct AgentLaunch {
     pub argv: Vec<String>,
     pub environment: Vec<(OsString, OsString)>,
-    pub repository: PathBuf,
-    pub worker_socket_path: PathBuf,
+    /// The credentials this stage's agent presents on the worker socket. The
+    /// caller mints them so the daemon can serve them before the process
+    /// exists; the runner only hands them to the child.
+    pub worker: WorkerCredentials,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +70,7 @@ pub struct ExecutionEvidence {
 #[derive(Debug, Clone)]
 pub struct AgentProcessCheckpoint {
     pub run_id: String,
+    pub stage: String,
     pub branch: String,
     pub worktree: PathBuf,
     pub process: ProcessIdentity,

@@ -332,7 +332,9 @@ impl Harness {
         };
         let result = self.store.runs.start(&start, self.now_ms).expect("start");
         let run = self.model.runs.get_mut(run_id).expect("known run");
-        if run.state == "claimed" {
+        // A driver launches an agent stage wherever the flow puts one, so a run
+        // already under way turns running again, not only a freshly claimed one.
+        if run.state == "claimed" || run.state == "driving" {
             assert_eq!(result, Start::Granted);
             run.state = "running";
         } else {
@@ -361,7 +363,7 @@ impl Harness {
         let run = self.model.runs.get_mut(run_id).expect("known run");
         if run.state == "running" {
             assert_eq!(result, Exit::Granted);
-            run.state = "aftercare";
+            run.state = "driving";
         } else {
             assert!(
                 matches!(result, Exit::Denied(_)),
@@ -631,7 +633,7 @@ pub(crate) fn extra_invariants(connection: &Connection) {
     let torn_runs: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM runs
-             WHERE (state IN ('claimed', 'running', 'aftercare'))
+             WHERE (state IN ('claimed', 'running', 'driving'))
                 != (exited_at_ms IS NULL)",
             [],
             |row| row.get(0),

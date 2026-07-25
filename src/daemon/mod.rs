@@ -1,6 +1,6 @@
-mod aftercare;
 mod commands;
 mod dispatcher;
+mod driver;
 mod history;
 mod recovery;
 mod scheduler;

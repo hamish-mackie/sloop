@@ -122,7 +122,7 @@ fn recovery_re_arms_the_lapsed_lease_of_a_run_that_is_still_alive() {
     // However the readopted run is classified, it settles and releases its
     // lease; re-arming delays neither.
     assert!(
-        !["claimed", "running", "aftercare"].contains(&world.run_state(&run_id).as_str()),
+        !["claimed", "running", "stage"].contains(&world.run_state(&run_id).as_str()),
         "the readopted run did not settle: {}",
         world.run_state(&run_id)
     );

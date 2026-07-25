@@ -1369,10 +1369,10 @@ fn durable_capacity_is_repaired_before_another_agent_can_spawn() {
 }
 
 #[test]
-fn periodic_reconciliation_does_not_duplicate_supervisor_aftercare() {
+fn periodic_reconciliation_does_not_duplicate_a_supervised_walk() {
     let world = World::configured();
     world.configure_fake_agent(FakeAgent::new());
-    let ticket = world.write_ticket("single-aftercare.md", "# Single aftercare\nwork\n");
+    let ticket = world.write_ticket("single-walk.md", "# Single walk\nwork\n");
     world.commit_all("seed");
     world.arm_test_hook("after-agent-exit-checkpoint");
     world.start_daemon();
@@ -1383,7 +1383,7 @@ fn periodic_reconciliation_does_not_duplicate_supervisor_aftercare() {
     });
 
     world.arm_test_hook("after-run-liveness-reconciliation");
-    wait_until_slow("reconciliation observes supervisor-owned aftercare", || {
+    wait_until_slow("reconciliation observes the supervised walk", || {
         world.test_hook_reached("after-run-liveness-reconciliation")
     });
     world.release_test_hook("after-run-liveness-reconciliation");
@@ -1397,12 +1397,12 @@ fn periodic_reconciliation_does_not_duplicate_supervisor_aftercare() {
     // its own beside the action's, so one execution of it is two log rows.
     let stage_count: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM aftercare_stages
+            "SELECT COUNT(*) FROM stage_runs
              WHERE run_id = ?1 AND state IS NOT NULL",
             [world.run_id(1)],
             |row| row.get(0),
         )
-        .expect("count aftercare stages");
+        .expect("count stage rows");
     assert_eq!(stage_count, 2);
     let exit_evidence_count: i64 = connection
         .query_row(

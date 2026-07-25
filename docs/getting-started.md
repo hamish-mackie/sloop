@@ -59,7 +59,7 @@ itself with that binary:
 sloop daemon restart
 ```
 
-The command returns immediately. Active runs finish through aftercare, queued
+The command returns immediately. Active runs finish their stages, queued
 work waits without changing state, and dispatch resumes under the replacement.
 
 ## Write a ticket

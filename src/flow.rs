@@ -465,24 +465,10 @@ pub(crate) fn built_in_default() -> Flow {
     }
 }
 
+/// Structural rules on a whole flow. Agent actions are deliberately absent:
+/// one driver walks every stage the same way, so an agent action is legal in
+/// any position and any number of times, each with its own supervised process.
 fn validate_order(stages: &[Stage]) -> Result<(), String> {
-    if !stages
-        .first()
-        .is_some_and(|stage| stage.action == Actor::Agent)
-    {
-        return Err("the first stage must be an agent stage".into());
-    }
-    let agent_count = stages
-        .iter()
-        .filter(|stage| stage.action == Actor::Agent)
-        .count();
-    if agent_count > 1 {
-        return Err(
-            "only the first stage may be an agent stage; additional agent stages require runner support"
-                .into(),
-        );
-    }
-
     let merge = Actor::Builtin(Builtin::Merge);
     let merge_count = stages.iter().filter(|stage| stage.action == merge).count();
     if merge_count > 1 {
@@ -1304,16 +1290,27 @@ mod tests {
         assert!(error.contains("duplicate stage name `build`"), "{error}");
     }
 
+    /// One driver walks every stage, so nothing about a flow's shape depends
+    /// on where its agent actions sit or how many there are.
     #[test]
-    fn exactly_one_first_agent_stage_is_required() {
-        let missing = error("- { name: check, kind: exec, cmd: ['true'] }\n");
-        assert!(
-            missing.contains("first stage must be an agent"),
-            "{missing}"
-        );
+    fn agent_actions_are_legal_in_any_position_and_any_number() {
+        let leading_exec = parse(
+            "example",
+            "- { name: check, kind: exec, cmd: ['true'] }\n- { name: build, kind: agent }\n",
+        )
+        .unwrap();
+        assert_eq!(leading_exec.stages[1].action, Actor::Agent);
 
-        let duplicate = error("- { name: build, kind: agent }\n- { name: rebuild, kind: agent }\n");
-        assert!(duplicate.contains("require runner support"), "{duplicate}");
+        let two_agents = parse(
+            "example",
+            "- { name: build, kind: agent }\n- { name: review, kind: agent, verdict: reported }\n",
+        )
+        .unwrap();
+        assert_eq!(two_agents.stages[0].action, Actor::Agent);
+        assert_eq!(two_agents.stages[1].action, Actor::Agent);
+
+        let no_agent = parse("example", "- { name: check, kind: exec, cmd: ['true'] }\n").unwrap();
+        assert_eq!(no_agent.stages.len(), 1);
     }
 
     #[test]

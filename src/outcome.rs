@@ -27,6 +27,31 @@ pub fn classify_exit(exit_code: Option<i32>) -> ExitClass {
     }
 }
 
+/// Which stage a halted flow walk stopped on. The distinction the outcome
+/// turns on is only ever first-versus-later: the first stage is the run's own
+/// attempt at the work and its failure is fully described by the process exit
+/// already in evidence, while a later one halting means earlier stages passed
+/// and whatever they produced is worth preserving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowHalt {
+    /// The flow's first stage failed.
+    FirstStage,
+    /// A stage after the first failed, or the driver could not carry the walk
+    /// past one.
+    LaterStage,
+}
+
+impl FlowHalt {
+    /// Classifies a halt by the index of the stage that stopped the walk.
+    pub fn at_stage(stage_index: usize) -> Self {
+        if stage_index == 0 {
+            Self::FirstStage
+        } else {
+            Self::LaterStage
+        }
+    }
+}
+
 /// Result of an attempted merge of the run branch into the default branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeOutcome {
@@ -47,12 +72,13 @@ pub struct RunEvidence {
     pub exit: ExitClass,
     /// A rejection recognized from the adapter's captured output.
     pub vendor_error: Option<VendorErrorClass>,
-    /// Commits are activity metadata except when aftercare fails: committed
-    /// work is then preserved for review, while a known unchanged branch
-    /// failed. `None` means commit enumeration was incomplete.
+    /// Commits are activity metadata except when the walk halts past the
+    /// first stage: committed work is then preserved for review, while a
+    /// known unchanged branch failed. `None` means commit enumeration was
+    /// incomplete.
     pub commit_count: Option<usize>,
-    /// Whether a flow stage after the first stage failed.
-    pub aftercare_failed: bool,
+    /// Where the flow walk stopped short, if it did.
+    pub halt: Option<FlowHalt>,
     /// `None` when a merge was never attempted.
     pub merge: Option<MergeOutcome>,
 }
@@ -95,8 +121,8 @@ impl Outcome {
 ///   (`Some(MergeOutcome::Merged)`).
 ///
 /// Policy decisions taken here:
-/// - A successful exit whose aftercare failed is `NeedsReview` when its run
-///   branch has commits, otherwise `Failed`.
+/// - A successful exit whose walk halted after the first stage is
+///   `NeedsReview` when its run branch has commits, otherwise `Failed`.
 /// - A nonzero or killed exit is `Failed`; Git history does not upgrade or
 ///   downgrade the verdict.
 /// - A merge attempt that conflicted is `NeedsReview`: the work passed its
@@ -121,7 +147,7 @@ pub fn derive_outcome(evidence: &RunEvidence) -> Outcome {
     if evidence.exit != ExitClass::Success {
         return Outcome::Failed;
     }
-    if evidence.aftercare_failed && evidence.commit_count == Some(0) {
+    if evidence.halt == Some(FlowHalt::LaterStage) && evidence.commit_count == Some(0) {
         return Outcome::Failed;
     }
     Outcome::NeedsReview
@@ -138,7 +164,7 @@ mod tests {
             exit: ExitClass::Success,
             vendor_error: None,
             commit_count: Some(0),
-            aftercare_failed: false,
+            halt: None,
             merge: None,
         }
     }
@@ -166,30 +192,54 @@ mod tests {
         assert_ne!(diverged, Outcome::Merged);
     }
 
+    /// The first stage's own failure is already fully described by the exit
+    /// class in evidence, so halting there adds nothing: a clean exit that
+    /// simply produced no commits is still work a human should look at.
     #[test]
-    fn failed_aftercare_with_commits_needs_review() {
+    fn a_first_stage_halt_leaves_the_exit_class_to_speak() {
+        assert_eq!(
+            derive_outcome(&RunEvidence {
+                halt: Some(FlowHalt::FirstStage),
+                ..evidence()
+            }),
+            Outcome::NeedsReview
+        );
+        assert_eq!(
+            derive_outcome(&RunEvidence {
+                halt: Some(FlowHalt::FirstStage),
+                exit: ExitClass::Failure(1),
+                ..evidence()
+            }),
+            Outcome::Failed
+        );
+        assert_eq!(FlowHalt::at_stage(0), FlowHalt::FirstStage);
+        assert_eq!(FlowHalt::at_stage(1), FlowHalt::LaterStage);
+    }
+
+    #[test]
+    fn a_later_stage_halting_with_commits_needs_review() {
         let outcome = derive_outcome(&RunEvidence {
             commit_count: Some(1),
-            aftercare_failed: true,
+            halt: Some(FlowHalt::LaterStage),
             ..evidence()
         });
         assert_eq!(outcome, Outcome::NeedsReview);
     }
 
     #[test]
-    fn failed_aftercare_without_commits_fails() {
+    fn a_later_stage_halting_without_commits_fails() {
         let outcome = derive_outcome(&RunEvidence {
-            aftercare_failed: true,
+            halt: Some(FlowHalt::LaterStage),
             ..evidence()
         });
         assert_eq!(outcome, Outcome::Failed);
     }
 
     #[test]
-    fn failed_aftercare_with_unknown_commits_needs_review() {
+    fn a_later_stage_halting_with_unknown_commits_needs_review() {
         let outcome = derive_outcome(&RunEvidence {
             commit_count: None,
-            aftercare_failed: true,
+            halt: Some(FlowHalt::LaterStage),
             ..evidence()
         });
         assert_eq!(outcome, Outcome::NeedsReview);
@@ -212,7 +262,7 @@ mod tests {
             exit: ExitClass::KilledBySignal,
             vendor_error: None,
             commit_count: Some(5),
-            aftercare_failed: false,
+            halt: None,
             merge: Some(MergeOutcome::Merged),
         });
         assert_eq!(outcome, Outcome::Cancelled);

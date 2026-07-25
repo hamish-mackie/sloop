@@ -109,7 +109,7 @@ fn expanded_help_explains_every_ticket_state() {
         );
     }
     assert!(
-        help.contains("Terminal: aftercare could not merge the run; inspect manually."),
+        help.contains("Terminal: the run could not be merged; inspect manually."),
         "needs_review meaning missing"
     );
 }

@@ -87,10 +87,8 @@ pub(crate) mod tx {
             "DELETE FROM run_evidence WHERE run_id = ?1",
             params![run_id],
         )?;
-        let stages = transaction.execute(
-            "DELETE FROM aftercare_stages WHERE run_id = ?1",
-            params![run_id],
-        )?;
+        let stages =
+            transaction.execute("DELETE FROM stage_runs WHERE run_id = ?1", params![run_id])?;
         Ok(evidence + stages)
     }
 
@@ -177,12 +175,12 @@ pub(crate) mod tx {
             // duplicating it, and `seq` is deliberately absent from the update
             // so the rewrite keeps the log position it first took.
             transaction.execute(
-                "INSERT INTO aftercare_stages
+                "INSERT INTO stage_runs
                      (run_id, seq, stage_index, stage, state, attempt, phase,
                       started_at_ms, finished_at_ms, exit_code, evidence_json)
                  VALUES (?1,
                          (SELECT COALESCE(MAX(seq), 0) + 1
-                          FROM aftercare_stages WHERE run_id = ?1),
+                          FROM stage_runs WHERE run_id = ?1),
                          ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(run_id, stage_index, attempt, phase) DO UPDATE SET
                      stage = excluded.stage,
@@ -208,7 +206,7 @@ pub(crate) mod tx {
         Ok(())
     }
 
-    pub(crate) fn record_aftercare_evidence(
+    pub(crate) fn record_stage_evidence(
         transaction: &Transaction<'_>,
         run_id: &str,
         kind: &str,
@@ -227,13 +225,13 @@ pub(crate) mod tx {
         Ok(())
     }
 
-    pub(crate) fn clear_aftercare_process(
+    pub(crate) fn clear_stage_process(
         transaction: &Transaction<'_>,
         run_id: &str,
     ) -> rusqlite::Result<()> {
         transaction.execute(
             "DELETE FROM run_evidence
-             WHERE run_id = ?1 AND dedupe_key = 'settlement:' || ?1 || ':aftercare_process'",
+             WHERE run_id = ?1 AND dedupe_key = 'settlement:' || ?1 || ':stage_process'",
             params![run_id],
         )?;
         Ok(())
@@ -333,7 +331,7 @@ fn stage_log(connection: &Connection, run_id: &str) -> rusqlite::Result<Vec<Stag
     let mut statement = connection.prepare(
         "SELECT stage_index, stage, attempt, phase, state, started_at_ms, finished_at_ms,
                 exit_code, evidence_json
-         FROM aftercare_stages WHERE run_id = ?1 ORDER BY seq",
+         FROM stage_runs WHERE run_id = ?1 ORDER BY seq",
     )?;
     statement
         .query_map(params![run_id], |row| {
@@ -475,7 +473,7 @@ impl RunStore {
         stage_log(&self.db.lock(), run_id).map_err(StoreError::from)
     }
 
-    pub(crate) fn record_aftercare_evidence(
+    pub(crate) fn record_stage_evidence(
         &self,
         run_id: &str,
         kind: &str,
@@ -483,13 +481,13 @@ impl RunStore {
         now_ms: i64,
     ) -> Result<(), StoreError> {
         self.write(TransactionBehavior::Deferred, |transaction| {
-            tx::record_aftercare_evidence(transaction, run_id, kind, data_json, now_ms)
+            tx::record_stage_evidence(transaction, run_id, kind, data_json, now_ms)
         })
     }
 
-    pub(crate) fn clear_aftercare_process(&self, run_id: &str) -> Result<(), StoreError> {
+    pub(crate) fn clear_stage_process(&self, run_id: &str) -> Result<(), StoreError> {
         self.write(TransactionBehavior::Deferred, |transaction| {
-            tx::clear_aftercare_process(transaction, run_id)
+            tx::clear_stage_process(transaction, run_id)
         })
     }
 
@@ -585,7 +583,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::db::{Db, StoreError};
+    use crate::db::{Db, LEGACY_STAGE_TABLE, StoreError};
     use crate::outcome::Outcome;
     use crate::run_store::test_support::{claim_run, open_seeded, settle_run};
     use crate::run_store::{
@@ -642,6 +640,10 @@ mod tests {
     fn running_r1(store: &RunStore) {
         claim_run(store, "R1", "{}", "{}", 2_000);
         assert_eq!(
+            store.begin("R1", "branch", "/worktree", 2_050).unwrap(),
+            Start::Granted
+        );
+        assert_eq!(
             store
                 .start(
                     &RunStart {
@@ -662,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_exit_and_aftercare_results_are_checkpointed_idempotently() {
+    fn agent_exit_and_stage_results_are_checkpointed_idempotently() {
         let directory = tempdir().unwrap();
         let store = open_seeded(&directory.path().join("sloop.db"));
         running_r1(&store);
@@ -682,7 +684,7 @@ mod tests {
             ExitClaim::Claimed
         );
         store
-            .record_aftercare_evidence(
+            .record_stage_evidence(
                 "R1",
                 "test_result",
                 r#"{"passed":true,"exit_code":0}"#,
@@ -690,7 +692,7 @@ mod tests {
             )
             .unwrap();
         store
-            .record_aftercare_evidence(
+            .record_stage_evidence(
                 "R1",
                 "test_result",
                 r#"{"passed":true,"exit_code":0}"#,
@@ -699,11 +701,11 @@ mod tests {
             .unwrap();
 
         let run = store.run("R1").unwrap().unwrap();
-        assert_eq!(run.state, "aftercare");
+        assert_eq!(run.state, "driving");
         assert_eq!(run.exit_code, Some(0));
         assert_eq!(
             store.recoverable_runs().unwrap()[0].state,
-            RunState::Aftercare
+            RunState::Driving
         );
         let evidence = store.run_evidence("R1").unwrap();
         assert_eq!(
@@ -730,7 +732,7 @@ mod tests {
             cooldown_until_ms: None,
         };
         assert_eq!(store.record_exit(&exit, 2_200).unwrap(), Exit::Granted);
-        assert_eq!(store.run("R1").unwrap().unwrap().state, "aftercare");
+        assert_eq!(store.run("R1").unwrap().unwrap().state, "driving");
         let evidence = store.run_evidence("R1").unwrap();
         assert!(evidence.iter().any(|(kind, _)| kind == "exit_classified"));
         assert!(evidence.iter().any(|(kind, _)| kind == "commits_observed"));
@@ -738,11 +740,11 @@ mod tests {
         assert_eq!(
             store.record_exit(&exit, 2_300).unwrap(),
             Exit::Denied(ExitDenial::AlreadyClaimed {
-                state: "aftercare".into(),
+                state: "driving".into(),
             })
         );
         let run = store.run("R1").unwrap().unwrap();
-        assert_eq!(run.state, "aftercare");
+        assert_eq!(run.state, "driving");
         assert_eq!(run.exit_code, Some(0));
         assert_eq!(store.run_evidence("R1").unwrap(), evidence);
     }
@@ -909,9 +911,9 @@ mod tests {
 
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
-            .execute_batch(
-                "DROP TABLE aftercare_stages;
-                 CREATE TABLE aftercare_stages (
+            .execute_batch(&format!(
+                "DROP TABLE stage_runs;
+                 CREATE TABLE {LEGACY_STAGE_TABLE} (
                      run_id          TEXT NOT NULL REFERENCES runs(id),
                      stage_index     INTEGER NOT NULL,
                      stage           TEXT NOT NULL,
@@ -923,15 +925,15 @@ mod tests {
                      evidence_json   TEXT,
                      PRIMARY KEY (run_id, stage_index, attempt)
                  );
-                 INSERT INTO aftercare_stages
+                 INSERT INTO {LEGACY_STAGE_TABLE}
                      (run_id, stage_index, stage, state, attempt, started_at_ms,
                       finished_at_ms, exit_code, evidence_json)
                  VALUES
                      ('R1', 1, 'test', 'passed', 1, 3000, 3100, 0, NULL),
                      ('R1', 0, 'build', 'passed', 1, 2900, 3000, 0,
-                      '{\"output\":\"runs/R1/output.ndjson\",\"verdict_source\":\"reported\"}');
-                 PRAGMA user_version = 13;",
-            )
+                      '{{\"output\":\"runs/R1/output.ndjson\",\"verdict_source\":\"reported\"}}');
+                 PRAGMA user_version = 13;"
+            ))
             .unwrap();
         drop(connection);
 
@@ -974,7 +976,7 @@ mod tests {
                 .db()
                 .lock()
                 .query_row(
-                    "SELECT seq FROM aftercare_stages WHERE run_id = 'R1' AND stage = 'merge'",
+                    "SELECT seq FROM stage_runs WHERE run_id = 'R1' AND stage = 'merge'",
                     [],
                     |row| row.get::<_, i64>(0)
                 )

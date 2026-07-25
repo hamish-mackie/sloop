@@ -1,4 +1,4 @@
-//! Per-run NDJSON output capture. Agent and aftercare stdout/stderr are
+//! Per-run NDJSON output capture. Agent and stage stdout/stderr are
 //! untrusted evidence: they are stored as ordered chunks, never parsed as
 //! lines and never routed through the dispatcher.
 
@@ -19,8 +19,10 @@ use crate::clock::format_timestamp;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputSource {
+    /// A supervised agent process.
     Agent,
-    Aftercare,
+    /// A stage process the daemon ran itself.
+    Stage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,7 +338,7 @@ pub fn visit_agent_output(
     Ok(())
 }
 
-/// Selects the records belonging to one flow stage. Aftercare records carry
+/// Selects the records belonging to one flow stage. Stage records carry
 /// their stage name; agent records captured before stages were tagged carry
 /// none, so `agent_fallback` lets the flow's agent stage claim them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -470,8 +472,8 @@ mod tests {
             &path,
             &[
                 (OutputSource::Agent, Some("build"), "built"),
-                (OutputSource::Aftercare, Some("test"), "tested"),
-                (OutputSource::Aftercare, Some("merge"), "merged"),
+                (OutputSource::Stage, Some("test"), "tested"),
+                (OutputSource::Stage, Some("merge"), "merged"),
             ],
         );
 
@@ -503,7 +505,7 @@ mod tests {
             &path,
             &[
                 (OutputSource::Agent, None, "legacy agent"),
-                (OutputSource::Aftercare, None, "legacy aftercare"),
+                (OutputSource::Stage, None, "legacy untagged"),
                 (OutputSource::Agent, Some("build"), "tagged agent"),
             ],
         );
@@ -531,7 +533,7 @@ mod tests {
         let path = directory.path().join("output.ndjson");
         let mut records = Vec::new();
         for index in 0..6 {
-            records.push((OutputSource::Aftercare, Some("test"), format!("t{index}")));
+            records.push((OutputSource::Stage, Some("test"), format!("t{index}")));
             records.push((OutputSource::Agent, Some("build"), format!("b{index}")));
         }
         write_records(
@@ -610,7 +612,7 @@ mod tests {
             .unwrap();
         writer
             .append(
-                OutputSource::Aftercare,
+                OutputSource::Stage,
                 Some("test"),
                 OutputStream::Stderr,
                 &[0xff, 0x00],
@@ -632,7 +634,7 @@ mod tests {
         assert!(records[0]["timestamp"].as_str().unwrap().ends_with('Z'));
 
         assert_eq!(records[1]["sequence"], 2);
-        assert_eq!(records[1]["source"], "aftercare");
+        assert_eq!(records[1]["source"], "stage");
         assert_eq!(records[1]["stage"], "test");
         assert_eq!(records[1]["encoding"], "base64");
         assert_eq!(records[1]["data"], "/wA=");
@@ -688,7 +690,7 @@ mod tests {
         writer
             .append_at(
                 200_000,
-                OutputSource::Aftercare,
+                OutputSource::Stage,
                 Some("test"),
                 OutputStream::Stdout,
                 b"ignored",
@@ -794,7 +796,7 @@ mod tests {
         let record = super::OutputRecord {
             sequence: 7,
             timestamp: "2026-07-13T20:00:01Z".into(),
-            source: OutputSource::Aftercare,
+            source: OutputSource::Stage,
             stage: Some("test".into()),
             stream: OutputStream::Stderr,
             chunk: OutputChunk::Utf8 { text: "x".into() },
@@ -805,7 +807,7 @@ mod tests {
             json!({
                 "sequence": 7,
                 "timestamp": "2026-07-13T20:00:01Z",
-                "source": "aftercare",
+                "source": "stage",
                 "stage": "test",
                 "stream": "stderr",
                 "encoding": "utf8",
@@ -826,7 +828,7 @@ mod tests {
             .unwrap();
         writer
             .append(
-                OutputSource::Aftercare,
+                OutputSource::Stage,
                 Some("test"),
                 OutputStream::Stderr,
                 b"must not match",

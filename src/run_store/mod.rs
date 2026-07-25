@@ -1,7 +1,7 @@
 //! Concrete SQLite storage for run supervision state.
 //!
 //! `runs` owns run lifecycle records and their attached notes and activity
-//! events, `evidence` owns verdict and aftercare facts, and `limits` owns
+//! events, `evidence` owns verdict and stage facts, and `limits` owns
 //! cooldown and budget state. Scheduler state and shared ID counters stay on
 //! [`RunStore`] because they apply across those families.
 //!
@@ -32,8 +32,8 @@ pub struct ProjectCommitEvidence {
     pub data_json: String,
 }
 
-/// Whether the caller won the `running` to `aftercare` transition and with it
-/// ownership of exit processing and aftercare for the run.
+/// Whether the caller won the `running` to `driving` transition and with it
+/// ownership of the agent's exit evidence and of the rest of the walk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitClaim {
     Claimed,
@@ -60,7 +60,7 @@ pub enum Exit {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitDenial {
-    /// Another path checkpointed this exit first and owns aftercare.
+    /// Another path checkpointed this exit first and owns the walk.
     AlreadyClaimed { state: String },
 }
 
@@ -76,7 +76,8 @@ pub struct RunStart<'a> {
     pub worker_socket_path: &'a str,
 }
 
-/// Facts about an agent exit at the checkpoint that hands the run to aftercare.
+/// Facts about an agent exit at the checkpoint that returns the run to its
+/// driver.
 pub struct RunExit<'a> {
     pub run_id: &'a str,
     pub exit_code: Option<i32>,
@@ -299,7 +300,38 @@ impl RunStore {
         recorded_outcome(&self.db.lock(), run_id).map_err(StoreError::from)
     }
 
-    /// Turns a claimed run running once its agent process exists.
+    /// Hands a claimed run to its driver, recording the workspace every stage
+    /// will execute in. This is the run's start: the activity feed says so
+    /// here, once, whatever kind of stage the flow opens with.
+    pub fn begin(
+        &self,
+        run_id: &str,
+        branch: &str,
+        worktree_path: &str,
+        now_ms: i64,
+    ) -> Result<Start, StoreError> {
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = runs::tx::mark_driving(&transaction, run_id, branch, worktree_path, now_ms)?;
+        if changed != 1 {
+            let state = runs::tx::state(&transaction, run_id)?;
+            return Ok(Start::Denied(StartDenial::NotClaimed { state }));
+        }
+        let ticket_id = runs::tx::ticket_id(&transaction, run_id)?;
+        runs::tx::record_event(
+            &transaction,
+            now_ms,
+            "run_started",
+            Some(run_id),
+            Some(&ticket_id),
+            "{}",
+        )?;
+        transaction.commit()?;
+        Ok(Start::Granted)
+    }
+
+    /// Records the agent process an agent stage launched. The run is already
+    /// under way; this only says which process the daemon is now supervising.
     pub fn start(&self, start: &RunStart<'_>, now_ms: i64) -> Result<Start, StoreError> {
         let mut connection = self.db.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -319,15 +351,6 @@ impl RunStore {
             let state = runs::tx::state(&transaction, start.run_id)?;
             return Ok(Start::Denied(StartDenial::NotClaimed { state }));
         }
-        let ticket_id = runs::tx::ticket_id(&transaction, start.run_id)?;
-        runs::tx::record_event(
-            &transaction,
-            now_ms,
-            "run_started",
-            Some(start.run_id),
-            Some(&ticket_id),
-            "{}",
-        )?;
         transaction.commit()?;
         Ok(Start::Granted)
     }
@@ -369,7 +392,28 @@ impl RunStore {
         Ok(ExitClaim::Claimed)
     }
 
-    /// Checkpoints an agent exit, granting one caller ownership of aftercare.
+    /// Returns a run to its driver after an agent stage that is not the run's
+    /// own attempt at its ticket. The exit code, commits, and vendor reading on
+    /// the run belong to the first agent stage alone, so none of them move
+    /// here; only ownership of the walk does.
+    pub fn release_agent(&self, run_id: &str, now_ms: i64) -> Result<Exit, StoreError> {
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = runs::tx::release_agent(&transaction, run_id, now_ms)?;
+        if changed == 0 {
+            let state = runs::tx::state(&transaction, run_id)?;
+            return match state {
+                Some(state) => Ok(Exit::Denied(ExitDenial::AlreadyClaimed { state })),
+                None => Err(StoreError::RunNotFound {
+                    run_id: run_id.into(),
+                }),
+            };
+        }
+        transaction.commit()?;
+        Ok(Exit::Granted)
+    }
+
+    /// Checkpoints an agent exit, granting one caller ownership of the walk.
     pub fn record_exit(&self, exit: &RunExit<'_>, now_ms: i64) -> Result<Exit, StoreError> {
         match self.record_agent_exit(
             exit.run_id,

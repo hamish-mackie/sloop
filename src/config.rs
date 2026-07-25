@@ -80,10 +80,10 @@ pub struct Config {
     /// overridden by a repository file.
     pub flows: BTreeMap<String, Flow>,
     pub default_flow: String,
-    /// The single test aftercare stage: an argv run in the worktree after a
-    /// successful exit. Absent means the run branch merges without a test
+    /// The implicit `test` stage spliced into every flow at index 1: an argv
+    /// run in the worktree. Absent means the run branch merges without a test
     /// gate; an unchanged branch completes as a no-op.
-    pub aftercare_test_cmd: Option<Vec<String>>,
+    pub flow_test_cmd: Option<Vec<String>>,
     /// Repository-scoped prefixes for durable IDs stamped into committed
     /// files. These deliberately do not inherit user defaults.
     pub ticket_prefix: String,
@@ -293,21 +293,21 @@ impl Config {
             .map(|agent| validate_agent(agent, &repository.config_path))
             .transpose()?;
 
-        let aftercare_test_cmd = config
-            .aftercare
+        let flow_test_cmd = config
+            .flow
             .as_ref()
             .or_else(|| {
                 user.as_ref()
                     .and_then(|config| config.defaults.as_ref())
-                    .and_then(|defaults| defaults.aftercare.as_ref())
+                    .and_then(|defaults| defaults.flow.as_ref())
             })
-            .and_then(|aftercare| aftercare.test_cmd.clone());
-        if let Some(cmd) = &aftercare_test_cmd
+            .and_then(|flow| flow.test_cmd.clone());
+        if let Some(cmd) = &flow_test_cmd
             && cmd.is_empty()
         {
             return Err(ConfigError::Invalid {
                 path: repository.config_path.clone(),
-                message: "aftercare.test_cmd must name a command".into(),
+                message: "flow.test_cmd must name a command".into(),
             });
         }
 
@@ -330,7 +330,7 @@ impl Config {
 
         let flows = load_flows(&repository.root)?;
         validate_on_fail_targets(&flows, agent.as_ref(), &repository.config_path)?;
-        if aftercare_test_cmd.is_some()
+        if flow_test_cmd.is_some()
             && let Some(flow) = flows
                 .values()
                 .find(|flow| flow.stages.iter().any(|stage| stage.name == "test"))
@@ -338,7 +338,7 @@ impl Config {
             return Err(ConfigError::Invalid {
                 path: repository.config_path.clone(),
                 message: format!(
-                    "aftercare.test_cmd conflicts with stage `test` in flow `{}`",
+                    "flow.test_cmd conflicts with stage `test` in flow `{}`",
                     flow.name
                 ),
             });
@@ -381,7 +381,7 @@ impl Config {
             agent,
             flows,
             default_flow: DEFAULT_FLOW_NAME.into(),
-            aftercare_test_cmd,
+            flow_test_cmd,
             ticket_prefix,
             project_prefix,
             delete_missing_after_ms,
@@ -683,7 +683,7 @@ struct RawConfig {
     scheduler: Option<RawScheduler>,
     agent: Option<RawAgent>,
     sources: Option<RawSources>,
-    aftercare: Option<RawAftercare>,
+    flow: Option<RawFlowDefaults>,
     ids: Option<RawIds>,
     delete_missing_after: Option<String>,
 }
@@ -733,7 +733,7 @@ struct RawDefaults {
     scheduler: Option<RawScheduler>,
     agent: Option<RawAgent>,
     sources: Option<RawSources>,
-    aftercare: Option<RawAftercare>,
+    flow: Option<RawFlowDefaults>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -749,7 +749,7 @@ struct RawTicketSource {
 }
 
 #[derive(Debug, Deserialize)]
-struct RawAftercare {
+struct RawFlowDefaults {
     test_cmd: Option<Vec<String>>,
 }
 
@@ -1526,12 +1526,12 @@ mod tests {
     }
 
     #[test]
-    fn aftercare_test_command_is_not_duplicated_in_the_built_in_default_flow() {
+    fn flow_test_command_is_not_duplicated_in_the_built_in_default_flow() {
         let root = tempdir().unwrap();
         fs::create_dir_all(root.path().join(".agents/sloop")).unwrap();
         fs::write(
             root.path().join(".agents/sloop/config.yaml"),
-            "version: 1\naftercare:\n  test_cmd: [cargo, test]\n",
+            "version: 1\nflow:\n  test_cmd: [cargo, test]\n",
         )
         .unwrap();
 
@@ -1553,7 +1553,7 @@ mod tests {
         fs::create_dir_all(root.path().join(".agents/sloop/flows")).unwrap();
         fs::write(
             root.path().join(".agents/sloop/config.yaml"),
-            "version: 1\naftercare:\n  test_cmd: [cargo, test]\n",
+            "version: 1\nflow:\n  test_cmd: [cargo, test]\n",
         )
         .unwrap();
         fs::write(

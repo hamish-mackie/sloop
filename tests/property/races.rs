@@ -182,7 +182,7 @@ fn simultaneous_claims_grant_exactly_one_winner() {
 }
 
 /// Eight connections race to checkpoint the same run's exit — the deliberate
-/// supervisor-vs-recovery race, widened. Exactly one owns aftercare.
+/// driver-vs-recovery race, widened. Exactly one owns the walk.
 #[test]
 fn simultaneous_exit_checkpoints_grant_exactly_one_owner() {
     let arena = Arena::new();
@@ -232,7 +232,7 @@ fn simultaneous_exit_checkpoints_grant_exactly_one_owner() {
         });
 
         let owners = grants.iter().filter(|granted| **granted).count();
-        assert_eq!(owners, 1, "round {round}: {owners} threads own aftercare");
+        assert_eq!(owners, 1, "round {round}: {owners} threads own the walk");
         arena.check_invariants();
     }
 }

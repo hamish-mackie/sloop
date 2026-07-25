@@ -237,7 +237,7 @@ fn tail_returns_exactly_the_last_matching_entries() {
     for index in 1..=8 {
         let sequence = captured + index;
         appended.push_str(&format!(
-            "{{\"sequence\":{sequence},\"timestamp\":\"2026-07-20T00:00:0{index}Z\",\"source\":\"aftercare\",\"stage\":\"check\",\"stream\":\"stdout\",\"encoding\":\"utf8\",\"text\":\"tail line {index}\\n\"}}\n"
+            "{{\"sequence\":{sequence},\"timestamp\":\"2026-07-20T00:00:0{index}Z\",\"source\":\"stage\",\"stage\":\"check\",\"stream\":\"stdout\",\"encoding\":\"utf8\",\"text\":\"tail line {index}\\n\"}}\n"
         ));
     }
     fs::write(&log, format!("{existing}{appended}")).expect("extend run log");
