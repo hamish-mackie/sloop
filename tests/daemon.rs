@@ -788,6 +788,71 @@ fn worker_verbs_on_the_operator_socket_point_at_an_alternative() {
     );
 }
 
+/// A run claimed by a `0.3.x` binary carries a flow snapshot in a grammar this
+/// one no longer reads. The snapshot is machine-local, so the daemon cannot
+/// repair it, but the failure belongs to that one run: it is parked for review
+/// by id and startup carries on rather than the recovery pass — and with it
+/// every other run's recovery — dying on one unreadable row.
+#[test]
+fn an_unreadable_flow_snapshot_parks_its_run_without_stopping_recovery() {
+    let world = World::configured();
+    world.configure_fake_agent(FakeAgent::new().block_until_released("legacy-snapshot"));
+    let ticket = world.write_ticket("legacy.md", "# Legacy\nwork\n");
+    world.commit_all("seed");
+    let daemon_pid = world.start_daemon()["data"]["pid"].as_u64().unwrap() as u32;
+    let posted = world.sloop(&["post", ticket.to_str().unwrap(), "--auto"]);
+    assert!(posted.status.success());
+    wait_until("the agent reaches its blocking point", || {
+        world.fake_agent_reached("legacy-snapshot")
+    });
+    let run_id = world.run_id(1);
+    let agent_pid = world.run_process_id(&run_id);
+
+    world.kill_daemon(daemon_pid);
+    world.release("legacy-snapshot");
+    wait_until("the orphaned agent exits", || !process_alive(agent_pid));
+
+    // Forge exactly what a pre-split binary left behind: a driving run whose
+    // snapshot spells its stages in the removed `kind`/`verdict` grammar.
+    let connection = rusqlite::Connection::open(world.db_path()).unwrap();
+    connection
+        .execute(
+            "UPDATE runs
+             SET state = 'driving',
+                 flow_json = '{\"name\":\"default\",\"stages\":[{\"name\":\"build\",\"kind\":\"Build\"}]}'
+             WHERE id = ?1",
+            [&run_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    world.start_daemon();
+    wait_until("the unresumable run is parked for review", || {
+        let snapshot = status(&world);
+        snapshot["gate"]["active_agents"] == 0 && snapshot["tickets"]["needs_review"] == 1
+    });
+    assert_eq!(world.show_snapshot(&run_id)["state"], "needs_review");
+
+    let named_the_run = fs::read_to_string(world.daemon_log())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|record| {
+            record["event"] == "driver_resume_failed" && record["fields"]["run_id"] == run_id
+        });
+    assert!(named_the_run, "the parked run is not named in the log");
+
+    // The pass survived the bad row: the scheduler is still serving demand.
+    let next = world.write_ticket("next.md", "# Next\nwork\n");
+    world.commit_all("second ticket");
+    world.configure_fake_agent(FakeAgent::new().commit("completed work").exit(0));
+    let posted = world.sloop(&["post", next.to_str().unwrap(), "--auto"]);
+    assert!(posted.status.success());
+    wait_until_slow("the daemon still dispatches after the parked run", || {
+        status(&world)["tickets"]["merged"] == 1
+    });
+}
+
 /// A trigger pinned to a merged ticket can never fire: dispatch requires the
 /// ticket to be `ready`, and `merged` is terminal. Settling now retires such a
 /// trigger in the same transaction as the merge, but rows stranded before that

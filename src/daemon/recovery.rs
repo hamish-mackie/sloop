@@ -11,19 +11,24 @@ use tokio::sync::mpsc;
 
 use crate::clock::Clock;
 use crate::db::{Db, StoreError};
-use crate::domain::work::Disposition;
+use crate::domain::work::{Disposition, TicketRef};
 use crate::flow::Flow;
 use crate::logging::{LogLevel, OperationalLog};
+use crate::outcome::Outcome;
 use crate::run_log::{OutputStream, output_staleness};
 use crate::run_store::{
-    Exit, ExitDenial, OutputStallEvidence, RecoverableRun, RunExit, RunState, RunStore,
+    EvidenceRecord, Exit, ExitDenial, OutputStallEvidence, RecoverableRun, RunExit, RunState,
+    RunStore,
 };
 use crate::runner::local::{
     process_start_time, run_output_path, wait_for_test_hook, worker_socket_path,
 };
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
 
-use super::dispatcher::{DispatcherState, RunEvent, disposition_for_outcome, push_work_outcome};
+use super::dispatcher::{
+    DispatcherState, RunEvent, close_worker_socket, disposition_for_outcome, mark_storage_full,
+    push_work_outcome,
+};
 use super::driver::{
     DriverEnvironment, DriverPlan, STAGE_PROCESS, git_index_lock_path, git_index_matches_head,
     git_is_ancestor, git_stdout, shared_checkout_has_git_operation, start_driver,
@@ -198,7 +203,9 @@ pub(super) async fn recover_inflight_runs(
                             json!({"run_id": run.id, "error": error}),
                         );
                     }
-                    resume_run_driver(state, events.clone(), run)?;
+                    if let Err(error) = resume_run_driver(state, events.clone(), run.clone()) {
+                        park_unresumable_run(state, &run, &error, log).await;
+                    }
                 } else {
                     spawn_dead_run_recovery(state, events.clone(), run, log.clone());
                 }
@@ -597,6 +604,104 @@ pub(super) fn resume_run_driver(
     Ok(())
 }
 
+/// Settles a run whose driver refused to resume — an unreadable flow snapshot,
+/// a row with no branch or worktree.
+///
+/// The failure belongs to the one run, so it is parked for a human with its
+/// branch and evidence intact rather than retried against a flow the daemon
+/// cannot read, and the recovery pass carries on to the next run. One bad row
+/// must not cost every other run its recovery.
+async fn park_unresumable_run(
+    state: &mut DispatcherState,
+    run: &RecoverableRun,
+    error: &DaemonError,
+    log: &OperationalLog,
+) {
+    let error = error.to_string();
+    log.emit_with_fields(
+        LogLevel::Error,
+        "sloop::recovery",
+        "driver_resume_failed",
+        json!({"run_id": run.id, "ticket_id": run.ticket_id, "error": error}),
+    );
+    let records = [EvidenceRecord {
+        kind: "driver_resume_failed",
+        data_json: json!({"error": error}).to_string(),
+    }];
+    let recorded = match state.run_store.settle(
+        &run.id,
+        None,
+        Outcome::NeedsReview,
+        &records,
+        None,
+        state.clock.now_ms(),
+    ) {
+        Ok((recorded, _)) => recorded,
+        Err(store_error) => {
+            mark_storage_full(state, &store_error);
+            log.emit_with_fields(
+                LogLevel::Error,
+                "sloop::recovery",
+                "unresumable_run_park_failed",
+                json!({"run_id": run.id, "error": store_error.to_string()}),
+            );
+            return;
+        }
+    };
+    match state.local_work_state.ticket(&run.ticket_id) {
+        Ok(Some(ticket)) => {
+            let ticket_ref = TicketRef {
+                id: ticket.id,
+                source: ticket.source,
+                source_ref: ticket.source_ref,
+            };
+            if let Err(release_error) = state
+                .work_state
+                .release(
+                    &ticket_ref,
+                    &recorded.work.owner,
+                    disposition_for_outcome(recorded.work.verdict, recorded.not_before_ms),
+                )
+                .await
+            {
+                log.emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::recovery",
+                    "claim_release_failed",
+                    json!({
+                        "run_id": run.id,
+                        "ticket_id": run.ticket_id,
+                        "error": release_error.to_string(),
+                    }),
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(store_error) => {
+            mark_storage_full(state, &store_error);
+            log.emit_with_fields(
+                LogLevel::Error,
+                "sloop::recovery",
+                "claim_release_failed",
+                json!({
+                    "run_id": run.id,
+                    "ticket_id": run.ticket_id,
+                    "error": store_error.to_string(),
+                }),
+            );
+        }
+    }
+    push_work_outcome(state, recorded.work, log, "sloop::recovery");
+    state.active.remove(&run.id);
+    state.supervised.remove(&run.id);
+    state.suspected_dead.remove(&run.id);
+    state.recovering.remove(&run.id);
+    state.cancelling.remove(&run.id);
+    state.stalling.remove(&run.id);
+    state.reported_stalls.remove(&run.id);
+    close_worker_socket(state, &run.id);
+}
+
 pub(super) fn stop_interrupted_process(
     rows: &[(String, String)],
     stage: &str,
@@ -808,13 +913,7 @@ pub(super) async fn reconcile_run_liveness(
         state.recovering.insert(run.id.clone());
         if run.state == RunState::Driving {
             if let Err(error) = resume_run_driver(state, events.clone(), run.clone()) {
-                state.recovering.remove(&run.id);
-                log.emit_with_fields(
-                    LogLevel::Error,
-                    "sloop::recovery",
-                    "driver_resume_failed",
-                    json!({"run_id": run.id, "error": error.to_string()}),
-                );
+                park_unresumable_run(state, &run, &error, log).await;
             }
         } else {
             spawn_dead_run_recovery(state, events.clone(), run, log.clone());

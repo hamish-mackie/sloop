@@ -7,8 +7,8 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use serde::de::{Error as _, IgnoredAny};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::de::IgnoredAny;
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_FLOW_NAME: &str = "default";
 pub const REVIEW_PROMPT_PATH: &str = ".agents/sloop/prompts/review.md";
@@ -41,7 +41,7 @@ pub struct Flow {
 /// action's own exit, or a worker's report) that decides. Every judgement a
 /// stage can carry is a configuration of this one shape rather than a policy
 /// of its own.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stage {
     pub name: String,
     pub action: Actor,
@@ -235,84 +235,6 @@ fn default_check(action: &Actor) -> Check {
     match action {
         Actor::Agent => Check::Actor(Actor::Builtin(Builtin::Commits)),
         Actor::Exec { .. } | Actor::Builtin(_) => Check::None,
-    }
-}
-
-impl<'de> Deserialize<'de> for Stage {
-    /// Reads both vocabularies. Snapshots written before the
-    /// action/result_check split carry `kind`/`verdict` (including the
-    /// long-deprecated `Build` spelling for an agent), and queued runs must
-    /// recover from them unchanged; anything written since carries
-    /// `action`/`result_check`/`fail_action`.
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        /// The pre-split stage kind, kept only so old snapshots still read.
-        #[derive(Deserialize)]
-        enum SnapshotKind {
-            #[serde(alias = "Build")]
-            Agent,
-            Merge,
-            Exec {
-                cmd: Vec<String>,
-            },
-        }
-
-        /// The pre-split result check, kept only so old snapshots still read.
-        #[derive(Deserialize)]
-        enum SnapshotVerdict {
-            Exit,
-            Commits,
-            Check { cmd: Vec<String> },
-            Reported,
-        }
-
-        #[derive(Deserialize)]
-        struct SnapshotStage {
-            name: String,
-            #[serde(default)]
-            action: Option<Actor>,
-            #[serde(default)]
-            result_check: Option<Check>,
-            #[serde(default)]
-            fail_action: Option<FailAction>,
-            #[serde(default)]
-            kind: Option<SnapshotKind>,
-            #[serde(default)]
-            verdict: Option<SnapshotVerdict>,
-            #[serde(default)]
-            ff_only: bool,
-            #[serde(default)]
-            on_fail: Option<OnFail>,
-        }
-
-        let stage = SnapshotStage::deserialize(deserializer)?;
-        let action = match (stage.action, stage.kind) {
-            (Some(action), _) => action,
-            (None, Some(SnapshotKind::Agent)) => Actor::Agent,
-            (None, Some(SnapshotKind::Merge)) => Actor::Builtin(Builtin::Merge),
-            (None, Some(SnapshotKind::Exec { cmd })) => Actor::Exec { cmd },
-            (None, None) => return Err(D::Error::missing_field("action")),
-        };
-        let result_check = match (stage.result_check, stage.verdict) {
-            (Some(check), _) => check,
-            (None, Some(SnapshotVerdict::Exit)) => Check::None,
-            (None, Some(SnapshotVerdict::Commits)) => {
-                Check::Actor(Actor::Builtin(Builtin::Commits))
-            }
-            (None, Some(SnapshotVerdict::Check { cmd })) => Check::Actor(Actor::Exec { cmd }),
-            (None, Some(SnapshotVerdict::Reported)) => Check::Reported,
-            (None, None) => default_check(&action),
-        };
-        Ok(Self {
-            name: stage.name,
-            action,
-            result_check,
-            fail_action: stage.fail_action.unwrap_or(FailAction::Halt),
-            ff_only: stage.ff_only,
-            on_fail: stage.on_fail,
-        })
     }
 }
 
@@ -1265,80 +1187,34 @@ mod tests {
         assert_eq!(flow.stages[2].result_check, commits());
     }
 
+    /// The snapshot contract: a flow this binary writes onto a `runs` row is
+    /// the flow this binary reads back when it recovers that run. Every field
+    /// a stage can carry is exercised, because the ones that are skipped when
+    /// absent — `ff_only`, `on_fail` — are exactly the ones a missing serde
+    /// default would silently break.
     #[test]
-    fn old_build_snapshots_deserialize_with_the_agent_default() {
-        let flow: Flow = serde_json::from_str(
-            r#"{"name":"example","stages":[{"name":"build","kind":"Build"}]}"#,
-        )
-        .unwrap();
-        assert_eq!(flow.stages[0].action, Actor::Agent);
-        assert_eq!(flow.stages[0].result_check, commits());
-        assert_eq!(flow.stages[0].fail_action, FailAction::Halt);
-    }
-
-    /// Every old `kind`/`verdict` pairing a snapshot can carry maps onto the
-    /// new representation, so runs queued before the split still recover.
-    #[test]
-    fn old_snapshots_map_onto_the_new_representation() {
-        let snapshot = r#"{"name":"example","stages":[
-            {"name":"a","kind":"Agent","verdict":"Commits"},
-            {"name":"b","kind":{"Exec":{"cmd":["true"]}},"verdict":"Exit"},
-            {"name":"c","kind":{"Exec":{"cmd":["true"]}},"verdict":{"Check":{"cmd":["cargo","fmt"]}}},
-            {"name":"d","kind":{"Exec":{"cmd":["true"]}},"verdict":"Reported"},
-            {"name":"e","kind":"Merge"}
-        ]}"#;
-        let flow: Flow = serde_json::from_str(snapshot).unwrap();
-
-        let actions: Vec<&Actor> = flow.stages.iter().map(|stage| &stage.action).collect();
-        assert_eq!(
-            actions,
-            vec![
-                &Actor::Agent,
-                &Actor::Exec {
-                    cmd: vec!["true".into()]
-                },
-                &Actor::Exec {
-                    cmd: vec!["true".into()]
-                },
-                &Actor::Exec {
-                    cmd: vec!["true".into()]
-                },
-                &Actor::Builtin(Builtin::Merge),
-            ]
-        );
-        let checks: Vec<&Check> = flow
-            .stages
-            .iter()
-            .map(|stage| &stage.result_check)
-            .collect();
-        assert_eq!(
-            checks,
-            vec![
-                &commits(),
-                &Check::None,
-                &exec_check(&["cargo", "fmt"]),
-                &Check::Reported,
-                &Check::None,
-            ]
-        );
-        assert!(
-            flow.stages
-                .iter()
-                .all(|stage| stage.fail_action == FailAction::Halt)
-        );
-    }
-
-    /// Snapshots are written in the new vocabulary and read back identically.
-    #[test]
-    fn new_snapshots_round_trip_through_the_new_vocabulary() {
+    fn snapshots_round_trip_through_the_new_vocabulary() {
         let flow = parse(
             "example",
-            "- { name: build, action: agent, result_check: reported }\n- { name: test, action: { exec: [cargo, test] }, result_check: { exec: [cargo, fmt] } }\n- { name: merge, action: { builtin: merge }, result_check: none }\n",
+            concat!(
+                "- { name: build, action: agent, result_check: reported }\n",
+                "- { name: test, action: { exec: [cargo, test] }, result_check: { exec: [cargo, fmt] }, on_fail: { agent: fix it, attempts: 2 } }\n",
+                "- name: review\n",
+                "  action: agent\n",
+                "  result_check:\n",
+                "    panel:\n",
+                "      prompt: prompts/review.md\n",
+                "      reviewers: [{ target: claude }, { target: codex, model: gpt }]\n",
+                "      require: { quorum: 2 }\n",
+                "- { name: merge, action: { builtin: merge, ff_only: true }, result_check: none }\n",
+            ),
         )
         .unwrap();
         let snapshot = serde_json::to_string(&flow).unwrap();
 
         assert!(snapshot.contains("result_check"), "{snapshot}");
+        assert!(snapshot.contains("ff_only"), "{snapshot}");
+        assert!(snapshot.contains("Panel"), "{snapshot}");
         assert!(!snapshot.contains("\"kind\""), "{snapshot}");
         assert!(!snapshot.contains("\"verdict\""), "{snapshot}");
         assert_eq!(serde_json::from_str::<Flow>(&snapshot).unwrap(), flow);
@@ -1508,11 +1384,10 @@ mod tests {
         assert!(!explicit.stages[1].ff_only);
     }
 
-    /// A queued run must recover the mode it was admitted with, and a flow
-    /// snapshotted before the option existed must still read as the merge
-    /// policy it was written for.
+    /// A queued run must recover the mode it was admitted with, and a stage
+    /// that never asked for the mode must not start carrying it.
     #[test]
-    fn ff_only_survives_a_snapshot_round_trip_and_defaults_on_old_ones() {
+    fn ff_only_survives_a_snapshot_round_trip() {
         let flow = parse(
             "example",
             "- { name: build, action: agent }\n- { name: merge, action: { builtin: merge, ff_only: true } }\n",
@@ -1531,12 +1406,7 @@ mod tests {
         // Off is the absence of the key, so a flow that never asked for the
         // mode does not start carrying it.
         assert!(!snapshot.contains("ff_only"), "{snapshot}");
-
-        let old: Flow = serde_json::from_str(
-            r#"{"name":"example","stages":[{"name":"merge","kind":"Merge"}]}"#,
-        )
-        .unwrap();
-        assert!(!old.stages[0].ff_only);
+        assert_eq!(serde_json::from_str::<Flow>(&snapshot).unwrap(), plain);
     }
 
     /// `ff_only` describes what the merge does to the default branch, so

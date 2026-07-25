@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- The compatibility path that read a `0.3.x` flow snapshot off a `runs` row is
+  gone, now that the grammar which produced one no longer parses. The only run
+  it could still have served is one claimed by a `0.3.x` binary and recovered
+  by a `0.4.0` one. Such a run is now parked for review by id rather than
+  resumed: its branch and evidence are untouched, the recovery pass carries on
+  to every other run, and `sloop reindex` rebuilds local state from the
+  committed files and Git.
+
 ## [0.4.0-rc.1] - 2026-07-25
 
 ### Added
