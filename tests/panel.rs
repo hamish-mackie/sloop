@@ -597,7 +597,7 @@ fn reports_land_on_the_right_attempt_after_a_return_to_re_run() {
             &world,
             &format!("{name}.sh"),
             &format!(
-                "printf x >> {counter}\nrounds=$(wc -c < {counter})\n\
+                "printf x >> {counter}\nrounds=$(wc -c < {counter} | tr -d ' ')\n\
                  if [ \"$rounds\" -le 1 ]; then\n  \
                    {sloop} --json verdict fail --reason 'round one' >/dev/null 2>&1 || true\n\
                  else\n  \

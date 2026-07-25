@@ -113,7 +113,9 @@ fn flaky_test_command(world: &World, name: &str, failures: usize) -> PathBuf {
         world,
         name,
         &format!(
-            "printf x >> {counter}\nruns=$(wc -c < {counter})\nif [ \"$runs\" -le {failures} ]; then\n  echo \"assertion failed: the widget is not blue\"\n  echo \"run $runs of the test command\"\n  exit 3\nfi\necho \"tests passed on run $runs\"\nexit 0\n",
+            // `tr -d ' '` because BSD `wc` pads its count to a fixed width and
+            // GNU `wc` does not; the run number reaches the prompt verbatim.
+            "printf x >> {counter}\nruns=$(wc -c < {counter} | tr -d ' ')\nif [ \"$runs\" -le {failures} ]; then\n  echo \"assertion failed: the widget is not blue\"\n  echo \"run $runs of the test command\"\n  exit 3\nfi\necho \"tests passed on run $runs\"\nexit 0\n",
             counter = shell_quote(&counter.to_string_lossy()),
         ),
     )
@@ -469,7 +471,7 @@ fn a_re_entered_reported_stage_is_judged_again() {
         &world,
         "review.sh",
         &format!(
-            "printf x >> {counter}\nruns=$(wc -c < {counter})\nif [ \"$runs\" -le 1 ]; then\n  {sloop} --json verdict fail --reason 'needs another pass' >/dev/null\nelse\n  {sloop} --json verdict pass --reason 'looks right now' >/dev/null\nfi\nexit 0\n",
+            "printf x >> {counter}\nruns=$(wc -c < {counter} | tr -d ' ')\nif [ \"$runs\" -le 1 ]; then\n  {sloop} --json verdict fail --reason 'needs another pass' >/dev/null\nelse\n  {sloop} --json verdict pass --reason 'looks right now' >/dev/null\nfi\nexit 0\n",
             counter = shell_quote(&counter.to_string_lossy()),
             sloop = shell_quote(env!("CARGO_BIN_EXE_sloop")),
         ),
