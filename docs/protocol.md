@@ -78,6 +78,21 @@ Patterns that fall out of the verbs:
 - **Drive a queue from your own tool** — `post` tickets, `hold`/`ready` to
   sequence them, then `show` a ticket pattern to observe why work is not
   running.
+- **Register or refresh a ticket** — `post` returns `ticket`, `created`,
+  `activation`, and `activation_suppressed`. `created` is `false` when the
+  file was already registered and the post only refreshed its indexed
+  content.
+
+  An activation is queued only when the post leaves the ticket in `ready`.
+  `--manual` and `--hold` request none, so `activation` is null and
+  `activation_suppressed` is null too. Reposting a ticket that is `merged`,
+  `failed`, or `needs_review` still refreshes the index, but a post cannot
+  return such a ticket to `ready`, so nothing is queued and nothing is
+  rescheduled — including with `--at`. There `activation` is null and
+  `activation_suppressed` is
+  `{"reason": "terminal_ticket", "state": "<ticket state>"}`. Read
+  `activation_suppressed`, not a null `activation`, to tell "none requested"
+  apart from "requested and refused".
 - **Build a dashboard or search tickets** — `show` takes optional `ref` and
   `limit` arguments. With neither, it returns the dashboard. The dashboard
   preserves the status fields (`daemon`, `gate`, `runs`,
@@ -158,6 +173,10 @@ the dashboard and match fields above: they are additive protocol-v1 changes.
 The existing status fields and top-level ticket rows keep their meanings.
 Existing v1 `status`, `list`, and `wait` requests remain accepted, although
 the CLI names are hidden deprecated aliases for the `show` surface.
+
+`post`'s `created` and `activation_suppressed` are additive in the same sense.
+`activation` keeps its meaning; it was already null whenever no activation was
+queued, and the new field only explains which null it is.
 
 The same rule applies to `show`'s run and stage history: `value.runs`,
 `value.stages`, `value.attempt`, `value.agent_exit_code`, and the timeline

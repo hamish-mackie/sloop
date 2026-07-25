@@ -230,6 +230,10 @@ impl WorkStateAuthor for MarkdownWorkStateAuthor<'_> {
 /// reschedules the queued activation. The dispatcher is the only caller and
 /// computes `at_eligible_ms` from its injected clock, so plain reads before
 /// writes here cannot race another writer.
+///
+/// An activation is queued only when the post leaves the ticket in `ready`.
+/// Reposting a settled ticket still refreshes the indexed content — editing
+/// a merged ticket's file must keep working — but queues nothing.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle(
     root: &Path,
@@ -392,18 +396,34 @@ pub async fn handle(
             error,
         })?
         .unwrap_or_else(|| content.clone());
-    let activation_request = match &args.activation {
-        PostActivation::Manual | PostActivation::Hold => None,
-        PostActivation::Auto => Some(ActivationRequest {
-            kind: ActivationKind::Auto,
-            eligible_at_ms: None,
-        }),
-        PostActivation::At { .. } => Some(ActivationRequest {
-            kind: ActivationKind::At,
-            eligible_at_ms: Some(
-                at_eligible_ms.expect("the dispatcher computes eligibility for at activations"),
-            ),
-        }),
+    // A repost cannot move a settled ticket: `update_authored_ticket` omits
+    // `state` from its `SET`, so `merged`, `failed`, and `needs_review` all
+    // survive the write. Dispatch requires `ready`, so an activation queued
+    // here could never fire; it would only sit in `queued_activations` as
+    // phantom demand and skew every gate that reads that count. `failed` is
+    // included even though `sloop retry` revives it: a lingering activation
+    // would make one failed ticket spawn on `retry` while every other one
+    // waits for `sloop run`.
+    let terminal_state = existing
+        .as_ref()
+        .map(|ticket| ticket.state.clone())
+        .filter(|state| matches!(state.as_str(), "merged" | "failed" | "needs_review"));
+    let activation_request = if terminal_state.is_some() {
+        None
+    } else {
+        match &args.activation {
+            PostActivation::Manual | PostActivation::Hold => None,
+            PostActivation::Auto => Some(ActivationRequest {
+                kind: ActivationKind::Auto,
+                eligible_at_ms: None,
+            }),
+            PostActivation::At { .. } => Some(ActivationRequest {
+                kind: ActivationKind::At,
+                eligible_at_ms: Some(
+                    at_eligible_ms.expect("the dispatcher computes eligibility for at activations"),
+                ),
+            }),
+        }
     };
     let work_ticket = WorkTicket {
         id: ticket_id.clone(),
@@ -447,12 +467,13 @@ pub async fn handle(
         source: "local".into(),
         source_ref: Some(relative_str.clone()),
     };
-    if existing.is_some() {
+    let created = existing.is_none();
+    if created {
+        author.post(&work_ticket).await?;
+    } else {
         author
             .update(&ticket_ref, &work_ticket, &author.original_version)
             .await?;
-    } else {
-        author.post(&work_ticket).await?;
     }
     let activation = author.activation_result();
     let ticket = work_state
@@ -473,7 +494,15 @@ pub async fn handle(
             "effort": ticket.effort,
             "flow": ticket.flow,
         },
+        "created": created,
         "activation": activation,
+        // `activation` alone cannot tell a machine consumer why it is null:
+        // `--manual` and `--hold` never asked for one, while a terminal
+        // ticket asked and was refused. Only the second sets this.
+        "activation_suppressed": terminal_state.map(|state| json!({
+            "reason": "terminal_ticket",
+            "state": state,
+        })),
     }))
 }
 
@@ -538,6 +567,10 @@ pub(crate) fn parse_ticket_frontmatter(
 /// Reuses an existing queued activation of the same kind so reposting cannot
 /// enqueue duplicate work. Ticket registration, counter reservation, and this
 /// queue operation share one transaction.
+///
+/// `request` is `None` for a settled ticket, which is what keeps the reschedule
+/// branch below from re-timing a stale `--at` activation onto one: the caller
+/// decides eligibility, this function only carries it out.
 fn queue_activation_transaction(
     transaction: &Transaction<'_>,
     ticket_id: &str,
@@ -989,6 +1022,106 @@ mod tests {
                 ),
             ]),
         }
+    }
+
+    /// Drops a ticket into a state a post cannot leave, the way a settled run
+    /// would. Going through the run machinery here would say nothing extra
+    /// about `post`.
+    fn settle(store: &LocalSqlite, id: &str, state: &str) {
+        let changed = store
+            .db()
+            .lock()
+            .execute(
+                "UPDATE tickets SET state = ?2 WHERE id = ?1",
+                rusqlite::params![id, state],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+
+    #[test]
+    fn reposting_a_settled_ticket_refreshes_content_without_queuing_an_activation() {
+        for state in ["merged", "failed", "needs_review"] {
+            let (root, store) = world();
+            let relative = ".agents/sloop/tickets/settled.md";
+            let path = root.path().join(relative);
+            std::fs::write(&path, ticket("", "# Original\n")).unwrap();
+            handle(
+                root.path(),
+                &store,
+                &post(relative, PostActivation::Manual),
+                2_000,
+                "TICK",
+                None,
+                &flows(),
+                "default",
+            )
+            .unwrap();
+            settle(&store, "TICK-1", state);
+            let stamped = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, stamped.replace("# Original", "# Edited")).unwrap();
+
+            let response = handle(
+                root.path(),
+                &store,
+                &post(relative, PostActivation::Auto),
+                3_000,
+                "TICK",
+                None,
+                &flows(),
+                "default",
+            )
+            .unwrap();
+
+            // The edit lands; only the activation is withheld.
+            assert_eq!(response["ticket"]["id"], "TICK-1");
+            assert_eq!(response["created"], false);
+            assert_eq!(
+                response["ticket"]["state"], state,
+                "a repost must not resurrect a {state} ticket"
+            );
+            assert!(
+                store
+                    .ticket("TICK-1")
+                    .unwrap()
+                    .unwrap()
+                    .body
+                    .unwrap()
+                    .contains("# Edited")
+            );
+            assert!(response["activation"].is_null());
+            assert_eq!(
+                response["activation_suppressed"],
+                serde_json::json!({"reason": "terminal_ticket", "state": state})
+            );
+            assert!(store.queued_activations().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn reposting_a_settled_ticket_with_at_neither_creates_nor_reschedules_an_activation() {
+        let (root, store) = world();
+        let relative = ".agents/sloop/tickets/timed.md";
+        std::fs::write(root.path().join(relative), ticket("", "# Timed\n")).unwrap();
+        let args = post(
+            relative,
+            PostActivation::At {
+                time: "03:00".into(),
+            },
+        );
+        let first = handle_at(root.path(), &store, &args, 2_000, 10_000).unwrap();
+        assert_eq!(first["activation"]["eligible_at_ms"], 10_000);
+        settle(&store, "TICK-1", "merged");
+
+        let second = handle_at(root.path(), &store, &args, 3_000, 20_000).unwrap();
+
+        assert!(second["activation"].is_null());
+        assert_eq!(second["activation_suppressed"]["state"], "merged");
+        // The activation left over from before the merge keeps its original
+        // time: the reschedule branch must not run for a settled ticket.
+        let queued = store.queued_activations().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].eligible_at_ms, Some(10_000));
     }
 
     #[test]

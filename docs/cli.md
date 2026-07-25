@@ -107,6 +107,18 @@ Reposting an edited file updates the ticket in place without queuing a
 duplicate run; reposting with a different `--at` time reschedules the
 queued run.
 
+A run is queued only when the post leaves the ticket ready. A post never
+moves a ticket out of `merged`, `failed`, or `needs_review`, so reposting a
+settled ticket refreshes its indexed content and queues nothing — a run
+pinned to it could never be dispatched. Neither `--auto` nor `--at` changes
+that, and `--at` does not re-time an existing queued run either. The output
+says which state suppressed it:
+
+```
+ticket TICK-43 updated from .agents/sloop/tickets/cooldown.md (project default, merged)
+no activation queued: TICK-43 is merged
+```
+
 ### sloop run [TICKET] [--project P] [--only T1,T2] [--at TIME | --every INTERVAL | --overnight]
 
 Enqueue a run. Naming a ticket or a project says *which* work, not

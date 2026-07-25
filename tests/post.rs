@@ -3,7 +3,7 @@ mod support;
 use std::fs;
 
 use sloop::clock::{Clock, SystemClock};
-use support::World;
+use support::{FakeAgent, World, wait_until};
 
 #[test]
 fn post_manual_stamps_and_registers_without_an_activation() {
@@ -681,4 +681,54 @@ fn invalid_flow_is_rejected_without_registering_the_ticket() {
             .unwrap()
             .contains("id:")
     );
+}
+
+#[test]
+fn reposting_a_failed_ticket_queues_nothing_and_leaves_retry_predictable() {
+    let world = World::configured();
+    world.configure_fake_agent(FakeAgent::new().exit(1));
+    world.commit_all("initial");
+    world.start_daemon();
+    let ticket = world.write_ticket("cooldown.md", "# Persist cooldowns\n");
+    let path = ticket.to_str().expect("UTF-8 ticket path").to_owned();
+    let posted = World::json_stdout(&world.sloop(&["post", &path, "--manual"]));
+    let id = posted["data"]["ticket"]["id"]
+        .as_str()
+        .expect("ticket id")
+        .to_owned();
+    assert!(world.sloop(&["run", &id]).status.success());
+    wait_until("the run fails the ticket", || {
+        World::json_stdout(&world.sloop(&["status"]))["data"]["tickets"]["failed"] == 1
+    });
+
+    // `--auto` is the default, and a failed ticket cannot be dispatched, so
+    // the edit must land without minting an activation that can never fire.
+    let repost = world.sloop(&["post", &path]);
+    assert!(
+        repost.status.success(),
+        "repost failed: {}",
+        String::from_utf8_lossy(&repost.stderr)
+    );
+    let response = World::json_stdout(&repost);
+    assert_eq!(response["data"]["ticket"]["state"], "failed");
+    assert_eq!(response["data"]["created"], false);
+    assert!(response["data"]["activation"].is_null());
+    assert_eq!(
+        response["data"]["activation_suppressed"],
+        serde_json::json!({"reason": "terminal_ticket", "state": "failed"})
+    );
+
+    // The point of covering `failed`: `retry` here does exactly what it does
+    // on a ticket that was never reposted — ready, and waiting for `sloop run`.
+    assert!(world.sloop(&["retry", &id]).status.success());
+    let list = World::json_stdout(&world.sloop(&["list"]));
+    assert_eq!(list["data"]["tickets"][0]["id"], id);
+    assert_eq!(list["data"]["tickets"][0]["state"], "ready");
+    assert_eq!(
+        list["data"]["tickets"][0]["reason"],
+        "ready but no queued activation; enqueue with `sloop run`"
+    );
+    let status = World::json_stdout(&world.sloop(&["status"]));
+    assert_eq!(status["data"]["queued_activations"], serde_json::json!([]));
+    assert_eq!(status["data"]["gate"]["active_agents"], 0);
 }

@@ -98,14 +98,30 @@ fn render_init(data: &Value) -> String {
 
 fn render_post(data: &Value) -> String {
     let ticket = &data["ticket"];
+    let id = ticket["id"].as_str().unwrap_or("?");
+    let verb = if data["created"] == Value::Bool(false) {
+        "updated"
+    } else {
+        "registered"
+    };
     let mut text = format!(
-        "ticket {} registered from {} (project {}, {})\n",
-        ticket["id"].as_str().unwrap_or("?"),
+        "ticket {id} {verb} from {} (project {}, {})\n",
         ticket["file"].as_str().unwrap_or("?"),
         ticket["project"].as_str().unwrap_or("?"),
         ticket["state"].as_str().unwrap_or("?"),
     );
-    text.push_str(&render_activation(&data["activation"]));
+    // Silence would read as "nothing was asked for". A settled ticket did ask
+    // and was refused, so name the state that refused it — and the one verb
+    // that undoes it, which exists only for `failed`.
+    if let Some(state) = data["activation_suppressed"]["state"].as_str() {
+        let _ = write!(text, "no activation queued: {id} is {state}");
+        if state == "failed" {
+            let _ = write!(text, "; `sloop retry {id}` returns it to ready");
+        }
+        text.push('\n');
+    } else {
+        text.push_str(&render_activation(&data["activation"]));
+    }
     text
 }
 
@@ -800,7 +816,7 @@ fn string_items(value: &Value) -> impl Iterator<Item = &str> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::render;
     use crate::protocol::{ErrorBody, ErrorCode, ResponseEnvelope};
@@ -954,6 +970,81 @@ mod tests {
         assert_eq!(
             render(Some("retry"), &response),
             "ticket T1: failed -> ready\n"
+        );
+    }
+
+    fn post_response(created: bool, activation: Value, suppressed: Value) -> ResponseEnvelope {
+        ResponseEnvelope::success(
+            None,
+            json!({
+                "ticket": {
+                    "id": "TICK-43",
+                    "project": "default",
+                    "file": ".agents/sloop/tickets/cooldown.md",
+                    "state": suppressed["state"].as_str().unwrap_or("ready"),
+                },
+                "created": created,
+                "activation": activation,
+                "activation_suppressed": suppressed,
+            }),
+        )
+    }
+
+    #[test]
+    fn a_fresh_post_reports_the_registration_and_its_activation() {
+        let response = post_response(
+            true,
+            json!({"id": "A95", "kind": "auto", "state": "queued", "ticket": "TICK-43"}),
+            Value::Null,
+        );
+
+        assert_eq!(
+            render(Some("post"), &response),
+            "ticket TICK-43 registered from .agents/sloop/tickets/cooldown.md \
+             (project default, ready)\n\
+             activation A95 queued (auto, ticket TICK-43)\n"
+        );
+    }
+
+    #[test]
+    fn a_repost_of_a_terminal_ticket_names_the_state_that_suppressed_the_activation() {
+        let merged = post_response(
+            false,
+            Value::Null,
+            json!({"reason": "terminal_ticket", "state": "merged"}),
+        );
+
+        assert_eq!(
+            render(Some("post"), &merged),
+            "ticket TICK-43 updated from .agents/sloop/tickets/cooldown.md \
+             (project default, merged)\n\
+             no activation queued: TICK-43 is merged\n"
+        );
+
+        // Only `failed` has a verb that undoes it, so only `failed` gets one.
+        let failed = post_response(
+            false,
+            Value::Null,
+            json!({"reason": "terminal_ticket", "state": "failed"}),
+        );
+
+        assert_eq!(
+            render(Some("post"), &failed),
+            "ticket TICK-43 updated from .agents/sloop/tickets/cooldown.md \
+             (project default, failed)\n\
+             no activation queued: TICK-43 is failed; \
+             `sloop retry TICK-43` returns it to ready\n"
+        );
+    }
+
+    #[test]
+    fn a_post_that_requested_no_activation_stays_silent_about_one() {
+        let response = post_response(false, Value::Null, Value::Null);
+
+        assert_eq!(
+            render(Some("post"), &response),
+            "ticket TICK-43 updated from .agents/sloop/tickets/cooldown.md \
+             (project default, ready)\n"
         );
     }
 
