@@ -267,11 +267,96 @@ The checks are:
 - `result_check: reported` requires the action to call
   `sloop verdict pass|fail [--reason <text>]`; no report is a failure, and the
   first report is final.
+- `result_check: { panel: {...} }` puts several independent reviewers on the
+  stage and derives the verdict from a quorum of their reports. See
+  [Panels](#panels-several-reviewers-one-deterministic-verdict) below.
 
 The default is the commits builtin for `agent` and `none` for everything else.
 An agent action may not use `result_check: none` — grading itself by exiting
 cleanly grades nothing. A merge action must use `result_check: none` because
 the merge result *is* its verdict, and the merge builtin may never be a check.
+
+### Panels: several reviewers, one deterministic verdict
+
+A single `reported` reviewer is one uncalibrated opinion, and it is the only
+thing standing between the agent's work and the merge. A **panel** spends more
+tokens to buy independence: `N` reviewers each examine the run alone and
+report, and a pure function over their reports decides the stage.
+
+```yaml
+- name: review
+  action: { exec: ['true'] }
+  result_check:
+    panel:
+      prompt: prompts/review.md
+      reviewers:
+        - { target: claude }
+        - { target: codex }
+        - { target: gemini, model: pro }
+      require: { quorum: 2 }
+```
+
+- `prompt` is a path under `.agents/sloop/`, so `prompts/review.md` is the file
+  `sloop init` already scaffolds. Every seat gets the *same* prompt: reviewers
+  asked different questions produce answers a quorum cannot meaningfully count.
+- `reviewers` is 2 to 5 entries. Each names a `target` from `agent.targets` in
+  config.yaml — validated at load, so a typo'd vendor is a startup error rather
+  than a reviewer that silently never runs. `model` and `effort` are optional
+  per-seat overrides that default to the *target's* own defaults, not the
+  ticket's: the ticket says how the work should be done, and a panel is about
+  who judges it.
+- `require: { quorum: N }` is how many `Pass` reports the stage needs, from 1
+  to the number of seats. Omit it and the panel is unanimous — a rule nobody
+  wrote down must not silently be the most permissive one it could have been.
+
+**Seat different vendors.** The point of a panel is decorrelated failure modes.
+Three seats on one model share its blind spots and mostly buy you the same
+opinion three times; three seats across three vendors do not.
+
+**It costs what it looks like it costs.** A three-seat panel spawns three
+review agents per execution of that stage, and a `return_to` edge multiplies
+that by its attempt budget. Sloop counts panel seats into the worst-case
+execution budget and refuses at parse time any flow whose total could exceed
+32, so the bill is bounded — but a five-seat panel inside a looping span is
+genuinely five times the review tokens, every time round.
+
+Reviewers run **one at a time**, so a panel never occupies more of the daemon
+than a single-agent stage does and cannot exceed `max_parallel_tasks`.
+
+Each reviewer gets one-shot credentials bound to its own seat — the run, the
+stage, the attempt, and the reviewer index. Which report a `sloop verdict` call
+lands on is derived from that credential and never from its arguments, so a
+reviewer cannot report for another seat, another stage, another attempt, or
+another run, and a second `verdict` call is refused. Reason is mandatory for a
+panel reviewer; `--confidence low|medium|high` is optional and defaults to
+`medium`.
+
+The aggregation is deliberately dull, and is `Pass` if and only if at least
+`quorum` seats reported `Pass`:
+
+- A reviewer that exits without reporting counts as a `Fail` with the reason
+  `no verdict reported`. Silence is not an abstention — a panel that could not
+  be heard from has approved nothing.
+- Confidence is recorded evidence only. It is never weighted, so two
+  high-confidence rejections do not outvote three low-confidence approvals.
+  There is no veto rule either: quorum only, so a panel's behaviour is
+  predictable from the config alone.
+- The aggregate is **never stored**. What persists is one append-only evidence
+  row per reviewer, and the verdict is recomputed from those rows every time —
+  which is what lets a daemon that restarted mid-stage reach the same reading
+  as the one that started it.
+
+`sloop show <run>` lists each seat under the panel stage with its verdict,
+confidence, and reason, silent seats included:
+
+```
+stages:
+  build   passed   ...
+  review  failed   ...  verdict from panel
+    claude  pass  confidence high  reads correct
+    codex   fail  confidence medium  missing a test
+    gemini  fail  no verdict reported
+```
 
 ### `fail_action`: what a failure does to the walk
 

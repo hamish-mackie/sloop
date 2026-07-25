@@ -56,6 +56,13 @@ The operator/worker split is enforced at the transport layer:
   only for the currently executing stage when its snapshotted policy is
   `reported`; the first report for that stage wins.
 
+  A **panel reviewer's** credential is narrower still: it is minted for one
+  seat — `(run, stage, attempt, reviewer index)` — and authorises exactly one
+  `verdict`. Which report the call lands on is derived from the credential,
+  never from its arguments, so no request a reviewer can compose reports for
+  another seat, stage, attempt, or run. A run holds one live credential at a
+  time, so a seat's token stops validating the moment the next one is issued.
+
 Both rejections use the same `unauthorized` error, so a probing worker
 learns nothing about what exists outside its scope.
 

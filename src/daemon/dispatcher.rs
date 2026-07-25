@@ -19,8 +19,8 @@ use crate::outcome::{FlowHalt, MergeOutcome, RunEvidence, classify_exit, derive_
 use crate::protocol::{ErrorBody, ErrorCode, Request, RequestId, ResponseEnvelope};
 use crate::run_ref::RunIdSource;
 use crate::run_store::{CooldownUpdate, EvidenceRecord, RunStore};
-use crate::runner::WorkerCredentials;
 use crate::runner::local::worker_socket_path;
+use crate::runner::{WorkerCredentials, WorkerScope};
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
 use crate::work_state::local::LocalSqlite;
 use crate::work_state::{SourceError, TicketFeeder, WorkState};
@@ -120,9 +120,9 @@ pub(super) struct DispatcherState {
     pub(super) cancelling: HashSet<String>,
     /// Run IDs with durable output-stall intent awaiting final settlement.
     pub(super) stalling: HashSet<String>,
-    /// Tokens issued to live runs; a worker request must present its run's
-    /// token exactly. Entries die with the run.
-    pub(super) worker_tokens: HashMap<String, String>,
+    /// Credentials issued to live runs; a worker request must present its
+    /// run's token exactly. Entries die with the run.
+    pub(super) worker_tokens: HashMap<String, IssuedWorker>,
     /// Accept-loop tasks for live per-run worker sockets, aborted at settle.
     pub(super) worker_listeners: HashMap<String, tokio::task::JoinHandle<()>>,
     pub(super) worker_socket_paths: HashMap<String, PathBuf>,
@@ -148,6 +148,17 @@ pub(super) struct DispatcherState {
     /// exits such as the project-root liveness check.
     pub(super) shutdown: mpsc::Sender<DaemonControl>,
     pub(super) shutdown_flag: Arc<AtomicBool>,
+}
+
+/// The live credential for a run's one worker socket: the token a request must
+/// present, and what presenting it authorises. The scope is stored here rather
+/// than derived per request because it is minted with the token — the daemon
+/// decides what a worker may do at the moment it hands over the secret, and
+/// nothing the worker sends afterwards can change the answer.
+#[derive(Debug, Clone)]
+pub(super) struct IssuedWorker {
+    pub(super) token: String,
+    pub(super) scope: WorkerScope,
 }
 
 /// Internal dispatcher events reported by drivers and recovery tasks, never by
@@ -320,9 +331,13 @@ fn register_worker_socket(
     worker: &WorkerCredentials,
     listener: tokio::net::UnixListener,
 ) {
-    state
-        .worker_tokens
-        .insert(run_id.to_owned(), worker.token.clone());
+    state.worker_tokens.insert(
+        run_id.to_owned(),
+        IssuedWorker {
+            token: worker.token.clone(),
+            scope: worker.scope.clone(),
+        },
+    );
     state
         .worker_socket_paths
         .insert(run_id.to_owned(), worker.socket.clone());

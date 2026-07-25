@@ -18,6 +18,7 @@
 #       reported                  the action must call `sloop verdict`
 #       { exec: [argv, ...] }     an independent command decides
 #       { builtin: commits }      passes when a new run-branch commit exists
+#       { panel: {...} }          several reviewers report; a quorum decides
 #   - `fail_action`: what the walk does with a failure.
 #       fail                      halt; stages after it are never requested
 #                                 (the default)
@@ -37,6 +38,7 @@
 #   - Stage names must be unique.
 #   - `return_to` must name an earlier stage, `attempts` must be 1..=3, and
 #     the worst case a flow's budgets imply may not exceed 32 executions.
+#     Panel reviewers are spawns and count towards that budget.
 #   - `on_fail` is rejected on the `agent` stage, and is deprecated in
 #     favour of `return_to`.
 #
@@ -129,6 +131,28 @@ stages:
     #   Under `none` a reviewer that always exits 0 — as `claude --print`
     #   does — would approve every run.
     result_check: reported
+    # ---- result_check: { panel: {...} } (the advanced form) --------------
+    # One reviewer is one uncalibrated opinion. A panel seats 2..=5 of them,
+    # spawns each in turn with the same prompt, and derives the verdict from
+    # a quorum of their reports — Pass iff at least `quorum` seats passed. A
+    # reviewer that never reports counts as a Fail, and `--confidence` is
+    # recorded but never weighted. Seat different vendors: the independence
+    # is the whole product, and three seats on one model mostly buy the same
+    # opinion three times. Every seat is a spawn, so a three-seat panel is
+    # three review agents each time the stage runs.
+    #
+    # result_check:
+    #   panel:
+    #     # A path under .agents/sloop/. One prompt for the whole panel.
+    #     prompt: prompts/review.md
+    #     # `target` must name an entry under `agent.targets`; `model` and
+    #     # `effort` are optional per-seat overrides.
+    #     reviewers:
+    #       - { target: claude }
+    #       - { target: codex }
+    #       - { target: gemini, model: pro }
+    #     # How many must pass. Optional; defaults to all of them.
+    #     require: { quorum: 2 }
 
   # ---- the merge builtin -----------------------------------------------
   # Applies the run branch to the default branch using Sloop's merge

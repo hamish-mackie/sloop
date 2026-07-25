@@ -377,7 +377,17 @@ pub(super) fn restore_worker_socket(
     let listener = UnixListener::bind(&socket_path).map_err(|error| error.to_string())?;
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
         .map_err(|error| error.to_string())?;
-    state.worker_tokens.insert(run.id.clone(), token.clone());
+    // The persisted token is the *agent stage's*: only an agent launch writes
+    // one to the run row. A panel reviewer's credential is minted per seat and
+    // never persisted, so nothing here can restore one — which is right, since
+    // recovery re-runs the stage and its panel from the top.
+    state.worker_tokens.insert(
+        run.id.clone(),
+        super::dispatcher::IssuedWorker {
+            token: token.clone(),
+            scope: crate::runner::WorkerScope::Stage,
+        },
+    );
     state
         .worker_socket_paths
         .insert(run.id.clone(), socket_path.clone());

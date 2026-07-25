@@ -29,8 +29,10 @@ use crate::config::{AgentConfig, RunningHours, expand_agent_cmd};
 use crate::db::{Db, StoreError};
 use crate::domain::ticket::TicketSnapshot;
 use crate::flow::{
-    Actor, Builtin, Check, FailAction, Flow, OnFail, Reported, Stage, StageEvidence, Step, Verdict,
-    VerdictSource, next_step, resolve_verdict, return_trigger,
+    Actor, Builtin, Check, Confidence, FailAction, Flow, OnFail, PANEL_PROMPT_ROOT,
+    PANEL_REVIEWER_INSTRUCTION, Panel, PanelOutcome, Reported, Reviewer, ReviewerReport, Stage,
+    StageEvidence, Step, Verdict, VerdictSource, aggregate, next_step, resolve_verdict,
+    return_trigger,
 };
 use crate::logging::{LogLevel, OperationalLog};
 use crate::outcome::{ExitClass, FlowHalt, MergeOutcome, classify_exit};
@@ -46,6 +48,7 @@ use crate::runner::local::{
 use crate::runner::{
     AgentLaunch, AgentProcessCheckpoint, ExecLaunch, ExecProcessCheckpoint, ExecutionEvidence,
     ProcessIdentity, RunnerError, StageExecution, StageHooks, StageOrder, WorkerCredentials,
+    WorkerScope,
 };
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
 use crate::work_state::local::LocalSqlite;
@@ -680,6 +683,7 @@ impl RunDriver<'_> {
             // of its own, and so a second log row; the rest judge in place.
             let mut reading = action.verdict;
             let mut check = None;
+            let mut panel = None;
             match &stage.result_check {
                 Check::None | Check::Reported => {}
                 Check::Actor(Actor::Builtin(Builtin::Commits)) => {
@@ -696,6 +700,18 @@ impl RunDriver<'_> {
                     check = Some(judged);
                 }
                 Check::Actor(Actor::Exec { .. }) => {}
+                Check::Panel(configured) if reading == Verdict::Pass => {
+                    let (outcome, judged) =
+                        self.run_panel(run, configured).map_err(WalkError::Stage)?;
+                    reading = outcome.verdict;
+                    panel = Some(outcome);
+                    check = Some(judged);
+                }
+                // The action failed on its own terms, so there is nothing left
+                // for a panel to judge — and a panel is the most expensive
+                // check there is. Seating five reviewers to confirm a verdict
+                // already reached is tokens spent on nothing.
+                Check::Panel(_) => {}
                 // Parsing refuses an agent judge and the merge builtin as a
                 // check, so neither can reach a run. Fail closed rather than
                 // pass a stage nothing actually judged.
@@ -709,7 +725,17 @@ impl RunDriver<'_> {
             } else {
                 None
             };
-            let (verdict, source, reason) = resolve_verdict(&stage.result_check, reading, reported);
+            // A panel's aggregate is derived, never stored: what persists is
+            // the reviewers' reports, and this reading is recomputed from them
+            // every time — including by a daemon that resumed mid-walk.
+            let (verdict, source, reason) = match &panel {
+                Some(outcome) => (
+                    outcome.verdict,
+                    VerdictSource::Panel,
+                    Some(outcome.reason.clone()),
+                ),
+                None => resolve_verdict(&stage.result_check, reading, reported),
+            };
             // Fill in the verdict of the re-run that followed the last repair.
             if let Some((repair_attempt, identity, target)) = pending_repair.take() {
                 let _ = self.run_store.record_repair_attempt(
@@ -1384,6 +1410,188 @@ impl RunDriver<'_> {
             .ok_or_else(|| format!("repair agent for stage `{stage}` produced no process identity"))
     }
 
+    /// Runs a stage's panel and derives its verdict.
+    ///
+    /// Reviewers run **one at a time**. A panel is the only check that spawns
+    /// more than one process, and running them in sequence is what keeps that
+    /// from being a way around `max_parallel_tasks`: at any instant the run
+    /// holds exactly the one child a single-agent stage would have held, so a
+    /// five-seat panel never occupies more of the daemon than a one-seat one.
+    /// It also preserves the run's single-live-worker-socket invariant, which
+    /// is what lets each seat's credential be the only one that validates
+    /// while that seat is speaking.
+    ///
+    /// A reviewer that cannot be launched at all is not fatal: its seat simply
+    /// goes unreported, and the aggregation counts an unreported seat as a
+    /// `Fail`. Failing closed is the point — a panel that could not be heard
+    /// from has approved nothing.
+    fn run_panel(
+        &self,
+        run: &StageRun,
+        panel: &Panel,
+    ) -> Result<(PanelOutcome, StageResult), String> {
+        let started_at_ms = self.clock().now_ms();
+        let prompt = self.panel_prompt(panel)?;
+        // A crash part-way through a panel re-runs the stage, but the seats
+        // that already reported are append-only and one-shot: their reports
+        // stand, and re-spawning those reviewers could only burn tokens to be
+        // refused. Silent seats are the ones still owed a hearing.
+        let filed = self.panel_reports(run, panel.reviewers.len())?;
+        for (index, reviewer) in panel.reviewers.iter().enumerate() {
+            if cancelled(&self.run_store, self.run_id(), self.log()) {
+                break;
+            }
+            if filed[index].is_some() {
+                self.log().emit_with_fields(
+                    LogLevel::Info,
+                    "sloop::driver",
+                    "panel_reviewer_already_reported",
+                    json!({
+                        "run_id": self.run_id(),
+                        "stage": run.stage.name,
+                        "attempt": run.attempt,
+                        "reviewer": index,
+                    }),
+                );
+                continue;
+            }
+            self.log().emit_with_fields(
+                LogLevel::Info,
+                "sloop::driver",
+                "panel_reviewer_spawned",
+                json!({
+                    "run_id": self.run_id(),
+                    "stage": run.stage.name,
+                    "attempt": run.attempt,
+                    "reviewer": index,
+                    "target": reviewer.target,
+                }),
+            );
+            if let Err(error) = self.run_reviewer(run, &prompt, index, reviewer) {
+                self.log().emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::driver",
+                    "panel_reviewer_failed",
+                    json!({
+                        "run_id": self.run_id(),
+                        "stage": run.stage.name,
+                        "reviewer": index,
+                        "error": error,
+                    }),
+                );
+            }
+        }
+        let reported = self.panel_reports(run, panel.reviewers.len())?;
+        let outcome = aggregate(panel, &reported);
+        let judged = StageResult {
+            verdict: outcome.verdict,
+            // No single process spoke for the panel, and inventing a code for
+            // the aggregate would read as one that did.
+            exit_code: None,
+            started_at_ms,
+            finished_at_ms: self.clock().now_ms(),
+        };
+        Ok((outcome, judged))
+    }
+
+    /// The prompt every seat is handed, read from the committed file the panel
+    /// names. One prompt for the whole panel: reviewers who were asked
+    /// different questions do not produce comparable answers, so a quorum over
+    /// them would count nothing in particular.
+    fn panel_prompt(&self, panel: &Panel) -> Result<String, String> {
+        let path = self
+            .environment
+            .root
+            .join(PANEL_PROMPT_ROOT)
+            .join(&panel.prompt);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read panel prompt {}: {error}", path.display()))?;
+        Ok(format!("{PANEL_REVIEWER_INSTRUCTION}\n\n{text}"))
+    }
+
+    /// Spawns one reviewer in the run worktree, holding a credential that
+    /// authorises exactly one report against its own seat.
+    ///
+    /// A seat's model and effort default to its *target's*, not the ticket's:
+    /// the ticket says how the work should be done, and a panel is about who
+    /// judges it.
+    fn run_reviewer(
+        &self,
+        run: &StageRun,
+        prompt: &str,
+        index: usize,
+        reviewer: &Reviewer,
+    ) -> Result<(), String> {
+        let agent = self
+            .environment
+            .agent
+            .as_ref()
+            .ok_or_else(|| "no agent targets configured".to_owned())?;
+        let ticket = self
+            .plan
+            .ticket
+            .as_ref()
+            .ok_or_else(|| "the run has no ticket snapshot".to_owned())?;
+        let template = agent.targets.get(&reviewer.target).ok_or_else(|| {
+            format!(
+                "panel reviewer target `{}` is not a configured agent target",
+                reviewer.target
+            )
+        })?;
+        let argv = expand_agent_cmd(
+            template,
+            reviewer.model.as_deref(),
+            reviewer.effort.as_deref(),
+            prompt,
+        )
+        .map_err(|message| format!("panel reviewer target `{}` {message}", reviewer.target))?;
+        let worker = self.issue_credentials(WorkerScope::PanelReviewer {
+            stage: run.stage.name.clone(),
+            stage_index: run.index,
+            attempt: run.attempt,
+            reviewer_index: index,
+        })?;
+        let order = StageOrder {
+            run_id: self.plan.run_id.clone(),
+            stage: run.stage.name.clone(),
+            attempt: run.attempt,
+            execution: StageExecution::Exec(ExecLaunch {
+                argv,
+                worker: Some(worker),
+                environment: agent_environment(&ticket.id, self.run_id())?,
+            }),
+            worktree: self.plan.worktree.clone(),
+            branch: self.plan.branch.clone(),
+            output_path: self.output_path.clone(),
+        };
+        let hooks = StoreStageHooks::new(&self.run_store, self.log());
+        // The exit is deliberately ignored. A reviewer's report is its verdict
+        // and its exit says nothing: `claude --print` exits 0 whatever it
+        // concluded, which is exactly why a panel is not judged by exit codes.
+        match run_exec_stage(&order, &hooks, self.clock()) {
+            Ok(_) => Ok(()),
+            Err(failure) => Err(failure.error.to_string()),
+        }
+    }
+
+    /// The reports this execution's seats have filed, indexed by seat.
+    ///
+    /// Read back out of durable evidence rather than collected in memory as
+    /// the reviewers exit: that is what makes the aggregate reproducible after
+    /// a restart, and what keeps `(stage_index, attempt)` — not "the reviewers
+    /// this driver happened to run" — the thing a report belongs to.
+    fn panel_reports(
+        &self,
+        run: &StageRun,
+        seats: usize,
+    ) -> Result<Vec<Option<ReviewerReport>>, String> {
+        let rows = self
+            .run_store
+            .run_evidence(self.run_id())
+            .map_err(|error| error.to_string())?;
+        Ok(panel_reports(&rows, run.index, run.attempt, seats))
+    }
+
     /// Mints the worker credentials for the stage about to execute and hands
     /// the dispatcher the socket to serve them on. A fresh token per stage
     /// execution is what scopes a worker's authority to the stage it is
@@ -1393,8 +1601,12 @@ impl RunDriver<'_> {
     /// The socket path stays per-run — macOS caps Unix socket paths at 104
     /// bytes and the run's short id is already most of the budget.
     fn issue_worker_credentials(&self) -> Result<WorkerCredentials, String> {
+        self.issue_credentials(WorkerScope::Stage)
+    }
+
+    fn issue_credentials(&self, scope: WorkerScope) -> Result<WorkerCredentials, String> {
         let socket = worker_socket_path(&self.environment.runtime_dir, self.run_id());
-        let (worker, listener) = mint_worker_credentials(&socket)?;
+        let (worker, listener) = mint_worker_credentials(&socket, scope)?;
         self.events
             .blocking_send(RunEvent::WorkerReady {
                 run_id: self.plan.run_id.clone(),
@@ -1433,13 +1645,7 @@ impl RunDriver<'_> {
             finished_at_ms: result.finished_at_ms,
             exit_code: result.exit_code,
             output_ref: output_ref.clone(),
-            verdict_source: resolved.then(|| {
-                match source {
-                    VerdictSource::ExitCode => "exit_code",
-                    VerdictSource::Reported => "reported",
-                }
-                .to_owned()
-            }),
+            verdict_source: resolved.then(|| source.as_str().to_owned()),
             reason: resolved.then(|| reason.clone()).flatten(),
         };
         let rows = match check {
@@ -1548,15 +1754,62 @@ pub(super) fn replayable(log: &[StageRecord]) -> Vec<StageEvidence> {
                 } else {
                     Verdict::Fail
                 },
-                source: if row.verdict_source.as_deref() == Some("reported") {
-                    VerdictSource::Reported
-                } else {
-                    VerdictSource::ExitCode
+                source: match row.verdict_source.as_deref() {
+                    Some("reported") => VerdictSource::Reported,
+                    Some("panel") => VerdictSource::Panel,
+                    _ => VerdictSource::ExitCode,
                 },
                 reason: row.reason.clone(),
             })
         })
         .collect()
+}
+
+/// The panel reports one stage execution's seats have filed, indexed by seat.
+///
+/// The one place the `panel_report` evidence shape is read. The driver derives
+/// a verdict from it and `show` renders it, and they must agree exactly — the
+/// aggregate is never stored, so a divergence here would show an operator a
+/// tally the walk never used.
+///
+/// Rows are matched on `(stage_index, attempt)`: a `return_to` re-run reports
+/// onto its own attempt, so an earlier round's reports can never be counted
+/// towards a later one.
+pub(super) fn panel_reports(
+    evidence: &[(String, String)],
+    stage_index: usize,
+    attempt: u32,
+    seats: usize,
+) -> Vec<Option<ReviewerReport>> {
+    let mut reports = vec![None; seats];
+    for (_, data) in evidence.iter().filter(|(kind, _)| kind == "panel_report") {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        if value["stage_index"].as_u64() != Some(stage_index as u64)
+            || value["attempt"].as_u64() != Some(u64::from(attempt))
+        {
+            continue;
+        }
+        let Some(slot) = value["reviewer"]
+            .as_u64()
+            .and_then(|seat| usize::try_from(seat).ok())
+            .and_then(|seat| reports.get_mut(seat))
+        else {
+            continue;
+        };
+        let verdict = match value["verdict"].as_str() {
+            Some("pass") => Verdict::Pass,
+            Some("fail") => Verdict::Fail,
+            _ => continue,
+        };
+        *slot = Some(ReviewerReport {
+            verdict,
+            confidence: value["confidence"].as_str().and_then(Confidence::parse),
+            reason: value["reason"].as_str().unwrap_or_default().to_owned(),
+        });
+    }
+    reports
 }
 
 fn flow_with_implicit_test(flow: &Flow, test_cmd: Option<&[String]>) -> Result<Flow, String> {

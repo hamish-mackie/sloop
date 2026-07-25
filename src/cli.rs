@@ -13,9 +13,9 @@ use clap::{
 use serde_json::json;
 
 use crate::protocol::{
-    EmptyArgs, ErrorBody, ErrorCode, EventsArgs, ListArgs, LogsArgs, NoteArgs, PostActivation,
-    PostArgs, Request, RequestEnvelope, RequestId, ResponseEnvelope, RunActivation, RunArgs,
-    RunReferenceArgs, ShowArgs, StopArgs, TicketReferenceArgs, VerdictArgs, VerdictValue,
+    ConfidenceValue, EmptyArgs, ErrorBody, ErrorCode, EventsArgs, ListArgs, LogsArgs, NoteArgs,
+    PostActivation, PostArgs, Request, RequestEnvelope, RequestId, ResponseEnvelope, RunActivation,
+    RunArgs, RunReferenceArgs, ShowArgs, StopArgs, TicketReferenceArgs, VerdictArgs, VerdictValue,
 };
 use crate::templates::TemplateKind;
 
@@ -211,6 +211,10 @@ pub enum Command {
         verdict: VerdictCliValue,
         #[arg(long)]
         reason: Option<String>,
+        /// How sure you are. Defaults to `medium`; only ever recorded as
+        /// evidence, never weighted into a panel's aggregation.
+        #[arg(long)]
+        confidence: Option<ConfidenceCliValue>,
     },
 }
 
@@ -218,6 +222,15 @@ pub enum Command {
 pub enum VerdictCliValue {
     Pass,
     Fail,
+}
+
+/// clap renders the variants as the accepted values, so `--confidence 0.8`
+/// fails with the valid list rather than being rounded into one of them.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ConfidenceCliValue {
+    Low,
+    Medium,
+    High,
 }
 
 #[derive(Debug, Args)]
@@ -384,12 +397,21 @@ impl TryFrom<Command> for Request {
             Command::Note { text } => Self::Note(NoteArgs {
                 text: text.join(" "),
             }),
-            Command::Verdict { verdict, reason } => Self::Verdict(VerdictArgs {
+            Command::Verdict {
+                verdict,
+                reason,
+                confidence,
+            } => Self::Verdict(VerdictArgs {
                 verdict: match verdict {
                     VerdictCliValue::Pass => VerdictValue::Pass,
                     VerdictCliValue::Fail => VerdictValue::Fail,
                 },
                 reason,
+                confidence: confidence.map(|confidence| match confidence {
+                    ConfidenceCliValue::Low => ConfidenceValue::Low,
+                    ConfidenceCliValue::Medium => ConfidenceValue::Medium,
+                    ConfidenceCliValue::High => ConfidenceValue::High,
+                }),
             }),
         })
     }

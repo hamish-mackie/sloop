@@ -12,7 +12,9 @@ pub(crate) mod evidence;
 pub(crate) mod limits;
 pub(crate) mod runs;
 
-pub use evidence::{EvidenceRecord, OutputStallEvidence, StagePhase, StageRecord};
+pub use evidence::{
+    EvidenceRecord, OutputStallEvidence, PanelReportRecord, StagePhase, StageRecord,
+};
 pub use limits::{CooldownRecord, CooldownUpdate};
 pub use runs::{ActiveRun, EventRecord, ProjectNote, RunRecord, RunState, RunTimeline};
 pub use runs::{AdmittedRun, RunAdmission};

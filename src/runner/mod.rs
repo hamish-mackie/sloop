@@ -52,6 +52,30 @@ pub struct ExecLaunch {
 pub struct WorkerCredentials {
     pub socket: PathBuf,
     pub token: String,
+    /// What the token authorises. Minted with the credential and never read
+    /// off a request, so a worker cannot widen its own authority by argument.
+    pub scope: WorkerScope,
+}
+
+/// The authority a worker token carries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum WorkerScope {
+    /// The stage's own worker. A verdict it reports lands on whichever stage
+    /// execution the driver has checkpointed a process for — there is exactly
+    /// one, so the answer is unambiguous without the token saying it.
+    #[default]
+    Stage,
+    /// One seat on a panel. A panel runs several workers against one stage
+    /// execution, so "the executing stage" no longer picks out a report row:
+    /// the seat is named by the credential instead, and a reviewer holding it
+    /// can report for nothing else — not another seat, not another attempt,
+    /// not another run.
+    PanelReviewer {
+        stage: String,
+        stage_index: usize,
+        attempt: u32,
+        reviewer_index: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -3,14 +3,16 @@ use std::fs;
 use serde_json::json;
 
 use crate::domain::ticket::TicketSnapshot;
-use crate::flow::{Check, Flow};
+use crate::flow::{Check, Confidence, Flow};
 use crate::protocol::{ErrorBody, Request, RequestId, ResponseEnvelope, VerdictArgs, VerdictValue};
+use crate::run_store::PanelReportRecord;
+use crate::runner::WorkerScope;
 use crate::vendor_error::VendorErrorMatch;
 
 use crate::work_state::local::TicketRecord;
 
 use super::commands::{local_lookup, mark_storage_full, run_lookup};
-use super::dispatcher::{DispatcherState, conflict, internal, unauthorized};
+use super::dispatcher::{DispatcherState, conflict, internal, invalid_arguments, unauthorized};
 
 /// Serves a worker verb after proving the caller holds the run's token.
 /// Everything an agent can reach flows through here: reads and writes are
@@ -23,18 +25,21 @@ pub(super) fn dispatch_worker(
     run_id: &str,
     token: Option<&str>,
 ) -> ResponseEnvelope {
-    let valid = token.is_some_and(|presented| {
+    // The scope is read from the issued credential, not from the request: what
+    // a token may do was decided when it was minted.
+    let scope = token.and_then(|presented| {
         state
             .worker_tokens
             .get(run_id)
-            .is_some_and(|issued| issued == presented)
+            .filter(|issued| issued.token == presented)
+            .map(|issued| issued.scope.clone())
     });
-    if !valid {
+    let Some(scope) = scope else {
         return ResponseEnvelope::failure(
             Some(id),
             unauthorized("the presented token is not valid for this run"),
         );
-    }
+    };
 
     let data = match request {
         Request::Brief(_) => handle_brief(state, run_id),
@@ -45,7 +50,25 @@ pub(super) fn dispatch_worker(
             )),
         },
         Request::Note(args) => handle_note(state, run_id, &args.text),
-        Request::Verdict(args) => handle_verdict(state, run_id, &args),
+        Request::Verdict(args) => match &scope {
+            WorkerScope::Stage => handle_verdict(state, run_id, &args),
+            WorkerScope::PanelReviewer {
+                stage,
+                stage_index,
+                attempt,
+                reviewer_index,
+            } => handle_panel_report(
+                state,
+                run_id,
+                PanelSeat {
+                    stage,
+                    stage_index: *stage_index,
+                    attempt: *attempt,
+                    reviewer_index: *reviewer_index,
+                },
+                &args,
+            ),
+        },
         // The connection handler already rejected operator verbs.
         _ => Err(unauthorized(
             "operator verbs are not available on a worker socket",
@@ -194,6 +217,85 @@ fn handle_note(
             internal(&format!("cannot record note: {error}"))
         })?;
     Ok(json!({"note": {"id": note_id, "run": run_id, "text": text}}))
+}
+
+/// The seat a panel reviewer's credential names. Copied out of the scope so
+/// the handler cannot accidentally read anything else off the request.
+struct PanelSeat<'a> {
+    stage: &'a str,
+    stage_index: usize,
+    attempt: u32,
+    reviewer_index: usize,
+}
+
+/// Records one panel reviewer's report against the seat its credential names.
+///
+/// Nothing in `args` says where the report lands: the run comes from the
+/// socket, and the stage, attempt, and seat come from the token. A reviewer
+/// therefore cannot report for another run, another stage, another attempt, or
+/// another reviewer even if it fabricates every argument it sends.
+///
+/// The report is one-shot. The storage refuses a second insert on the same
+/// seat, so the first report a reviewer makes is the one the panel counts;
+/// there is no revising a vote after casting it.
+fn handle_panel_report(
+    state: &DispatcherState,
+    run_id: &str,
+    seat: PanelSeat<'_>,
+    args: &VerdictArgs,
+) -> Result<serde_json::Value, ErrorBody> {
+    let run = run_lookup(state, |run_store| run_store.run(run_id))?
+        .ok_or_else(|| internal("the run for this token no longer exists"))?;
+    if !matches!(run.state.as_str(), "running" | "driving") {
+        return Err(conflict("the run has no stage currently executing"));
+    }
+    // A panel report is what the whole stage turns on, and an unexplained one
+    // is worth nothing to the operator reading `sloop show` afterwards.
+    let reason = args
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .ok_or_else(|| invalid_arguments("a panel reviewer must report a non-empty `--reason`"))?;
+    let verdict = match args.verdict {
+        VerdictValue::Pass => "pass",
+        VerdictValue::Fail => "fail",
+    };
+    let confidence = args
+        .confidence
+        .map_or(Confidence::default(), Confidence::from);
+    let record = PanelReportRecord {
+        stage: seat.stage,
+        stage_index: seat.stage_index,
+        attempt: seat.attempt,
+        reviewer_index: seat.reviewer_index,
+        verdict,
+        confidence: confidence.as_str(),
+        reason,
+    };
+    let inserted = state
+        .run_store
+        .record_panel_report(run_id, &record, state.clock.now_ms())
+        .map_err(|error| {
+            mark_storage_full(state, &error);
+            internal(&format!("cannot record panel report: {error}"))
+        })?;
+    if !inserted {
+        return Err(conflict(&format!(
+            "reviewer {} of stage `{}` has already reported",
+            seat.reviewer_index, seat.stage
+        )));
+    }
+    Ok(json!({
+        "verdict": {
+            "run": run_id,
+            "stage": seat.stage,
+            "reviewer": seat.reviewer_index,
+            "verdict": verdict,
+            "confidence": confidence.as_str(),
+            "reason": reason,
+        }
+    }))
 }
 
 fn handle_verdict(

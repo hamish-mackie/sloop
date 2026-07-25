@@ -367,9 +367,16 @@ Append an advisory note to the current run. It moves nothing: no note changes
 a ticket's state, and claims like "done" carry no weight. Notes appear in
 `sloop show <project>` output and may not survive a state rebuild.
 
-### sloop verdict pass|fail [--reason <TEXT>]
+### sloop verdict pass|fail [--reason <TEXT>] [--confidence low|medium|high]
 
 Report the current stage's verdict when, and only when, that stage declares
 `result_check: reported`. The first report is persisted and final; a second report
 is rejected. A reported stage that exits without calling this command fails
 with `no verdict reported`.
+
+`--confidence` defaults to `medium` and takes only those three words — a float
+is rejected. It is recorded as evidence and never weighted into any decision.
+
+A **panel reviewer** uses the same command. Its credential names the seat the
+report lands on, so nothing about the call chooses one; `--reason` is mandatory
+there, and the credential authorises exactly one report.

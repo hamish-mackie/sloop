@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `result_check: { panel: {...} }` puts 2 to 5 independent reviewers on a stage
+  and derives its verdict from a quorum of their reports: `Pass` iff at least
+  `quorum` seats reported `Pass`. Reviewers run one at a time in the run
+  worktree with one shared prompt, so a panel never exceeds
+  `max_parallel_tasks`, and their spawns count towards the worst-case execution
+  budget a flow is admitted against. Each seat gets one-shot credentials bound
+  to `(run, stage, attempt, reviewer)`, so which report a `sloop verdict` call
+  lands on comes from the credential and never from its arguments. A reviewer
+  that exits without reporting counts as a `Fail` with `no verdict reported`.
+  The aggregate is never stored — one append-only evidence row per reviewer is,
+  and the verdict is recomputed from those rows by a pure function, so a
+  restarted daemon reaches the same reading.
+- `sloop verdict` takes `--confidence low|medium|high`, defaulting to `medium`.
+  It is recorded as evidence and never weighted into a panel's aggregation;
+  floats are rejected. `sloop show <run>` lists each panel seat's verdict,
+  confidence, and reason under its stage, silent seats included.
 - Flow stages can now bind the two `fail_action` forms that previously parsed
   but were rejected. `fail_action: continue` makes a stage advisory: its
   failure is recorded and visible in `sloop show`, the walk carries on, and the

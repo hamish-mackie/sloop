@@ -13,6 +13,7 @@ use tokio::net::UnixListener;
 use super::{
     AgentProcessCheckpoint, ExecProcessCheckpoint, ExecutionEvidence, ExecutionFailure,
     ProcessIdentity, RunnerError, StageExecution, StageHooks, StageOrder, WorkerCredentials,
+    WorkerScope,
 };
 use crate::clock::Clock;
 use crate::run_log::{OutputSource, OutputStream, RunLogWriter};
@@ -91,11 +92,12 @@ pub fn create_run_worktree(repository: &Path, worktree: &Path, branch: &str) -> 
     }
 }
 
-/// Binds a worker socket and mints the token that authenticates against it.
-/// Returned unregistered: the caller decides who serves the socket, and no
-/// request can be answered before it does.
+/// Binds a worker socket and mints the token that authenticates against it,
+/// scoped to what the token may do. Returned unregistered: the caller decides
+/// who serves the socket, and no request can be answered before it does.
 pub fn mint_worker_credentials(
     socket_path: &Path,
+    scope: WorkerScope,
 ) -> Result<(WorkerCredentials, UnixListener), String> {
     let token = generate_worker_token()?;
     fs::create_dir_all(socket_path.parent().expect("worker sockets have a parent"))
@@ -108,6 +110,7 @@ pub fn mint_worker_credentials(
         WorkerCredentials {
             socket: socket_path.to_path_buf(),
             token,
+            scope,
         },
         listener,
     ))

@@ -691,6 +691,42 @@ fn run_stages(stages: &Value) -> String {
             let _ = write!(line, "  (no output {})", duration(silent_for_ms));
         }
         let _ = writeln!(text, "{}", line.trim_end());
+        text.push_str(&panel_reviewers(&stage["reviewers"]));
+    }
+    text
+}
+
+/// The seats under a panel-judged stage: who reviewed, what they said, how
+/// sure they were, and why.
+///
+/// A panel's verdict is a count, and a count on its own tells an operator
+/// nothing about *which* reviewer objected — which is the only part worth
+/// reading when the stage failed. Every seat prints, silent ones included,
+/// because a seat that never reported is a `Fail` the count used.
+fn panel_reviewers(reviewers: &Value) -> String {
+    let Some(reviewers) = reviewers.as_array().filter(|seats| !seats.is_empty()) else {
+        return String::new();
+    };
+    let targets: Vec<&str> = reviewers
+        .iter()
+        .map(|seat| seat["target"].as_str().unwrap_or("?"))
+        .collect();
+    let width = targets.iter().map(|target| target.len()).max().unwrap_or(0);
+    let mut text = String::new();
+    for (seat, target) in reviewers.iter().zip(&targets) {
+        let mut line = format!(
+            "    {target:width$}  {:4}",
+            seat["verdict"].as_str().unwrap_or("?"),
+        );
+        // A reviewer that never reported has no confidence to state, and
+        // inventing one would dress an absence up as an opinion.
+        if let Some(confidence) = seat["confidence"].as_str() {
+            let _ = write!(line, "  confidence {confidence}");
+        }
+        if let Some(reason) = seat["reason"].as_str().filter(|text| !text.is_empty()) {
+            let _ = write!(line, "  {reason}");
+        }
+        let _ = writeln!(text, "{}", line.trim_end());
     }
     text
 }
@@ -1366,6 +1402,54 @@ mod tests {
                 "  test     failed   -  exit 1\n",
                 "  test#2   passed   -  exit 0\n",
                 "  merge    passed   -\n",
+            )
+        );
+    }
+
+    /// A panel's verdict is a tally, and a tally alone does not say which
+    /// reviewer objected — which is the only part worth reading when the stage
+    /// failed. Every seat prints, including the one that never reported.
+    #[test]
+    fn run_show_lists_every_panel_seat_under_its_stage() {
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "ref": "TICK-1-r1",
+                "kind": "run",
+                "value": {
+                    "id": "R14", "alias": "TICK-1-r1", "ticket": "TICK-1",
+                    "state": "needs_review", "terminal": true,
+                    "stages": [
+                        {"stage": "build", "state": "passed", "attempt": 1, "attempts": 1},
+                        {
+                            "stage": "review", "state": "failed", "attempt": 1, "attempts": 1,
+                            "verdict_source": "panel",
+                            "reason": "panel: 1 of 3 reviewers passed, quorum 2",
+                            "reviewers": [
+                                {"reviewer": 0, "target": "claude", "verdict": "pass",
+                                 "confidence": "high", "reason": "reads correct"},
+                                {"reviewer": 1, "target": "codex", "verdict": "fail",
+                                 "confidence": "medium", "reason": "missing a test"},
+                                {"reviewer": 2, "target": "gemini", "verdict": "fail",
+                                 "confidence": null, "reason": "no verdict reported"},
+                            ],
+                        },
+                    ],
+                }
+            }),
+        );
+
+        assert_eq!(
+            render(Some("show"), &response),
+            concat!(
+                "TICK-1-r1  (needs_review)\n",
+                "ticket: TICK-1\n",
+                "stages:\n",
+                "  build   passed   -\n",
+                "  review  failed   -  verdict from panel\n",
+                "    claude  pass  confidence high  reads correct\n",
+                "    codex   fail  confidence medium  missing a test\n",
+                "    gemini  fail  no verdict reported\n",
             )
         );
     }

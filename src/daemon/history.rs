@@ -54,6 +54,10 @@ struct Stage {
     verdict_source: Option<String>,
     reason: Option<String>,
     silent_for_ms: Option<i64>,
+    /// One entry per seat when this execution was judged by a panel, in
+    /// reviewer order and including seats that never reported. Empty for every
+    /// other check.
+    reviewers: Vec<Value>,
     /// Where the execution sits in the run's log. Rows are rendered in flow
     /// order, but "which failure ended the run" is a question about log order,
     /// and a loop makes the two differ. `0` on a stage with no row.
@@ -74,6 +78,7 @@ impl Stage {
             "verdict_source": self.verdict_source,
             "reason": self.reason,
             "silent_for_ms": self.silent_for_ms,
+            "reviewers": self.reviewers,
         })
     }
 
@@ -315,12 +320,13 @@ fn stages(
     // already-recorded stage can be the one running right now, so "the first
     // stage with no row" no longer finds it. Only a run still in flight has a
     // running stage at all.
-    let running = flow.filter(|_| !terminal).and_then(|flow| {
-        match crate::flow::next_step(&flow, &super::driver::replayable(recorded)) {
-            crate::flow::Step::Run { stage, attempt } => Some((stage.name.clone(), attempt)),
-            _ => None,
-        }
-    });
+    let running =
+        flow.as_ref().filter(|_| !terminal).and_then(|flow| {
+            match crate::flow::next_step(flow, &super::driver::replayable(recorded)) {
+                crate::flow::Step::Run { stage, attempt } => Some((stage.name.clone(), attempt)),
+                _ => None,
+            }
+        });
     let mut running_claimed = false;
 
     let mut stages = Vec::with_capacity(names.len());
@@ -347,6 +353,7 @@ fn stages(
                 verdict_source: row.verdict_source.clone(),
                 reason: row.reason.clone(),
                 silent_for_ms: None,
+                reviewers: panel_reviewers(flow.as_ref(), evidence, row),
                 name: name.clone(),
             });
         }
@@ -382,8 +389,59 @@ fn pending(name: String, state: &'static str, attempt: u32) -> Stage {
         verdict_source: None,
         reason: None,
         silent_for_ms: None,
+        reviewers: Vec::new(),
         log_position: 0,
     }
+}
+
+/// One panel's seats as `show` reports them: who sat, what they said, and how
+/// sure they were.
+///
+/// The list is built by running the *same* aggregation the walk ran, over the
+/// same rows, so a seat that never reported appears here as the `Fail` the
+/// verdict actually counted rather than as an absence the reader has to infer.
+/// Nothing about the panel is stored, so this is the only way `show` and the
+/// driver can be made to agree — and running the shared function is what makes
+/// that agreement structural rather than a convention.
+fn panel_reviewers(
+    flow: Option<&crate::flow::Flow>,
+    evidence: &[(String, String)],
+    row: &StageRecord,
+) -> Vec<Value> {
+    // The panel is found by *name*: a configured `flow.test_cmd` splices a
+    // stage into the flow the driver walks but not into the snapshot, so the
+    // recorded index need not be an index into the snapshot. The evidence rows
+    // are still keyed by the driver's index, which is what the row carries.
+    let Some(crate::flow::Check::Panel(panel)) = flow
+        .and_then(|flow| flow.stages.iter().find(|stage| stage.name == row.stage))
+        .map(|stage| &stage.result_check)
+    else {
+        return Vec::new();
+    };
+    let reported = super::driver::panel_reports(
+        evidence,
+        row.stage_index,
+        row.attempt,
+        panel.reviewers.len(),
+    );
+    crate::flow::aggregate(panel, &reported)
+        .reports
+        .into_iter()
+        .zip(&panel.reviewers)
+        .enumerate()
+        .map(|(seat, (report, reviewer))| {
+            json!({
+                "reviewer": seat,
+                "target": reviewer.target,
+                "verdict": match report.verdict {
+                    crate::flow::Verdict::Pass => "pass",
+                    crate::flow::Verdict::Fail => "fail",
+                },
+                "confidence": report.confidence.map(crate::flow::Confidence::as_str),
+                "reason": report.reason,
+            })
+        })
+        .collect()
 }
 
 /// Repair cycles a stage consumed, counted from the durable `repair_attempt`

@@ -329,7 +329,7 @@ impl Config {
         )?;
 
         let flows = load_flows(&repository.root)?;
-        validate_on_fail_targets(&flows, agent.as_ref(), &repository.config_path)?;
+        validate_flow_targets(&flows, agent.as_ref(), &repository.config_path)?;
         if flow_test_cmd.is_some()
             && let Some(flow) = flows
                 .values()
@@ -389,32 +389,51 @@ impl Config {
     }
 }
 
-/// Rejects `on_fail.target` overrides that do not name a configured agent
-/// target. Overrides without an explicit target resolve against the ticket's
-/// snapshot at spawn time, so they are left alone here.
-fn validate_on_fail_targets(
+/// Rejects flow-declared agent targets that do not name a configured one.
+///
+/// Two places name a target from a flow file: an `on_fail` repair override and
+/// a panel seat. Neither can be checked in `flow.rs`, which never sees
+/// config.yaml, and both are worth refusing here rather than at the moment the
+/// daemon would have spawned them — a panel that names a typo'd vendor would
+/// otherwise fail its stage with a silent reviewer and look like a review.
+///
+/// `on_fail` overrides without an explicit target resolve against the ticket's
+/// snapshot at spawn time, so they are left alone. A panel seat has no ticket
+/// to fall back on and always names its target.
+fn validate_flow_targets(
     flows: &BTreeMap<String, Flow>,
     agent: Option<&AgentConfig>,
     path: &Path,
 ) -> Result<(), ConfigError> {
+    let known = |target: &String| agent.is_some_and(|agent| agent.targets.contains_key(target));
+    let invalid = |flow: &Flow, stage: &str, position: &str, target: &str| ConfigError::Invalid {
+        path: path.to_path_buf(),
+        message: format!(
+            "flow `{}` stage `{stage}` {position} names unknown agent target `{target}`",
+            flow.name
+        ),
+    };
     for flow in flows.values() {
         for stage in &flow.stages {
-            let Some(target) = stage
+            if let Some(target) = stage
                 .on_fail
                 .as_ref()
                 .and_then(|on_fail| on_fail.target.as_ref())
-            else {
-                continue;
-            };
-            let known = agent.is_some_and(|agent| agent.targets.contains_key(target));
-            if !known {
-                return Err(ConfigError::Invalid {
-                    path: path.to_path_buf(),
-                    message: format!(
-                        "flow `{}` stage `{}` on_fail names unknown agent target `{target}`",
-                        flow.name, stage.name
-                    ),
-                });
+                && !known(target)
+            {
+                return Err(invalid(flow, &stage.name, "on_fail", target));
+            }
+            if let crate::flow::Check::Panel(panel) = &stage.result_check {
+                for reviewer in &panel.reviewers {
+                    if !known(&reviewer.target) {
+                        return Err(invalid(
+                            flow,
+                            &stage.name,
+                            "panel reviewer",
+                            &reviewer.target,
+                        ));
+                    }
+                }
             }
         }
     }
@@ -1592,6 +1611,32 @@ mod tests {
         let repository = Repository::discover(root.path()).unwrap();
         let error = Config::load(&repository).unwrap_err().to_string();
         assert!(error.contains("stage `check`"), "{error}");
+        assert!(error.contains("unknown agent target `ghost`"), "{error}");
+    }
+
+    /// A panel seat always names its target — there is no ticket to fall back
+    /// on — so a typo'd vendor is caught at load rather than becoming a
+    /// reviewer that could never be spawned and a stage that fails looking as
+    /// though it was reviewed.
+    #[test]
+    fn panel_reviewers_must_name_configured_agent_targets() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".agents/sloop/flows")).unwrap();
+        fs::write(
+            root.path().join(".agents/sloop/config.yaml"),
+            "version: 1\nagent:\n  default_target: fake\n  targets:\n    fake:\n      cmd: [fake, '{prompt}']\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join(".agents/sloop/flows/default.yaml"),
+            "- name: build\n  action: agent\n  result_check:\n    panel:\n      prompt: prompts/review.md\n      reviewers: [{ target: fake }, { target: ghost }]\n      require: { quorum: 1 }\n",
+        )
+        .unwrap();
+
+        let repository = Repository::discover(root.path()).unwrap();
+        let error = Config::load(&repository).unwrap_err().to_string();
+        assert!(error.contains("stage `build`"), "{error}");
+        assert!(error.contains("panel reviewer"), "{error}");
         assert!(error.contains("unknown agent target `ghost`"), "{error}");
     }
 

@@ -307,6 +307,10 @@ pub struct VerdictArgs {
     pub verdict: VerdictValue,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// How sure the reporter says it is. Absent from a client that predates
+    /// the field, and read as `medium`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<ConfidenceValue>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,6 +318,27 @@ pub struct VerdictArgs {
 pub enum VerdictValue {
     Pass,
     Fail,
+}
+
+/// Three named levels and nothing else. A float would decode here and then
+/// have to mean something in aggregation, which v1 deliberately does not
+/// define, so the wire type refuses one outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfidenceValue {
+    Low,
+    Medium,
+    High,
+}
+
+impl From<ConfidenceValue> for crate::flow::Confidence {
+    fn from(value: ConfidenceValue) -> Self {
+        match value {
+            ConfidenceValue::Low => Self::Low,
+            ConfidenceValue::Medium => Self::Medium,
+            ConfidenceValue::High => Self::High,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

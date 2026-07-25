@@ -65,6 +65,20 @@ pub struct StageRecord {
     pub reason: Option<String>,
 }
 
+/// One panel reviewer's report, as the storage takes it. The seat's key is
+/// separate from the report's content because only the key is authoritative:
+/// it comes from the reviewer's credential.
+#[derive(Debug, Clone, Copy)]
+pub struct PanelReportRecord<'a> {
+    pub stage: &'a str,
+    pub stage_index: usize,
+    pub attempt: u32,
+    pub reviewer_index: usize,
+    pub verdict: &'a str,
+    pub confidence: &'a str,
+    pub reason: &'a str,
+}
+
 /// Durable watchdog intent, recorded before the agent process group is killed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputStallEvidence {
@@ -77,7 +91,7 @@ pub struct OutputStallEvidence {
 pub(crate) mod tx {
     use rusqlite::{Transaction, params};
 
-    use super::{EvidenceRecord, OutputStallEvidence, StageRecord};
+    use super::{EvidenceRecord, OutputStallEvidence, PanelReportRecord, StageRecord};
 
     pub(crate) fn delete_for_run(
         transaction: &Transaction<'_>,
@@ -317,6 +331,44 @@ pub(crate) mod tx {
             "INSERT OR IGNORE INTO run_evidence
                  (run_id, kind, observed_at_ms, dedupe_key, data_json)
              VALUES (?1, 'stage_verdict', ?2, ?3, ?4)",
+            params![run_id, now_ms, dedupe_key, data_json],
+        )?;
+        Ok(inserted == 1)
+    }
+
+    /// Records one panel reviewer's report, append-only and one-shot.
+    ///
+    /// The key is the seat — `(run, stage_index, attempt, reviewer)` — and it
+    /// comes from the reviewer's credential, never from its arguments. `INSERT
+    /// OR IGNORE` is what makes the credential one-shot: a second `verdict`
+    /// call from the same reviewer inserts nothing and is refused, so a
+    /// reviewer cannot revise its own report once cast, and a `return_to`
+    /// re-run reports onto fresh rows because its attempt differs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_panel_report(
+        transaction: &Transaction<'_>,
+        run_id: &str,
+        report: &PanelReportRecord<'_>,
+        now_ms: i64,
+    ) -> rusqlite::Result<bool> {
+        let dedupe_key = format!(
+            "panel:{run_id}:{}:{}:{}",
+            report.stage_index, report.attempt, report.reviewer_index
+        );
+        let data_json = serde_json::json!({
+            "stage": report.stage,
+            "stage_index": report.stage_index,
+            "attempt": report.attempt,
+            "reviewer": report.reviewer_index,
+            "verdict": report.verdict,
+            "confidence": report.confidence,
+            "reason": report.reason,
+        })
+        .to_string();
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO run_evidence
+                 (run_id, kind, observed_at_ms, dedupe_key, data_json)
+             VALUES (?1, 'panel_report', ?2, ?3, ?4)",
             params![run_id, now_ms, dedupe_key, data_json],
         )?;
         Ok(inserted == 1)
@@ -568,6 +620,17 @@ impl RunStore {
     ) -> Result<bool, StoreError> {
         self.write(TransactionBehavior::Deferred, |transaction| {
             tx::record_stage_verdict(transaction, run_id, stage, attempt, verdict, reason, now_ms)
+        })
+    }
+
+    pub(crate) fn record_panel_report(
+        &self,
+        run_id: &str,
+        report: &PanelReportRecord<'_>,
+        now_ms: i64,
+    ) -> Result<bool, StoreError> {
+        self.write(TransactionBehavior::Deferred, |transaction| {
+            tx::record_panel_report(transaction, run_id, report, now_ms)
         })
     }
 
