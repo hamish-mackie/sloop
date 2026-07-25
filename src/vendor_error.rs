@@ -462,6 +462,34 @@ rules:
         }
     }
 
+    /// Verbatim stdout line captured from a rejected `claude` run, whose
+    /// `--output-format stream-json` command reports the vendor's refusal as a
+    /// synthetic assistant message rather than as stderr text.
+    const CLAUDE_SESSION_LIMIT_STDOUT: &str = r#"{"type":"assistant","message":{"id":"462199bc-1a76-4c09-aaff-df681c45b92c","model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","stop_sequence":"","type":"message","content":[{"type":"text","text":"You've hit your session limit · resets 12:50pm (Australia/Sydney)"}]},"session_id":"7f4420d2-0557-4535-849c-975a1adda3bc","error":"rate_limit","is_api_error_message":true}"#;
+
+    /// The signature is searched in the raw captured bytes, so it has to be
+    /// found inside the JSON payload without the catalog knowing the envelope.
+    #[test]
+    fn a_claude_session_limit_on_stdout_is_rate_limited() {
+        let classifier = VendorErrorClassifier::built_in().unwrap();
+        let matched = classifier
+            .classify(Some(1), CLAUDE_SESSION_LIMIT_STDOUT.as_bytes(), b"")
+            .expect("the captured session limit classifies");
+        assert_eq!(matched.class, VendorErrorClass::RateLimited);
+        assert_eq!(matched.rule_id, "claude.rate-limit.usage-limit");
+        assert!(matched.class.requires_cooldown());
+
+        // The earlier plain-limit wording keeps matching, on either stream.
+        let plain = b"API Error: You've hit your limit; resets 12am (UTC)".as_slice();
+        assert!(classifier.classify(Some(1), plain, b"").is_some());
+        assert!(classifier.classify(Some(1), b"", plain).is_some());
+        assert!(
+            classifier
+                .classify(Some(1), b"error: could not compile `sloop`", b"")
+                .is_none()
+        );
+    }
+
     #[test]
     fn schema_validation_rejects_unknown_classes_duplicate_ids_and_empty_signatures() {
         let unknown = VALID.replace("rate_limited", "retry_someday");

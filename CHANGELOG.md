@@ -62,6 +62,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   note when it admits a run whose flow uses `on_fail`. Nothing is removed:
   existing flows keep parsing, repairing, and settling exactly as before.
 
+### Fixed
+
+- A Claude session limit now classifies as `rate_limited` and cools the target
+  down instead of failing the ticket. The rule required stderr, but the
+  `claude` target runs with `--output-format stream-json` and reports vendor
+  rejections as synthetic assistant messages on stdout; its signature also only
+  covered `You've hit your limit`, not the `You've hit your session limit`
+  wording a real run hit. The rule now matches either stream on the wording
+  every limit window shares. Without this, one vendor limit could burn several
+  tickets' retry attempts and strand them in `failed`.
+
 ## [0.3.0] - 2026-07-21
 
 ### Added

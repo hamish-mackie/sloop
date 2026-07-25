@@ -2181,6 +2181,57 @@ fn retryable_and_unknown_rejections_release_under_a_target_cooldown() {
     }
 }
 
+/// Verbatim stdout line captured from a `claude` run that hit a session
+/// limit. The target runs with `--output-format stream-json`, so the vendor's
+/// refusal arrives as a synthetic assistant message on stdout instead of as
+/// stderr text.
+const CLAUDE_SESSION_LIMIT_STDOUT: &str = r#"{"type":"assistant","message":{"id":"462199bc-1a76-4c09-aaff-df681c45b92c","model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","stop_sequence":"","type":"message","content":[{"type":"text","text":"You've hit your session limit · resets 12:50pm (Australia/Sydney)"}]},"session_id":"7f4420d2-0557-4535-849c-975a1adda3bc","error":"rate_limit","is_api_error_message":true}"#;
+
+/// The rejection a real run hit: recognised from the JSON payload on stdout,
+/// it has to cool the target down rather than spend the ticket's attempts.
+#[test]
+fn a_claude_session_limit_on_stdout_cools_the_target_down() {
+    let world = World::configured();
+    configure(
+        &world,
+        &format!("cat <<'PAYLOAD'\n{CLAUDE_SESSION_LIMIT_STDOUT}\nPAYLOAD\nexit 1\n"),
+        None,
+    );
+    world.commit_all("initial");
+    world.start_daemon();
+    post_and_run(&world, "session-limit.md");
+
+    wait_until("the session-limited ticket is released", || {
+        let counts = tickets(&world);
+        counts["ready"] == 1 && counts["failed"] == 0
+    });
+    let snapshot = world.wait_snapshot(&world.run_id(1));
+    assert_eq!(snapshot["data"]["state"], "rate_limited");
+    assert_eq!(snapshot["data"]["classification"]["class"], "rate_limited");
+    assert_eq!(
+        snapshot["data"]["classification"]["rule_id"],
+        "claude.rate-limit.usage-limit"
+    );
+
+    let evidence = world
+        .run_evidence(&world.run_id(1), "vendor_error_classified")
+        .expect("vendor classification evidence");
+    assert!(evidence["cooldown_until_ms"].as_i64().is_some());
+    let encoded = evidence.to_string();
+    assert!(!encoded.contains("Australia/Sydney"), "unsafe: {encoded}");
+
+    let connection = rusqlite::Connection::open(world.db_path()).unwrap();
+    let cooldowns: i64 = connection
+        .query_row("SELECT COUNT(*) FROM cooldowns", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(cooldowns, 1, "the rejection must record a target cooldown");
+    let status = world.sloop(&["status"]);
+    assert_eq!(
+        World::json_stdout(&status)["data"]["gate"]["cooldowns"][0]["target"],
+        "fake"
+    );
+}
+
 #[test]
 fn cooldown_and_automatic_retry_survive_a_daemon_restart() {
     let world = World::configured();
