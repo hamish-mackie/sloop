@@ -560,14 +560,13 @@ before the flow's own later stages. It is an `exec` action with
 `result_check: none` and `fail_action: fail`. A flow that already has a stage
 called `test` conflicts with it and is rejected.
 
-### Appendix: the legacy grammar
+### Appendix: migrating from the legacy grammar
 
-Flows written before the `action`/`result_check`/`fail_action` split still
-parse, as sugar for exactly the stages above. This is the only place the older
-spellings are documented; new flows should use the grammar in the rest of this
-page.
+`0.3.0` spelled every stage with `kind`, `cmd`, and `verdict`. `0.4.0` removed
+that grammar; a flow file still using it no longer parses, and the parse error
+names the replacement key. The rewrite is mechanical:
 
-| Legacy | Current |
+| Removed in 0.4.0 | Replacement |
 | --- | --- |
 | `kind: agent`, or the deprecated `kind: build` | `action: agent` |
 | `kind: exec` with `cmd: [...]` | `action: { exec: [...] }` |
@@ -577,23 +576,6 @@ page.
 | `verdict: commits` | `result_check: { builtin: commits }` |
 | `verdict: { check: [...] }` | `result_check: { exec: [...] }` |
 | `verdict: reported` | `result_check: reported` |
-
-The two spellings may not be mixed on one stage: a stage that writes both
-`action` and `kind`, or both `result_check` and `verdict`, is a parse error
-rather than a merge of the two. A `merge` stage may not write `verdict` at all.
-
-```yaml
-stages:
-  - name: build
-    kind: agent
-    verdict: commits
-  - name: test
-    kind: exec
-    cmd: [cargo, test]
-    verdict: exit
-  - name: merge
-    kind: merge
-```
 
 #### `on_fail` repair blocks (deprecated)
 
