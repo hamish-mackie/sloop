@@ -703,6 +703,10 @@ pub(super) fn drive_flow(
         .iter()
         .map(|row| StageEvidence {
             stage: row.stage.clone(),
+            stage_index: row.stage_index,
+            // The runner records one row per stage and never re-enters one,
+            // so every recovered row is a first attempt.
+            attempt: 1,
             verdict: if row.state == "passed" {
                 Verdict::Pass
             } else {
@@ -747,8 +751,11 @@ pub(super) fn drive_flow(
             });
         }
         let stage = match next_step(&flow, &evidence) {
-            Step::Run(stage) => stage,
-            Step::Halted { failed_stage } => {
+            Step::Run { stage, attempt: _ } => stage,
+            Step::Halted {
+                failed_stage,
+                reason: _,
+            } => {
                 let first_stage_failed = flow
                     .stages
                     .first()
@@ -1088,6 +1095,8 @@ pub(super) fn drive_flow(
         }
         evidence.push(StageEvidence {
             stage: stage.name.clone(),
+            stage_index,
+            attempt: 1,
             verdict,
             source,
             reason,

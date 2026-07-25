@@ -275,8 +275,8 @@ the merge result *is* its verdict, and the merge builtin may never be a check.
 
 `fail_action` says what the walk does with a failure. Only `fail` — halt, the
 default — is supported today; `continue` and
-`{ return_to: <stage>, attempts: N }` parse but are rejected until the walk
-supports them.
+`{ return_to: <stage>, attempts: N }` parse but are rejected until the runner
+records the evidence they need.
 
 The older grammar still parses, as sugar for exactly the same stages:
 `kind: agent` (or the deprecated `kind: build`) is `action: agent`,
