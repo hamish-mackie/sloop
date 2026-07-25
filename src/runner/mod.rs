@@ -44,7 +44,7 @@ pub struct ExecLaunch {
     pub argv: Vec<String>,
     pub worker: Option<WorkerCredentials>,
     /// Extra environment applied to the child. Empty for ordinary exec
-    /// stages; repair agents carry the agent environment here.
+    /// stages; a spawned agent carries the agent environment here.
     pub environment: Vec<(OsString, OsString)>,
 }
 

@@ -1229,14 +1229,6 @@ impl LocalSqlite {
         Ok(expires_at_ms)
     }
 
-    pub(crate) fn active_lease_count(&self) -> Result<usize, StoreError> {
-        let count: i64 = self
-            .db
-            .lock()
-            .query_row("SELECT COUNT(*) FROM leases", [], |row| row.get(0))?;
-        Ok(count as usize)
-    }
-
     fn all_ticket_blockers(
         connection: &Connection,
     ) -> Result<BTreeMap<String, Vec<String>>, StoreError> {

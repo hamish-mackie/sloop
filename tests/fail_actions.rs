@@ -563,50 +563,6 @@ fn a_re_entered_exec_stage_is_handed_no_context() {
     assert_eq!(prompts(&prompt_log).len(), 1);
 }
 
-/// `on_fail` is deprecated, not removed: a flow using it still repairs, and
-/// the daemon says so in its log when it admits the run.
-#[test]
-fn a_legacy_on_fail_flow_still_repairs_and_logs_the_deprecation() {
-    let world = World::configured();
-    let script = write_script(
-        &world,
-        "fake-agent.sh",
-        &format!(
-            "case \"$1\" in\n  *REPAIR*)\n    : > fixed.txt\n    git add fixed.txt\n    {commit} --allow-empty -m repair ;;\n  *)\n    {commit} --allow-empty -m build ;;\nesac\nexit 0\n",
-            commit = commit("agent"),
-        ),
-    );
-    configure(
-        &world,
-        "- { name: build, action: agent, result_check: { exec: ['true'] } }\n- name: test\n  action: { exec: [\"sh\", \"-c\", \"test -f fixed.txt\"] }\n  on_fail:\n    agent: \"REPAIR make the test pass\"\n    attempts: 2\n- { name: merge, action: { builtin: merge } }\n",
-        &script,
-    );
-    world.commit_all("initial");
-    world.start_daemon();
-    let ticket = post(&world, "legacy-on-fail.md");
-    assert!(world.sloop(&["run", &ticket]).status.success());
-
-    wait_until_slow("the repaired legacy run merges", || {
-        status(&world)["tickets"]["merged"] == 1
-    });
-
-    let note = fs::read_to_string(world.daemon_log())
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .find(|record| record["event"] == "flow_on_fail_deprecated")
-        .expect("the deprecation note is in the daemon log");
-    let fields = &note["fields"];
-    assert_eq!(fields["stages"][0], "test");
-    assert_eq!(fields["ticket_id"], ticket.as_str());
-    assert!(
-        fields["replacement"]
-            .as_str()
-            .is_some_and(|text| text.contains("return_to")),
-        "{note}"
-    );
-}
-
 /// A flow whose backward edges could spin is refused before anything runs,
 /// so the bound is a property of the file rather than of the walk.
 #[test]

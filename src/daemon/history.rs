@@ -44,10 +44,6 @@ struct Stage {
     /// — a loop that converged and one that never ran twice must not read the
     /// same. `0` on a stage the walk has not reached.
     attempt: u32,
-    /// Total tries the execution cost, counting `on_fail` repair-then-retry
-    /// cycles. Distinct from `attempt`: a repair retries a stage *within* one
-    /// execution and records no row of its own.
-    attempts: u32,
     started_at_ms: Option<i64>,
     finished_at_ms: Option<i64>,
     exit_code: Option<i32>,
@@ -80,7 +76,6 @@ impl Stage {
             "stage": self.name,
             "state": self.state,
             "attempt": self.attempt,
-            "attempts": self.attempts,
             "started_at_ms": self.started_at_ms,
             "finished_at_ms": self.finished_at_ms,
             "duration_ms": self.duration_ms(),
@@ -268,14 +263,10 @@ impl RunHistory {
         if let Some(detail) = failed.reason.as_deref().filter(|text| !text.is_empty()) {
             reason.push_str(&format!(": {detail}"));
         }
-        // Two different budgets can be spent on one stage: `return_to` gives
-        // it whole re-entries, `on_fail` retries within one. Each is only
-        // worth saying when it was actually used.
+        // Only worth saying when a `return_to` edge actually re-entered the
+        // stage; a stage that ran once is the ordinary case and needs no count.
         if failed.attempt > 1 {
             reason.push_str(&format!(" on attempt {}", failed.attempt));
-        }
-        if failed.attempts > 1 {
-            reason.push_str(&format!(" after {} attempts", failed.attempts));
         }
         // Only worth saying when the agent is not itself the failure: if the
         // agent failed, the stage line above already carries its exit.
@@ -444,7 +435,6 @@ fn stages(
                     "failed"
                 },
                 attempt: row.attempt,
-                attempts: 1 + repair_attempts(evidence, &name),
                 started_at_ms: positive(row.started_at_ms),
                 finished_at_ms: positive(row.finished_at_ms),
                 exit_code: row.exit_code,
@@ -482,7 +472,6 @@ fn pending(name: String, state: &'static str, attempt: u32, advisory: bool) -> S
         name,
         state,
         attempt,
-        attempts: 0,
         started_at_ms: None,
         finished_at_ms: None,
         exit_code: None,
@@ -562,20 +551,6 @@ fn reported_confidence(evidence: &[(String, String)], stage: &str, attempt: u32)
             data["stage"] == stage && data["attempt"].as_u64().unwrap_or(1) == u64::from(attempt)
         })
         .and_then(|data| data["confidence"].as_str().map(str::to_owned))
-}
-
-/// Repair cycles a stage consumed, counted from the durable `repair_attempt`
-/// evidence rather than any in-memory counter, so a resumed run reports the
-/// same total a straight-through one does.
-fn repair_attempts(evidence: &[(String, String)], stage: &str) -> u32 {
-    evidence
-        .iter()
-        .filter(|(kind, _)| kind == "repair_attempt")
-        .filter_map(|(_, data)| serde_json::from_str::<Value>(data).ok())
-        .filter(|data| data["stage"] == stage)
-        .filter_map(|data| data["attempt"].as_u64())
-        .max()
-        .unwrap_or(0) as u32
 }
 
 fn observed_commits(evidence: &[(String, String)]) -> usize {

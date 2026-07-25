@@ -25,11 +25,11 @@ use serde_json::json;
 use tokio::sync::{Notify, mpsc};
 
 use crate::clock::Clock;
-use crate::config::{AgentConfig, RunningHours, expand_agent_cmd};
+use crate::config::{AgentConfig, expand_agent_cmd};
 use crate::db::{Db, StoreError};
 use crate::domain::ticket::TicketSnapshot;
 use crate::flow::{
-    Actor, Builtin, Check, Confidence, FailAction, Flow, OnFail, PANEL_PROMPT_ROOT,
+    Actor, Builtin, Check, Confidence, FailAction, Flow, PANEL_PROMPT_ROOT,
     PANEL_REVIEWER_INSTRUCTION, Panel, PanelOutcome, Reported, Reviewer, ReviewerReport, Stage,
     StageEvidence, Step, Verdict, VerdictSource, aggregate, next_step, resolve_verdict,
     return_trigger,
@@ -51,7 +51,6 @@ use crate::runner::{
     WorkerScope,
 };
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
-use crate::work_state::local::LocalSqlite;
 
 use super::dispatcher::{DispatcherState, RunEvent};
 use super::recovery::{
@@ -226,7 +225,7 @@ struct StageResult {
 ///
 /// The *first* agent stage in a flow owns them. A flow may hold several agent
 /// stages, but only one of them is the run's attempt at its ticket; the rest
-/// are review or repair steps whose verdicts speak for themselves.
+/// are later steps whose verdicts speak for themselves.
 #[derive(Debug, Clone)]
 struct AgentFacts {
     /// `Some(0)` until an agent has actually exited: with no process observed,
@@ -310,8 +309,6 @@ pub(super) struct DriverEnvironment {
     db_path: PathBuf,
     test_cmd: Option<Vec<String>>,
     agent: Option<AgentConfig>,
-    running_hours: Option<RunningHours>,
-    max_parallel_tasks: usize,
     clock: Arc<dyn Clock>,
     classifier: Arc<VendorErrorClassifier>,
     log: OperationalLog,
@@ -328,8 +325,6 @@ impl DriverEnvironment {
             db_path: state.state_dir.join("sloop.db"),
             test_cmd: state.flow_test_cmd.clone(),
             agent: state.agent.clone(),
-            running_hours: state.running_hours.clone(),
-            max_parallel_tasks: state.max_agents,
             clock: state.clock.clone(),
             classifier: state.classifier.clone(),
             log: state.log.clone(),
@@ -384,8 +379,7 @@ pub(super) fn start_driver(
             }
         };
         let mut driver = RunDriver {
-            run_store: RunStore::from_db(db.clone()),
-            local_work_state: LocalSqlite::from_db_with_clock(db, environment.clock.clone()),
+            run_store: RunStore::from_db(db),
             output_path: run_output_path(&environment.state_dir, &plan.run_id),
             flow: plan.flow.clone(),
             environment: &environment,
@@ -420,7 +414,6 @@ struct RunDriver<'a> {
     plan: &'a DriverPlan,
     events: &'a mpsc::Sender<RunEvent>,
     run_store: RunStore,
-    local_work_state: LocalSqlite,
     output_path: PathBuf,
     /// The run's flow with the configured implicit `test` stage spliced in.
     /// This is the flow the walk is over; nothing else sees it.
@@ -655,117 +648,81 @@ impl RunDriver<'_> {
     }
 
     /// Executes one stage: its action, then the independent check that judges
-    /// it, then any repair-and-retry cycles its `on_fail` allows, and finally
-    /// the row (or rows) the execution earned. `false` means another owner
-    /// claimed the run mid-stage.
+    /// it, and finally the row (or rows) the execution earned. A stage that
+    /// fails gets no second chance here — retrying is the walk's business, and
+    /// it re-enters the stage through a `return_to` edge with an attempt number
+    /// of its own. `false` means another owner claimed the run mid-stage.
     fn execute(&mut self, run: &StageRun) -> Result<bool, WalkError> {
         let stage = &run.stage;
         let interrupted = self
             .run_store
             .run_evidence(self.run_id())
             .map_err(|error| WalkError::Stage(error.to_string()))?;
-        let mut merge_recovery = self
+        let merge_recovery = self
             .recover_interrupted_stage(&interrupted, stage)
             .map_err(WalkError::Stage)?;
 
-        // Each `on_fail` stage may run up to `attempts` repair-then-retry
-        // cycles. The repair agent never produces the verdict: after it exits
-        // the stage is re-run and its own result check re-applied, and that
-        // re-run is the only evidence.
-        let mut repair_used = repair_attempts_used(&interrupted, &stage.name);
-        let mut pending_repair: Option<(u32, ProcessIdentity, String)> = None;
-        let (verdict, source, reason, action, check) = loop {
-            let Some(action) = self.run_action(run, merge_recovery)? else {
-                return Ok(false);
-            };
-            // The action's own reading, before the result check has a say.
-            // Only an independent actor that actually runs produces evidence
-            // of its own, and so a second log row; the rest judge in place.
-            let mut reading = action.verdict;
-            let mut check = None;
-            let mut panel = None;
-            match &stage.result_check {
-                Check::None | Check::Reported => {}
-                Check::Actor(Actor::Builtin(Builtin::Commits)) => {
-                    if reading != Verdict::Pass
-                        || !self.agent.commit_observation_complete
-                        || self.agent.commits.is_empty()
-                    {
-                        reading = Verdict::Fail;
-                    }
-                }
-                Check::Actor(Actor::Exec { cmd }) if reading == Verdict::Pass => {
-                    let judged = self.run_exec(&stage.name, run.attempt, cmd, None);
-                    reading = judged.verdict;
-                    check = Some(judged);
-                }
-                Check::Actor(Actor::Exec { .. }) => {}
-                Check::Panel(configured) if reading == Verdict::Pass => {
-                    let (outcome, judged) =
-                        self.run_panel(run, configured).map_err(WalkError::Stage)?;
-                    reading = outcome.verdict;
-                    panel = Some(outcome);
-                    check = Some(judged);
-                }
-                // The action failed on its own terms, so there is nothing left
-                // for a panel to judge — and a panel is the most expensive
-                // check there is. Seating five reviewers to confirm a verdict
-                // already reached is tokens spent on nothing.
-                Check::Panel(_) => {}
-                // Parsing refuses an agent judge and both git builtins as a
-                // check, so none of them can reach a run. Fail closed rather
-                // than pass a stage nothing actually judged.
-                Check::Actor(Actor::Agent)
-                | Check::Actor(Actor::Builtin(Builtin::Merge | Builtin::Sync)) => {
+        let Some(action) = self.run_action(run, merge_recovery)? else {
+            return Ok(false);
+        };
+        // The action's own reading, before the result check has a say. Only an
+        // independent actor that actually runs produces evidence of its own,
+        // and so a second log row; the rest judge in place.
+        let mut reading = action.verdict;
+        let mut check = None;
+        let mut panel = None;
+        match &stage.result_check {
+            Check::None | Check::Reported => {}
+            Check::Actor(Actor::Builtin(Builtin::Commits)) => {
+                if reading != Verdict::Pass
+                    || !self.agent.commit_observation_complete
+                    || self.agent.commits.is_empty()
+                {
                     reading = Verdict::Fail;
                 }
             }
-            let reported = if stage.result_check == Check::Reported {
-                reported_verdict(&self.run_store, self.run_id(), &stage.name, run.attempt)
-                    .map_err(WalkError::Stage)?
-            } else {
-                None
-            };
-            // A panel's aggregate is derived, never stored: what persists is
-            // the reviewers' reports, and this reading is recomputed from them
-            // every time — including by a daemon that resumed mid-walk.
-            let (verdict, source, reason) = match &panel {
-                Some(outcome) => (
-                    outcome.verdict,
-                    VerdictSource::Panel,
-                    Some(outcome.reason.clone()),
-                ),
-                None => resolve_verdict(&stage.result_check, reading, reported),
-            };
-            // Fill in the verdict of the re-run that followed the last repair.
-            if let Some((repair_attempt, identity, target)) = pending_repair.take() {
-                let _ = self.run_store.record_repair_attempt(
-                    self.run_id(),
-                    &stage.name,
-                    repair_attempt,
-                    &repair_attempt_json(
-                        &stage.name,
-                        repair_attempt,
-                        &target,
-                        Some(identity),
-                        Some(verdict),
-                    ),
-                    self.clock().now_ms(),
-                );
+            Check::Actor(Actor::Exec { cmd }) if reading == Verdict::Pass => {
+                let judged = self.run_exec(&stage.name, run.attempt, cmd, None);
+                reading = judged.verdict;
+                check = Some(judged);
             }
-            if verdict == Verdict::Pass {
-                break (verdict, source, reason, action, check);
+            Check::Actor(Actor::Exec { .. }) => {}
+            Check::Panel(configured) if reading == Verdict::Pass => {
+                let (outcome, judged) =
+                    self.run_panel(run, configured).map_err(WalkError::Stage)?;
+                reading = outcome.verdict;
+                panel = Some(outcome);
+                check = Some(judged);
             }
-            match self.repair(run, repair_used).map_err(WalkError::Stage)? {
-                Some((repair_attempt, identity, target)) => {
-                    repair_used = repair_attempt;
-                    pending_repair = Some((repair_attempt, identity, target));
-                    // A fresh retry: any interrupted-merge recovery from a
-                    // crash applied only to the first execution.
-                    merge_recovery = None;
-                }
-                None => break (verdict, source, reason, action, check),
+            // The action failed on its own terms, so there is nothing left
+            // for a panel to judge — and a panel is the most expensive
+            // check there is. Seating five reviewers to confirm a verdict
+            // already reached is tokens spent on nothing.
+            Check::Panel(_) => {}
+            // Parsing refuses an agent judge and both git builtins as a
+            // check, so none of them can reach a run. Fail closed rather
+            // than pass a stage nothing actually judged.
+            Check::Actor(Actor::Agent)
+            | Check::Actor(Actor::Builtin(Builtin::Merge | Builtin::Sync)) => {
+                reading = Verdict::Fail;
             }
+        }
+        let reported = if stage.result_check == Check::Reported {
+            reported_verdict(&self.run_store, self.run_id(), &stage.name, run.attempt)
+                .map_err(WalkError::Stage)?
+        } else {
+            None
+        };
+        // A panel's aggregate is derived, never stored: what persists is the
+        // reviewers' reports, and this reading is recomputed from them every
+        // time — including by a daemon that resumed mid-walk.
+        let (verdict, source, reason) = match &panel {
+            Some(outcome) => (
+                outcome.verdict,
+                VerdictSource::Panel,
+                Some(outcome.reason.clone()),
+            ),
+            None => resolve_verdict(&stage.result_check, reading, reported),
         };
         self.append_rows(run, verdict, source, reason, &action, check.as_ref())
             .map_err(WalkError::Stage)?;
@@ -1384,162 +1341,6 @@ impl RunDriver<'_> {
         result
     }
 
-    /// Repairs a failed stage in place when it has a repair worker, attempts
-    /// remain, and every spawn gate is open. Returns the attempt that ran, so
-    /// the caller can re-run the stage and record what the retry decided.
-    fn repair(
-        &self,
-        run: &StageRun,
-        repair_used: u32,
-    ) -> Result<Option<(u32, ProcessIdentity, String)>, String> {
-        let stage = &run.stage;
-        let (Some(on_fail), Some(agent)) =
-            (stage.on_fail.as_ref(), self.environment.agent.as_ref())
-        else {
-            return Ok(None);
-        };
-        let Some(ticket) = self.plan.ticket.as_ref() else {
-            return Ok(None);
-        };
-        if repair_used >= on_fail.attempts {
-            return Ok(None);
-        }
-        let target = on_fail
-            .target
-            .clone()
-            .or_else(|| ticket.target.clone())
-            .unwrap_or_else(|| agent.default_target.clone());
-        if !self.repair_gates_open(&target) {
-            self.log().emit_with_fields(
-                LogLevel::Info,
-                "sloop::driver",
-                "repair_gate_closed",
-                json!({"run_id": self.run_id(), "stage": stage.name, "target": target}),
-            );
-            return Ok(None);
-        }
-        // A conflicting merge left the default checkout mid-merge. Restore it
-        // now — only because a repair will run — so the repair's integration
-        // and the retried merge start clean. An exhausted merge that never
-        // reaches here keeps the conflict for review.
-        if stage.action == Actor::Builtin(Builtin::Merge) {
-            abort_in_progress_merge(&self.environment.root);
-        }
-        let attempt = repair_used + 1;
-        // Record the attempt before spawning so a crash mid-repair still
-        // counts it: recovery re-runs the stage, never the repair, so the
-        // attempt is neither repeated nor lost.
-        self.run_store
-            .record_repair_attempt(
-                self.run_id(),
-                &stage.name,
-                attempt,
-                &repair_attempt_json(&stage.name, attempt, &target, None, None),
-                self.clock().now_ms(),
-            )
-            .map_err(|error| error.to_string())?;
-        match self.run_repair_agent(on_fail, &target, run, attempt) {
-            Ok(identity) => Ok(Some((attempt, identity, target))),
-            Err(error) => {
-                self.log().emit_with_fields(
-                    LogLevel::Error,
-                    "sloop::driver",
-                    "repair_agent_failed",
-                    json!({"run_id": self.run_id(), "stage": stage.name, "error": error}),
-                );
-                Ok(None)
-            }
-        }
-    }
-
-    /// Whether a repair spawn for `target` clears the same gates a normal spawn
-    /// would: running hours, the per-target cooldown, and capacity. Budget
-    /// reservations are not yet enforced for any spawn, so that gate is open. A
-    /// database read error closes the gate rather than risk an ungated spawn.
-    fn repair_gates_open(&self, target: &str) -> bool {
-        let now_ms = self.clock().now_ms();
-        let hours_open = self
-            .environment
-            .running_hours
-            .as_ref()
-            .is_none_or(|hours| hours.is_open(self.clock().local_minute(now_ms)));
-        if !hours_open {
-            return false;
-        }
-        if !matches!(
-            self.run_store.active_cooldown_for_target(target, now_ms),
-            Ok(None)
-        ) {
-            return false;
-        }
-        // The repair runs inside an already-leased run, so that run's own lease
-        // is counted here; an over-subscribed database still closes the gate.
-        matches!(
-            self.local_work_state.active_lease_count(),
-            Ok(count) if count <= self.environment.max_parallel_tasks
-        )
-    }
-
-    /// Spawns the stage's repair agent in the run worktree, captures its output
-    /// to the run log, checkpoints its process for crash recovery, and waits for
-    /// it to exit. The agent works in place; the caller re-runs the stage
-    /// afterwards. The repair agent never reports a verdict — the retried stage
-    /// is the only evidence.
-    fn run_repair_agent(
-        &self,
-        on_fail: &OnFail,
-        target: &str,
-        run: &StageRun,
-        attempt: u32,
-    ) -> Result<ProcessIdentity, String> {
-        let stage = run.stage.name.as_str();
-        let agent = self
-            .environment
-            .agent
-            .as_ref()
-            .ok_or_else(|| "no agent targets configured".to_owned())?;
-        let ticket = self
-            .plan
-            .ticket
-            .as_ref()
-            .ok_or_else(|| "the run has no ticket snapshot".to_owned())?;
-        let template = agent
-            .targets
-            .get(target)
-            .ok_or_else(|| format!("repair target `{target}` is not a configured agent target"))?;
-        let model = on_fail.model.as_deref().or(ticket.model.as_deref());
-        let effort = on_fail.effort.as_deref().or(ticket.effort.as_deref());
-        let argv = expand_agent_cmd(template, model, effort, &on_fail.agent)
-            .map_err(|message| format!("repair target `{target}` {message}"))?;
-        let order = StageOrder {
-            run_id: self.plan.run_id.clone(),
-            stage: stage.into(),
-            attempt: run.attempt,
-            execution: StageExecution::Exec(ExecLaunch {
-                argv,
-                worker: None,
-                environment: agent_environment(&ticket.id, self.run_id())?,
-            }),
-            worktree: self.plan.worktree.clone(),
-            branch: self.plan.branch.clone(),
-            output_path: self.output_path.clone(),
-        };
-        self.log().emit_with_fields(
-            LogLevel::Info,
-            "sloop::driver",
-            "repair_agent_spawned",
-            json!({"run_id": self.run_id(), "stage": stage, "attempt": attempt, "target": target}),
-        );
-        let hooks = StoreStageHooks::new(&self.run_store, self.log());
-        let evidence = match run_exec_stage(&order, &hooks, self.clock()) {
-            Ok(evidence) => evidence,
-            Err(failure) => failure.evidence,
-        };
-        evidence
-            .process
-            .ok_or_else(|| format!("repair agent for stage `{stage}` produced no process identity"))
-    }
-
     /// Runs a stage's panel and derives its verdict.
     ///
     /// Reviewers run **one at a time**. A panel is the only check that spawns
@@ -1956,43 +1757,10 @@ fn flow_with_implicit_test(flow: &Flow, test_cmd: Option<&[String]>) -> Result<F
                 result_check: Check::None,
                 fail_action: FailAction::Halt,
                 ff_only: false,
-                on_fail: None,
             },
         );
     }
     Ok(flow)
-}
-
-/// Repair attempts already consumed for `stage`, recovered from durable
-/// evidence so a restart never repeats or loses one.
-fn repair_attempts_used(evidence: &[(String, String)], stage: &str) -> u32 {
-    evidence
-        .iter()
-        .filter(|(kind, _)| kind == "repair_attempt")
-        .filter_map(|(_, data)| serde_json::from_str::<serde_json::Value>(data).ok())
-        .filter(|value| value["stage"].as_str() == Some(stage))
-        .count() as u32
-}
-
-fn repair_attempt_json(
-    stage: &str,
-    attempt: u32,
-    target: &str,
-    identity: Option<ProcessIdentity>,
-    retry_verdict: Option<Verdict>,
-) -> String {
-    json!({
-        "stage": stage,
-        "attempt": attempt,
-        "target": target,
-        "pid": identity.map(|id| id.pid),
-        "pid_start_time": identity.and_then(|id| id.start_time),
-        "retry_verdict": retry_verdict.map(|verdict| match verdict {
-            Verdict::Pass => "pass",
-            Verdict::Fail => "fail",
-        }),
-    })
-    .to_string()
 }
 
 fn reported_verdict(
@@ -2210,11 +1978,10 @@ pub(super) fn attempt_merge(
 /// Restores a checkout after a conflicting merge so whatever runs next is not
 /// wedged by the leftover `MERGE_HEAD`.
 ///
-/// On the shared default-branch checkout this is used only before a repair
-/// actually runs: an exhausted merge preserves the conflict for review. In a
-/// run worktree the sync builtin uses it unconditionally, because there the
-/// conflict has already been captured in the run log and the tree holding it
-/// is nobody's evidence.
+/// Only the sync builtin uses it, and only in the run worktree, because there
+/// the conflict has already been captured in the run log and the tree holding
+/// it is nobody's evidence. The shared default-branch checkout is deliberately
+/// left alone: a conflicted merge stage preserves its conflict for review.
 fn abort_in_progress_merge(checkout: &Path) {
     let _ = Command::new("git")
         .args(["merge", "--abort"])
@@ -2361,7 +2128,6 @@ mod tests {
                     result_check: crate::flow::Check::Reported,
                     fail_action: crate::flow::FailAction::Halt,
                     ff_only: false,
-                    on_fail: None,
                 })
                 .collect(),
         }

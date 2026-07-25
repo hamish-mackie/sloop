@@ -191,16 +191,6 @@ mod tests {
             flow.stages.len(),
             "every stage must write its own `fail_action`"
         );
-
-        // The canonical example is entirely in the current grammar: the
-        // deprecated `on_fail` survives only as a trailing note, where a
-        // reader looking it up will find it and a reader learning the grammar
-        // will not copy it.
-        assert!(
-            flow.stages.iter().all(|stage| stage.on_fail.is_none()),
-            "the canonical example must not use the deprecated `on_fail`"
-        );
-        assert!(FLOW.contains("`on_fail: { agent: <prompt>, attempts: N }`"));
     }
 
     #[test]
@@ -252,8 +242,9 @@ mod tests {
         let repository = crate::config::Repository::discover(root.path()).unwrap();
         let config = crate::config::Config::load(&repository).unwrap();
 
-        // Loading also validates every `on_fail.target` against the config's
-        // agent targets, which a flow template naming a target must satisfy.
+        // Loading also validates every panel seat's target against the
+        // config's agent targets, which a flow template seating one must
+        // satisfy.
         assert_eq!(config.flows["default"].stages.len(), 6);
     }
 }

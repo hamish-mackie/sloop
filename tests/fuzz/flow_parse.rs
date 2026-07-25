@@ -7,7 +7,7 @@ use crate::support::splice;
 
 /// A valid flow file to damage. Kept deliberately simple; the point of this
 /// seed is that mutations of it stay *nearly* valid.
-const SEED: &str = "stages:\n  - name: build\n    action: agent\n    result_check: reported\n  - name: test\n    action: { exec: [cargo, test] }\n    on_fail:\n      agent: fix the tests\n      attempts: 2\n  - name: merge\n    action: { builtin: merge }\n";
+const SEED: &str = "stages:\n  - name: build\n    action: agent\n    result_check: reported\n  - name: test\n    action: { exec: [cargo, test] }\n    fail_action: { return_to: build, attempts: 2 }\n  - name: merge\n    action: { builtin: merge }\n";
 
 proptest! {
     /// Tier 1: arbitrary text, YAML-flavored soup, and recursion probes.

@@ -186,12 +186,6 @@ stages:
     result_check: none
     fail_action: fail
 
-# `on_fail: { agent: <prompt>, attempts: N }` spawns a repair agent and
-# re-runs the stage, and is superseded by `fail_action: return_to`, which
-# re-runs the ticket's own agent instead. It is still accepted on any
-# non-`agent` stage; a run whose flow uses it is admitted with a
-# deprecation note in the daemon log.
-#
 # A configured `flow.test_cmd` in config.yaml is inserted as an implicit
 # `result_check: none` stage named `test` at index 1, so it cannot be
 # combined with a flow that already has a stage named `test`.

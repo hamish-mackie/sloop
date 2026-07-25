@@ -109,7 +109,7 @@ fn looks_like_a_flow(body: &str) -> bool {
 /// The floor on how many flow examples the documentation carries. It exists so
 /// that a classifier that stopped matching — or a section quietly deleted —
 /// fails loudly instead of leaving this test passing over an empty corpus.
-const MINIMUM_DOCUMENTED_FLOWS: usize = 8;
+const MINIMUM_DOCUMENTED_FLOWS: usize = 7;
 
 #[test]
 fn every_documented_flow_parses() {

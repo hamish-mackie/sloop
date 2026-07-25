@@ -391,15 +391,13 @@ impl Config {
 
 /// Rejects flow-declared agent targets that do not name a configured one.
 ///
-/// Two places name a target from a flow file: an `on_fail` repair override and
-/// a panel seat. Neither can be checked in `flow.rs`, which never sees
-/// config.yaml, and both are worth refusing here rather than at the moment the
-/// daemon would have spawned them — a panel that names a typo'd vendor would
-/// otherwise fail its stage with a silent reviewer and look like a review.
-///
-/// `on_fail` overrides without an explicit target resolve against the ticket's
-/// snapshot at spawn time, so they are left alone. A panel seat has no ticket
-/// to fall back on and always names its target.
+/// A panel seat is the one place a flow file names a target. It cannot be
+/// checked in `flow.rs`, which never sees config.yaml, and it is worth refusing
+/// here rather than at the moment the daemon would have spawned it — a panel
+/// that names a typo'd vendor would otherwise fail its stage with a silent
+/// reviewer and look like a review. Every other spawn resolves its target
+/// against the ticket's snapshot instead, so there is nothing in the flow file
+/// to check.
 fn validate_flow_targets(
     flows: &BTreeMap<String, Flow>,
     agent: Option<&AgentConfig>,
@@ -415,14 +413,6 @@ fn validate_flow_targets(
     };
     for flow in flows.values() {
         for stage in &flow.stages {
-            if let Some(target) = stage
-                .on_fail
-                .as_ref()
-                .and_then(|on_fail| on_fail.target.as_ref())
-                && !known(target)
-            {
-                return Err(invalid(flow, &stage.name, "on_fail", target));
-            }
             if let crate::flow::Check::Panel(panel) = &stage.result_check {
                 for reviewer in &panel.reviewers {
                     if !known(&reviewer.target) {
@@ -1593,27 +1583,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn on_fail_target_must_name_a_configured_agent_target() {
-        let root = tempdir().unwrap();
-        fs::create_dir_all(root.path().join(".agents/sloop/flows")).unwrap();
-        fs::write(
-            root.path().join(".agents/sloop/config.yaml"),
-            "version: 1\nagent:\n  default_target: fake\n  targets:\n    fake:\n      cmd: [fake, '{prompt}']\n",
-        )
-        .unwrap();
-        fs::write(
-            root.path().join(".agents/sloop/flows/default.yaml"),
-            "- { name: build, action: agent }\n- name: check\n  action: { exec: ['true'] }\n  on_fail:\n    agent: fix it\n    target: ghost\n- { name: merge, action: { builtin: merge } }\n",
-        )
-        .unwrap();
-
-        let repository = Repository::discover(root.path()).unwrap();
-        let error = Config::load(&repository).unwrap_err().to_string();
-        assert!(error.contains("stage `check`"), "{error}");
-        assert!(error.contains("unknown agent target `ghost`"), "{error}");
-    }
-
     /// A panel seat always names its target — there is no ticket to fall back
     /// on — so a typo'd vendor is caught at load rather than becoming a
     /// reviewer that could never be spawned and a stage that fails looking as
@@ -1638,33 +1607,6 @@ mod tests {
         assert!(error.contains("stage `build`"), "{error}");
         assert!(error.contains("panel reviewer"), "{error}");
         assert!(error.contains("unknown agent target `ghost`"), "{error}");
-    }
-
-    #[test]
-    fn on_fail_without_a_target_override_loads_without_an_agent() {
-        let root = tempdir().unwrap();
-        fs::create_dir_all(root.path().join(".agents/sloop/flows")).unwrap();
-        fs::write(
-            root.path().join(".agents/sloop/config.yaml"),
-            "version: 1\n",
-        )
-        .unwrap();
-        fs::write(
-            root.path().join(".agents/sloop/flows/default.yaml"),
-            "- { name: build, action: agent }\n- name: check\n  action: { exec: ['true'] }\n  on_fail:\n    agent: fix it\n- { name: merge, action: { builtin: merge } }\n",
-        )
-        .unwrap();
-
-        let repository = Repository::discover(root.path()).unwrap();
-        let config = Config::load(&repository).unwrap();
-        assert_eq!(
-            config.flows["default"].stages[1]
-                .on_fail
-                .as_ref()
-                .unwrap()
-                .agent,
-            "fix it"
-        );
     }
 
     #[test]

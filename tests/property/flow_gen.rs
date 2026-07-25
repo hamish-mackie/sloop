@@ -3,12 +3,11 @@
 //! The generator mirrors the validation rules in `flow::parse`: the first
 //! stage is the only agent stage, at most one merge stage and only in last
 //! position, exec actions carry a non-empty command, a merge stage's check is
-//! either omitted or `none`, agent stages define no `on_fail`, and an agent
-//! stage never writes `result_check: none` because an agent may not go
-//! unjudged.
+//! either omitted or `none`, and an agent stage never writes
+//! `result_check: none` because an agent may not go unjudged.
 
 use proptest::prelude::*;
-use sloop::flow::{Actor, Builtin, Check, FailAction, Flow, OnFail, Stage};
+use sloop::flow::{Actor, Builtin, Check, FailAction, Flow, Stage};
 
 /// A stage's action as written in YAML.
 #[derive(Debug, Clone)]
@@ -82,7 +81,6 @@ impl WrittenCheck {
 pub struct WrittenStage {
     pub action: WrittenAction,
     pub result_check: WrittenCheck,
-    pub on_fail: Option<OnFail>,
 }
 
 fn command() -> impl Strategy<Value = Vec<String>> {
@@ -97,25 +95,6 @@ fn result_check() -> impl Strategy<Value = WrittenCheck> {
         Just(WrittenCheck::Reported),
         command().prop_map(WrittenCheck::Exec),
     ]
-}
-
-fn on_fail() -> impl Strategy<Value = Option<OnFail>> {
-    prop::option::of(
-        (
-            "[a-z][a-z ]{0,19}",
-            1u32..=3,
-            prop::option::of("[a-z]{1,8}"),
-            prop::option::of("[a-z]{1,8}"),
-            prop::option::of("[a-z]{1,8}"),
-        )
-            .prop_map(|(agent, attempts, target, model, effort)| OnFail {
-                agent,
-                attempts,
-                target,
-                model,
-                effort,
-            }),
-    )
 }
 
 /// Every check an agent stage may write. `none` is excluded: an agent that
@@ -137,15 +116,13 @@ fn agent_stage() -> impl Strategy<Value = WrittenStage> {
     (action, agent_check()).prop_map(|(action, result_check)| WrittenStage {
         action,
         result_check,
-        on_fail: None,
     })
 }
 
 fn exec_stage() -> impl Strategy<Value = WrittenStage> {
-    (command(), result_check(), on_fail()).prop_map(|(cmd, result_check, on_fail)| WrittenStage {
+    (command(), result_check()).prop_map(|(cmd, result_check)| WrittenStage {
         action: WrittenAction::Exec(cmd),
         result_check,
-        on_fail,
     })
 }
 
@@ -153,10 +130,9 @@ fn exec_stage() -> impl Strategy<Value = WrittenStage> {
 /// write are the absent one and the `none` that spells the same thing out.
 fn merge_stage() -> impl Strategy<Value = WrittenStage> {
     let check = prop_oneof![Just(WrittenCheck::Omitted), Just(WrittenCheck::None)];
-    (check, on_fail()).prop_map(|(result_check, on_fail)| WrittenStage {
+    check.prop_map(|result_check| WrittenStage {
         action: WrittenAction::Merge,
         result_check,
-        on_fail,
     })
 }
 
@@ -183,22 +159,6 @@ fn render_stage(name: &str, stage: &WrittenStage, indent: &str) -> String {
     if let Some(check) = stage.result_check.render() {
         yaml.push_str(&format!("{indent}  result_check: {check}\n"));
     }
-    if let Some(on_fail) = &stage.on_fail {
-        yaml.push_str(&format!(
-            "{indent}  on_fail:\n{indent}    agent: {}\n{indent}    attempts: {}\n",
-            quote(&on_fail.agent),
-            on_fail.attempts
-        ));
-        for (key, value) in [
-            ("target", &on_fail.target),
-            ("model", &on_fail.model),
-            ("effort", &on_fail.effort),
-        ] {
-            if let Some(value) = value {
-                yaml.push_str(&format!("{indent}    {key}: {}\n", quote(value)));
-            }
-        }
-    }
     yaml
 }
 
@@ -211,7 +171,6 @@ fn expected_stage(name: &str, stage: &WrittenStage) -> Stage {
         result_check,
         fail_action: FailAction::Halt,
         ff_only: false,
-        on_fail: stage.on_fail.clone(),
     }
 }
 

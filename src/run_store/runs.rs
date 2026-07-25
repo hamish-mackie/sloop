@@ -1206,7 +1206,6 @@ mod tests {
                     result_check: Check::Actor(Actor::Builtin(Builtin::Commits)),
                     fail_action: FailAction::Halt,
                     ff_only: false,
-                    on_fail: None,
                 },
                 Stage {
                     name: "check".into(),
@@ -1216,7 +1215,6 @@ mod tests {
                     result_check: Check::None,
                     fail_action: FailAction::Halt,
                     ff_only: false,
-                    on_fail: None,
                 },
             ],
         };

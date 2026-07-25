@@ -56,42 +56,14 @@ pub struct Stage {
     /// its wire shape, and an absent key is the old behaviour exactly.
     #[serde(default, skip_serializing_if = "is_false")]
     pub ff_only: bool,
-    /// Optional repair agent for non-agent stages. When the stage fails,
-    /// this agent is spawned in the run worktree to fix the tree in place;
-    /// the stage is then re-run and its own result check re-applied. The
-    /// repair agent never produces the verdict.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_fail: Option<OnFail>,
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
 }
 
-/// A stage's optional repair configuration. It configures the repair worker
-/// (prompt, attempt budget, and target/model/effort overrides) but can never
-/// alter the stage's result check, action, or ordering.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OnFail {
-    /// The prompt handed to the repair agent.
-    pub agent: String,
-    /// How many repair-then-retry cycles are allowed per stage per run.
-    pub attempts: u32,
-    /// Agent target override; defaults to the ticket's target, then the
-    /// configured default target.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<String>,
-    /// Model override; defaults to the ticket's model.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// Effort override; defaults to the ticket's effort.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
-}
-
-/// The inclusive upper bound on `on_fail.attempts` and on a `return_to`
-/// edge's attempt budget.
-pub const MAX_ON_FAIL_ATTEMPTS: u32 = 3;
+/// The inclusive upper bound on a `return_to` edge's attempt budget.
+pub const MAX_RETURN_ATTEMPTS: u32 = 3;
 
 /// The worst-case number of stage executions a flow may imply once every
 /// `return_to` budget is spent. A flow that could exceed it is rejected at
@@ -256,23 +228,12 @@ pub fn parse(name: &str, contents: &str) -> Result<Flow, String> {
         let result_check = parse_result_check(&raw.name, &action, raw.result_check)?;
         let fail_action = parse_fail_action(&raw.name, raw.fail_action)?;
         validate_stage(&raw.name, &action, &result_check)?;
-        let on_fail = match raw.on_fail {
-            None => None,
-            Some(_) if action == Actor::Agent => {
-                return Err(format!(
-                    "agent stage `{}` must not define `on_fail`",
-                    raw.name
-                ));
-            }
-            Some(on_fail) => Some(validate_on_fail(&raw.name, on_fail)?),
-        };
         stages.push(Stage {
             name: raw.name,
             action,
             result_check,
             fail_action,
             ff_only,
-            on_fail,
         });
     }
 
@@ -283,12 +244,12 @@ pub fn parse(name: &str, contents: &str) -> Result<Flow, String> {
     })
 }
 
-/// Refuses the pre-`action` grammar by name. The keys are still read off the
-/// stage (see [`RawStage`]) for exactly this: a `0.3.0` flow file *does* say
-/// what its stages are, in a spelling nothing reads any more, and the error
-/// that names the replacement is the whole migration experience for whoever
-/// wrote it. Silence — or a generic "must define an `action`" — would leave
-/// them to diff against a template.
+/// Refuses every key the current grammar has dropped, by name. The keys are
+/// still read off the stage (see [`RawStage`]) for exactly this: a flow file
+/// written against an older grammar *does* say what its stages are, in a
+/// spelling nothing reads any more, and the error that names the replacement is
+/// the whole migration experience for whoever wrote it. Silence — or a generic
+/// "must define an `action`" — would leave them to diff against a template.
 fn reject_removed_keys(raw: &RawStage) -> Result<(), String> {
     let stage = &raw.name;
     if raw.kind.is_some() {
@@ -305,6 +266,12 @@ fn reject_removed_keys(raw: &RawStage) -> Result<(), String> {
     if raw.verdict.is_some() {
         return Err(format!(
             "stage `{stage}` uses the removed `verdict` key; write `result_check: ...`"
+        ));
+    }
+    if raw.on_fail.is_some() {
+        return Err(format!(
+            "stage `{stage}` uses the removed `on_fail` key; write \
+             `fail_action: {{ return_to: <stage>, attempts: N }}` instead"
         ));
     }
     Ok(())
@@ -472,9 +439,9 @@ fn parse_fail_action(stage: &str, raw: Option<RawFailAction>) -> Result<FailActi
             attempts,
         }) => {
             let attempts = attempts.unwrap_or(1);
-            if attempts == 0 || attempts > MAX_ON_FAIL_ATTEMPTS {
+            if attempts == 0 || attempts > MAX_RETURN_ATTEMPTS {
                 return Err(format!(
-                    "stage `{stage}` return_to attempts must be between 1 and {MAX_ON_FAIL_ATTEMPTS}"
+                    "stage `{stage}` return_to attempts must be between 1 and {MAX_RETURN_ATTEMPTS}"
                 ));
             }
             Ok(FailAction::ReturnTo {
@@ -510,29 +477,6 @@ fn validate_stage(stage: &str, action: &Actor, result_check: &Check) -> Result<(
     Ok(())
 }
 
-/// Validates an `on_fail` block's own shape. Target existence is checked
-/// later, where the configured agent targets are known (see `config.rs`).
-fn validate_on_fail(stage: &str, raw: RawOnFail) -> Result<OnFail, String> {
-    if raw.agent.trim().is_empty() {
-        return Err(format!(
-            "stage `{stage}` on_fail must define a non-empty `agent` prompt"
-        ));
-    }
-    let attempts = raw.attempts.unwrap_or(1);
-    if attempts == 0 || attempts > MAX_ON_FAIL_ATTEMPTS {
-        return Err(format!(
-            "stage `{stage}` on_fail attempts must be between 1 and {MAX_ON_FAIL_ATTEMPTS}"
-        ));
-    }
-    Ok(OnFail {
-        agent: raw.agent,
-        attempts,
-        target: raw.target,
-        model: raw.model,
-        effort: raw.effort,
-    })
-}
-
 pub(crate) fn built_in_default() -> Flow {
     let stages = vec![
         Stage {
@@ -541,7 +485,6 @@ pub(crate) fn built_in_default() -> Flow {
             result_check: Check::Actor(Actor::Builtin(Builtin::Commits)),
             fail_action: FailAction::Halt,
             ff_only: false,
-            on_fail: None,
         },
         Stage {
             name: "merge".into(),
@@ -549,7 +492,6 @@ pub(crate) fn built_in_default() -> Flow {
             result_check: Check::None,
             fail_action: FailAction::Halt,
             ff_only: false,
-            on_fail: None,
         },
     ];
     Flow {
@@ -967,10 +909,11 @@ enum RawFlowFile {
 
 /// A stage exactly as written.
 ///
-/// The three removed keys are still read — as payloads nobody looks at — so
-/// that `reject_removed_keys` can name them. Unknown fields are otherwise
-/// accepted here, so dropping them outright would turn a `0.3.0` flow file
-/// into a stage that appears to define nothing at all.
+/// The removed keys are still read — as payloads nobody looks at — so that
+/// `reject_removed_keys` can name them. Unknown fields are otherwise accepted
+/// here, so dropping them outright would turn an older flow file into a stage
+/// that appears to define nothing at all, or into one whose repair block was
+/// quietly ignored.
 #[derive(Debug, Deserialize)]
 struct RawStage {
     name: String,
@@ -983,7 +926,8 @@ struct RawStage {
     cmd: Option<IgnoredAny>,
     /// Removed in 0.4.0; `result_check` replaces it.
     verdict: Option<IgnoredAny>,
-    on_fail: Option<RawOnFail>,
+    /// Removed in 0.4.0; `fail_action: { return_to: ... }` replaces it.
+    on_fail: Option<IgnoredAny>,
 }
 
 /// `action: agent` | `{ agent: <ignored> }` | `{ exec: [argv] }` |
@@ -1067,16 +1011,6 @@ enum RawFailAction {
     },
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawOnFail {
-    agent: String,
-    attempts: Option<u32>,
-    target: Option<String>,
-    model: Option<String>,
-    effort: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1118,7 +1052,6 @@ mod tests {
                         result_check: commits(),
                         fail_action: FailAction::Halt,
                         ff_only: false,
-                        on_fail: None,
                     },
                     Stage {
                         name: "test".into(),
@@ -1128,7 +1061,6 @@ mod tests {
                         result_check: exec_check(&["cargo", "clippy"]),
                         fail_action: FailAction::Halt,
                         ff_only: false,
-                        on_fail: None,
                     },
                     Stage {
                         name: "merge".into(),
@@ -1136,7 +1068,6 @@ mod tests {
                         result_check: Check::None,
                         fail_action: FailAction::Halt,
                         ff_only: false,
-                        on_fail: None,
                     },
                 ],
             }
@@ -1189,16 +1120,16 @@ mod tests {
 
     /// The snapshot contract: a flow this binary writes onto a `runs` row is
     /// the flow this binary reads back when it recovers that run. Every field
-    /// a stage can carry is exercised, because the ones that are skipped when
-    /// absent — `ff_only`, `on_fail` — are exactly the ones a missing serde
-    /// default would silently break.
+    /// a stage can carry is exercised, because the one that is skipped when
+    /// absent — `ff_only` — is exactly the one a missing serde default would
+    /// silently break.
     #[test]
     fn snapshots_round_trip_through_the_new_vocabulary() {
         let flow = parse(
             "example",
             concat!(
                 "- { name: build, action: agent, result_check: reported }\n",
-                "- { name: test, action: { exec: [cargo, test] }, result_check: { exec: [cargo, fmt] }, on_fail: { agent: fix it, attempts: 2 } }\n",
+                "- { name: test, action: { exec: [cargo, test] }, result_check: { exec: [cargo, fmt] }, fail_action: { return_to: build, attempts: 2 } }\n",
                 "- name: review\n",
                 "  action: agent\n",
                 "  result_check:\n",
@@ -1261,6 +1192,10 @@ mod tests {
             (
                 "- { name: test, action: agent, verdict: reported }\n",
                 "uses the removed `verdict` key; write `result_check: ...`",
+            ),
+            (
+                "- { name: test, action: { exec: ['true'] }, on_fail: { agent: fix it } }\n",
+                "uses the removed `on_fail` key; write `fail_action: { return_to: <stage>, attempts: N }`",
             ),
         ] {
             let error = error(yaml);
@@ -1567,71 +1502,6 @@ mod tests {
     }
 
     #[test]
-    fn on_fail_parses_with_defaults_and_overrides() {
-        let flow = parse(
-            "example",
-            "- { name: build, action: agent }\n- name: test\n  action: { exec: [cargo, test] }\n  on_fail:\n    agent: fix the tests\n- name: merge\n  action: { builtin: merge }\n  on_fail:\n    agent: integrate the default branch\n    attempts: 2\n    target: claude\n    model: haiku\n    effort: low\n",
-        )
-        .unwrap();
-
-        let test = flow.stages[1].on_fail.as_ref().unwrap();
-        assert_eq!(test.agent, "fix the tests");
-        assert_eq!(test.attempts, 1);
-        assert_eq!(test.target, None);
-
-        let merge = flow.stages[2].on_fail.as_ref().unwrap();
-        assert_eq!(merge.attempts, 2);
-        assert_eq!(merge.target.as_deref(), Some("claude"));
-        assert_eq!(merge.model.as_deref(), Some("haiku"));
-        assert_eq!(merge.effort.as_deref(), Some("low"));
-    }
-
-    #[test]
-    fn on_fail_survives_a_snapshot_round_trip() {
-        let flow = parse(
-            "example",
-            "- { name: build, action: agent }\n- name: test\n  action: { exec: [cargo, test] }\n  on_fail:\n    agent: fix the tests\n    attempts: 3\n    model: haiku\n",
-        )
-        .unwrap();
-        let snapshot = serde_json::to_string(&flow).unwrap();
-        let restored: Flow = serde_json::from_str(&snapshot).unwrap();
-        assert_eq!(flow, restored);
-        assert_eq!(restored.stages[1].on_fail.as_ref().unwrap().attempts, 3);
-    }
-
-    #[test]
-    fn on_fail_is_rejected_on_agent_stages() {
-        let error = error(
-            "- name: build\n  action: agent\n  on_fail:\n    agent: patch it\n- { name: merge, action: { builtin: merge } }\n",
-        );
-        assert!(error.contains("agent stage `build`"), "{error}");
-        assert!(error.contains("must not define `on_fail`"), "{error}");
-    }
-
-    #[test]
-    fn on_fail_rejects_an_empty_prompt() {
-        let error = error(
-            "- { name: build, action: agent }\n- name: test\n  action: { exec: ['true'] }\n  on_fail:\n    agent: '   '\n",
-        );
-        assert!(error.contains("stage `test`"), "{error}");
-        assert!(error.contains("non-empty `agent` prompt"), "{error}");
-    }
-
-    #[test]
-    fn on_fail_rejects_out_of_range_attempts() {
-        for attempts in ["0", "4"] {
-            let error = error(&format!(
-                "- {{ name: build, action: agent }}\n- name: test\n  action: {{ exec: ['true'] }}\n  on_fail:\n    agent: fix it\n    attempts: {attempts}\n",
-            ));
-            assert!(error.contains("stage `test`"), "{error}");
-            assert!(
-                error.contains("attempts must be between 1 and 3"),
-                "{error}"
-            );
-        }
-    }
-
-    #[test]
     fn duplicate_stage_names_are_rejected() {
         let error = error(
             "- { name: build, action: agent }\n- { name: build, action: { builtin: merge } }\n",
@@ -1688,7 +1558,6 @@ mod tests {
                     result_check: commits(),
                     fail_action: FailAction::Halt,
                     ff_only: false,
-                    on_fail: None,
                 },
                 Stage {
                     name: "review".into(),
@@ -1698,7 +1567,6 @@ mod tests {
                     result_check: Check::None,
                     fail_action: FailAction::Halt,
                     ff_only: false,
-                    on_fail: None,
                 },
                 Stage {
                     name: "merge".into(),
@@ -1706,7 +1574,6 @@ mod tests {
                     result_check: Check::None,
                     fail_action: FailAction::Halt,
                     ff_only: false,
-                    on_fail: None,
                 },
             ],
         }
@@ -1727,7 +1594,6 @@ mod tests {
                     result_check: Check::None,
                     fail_action: fail_action.clone(),
                     ff_only: false,
-                    on_fail: None,
                 })
                 .collect(),
         }

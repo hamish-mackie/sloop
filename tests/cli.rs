@@ -105,9 +105,9 @@ fn invalid_flow_prevents_daemon_startup_with_a_named_error() {
 /// own loader. This goes one rung further out: the *printed bytes* of `sloop
 /// template flow` and `sloop template ticket`, dropped into a fresh repository
 /// and posted. `post` snapshots the ticket's flow, so a template the parser
-/// accepts but the post path rejects — an `on_fail.target` naming no configured
-/// agent, a stage colliding with a spliced `flow.test_cmd` — fails here rather
-/// than in a user's terminal.
+/// accepts but the post path rejects — a panel seat naming no configured agent,
+/// a stage colliding with a spliced `flow.test_cmd` — fails here rather than in
+/// a user's terminal.
 #[test]
 fn the_printed_templates_post_cleanly_in_a_fresh_repository() {
     let world = World::new();

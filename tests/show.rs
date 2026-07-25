@@ -275,7 +275,7 @@ fn a_merged_run_shows_every_stage_passed_on_the_ticket_and_the_run() {
         let row = stage(stages, name);
         assert_eq!(row["state"], "passed", "{row}");
         assert_eq!(row["exit_code"], 0, "{row}");
-        assert_eq!(row["attempts"], 1, "{row}");
+        assert_eq!(row["attempt"], 1, "{row}");
         assert!(row["started_at_ms"].is_i64(), "{row}");
         assert!(row["finished_at_ms"].is_i64(), "{row}");
     }

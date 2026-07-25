@@ -576,45 +576,14 @@ names the replacement key. The rewrite is mechanical:
 | `verdict: commits` | `result_check: { builtin: commits }` |
 | `verdict: { check: [...] }` | `result_check: { exec: [...] }` |
 | `verdict: reported` | `result_check: reported` |
+| `on_fail: { agent: <prompt>, attempts: N }` | `fail_action: { return_to: <stage>, attempts: N }` |
 
-#### `on_fail` repair blocks (deprecated)
-
-`on_fail` attaches a repair agent to a non-agent stage: when the stage fails,
-Sloop spawns that agent in the run worktree, then re-runs the stage and
-re-applies its result check, for up to `attempts` cycles (default 1, at most 3).
-
-```yaml
-stages:
-  - name: build
-    action: agent
-  - name: test
-    action: { exec: [cargo, test, --all-targets] }
-    on_fail:
-      agent: "Tests are failing in this worktree. Fix them without weakening assertions, then commit."
-      attempts: 2
-  - name: merge
-    action: { builtin: merge }
-```
-
-`target`, `model`, and `effort` are also accepted and configure the repair
-worker only, defaulting to the ticket's; the repair agent never reports a
-verdict, and the block can change neither the stage's action, its result check,
-nor the flow's ordering.
-
-**Deprecated in favour of `fail_action: { return_to: <stage> }`**, which does
-the same job with the flow's own stages. Nothing is removed and existing flows
-keep working, but the daemon logs a `flow_on_fail_deprecated` note when it
-admits a run whose flow uses `on_fail`, and new flows should prefer a backward
-edge. The replacement for the block above is a failing `test` returning to
-`build`, as in [`fail_action`](#fail_action-what-a-failure-does-to-the-walk).
-
-Two differences are worth knowing. A `return_to` re-runs the ticket's own agent
-with the failure in its prompt, rather than a separate repair worker with a
-prompt written into the flow file; and it re-runs every stage in the span, so
-nothing between `build` and `test` keeps a verdict earned before the fix. The
-two also report differently: `return_to` re-enters the stage and gets one
-`sloop show` row per execution with a `#N` label, while `on_fail` retries within
-a single execution and reports the total as `N attempts` on one row.
+`on_fail` attached a separate repair agent to a non-agent stage and retried
+within one execution. A backward edge does the same job with the flow's own
+stages: it re-runs the ticket's own agent with the failure in its prompt, over
+the whole span from the target stage forward, so nothing between the target and
+the failure keeps a verdict earned before the fix. See
+[`fail_action`](#fail_action-what-a-failure-does-to-the-walk).
 
 ## Worker instructions
 

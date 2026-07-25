@@ -394,27 +394,6 @@ pub(crate) mod tx {
         )?;
         Ok(inserted == 1)
     }
-
-    pub(crate) fn record_repair_attempt(
-        transaction: &Transaction<'_>,
-        run_id: &str,
-        stage: &str,
-        attempt: u32,
-        data_json: &str,
-        now_ms: i64,
-    ) -> rusqlite::Result<()> {
-        transaction.execute(
-            "INSERT INTO run_evidence
-                 (run_id, kind, observed_at_ms, dedupe_key, data_json)
-             VALUES (?1, 'repair_attempt', ?2,
-                     'repair:' || ?1 || ':' || ?3 || ':' || ?4, ?5)
-             ON CONFLICT(dedupe_key) DO UPDATE SET
-                 observed_at_ms = excluded.observed_at_ms,
-                 data_json = excluded.data_json",
-            params![run_id, now_ms, stage, attempt as i64, data_json],
-        )?;
-        Ok(())
-    }
 }
 
 /// The run's whole stage-evidence log, in `seq` order. Callers replay it; none
@@ -676,19 +655,6 @@ impl RunStore {
     ) -> Result<Option<crate::vendor_error::VendorErrorMatch>, StoreError> {
         let data = latest_vendor_error_for_ticket(&self.db.lock(), ticket_id)?;
         Ok(data.and_then(|data| serde_json::from_str(&data).ok()))
-    }
-
-    pub(crate) fn record_repair_attempt(
-        &self,
-        run_id: &str,
-        stage: &str,
-        attempt: u32,
-        data_json: &str,
-        now_ms: i64,
-    ) -> Result<(), StoreError> {
-        self.write(TransactionBehavior::Deferred, |transaction| {
-            tx::record_repair_attempt(transaction, run_id, stage, attempt, data_json, now_ms)
-        })
     }
 }
 

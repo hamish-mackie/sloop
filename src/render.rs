@@ -699,13 +699,6 @@ fn run_stages(stages: &Value) -> String {
         if state == "failed" && advisory(stage) {
             line.push_str("  advisory");
         }
-        // Attempts are only worth a column when the stage was actually retried
-        // within one execution; every other stage ran once, and saying so on
-        // every row is noise. Re-entries are counted separately, by the `#N`
-        // label on the stage name.
-        if let Some(attempts) = stage["attempts"].as_u64().filter(|attempts| *attempts > 1) {
-            let _ = write!(line, "  {attempts} attempts");
-        }
         if let Some(source) = stage["verdict_source"].as_str() {
             let _ = write!(line, "  verdict from {source}");
         }
@@ -1347,20 +1340,20 @@ mod tests {
                     "reason": "stage `test` failed (exit 1) after agent completed with commits",
                     "stages": [
                         {
-                            "stage": "build", "state": "passed", "attempts": 1,
+                            "stage": "build", "state": "passed",
                             "started_at_ms": today_at(1_000),
                             "finished_at_ms": today_at(61_000),
                             "duration_ms": 60_000, "exit_code": 0,
                             "verdict_source": "exit_code",
                         },
                         {
-                            "stage": "test", "state": "failed", "attempts": 2,
+                            "stage": "test", "state": "failed",
                             "started_at_ms": today_at(61_000),
                             "finished_at_ms": today_at(252_000),
                             "duration_ms": 191_000, "exit_code": 1,
                             "verdict_source": "exit_code",
                         },
-                        {"stage": "merge", "state": "pending", "attempts": 0},
+                        {"stage": "merge", "state": "pending"},
                     ],
                 }
             }),
@@ -1377,7 +1370,7 @@ mod tests {
                     "reason: stage `test` failed (exit 1) after agent completed with commits\n",
                     "stages:\n",
                     "  build  passed   {}-{}  1m0s  exit 0  verdict from exit_code\n",
-                    "  test   failed   {}-{}  3m11s  exit 1  2 attempts  verdict from exit_code\n",
+                    "  test   failed   {}-{}  3m11s  exit 1  verdict from exit_code\n",
                     "  merge  pending  -\n",
                 ),
                 clock_at(0),
@@ -1406,13 +1399,13 @@ mod tests {
                     "id": "R14", "alias": "TICK-1-r1", "ticket": "TICK-1",
                     "state": "merged", "terminal": true,
                     "stages": [
-                        {"stage": "build", "state": "passed", "attempt": 1, "attempts": 1},
-                        {"stage": "build", "state": "passed", "attempt": 2, "attempts": 1},
-                        {"stage": "test", "state": "failed", "attempt": 1, "attempts": 1,
+                        {"stage": "build", "state": "passed", "attempt": 1},
+                        {"stage": "build", "state": "passed", "attempt": 2},
+                        {"stage": "test", "state": "failed", "attempt": 1,
                          "exit_code": 1},
-                        {"stage": "test", "state": "passed", "attempt": 2, "attempts": 1,
+                        {"stage": "test", "state": "passed", "attempt": 2,
                          "exit_code": 0},
-                        {"stage": "merge", "state": "passed", "attempt": 1, "attempts": 1},
+                        {"stage": "merge", "state": "passed", "attempt": 1},
                     ],
                 }
             }),
@@ -1447,9 +1440,9 @@ mod tests {
                     "id": "R14", "alias": "TICK-1-r1", "ticket": "TICK-1",
                     "state": "needs_review", "terminal": true,
                     "stages": [
-                        {"stage": "build", "state": "passed", "attempt": 1, "attempts": 1},
+                        {"stage": "build", "state": "passed", "attempt": 1},
                         {
-                            "stage": "review", "state": "failed", "attempt": 1, "attempts": 1,
+                            "stage": "review", "state": "failed", "attempt": 1,
                             "verdict_source": "panel",
                             "reason": "panel: 1 of 3 reviewers passed, quorum 2",
                             "reviewers": [
@@ -1498,13 +1491,13 @@ mod tests {
                     "halt": "fail_action",
                     "reason": "stage `test` failed (exit 1) after agent completed with commits",
                     "stages": [
-                        {"stage": "build", "state": "passed", "attempt": 1, "attempts": 1,
+                        {"stage": "build", "state": "passed", "attempt": 1,
                          "advisory": false},
-                        {"stage": "lint", "state": "failed", "attempt": 1, "attempts": 1,
+                        {"stage": "lint", "state": "failed", "attempt": 1,
                          "exit_code": 2, "advisory": true},
-                        {"stage": "test", "state": "failed", "attempt": 1, "attempts": 1,
+                        {"stage": "test", "state": "failed", "attempt": 1,
                          "exit_code": 1, "advisory": false},
-                        {"stage": "merge", "state": "pending", "attempts": 0,
+                        {"stage": "merge", "state": "pending",
                          "advisory": false},
                     ],
                 }
@@ -1539,7 +1532,7 @@ mod tests {
                     "id": "R14", "alias": "TICK-1-r1", "ticket": "TICK-1",
                     "state": "merged", "terminal": true,
                     "stages": [{
-                        "stage": "review", "state": "passed", "attempt": 1, "attempts": 1,
+                        "stage": "review", "state": "passed", "attempt": 1,
                         "verdict_source": "reported", "confidence": "low",
                     }],
                 }
