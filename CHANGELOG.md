@@ -144,6 +144,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `sloop post` accepts an absolute path to a ticket that reaches the repository
+  through a symlink. The repository root is always canonicalized, but the path
+  the operator typed was compared to it unresolved, so on macOS — where `/tmp`
+  and `/var/folders` are both links into `/private` — posting a ticket by
+  absolute path was rejected as "outside the repository". Both sides now
+  resolve before the comparison. A ticket file that does not exist yet is
+  unaffected: the longest existing ancestor resolves and the rest is appended,
+  so a missing file inside the ticket directory still reports `not found`.
+
+  This tightens one case that used to pass: a ticket path that is itself a
+  symlink out of the repository is now rejected, because containment is
+  decided on the file whose bytes get read rather than on the name used to
+  reach it.
 - A Claude session limit now classifies as `rate_limited` and cools the target
   down instead of failing the ticket. The rule required stderr, but the
   `claude` target runs with `--output-format stream-json` and reports vendor

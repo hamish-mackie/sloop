@@ -652,8 +652,11 @@ fn repository_relative(root: &Path, ticket_dir: &Path, file: &str) -> Result<Pat
             component => normalized.push(component),
         }
     }
-    let relative = normalized
-        .strip_prefix(root)
+    // Both sides go through the same resolution: `Repository::discover` hands
+    // this a canonical root, but a caller that does not must not silently get
+    // a containment answer decided by symlink spelling.
+    let relative = resolve_symlinks(&normalized)
+        .strip_prefix(resolve_symlinks(root))
         .map(Path::to_path_buf)
         .map_err(|_| PostError::OutsideRepository(file.to_owned()))?;
     if !relative.starts_with(ticket_dir) {
@@ -663,6 +666,37 @@ fn repository_relative(root: &Path, ticket_dir: &Path, file: &str) -> Result<Pat
         });
     }
     Ok(relative)
+}
+
+/// Resolves `path` through any symlinks along it, so containment is decided on
+/// the same footing as the repository root, which `Repository::discover`
+/// always canonicalizes. Without this, a root reached through a symlink — the
+/// normal case on macOS, where `/tmp` and `/var/folders` are both links into
+/// `/private` — makes every absolute path the operator types look external.
+///
+/// Containment is checked before the ticket file is read, so the path need not
+/// exist yet. The longest existing ancestor is canonicalized and the remaining
+/// components are appended unresolved, which keeps a missing file inside the
+/// ticket directory reported as `not found` rather than as an escape. A path
+/// with no resolvable ancestor keeps its lexical form for the same reason.
+fn resolve_symlinks(path: &Path) -> PathBuf {
+    let mut unresolved = Vec::new();
+    let mut prefix = path;
+    loop {
+        if let Ok(resolved) = prefix.canonicalize() {
+            return unresolved
+                .iter()
+                .rev()
+                .fold(resolved, |base, component| base.join(component));
+        }
+        match (prefix.parent(), prefix.file_name()) {
+            (Some(parent), Some(name)) => {
+                unresolved.push(name);
+                prefix = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 /// A single problem with a ticket file, phrased without the file path so
@@ -1723,6 +1757,86 @@ mod tests {
                 "default"
             ),
             Err(PostError::OutsideRepository(_))
+        ));
+    }
+
+    /// The repository root is always canonical in production, so an absolute
+    /// path reaching the same file through a symlink has to resolve to it too.
+    /// This is the normal case on macOS, where the temporary directory these
+    /// tests run in is itself reached through a link into `/private`.
+    #[test]
+    fn absolute_paths_through_a_symlinked_root_stay_inside_the_repository() {
+        let (root, store) = world();
+        let link = tempdir().unwrap();
+        let linked_root = link.path().join("repository");
+        std::os::unix::fs::symlink(root.path(), &linked_root).unwrap();
+
+        let ticket = linked_root.join(".agents/sloop/tickets/linked.md");
+        std::fs::write(&ticket, "---\nname: Linked\nblocked_by: []\n---\n\nBody\n").unwrap();
+
+        let posted = handle(
+            root.path(),
+            &store,
+            &post(ticket.to_str().unwrap(), PostTrigger::Manual),
+            2_000,
+            "TICK",
+            None,
+            &flows(),
+            "default",
+        )
+        .unwrap();
+        assert_eq!(posted["ticket"]["name"], "Linked");
+    }
+
+    /// A lexical check accepts a link sitting in the ticket directory and then
+    /// reads whatever it points at. Containment is about the bytes that get
+    /// read, so the target decides.
+    #[test]
+    fn ticket_files_symlinked_out_of_the_repository_are_rejected() {
+        let (root, store) = world();
+        let outside = tempdir().unwrap();
+        let target = outside.path().join("elsewhere.md");
+        std::fs::write(
+            &target,
+            "---\nname: Elsewhere\nblocked_by: []\n---\n\nBody\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, root.path().join(".agents/sloop/tickets/escape.md"))
+            .unwrap();
+
+        assert!(matches!(
+            handle(
+                root.path(),
+                &store,
+                &post(".agents/sloop/tickets/escape.md", PostTrigger::Manual),
+                2_000,
+                "TICK",
+                None,
+                &flows(),
+                "default",
+            ),
+            Err(PostError::OutsideRepository(_))
+        ));
+    }
+
+    /// Containment is decided before the file is read, so resolution must not
+    /// turn a missing ticket into a containment failure.
+    #[test]
+    fn missing_ticket_files_inside_the_directory_still_report_not_found() {
+        let (root, store) = world();
+
+        assert!(matches!(
+            handle(
+                root.path(),
+                &store,
+                &post(".agents/sloop/tickets/absent.md", PostTrigger::Manual),
+                2_000,
+                "TICK",
+                None,
+                &flows(),
+                "default",
+            ),
+            Err(PostError::TicketFileNotFound(_))
         ));
     }
 
