@@ -70,10 +70,9 @@ With `--json`, the template text is returned as `data.template` alongside
 `sloop template flow` is the only complete description of the flow schema
 available from an installed binary. It prints the current grammar — `action`,
 `result_check`, and `fail_action` written out on every stage, one `return_to`
-edge, one advisory stage, and a commented `panel` block — with the pre-`action`
-stage spellings reduced to a short "legacy spellings" note at the end, since
-those still parse too. They are documented in
-[the legacy grammar appendix](configuration.md#appendix-the-legacy-grammar).
+edge, one advisory stage, and a commented `panel` block — annotated with the
+structural rules the parser enforces, so the printed file is both a working
+flow and the schema.
 
 `sloop template ticket`'s `flow:` comment names the two flows that ship inside
 the binary and are written out by `sloop init`: `default` (build, review,
@@ -316,11 +315,9 @@ stable token in `value.halt`: `fail_action`, `return_budget_exhausted`, or
 `corrupt_log`.
 
 Stage names come from the run's admitted flow snapshot, so a run still shows
-the stages it actually had even if the flow file changed afterwards. Two
-different budgets can be spent on one stage and they are reported separately:
-`return_to` re-enters the stage and gets a row per execution with a `#N`
-label, while a deprecated repair block retries *within* one execution and
-reports the total as `N attempts` on that one row.
+the stages it actually had even if the flow file changed afterwards. A stage a
+`return_to` edge re-entered is one row per execution, labelled `#N` past the
+first, rather than one row carrying a count.
 
 A stage judged by a `reported` check shows the worker's `--confidence` beside
 its verdict source. A stage judged by a `panel` lists every seat under it —

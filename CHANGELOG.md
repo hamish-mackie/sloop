@@ -9,13 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **The legacy `kind` / `cmd` / `verdict` stage grammar.** `0.3.x` named a
+  stage's work with `kind` and graded it with `verdict`; `0.4.0` names the same
+  two things with `action` and `result_check`, and the old keys no longer parse.
+  Every file under `.agents/sloop/flows/` is parsed eagerly when config loads,
+  so a flow left in the old spelling is a startup error naming the stage and the
+  key that replaces the one it found, not a surprise the first ticket bound to
+  that flow discovers. The rewrite is mechanical, the last row excepted:
+
+  | Removed | Replacement |
+  | --- | --- |
+  | `kind: agent`, `kind: build` | `action: agent` |
+  | `kind: exec` with `cmd: [...]` | `action: { exec: [...] }` |
+  | `kind: merge` | `action: { builtin: merge }` |
+  | `kind: sync` | `action: { builtin: sync }` |
+  | `verdict: exit` | `result_check: none` |
+  | `verdict: commits` | `result_check: { builtin: commits }` |
+  | `verdict: { check: [...] }` | `result_check: { exec: [...] }` |
+  | `verdict: reported` | `result_check: reported` |
+  | `on_fail: { agent: ..., attempts: N }` | `fail_action: { return_to: <stage>, attempts: N }` |
+
+  These are breaking changes with no compatibility window: there is no flag that
+  restores the old spelling, and a repository whose flows still use it does not
+  start. `sloop template flow` prints the current grammar in full, annotated,
+  and `docs/configuration.md` documents it.
+- **`on_fail` repair blocks**, deprecated in `0.4.0-rc.1`. The last row of the
+  table above is the only one that is not a rename. `on_fail` attached a
+  *separate* repair agent to one stage and retried it within a single execution;
+  `fail_action: { return_to: <stage>, attempts: N }` sends the walk back to an
+  earlier stage and re-runs the whole span from there using the ticket's own
+  agent, with the failure in its prompt. Converting one is therefore a decision
+  about which stage should do the fixing — usually the agent stage that produced
+  the work the failing stage was guarding — rather than a rename. Note also that
+  the whole span re-runs, so no verdict earned between the target stage and the
+  failure survives the loop.
+
+  Two things go with the blocks. Stage rows lose their `attempts` field, the
+  count of retries inside one execution: it is gone from `sloop show --json` and
+  from the `N attempts` the stage table printed off it, while a `return_to`
+  re-entry is what it always was, a row of its own labelled `#2`. A client that
+  read the field should read `attempt` and count the rows; the envelope stays at
+  version `1`, and `docs/protocol.md` records the removal. And the daemon no
+  longer logs `flow_on_fail_deprecated`, having nothing left to warn about.
 - The compatibility path that read a `0.3.x` flow snapshot off a `runs` row is
   gone, now that the grammar which produced one no longer parses. The only run
   it could still have served is one claimed by a `0.3.x` binary and recovered
   by a `0.4.0` one. Such a run is now parked for review by id rather than
   resumed: its branch and evidence are untouched, the recovery pass carries on
   to every other run, and `sloop reindex` rebuilds local state from the
-  committed files and Git.
+  committed files and Git. What an operator sees is one `driver_resume_failed`
+  log record and evidence row naming the run, and its ticket settled to
+  `needs_review` rather than left claimed by a run nobody is driving. The work
+  on the branch is intact, so the remedy is to review and merge it by hand, or
+  to start the ticket again with `sloop run` once its flow file is in the
+  current grammar.
 
 ## [0.4.0-rc.1] - 2026-07-25
 

@@ -128,17 +128,14 @@ Patterns that fall out of the verbs:
 - **Explain one run** — `show` on a run adds `attempt`, the timeline
   (`claimed_at_ms`, `started_at_ms`, `finished_at_ms`), `agent_exit_code`,
   `halt`, and `stages`. Each stage row carries `stage`, `state`, `attempt`,
-  `attempts`, `advisory`, `started_at_ms`, `finished_at_ms`, `duration_ms`,
-  `exit_code`, `verdict_source`, `reason`, `confidence`, `silent_for_ms`, and
-  `reviewers`. Stage names come from the run's admitted flow snapshot, so a run
-  reports the stages it actually had even after the flow file changes.
+  `advisory`, `started_at_ms`, `finished_at_ms`, `duration_ms`, `exit_code`,
+  `verdict_source`, `reason`, `confidence`, `silent_for_ms`, and `reviewers`.
+  Stage names come from the run's admitted flow snapshot, so a run reports the
+  stages it actually had even after the flow file changes.
 
-  The two attempt counters mean different things. `attempt` is which
-  *execution* of the stage the row is: a `return_to` edge re-enters a stage and
-  each re-entry is its own row, numbered from `1`. `attempts` is how many tries
-  one execution cost, counting the retries a deprecated repair block makes,
-  which record no row of their own. A row for a stage the walk has not reached has
-  `attempt: 0`.
+  `attempt` is which *execution* of the stage the row is: a `return_to` edge
+  re-enters a stage and each re-entry is its own row, numbered from `1`. A row
+  for a stage the walk has not reached has `attempt: 0`.
 
   `advisory` is `true` when the stage's `fail_action` is `continue`, so a
   `failed` row with it set was recorded and stepped over rather than ending the
@@ -277,8 +274,8 @@ vendor error" should read `value.classification` instead, which is unchanged.
 **The stage model did not bump the envelope.** Everything the `action` /
 `result_check` / `fail_action` split, `return_to` loops, advisory stages, the
 `sync` and `ff_only` builtins, and reviewer panels added to the wire is
-additive within version `1`, and the daemon still accepts and emits `v: 1`
-only:
+additive within version `1`, one removal aside, and the daemon still accepts and
+emits `v: 1` only:
 
 - `verdict.confidence` is a new optional request field. A client that predates
   it simply omits it and is read as `medium`, so every older caller keeps
@@ -294,3 +291,11 @@ only:
 - The one behavioural narrowing is in `stages`, and it predates this note: a
   run whose walk looped contributes more than one row per stage name. A client
   keying stage rows by name alone must key by `(stage, attempt)` instead.
+- The one field **removed** is `attempts` on a stage row. It counted the retries
+  an `on_fail` repair block made inside a single execution, and 0.4.0 removes
+  those blocks, so the only thing that could ever set it above `1` is gone with
+  it. The envelope stays `1` regardless: `v` versions the framing and the
+  guarantee that a field is never repurposed, and a field-level removal is
+  recorded here in the release that makes it — the same treatment the
+  activation → trigger swaps above get. A client that read `attempts` should
+  read `attempt` instead and count the rows.

@@ -167,15 +167,13 @@ Rows are in flow order, and every execution of one stage sits together under its
 name — so the table reads as the flow, not as a clock. The timestamps are what
 tell you the walk actually went `build`, `test`, `build#2`, `test#2`.
 
-Two different counters both get called attempts, and they mean different things:
-
-- A **re-entry** is a whole new execution of the stage, caused by a `return_to`
-  edge. It gets its own row, labelled `#2`, `#3`, and so on. The rows above show
-  a `test` failure sending the walk back to `build`, and the second lap passing.
-- **Retries within one execution** leave no row of their own and are reported as
-  `N attempts` on the one row they belong to. Only the deprecated repair blocks
-  in the [legacy grammar](configuration.md#appendix-the-legacy-grammar) produce
-  them.
+A stage's **attempt** is which execution of it a row is. A `return_to` edge
+re-enters an earlier stage and re-runs the whole span from there, and every
+execution gets a row of its own, labelled `#2`, `#3`, and so on past the first —
+the rows above show a `test` failure sending the walk back to `build`, and the
+second lap passing. Nothing is ever folded into a count on a single row, so a
+stage that ran twice is two rows with two verdicts, two spans, and two pages of
+output that `sloop logs --stage build#2` can name one of.
 
 A failing stage marked `advisory` was recorded and stepped over rather than
 ending the walk; the run's own reason names the stage that actually halted it,

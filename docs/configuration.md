@@ -560,31 +560,6 @@ before the flow's own later stages. It is an `exec` action with
 `result_check: none` and `fail_action: fail`. A flow that already has a stage
 called `test` conflicts with it and is rejected.
 
-### Appendix: migrating from the legacy grammar
-
-`0.3.0` spelled every stage with `kind`, `cmd`, and `verdict`. `0.4.0` removed
-that grammar; a flow file still using it no longer parses, and the parse error
-names the replacement key. The rewrite is mechanical:
-
-| Removed in 0.4.0 | Replacement |
-| --- | --- |
-| `kind: agent`, or the deprecated `kind: build` | `action: agent` |
-| `kind: exec` with `cmd: [...]` | `action: { exec: [...] }` |
-| `kind: merge` | `action: { builtin: merge }` |
-| `kind: sync` | `action: { builtin: sync }` |
-| `verdict: exit` | `result_check: none` |
-| `verdict: commits` | `result_check: { builtin: commits }` |
-| `verdict: { check: [...] }` | `result_check: { exec: [...] }` |
-| `verdict: reported` | `result_check: reported` |
-| `on_fail: { agent: <prompt>, attempts: N }` | `fail_action: { return_to: <stage>, attempts: N }` |
-
-`on_fail` attached a separate repair agent to a non-agent stage and retried
-within one execution. A backward edge does the same job with the flow's own
-stages: it re-runs the ticket's own agent with the failure in its prompt, over
-the whole span from the target stage forward, so nothing between the target and
-the failure keeps a verdict earned before the fix. See
-[`fail_action`](#fail_action-what-a-failure-does-to-the-walk).
-
 ## Worker instructions
 
 Sloop composes the agent's prompt itself: a fixed bootstrap tells the
