@@ -712,10 +712,11 @@ impl RunDriver<'_> {
                 // check there is. Seating five reviewers to confirm a verdict
                 // already reached is tokens spent on nothing.
                 Check::Panel(_) => {}
-                // Parsing refuses an agent judge and the merge builtin as a
-                // check, so neither can reach a run. Fail closed rather than
-                // pass a stage nothing actually judged.
-                Check::Actor(Actor::Agent) | Check::Actor(Actor::Builtin(Builtin::Merge)) => {
+                // Parsing refuses an agent judge and both git builtins as a
+                // check, so none of them can reach a run. Fail closed rather
+                // than pass a stage nothing actually judged.
+                Check::Actor(Actor::Agent)
+                | Check::Actor(Actor::Builtin(Builtin::Merge | Builtin::Sync)) => {
                     reading = Verdict::Fail;
                 }
             }
@@ -839,7 +840,7 @@ impl RunDriver<'_> {
                 self.run_exec(&stage.name, run.attempt, cmd, worker)
             }
             // `Commits` never reaches here: parsing refuses it as an action,
-            // so the only builtin that acts is `Merge`.
+            // so the builtins that act are `Merge` and `Sync`.
             Actor::Builtin(Builtin::Commits) => StageResult {
                 verdict: Verdict::Fail,
                 exit_code: Some(1),
@@ -847,6 +848,7 @@ impl RunDriver<'_> {
                 finished_at_ms: now(),
             },
             Actor::Builtin(Builtin::Merge) => self.run_merge(stage, merge_recovery),
+            Actor::Builtin(Builtin::Sync) => self.run_sync(run),
         }))
     }
 
@@ -1235,6 +1237,7 @@ impl RunDriver<'_> {
             &self.environment.root,
             &self.plan.branch,
             self.agent.commit_observation_complete && self.agent.commits.is_empty(),
+            stage.ff_only,
             &stage.name,
             &self.run_store,
             self.run_id(),
@@ -1252,6 +1255,133 @@ impl RunDriver<'_> {
             started_at_ms: now,
             finished_at_ms: self.clock().now_ms(),
         }
+    }
+
+    /// The sync builtin: integrates the default branch into the run branch,
+    /// inside the run worktree, so the stages after it judge the tree the
+    /// merge will land rather than one that was never assembled.
+    ///
+    /// It is the merge builtin's mirror image and its opposite in cost. A
+    /// merge writes to the shared default-branch checkout, so the daemon
+    /// performs it itself under the global lock; a sync writes only to the
+    /// run's own worktree, and reads the shared checkout for exactly as long
+    /// as it takes to pin one commit. The integration itself is an ordinary
+    /// supervised stage process, which is what puts git's conflict output in
+    /// the run log — and so in the prompt of whatever a `return_to` re-enters.
+    fn run_sync(&self, run: &StageRun) -> StageResult {
+        let started_at_ms = self.clock().now_ms();
+        let failed = |code: i32| StageResult {
+            verdict: Verdict::Fail,
+            exit_code: Some(code),
+            started_at_ms,
+            finished_at_ms: self.clock().now_ms(),
+        };
+        let integrated = || StageResult {
+            verdict: Verdict::Pass,
+            exit_code: Some(0),
+            started_at_ms,
+            finished_at_ms: self.clock().now_ms(),
+        };
+        let worktree = self.plan.worktree.as_path();
+
+        // Whatever the default branch is at this instant is what this sync
+        // integrates. The lock is held only for the read: a sync writes
+        // nothing the merge stage contends for, and holding it across the
+        // integration would let one run's conflicts stall another's merge.
+        let default_head = {
+            let Ok(_guard) = MERGE_LOCK.lock() else {
+                return failed(1);
+            };
+            match git_stdout(&self.environment.root, &["rev-parse", "HEAD"]) {
+                Ok(head) => head,
+                Err(error) => {
+                    self.log().emit_with_fields(
+                        LogLevel::Error,
+                        "sloop::driver",
+                        "sync_default_branch_unreadable",
+                        json!({"run_id": self.run_id(), "error": error}),
+                    );
+                    return failed(1);
+                }
+            }
+        };
+
+        // A sync owns merge state in the run worktree: it promises to leave
+        // none behind, and starts by making that true. A daemon that died
+        // mid-integration is the usual author of what is found here, and the
+        // branch tip it restores is a state the walk can always re-enter.
+        match shared_checkout_has_git_operation(worktree) {
+            Ok(true) => {
+                self.log().emit_with_fields(
+                    LogLevel::Info,
+                    "sloop::driver",
+                    "sync_aborted_leftover_merge",
+                    json!({"run_id": self.run_id(), "stage": run.stage.name}),
+                );
+                abort_in_progress_merge(worktree);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.log().emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::driver",
+                    "sync_worktree_unreadable",
+                    json!({"run_id": self.run_id(), "error": error}),
+                );
+                return failed(1);
+            }
+        }
+        if !matches!(merge_checkout_ready(worktree), Ok(true)) {
+            self.log().emit_with_fields(
+                LogLevel::Warn,
+                "sloop::driver",
+                "sync_worktree_not_ready",
+                json!({"run_id": self.run_id(), "stage": run.stage.name}),
+            );
+            return failed(1);
+        }
+        // Already up to date is a pass with nothing to run: the run branch
+        // holds the default branch, which is all the stage promises.
+        match git_is_ancestor(worktree, &default_head, &self.plan.branch) {
+            Ok(true) => return integrated(),
+            Ok(false) => {}
+            Err(error) => {
+                self.log().emit_with_fields(
+                    LogLevel::Error,
+                    "sloop::driver",
+                    "sync_ancestry_unreadable",
+                    json!({"run_id": self.run_id(), "error": error}),
+                );
+                return failed(1);
+            }
+        }
+
+        // The merge commit is Sloop's own action, so it carries Sloop's
+        // identity — the same one `attempt_merge` signs with.
+        let argv = vec![
+            "git".to_owned(),
+            "-c".to_owned(),
+            "user.name=sloop".to_owned(),
+            "-c".to_owned(),
+            "user.email=sloop@sloop.invalid".to_owned(),
+            "merge".to_owned(),
+            "--no-edit".to_owned(),
+            "-m".to_owned(),
+            format!(
+                "Merge the default branch into run branch '{}'",
+                self.plan.branch
+            ),
+            default_head,
+        ];
+        let result = self.run_exec(&run.stage.name, run.attempt, &argv, None);
+        if result.verdict == Verdict::Pass {
+            return result;
+        }
+        // The conflict has been captured in the run log by now, so the tree
+        // holding it has nothing left to say. Restoring the branch tip is what
+        // lets a `return_to` target start from a clean worktree.
+        abort_in_progress_merge(worktree);
+        result
     }
 
     /// Repairs a failed stage in place when it has a repair worker, attempts
@@ -1293,7 +1423,7 @@ impl RunDriver<'_> {
         // and the retried merge start clean. An exhausted merge that never
         // reaches here keeps the conflict for review.
         if stage.action == Actor::Builtin(Builtin::Merge) {
-            abort_conflicted_merge(&self.environment.root);
+            abort_in_progress_merge(&self.environment.root);
         }
         let attempt = repair_used + 1;
         // Record the attempt before spawning so a crash mid-repair still
@@ -1825,6 +1955,7 @@ fn flow_with_implicit_test(flow: &Flow, test_cmd: Option<&[String]>) -> Result<F
                 action: Actor::Exec { cmd: cmd.to_vec() },
                 result_check: Check::None,
                 fail_action: FailAction::Halt,
+                ff_only: false,
                 on_fail: None,
             },
         );
@@ -1921,11 +2052,20 @@ pub(super) fn try_commits_on_branch(root: &Path, branch: &str) -> Result<Vec<Str
 /// Attempts the policy merge into the default branch: fast-forward when
 /// possible, otherwise a merge commit. Failed merges leave the exact checkout
 /// state for human review; Sloop never guesses which post-merge edits it owns.
+///
+/// With `ff_only` the merge commit is off the table: the default branch either
+/// fast-forwards to the run branch or the stage fails, and git leaves the
+/// checkout untouched in the second case. That refusal is the point. A
+/// fast-forward can only succeed while the default branch is still the one an
+/// earlier sync integrated, so the run branch a flow verified is provably the
+/// tree that lands — and a default branch that moved in between trips the
+/// stage instead of quietly merging something no stage ever tested.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn attempt_merge(
     root: &Path,
     branch: &str,
     branch_unchanged: bool,
+    ff_only: bool,
     stage: &str,
     run_store: &RunStore,
     run_id: &str,
@@ -1965,10 +2105,15 @@ pub(super) fn attempt_merge(
             "user.email=sloop@sloop.invalid",
             "merge",
             "--quiet",
-            "-m",
-            &message,
-            &branch_tip,
-        ])
+        ]);
+    if ff_only {
+        // No commit is ever created here, so there is no message to write.
+        command.arg("--ff-only");
+    } else {
+        command.args(["-m", &message]);
+    }
+    command
+        .arg(&branch_tip)
         .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -2062,13 +2207,18 @@ pub(super) fn attempt_merge(
     }
 }
 
-/// Restores the default checkout after a conflicting merge so a following
-/// `on_fail` retry is not wedged by the leftover `MERGE_HEAD`. Only used before
-/// a repair actually runs: an exhausted merge preserves the conflict for review.
-fn abort_conflicted_merge(root: &Path) {
+/// Restores a checkout after a conflicting merge so whatever runs next is not
+/// wedged by the leftover `MERGE_HEAD`.
+///
+/// On the shared default-branch checkout this is used only before a repair
+/// actually runs: an exhausted merge preserves the conflict for review. In a
+/// run worktree the sync builtin uses it unconditionally, because there the
+/// conflict has already been captured in the run log and the tree holding it
+/// is nobody's evidence.
+fn abort_in_progress_merge(checkout: &Path) {
     let _ = Command::new("git")
         .args(["merge", "--abort"])
-        .current_dir(root)
+        .current_dir(checkout)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -2210,6 +2360,7 @@ mod tests {
                     action: Actor::Agent,
                     result_check: crate::flow::Check::Reported,
                     fail_action: crate::flow::FailAction::Halt,
+                    ff_only: false,
                     on_fail: None,
                 })
                 .collect(),

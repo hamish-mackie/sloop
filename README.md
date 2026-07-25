@@ -169,6 +169,14 @@ flow:
 This command runs as an implicit `test` stage at index 1, before the flow's
 own later stages.
 
+`init` also writes `.agents/sloop/flows/train.yaml`, an opt-in merge train:
+`build → sync → verify → merge`, where `{ builtin: sync }` merges the default
+branch into the run branch and `{ builtin: merge, ff_only: true }` refuses to
+land anything the verify stage did not run against. If the default branch moves
+in between, the fast-forward fails without side effects and
+`fail_action: { return_to: sync }` runs the train around again. See
+[docs/configuration.md](docs/configuration.md#the-merge-train).
+
 ## Logs
 
 Each run's full output is kept as `runs/<run-id>/output.ndjson` under Sloop's

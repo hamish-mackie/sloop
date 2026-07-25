@@ -30,6 +30,8 @@ This scaffolds committed configuration under `.agents/sloop/`:
 - `projects/default.md` — the default project for unassigned tickets
 - `tickets/` — where your ticket files live
 - `flows/default.yaml` — the default flow (build → review → merge)
+- `flows/train.yaml` — the opt-in merge train (build → sync → verify →
+  fast-forward merge); bind a ticket to it with `flow: train`
 - `prompts/review.md` — the prompt used by the default review stage
 
 `init` never edits `.gitignore`; whether worktrees and tickets are committed

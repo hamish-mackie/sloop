@@ -5,6 +5,13 @@ rules:
     class: rate_limited
     diagnostic: Claude usage limit reached
     match:
-      stream: stderr
+      # No stream constraint: `claude --output-format stream-json` reports
+      # vendor rejections as synthetic assistant messages on stdout, so a
+      # stderr-only rule is unreachable for this target.
+      #
+      # Signatures are conjunctive, so the one signature has to be the wording
+      # every limit shares. Claude qualifies the noun per limit window
+      # ("your limit", "your session limit", "your weekly limit"); the phrase
+      # up to that qualifier is what stays constant.
       message_signatures:
-        - You've hit your limit
+        - You've hit your

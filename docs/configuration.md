@@ -254,8 +254,18 @@ Each stage is an `action` — the work, never trusted to grade itself — and a
   own supervised process and worker credentials.
 - `action: { exec: ["argv", "..."] }` runs an argv (no shell) in the run
   worktree.
+- `action: { builtin: sync }` merges the default branch into the run branch,
+  inside the run worktree. It passes when that merge commits cleanly or there
+  was nothing to integrate, and fails on a conflict — leaving no in-progress
+  merge behind, so whatever the flow does next starts from a clean tree. Any
+  number, anywhere before the merge stage. The shared default-branch checkout
+  is only ever read.
 - `action: { builtin: merge }` applies the branch using Sloop's merge policy.
-  At most one, and it must be last.
+  At most one, and it must be last. It takes one option,
+  `{ builtin: merge, ff_only: true }`, which refuses the merge commit: the
+  default branch either fast-forwards to the run branch head, or the stage
+  fails having touched nothing. `ff_only` is meaningful nowhere else, and
+  writing it on another action is a parse error rather than an ignored key.
 
 The checks are:
 
@@ -273,8 +283,9 @@ The checks are:
 
 The default is the commits builtin for `agent` and `none` for everything else.
 An agent action may not use `result_check: none` — grading itself by exiting
-cleanly grades nothing. A merge action must use `result_check: none` because
-the merge result *is* its verdict, and the merge builtin may never be a check.
+cleanly grades nothing. The `merge` and `sync` actions must use
+`result_check: none` because what git did *is* their verdict, and neither may
+appear as a check: a judge that moves a branch is not judging anything.
 
 ### Panels: several reviewers, one deterministic verdict
 
@@ -405,6 +416,74 @@ nowhere for context to go.
 `sloop show` renders each execution separately, suffixing re-runs with their
 attempt (`build`, `build#2`), so a converged loop and a stage that only ever
 ran once do not read the same.
+
+### The merge train
+
+The worked example of a backward edge is the `train` flow, which `sloop init`
+writes to `.agents/sloop/flows/train.yaml` beside `default.yaml`. Bind a ticket
+to it with `flow: train` or `sloop post --flow train`; the `default` flow is
+unchanged and is still what a ticket gets when it names none.
+
+```yaml
+stages:
+  - name: build
+    action: agent
+    result_check: { builtin: commits }
+    fail_action: fail
+  - name: sync
+    action: { builtin: sync }
+    result_check: none
+    fail_action: { return_to: build, attempts: 1 }
+  - name: verify
+    action: { exec: [cargo, test] }
+    result_check: none
+    fail_action: { return_to: build, attempts: 1 }
+  - name: merge
+    action: { builtin: merge, ff_only: true }
+    result_check: none
+    fail_action: { return_to: sync, attempts: 3 }
+```
+
+The problem it solves is that what lands on the default branch is not the run
+branch — it is the *merge* of the two, a tree no stage ever tested. While a run
+is in flight the default branch keeps moving, so an ordinary flow either parks
+a conflict in `needs_review` or merges something semantically stale that every
+stage nonetheless passed.
+
+The train closes that gap with nothing but ordinary stages. `sync` integrates
+the default branch into the run branch, `verify` runs against the tree that
+produces, and `ff_only` makes the merge a fast-forward — which can only succeed
+while the default branch is still the commit `sync` integrated. If it moved in
+between, the fast-forward is impossible, the merge fails without touching
+anything, and `return_to: sync` runs the train around again. Each lap is one
+more chance to converge, and `attempts: 3` bounds how many the train gets
+before the ticket parks for a human. Note where the two edges point: a failing
+`sync` or `verify` goes back to `build`, because something about the work needs
+changing, while a failed fast-forward goes back to `sync`, because nothing
+about the work was wrong — only what it was sitting on.
+
+Two details are load-bearing rather than stylistic. Verification sits **after**
+the sync because a merge is the one irreversible act in a flow: once the
+default branch has moved, no later stage can un-move it, so everything that
+decides whether the work is good has to have run already. And the merge stage
+carries `result_check: none` on principle, not for convenience — a check runs
+*after* its action, so any verdict it reached would arrive too late to prevent
+anything. The merge's own outcome is the only thing it can honestly be judged
+by, which is why the grammar refuses every other check there.
+
+A sync that conflicts fails and aborts its own merge, so the stage it returns
+to gets a clean worktree rather than one wedged on `MERGE_HEAD`. Git's conflict
+output is captured in the run log like any stage's, so a re-entered agent is
+handed the conflicting paths in its prompt and can rework its commits to avoid
+them. The builtin never resolves a conflict itself and has no rebase mode; if
+you want a conflict resolved rather than avoided, route it to an agent stage
+with `return_to`.
+
+If your repository sets `flow.test_cmd`, `sloop init` uses that command for the
+train's `verify` stage. Prefer naming it there rather than in `flow.test_cmd`
+when you use the train: the implicit `test` stage is spliced in immediately
+after the first stage, which is *before* the sync, and so tests the tree the
+train exists to stop trusting.
 
 The older grammar still parses, as sugar for exactly the same stages:
 `kind: agent` (or the deprecated `kind: build`) is `action: agent`,

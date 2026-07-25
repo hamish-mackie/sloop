@@ -25,6 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It is recorded as evidence and never weighted into a panel's aggregation;
   floats are rejected. `sloop show <run>` lists each panel seat's verdict,
   confidence, and reason under its stage, silent seats included.
+- A new `{ builtin: sync }` action merges the default branch into the run
+  branch, inside the run worktree. It passes when that merge commits cleanly or
+  there was nothing to integrate, and fails on a conflict — aborting the merge
+  so a `return_to` target starts from a clean tree, with git's conflict output
+  captured in the run log and so in the re-entered agent's prompt. Any number
+  of sync stages, anywhere before the merge; the shared default-branch checkout
+  is only ever read.
+- The merge stage takes `{ builtin: merge, ff_only: true }`, which refuses the
+  merge commit: the default branch either fast-forwards to the run branch head,
+  or the stage fails having touched nothing. Absent, the merge policy is
+  unchanged. `ff_only` is meaningful nowhere else and is a parse error on any
+  other action.
+- `sloop init` writes a `train` flow beside `default.yaml`, opt-in with
+  `flow: train`. It is the merge train: `build → sync → verify → ff_only
+  merge`, with `fail_action: { return_to: sync }` on the merge, so a default
+  branch that moves between the verification and the merge loops the train
+  rather than landing a tree no stage tested. Its `verify` stage uses the
+  repository's configured `flow.test_cmd` when it has one.
 - Flow stages can now bind the two `fail_action` forms that previously parsed
   but were rejected. `fail_action: continue` makes a stage advisory: its
   failure is recorded and visible in `sloop show`, the walk carries on, and the
@@ -59,6 +77,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the stage it guards — and the daemon now logs a `flow_on_fail_deprecated`
   note when it admits a run whose flow uses `on_fail`. Nothing is removed:
   existing flows keep parsing, repairing, and settling exactly as before.
+
+### Fixed
+
+- A Claude session limit now classifies as `rate_limited` and cools the target
+  down instead of failing the ticket. The rule required stderr, but the
+  `claude` target runs with `--output-format stream-json` and reports vendor
+  rejections as synthetic assistant messages on stdout; its signature also only
+  covered `You've hit your limit`, not the `You've hit your session limit`
+  wording a real run hit. The rule now matches either stream on the wording
+  every limit window shares. Without this, one vendor limit could burn several
+  tickets' retry attempts and strand them in `failed`.
 
 ## [0.3.0] - 2026-07-21
 

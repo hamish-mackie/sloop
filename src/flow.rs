@@ -47,12 +47,25 @@ pub struct Stage {
     pub action: Actor,
     pub result_check: Check,
     pub fail_action: FailAction,
+    /// The merge builtin's fast-forward-only mode, written inside the action
+    /// as `{ builtin: merge, ff_only: true }`. It is refused on every other
+    /// action, so a `true` here always describes a merge stage.
+    ///
+    /// It rides on the stage rather than inside `Actor` so that a snapshot
+    /// written before the option existed still reads: `Builtin::Merge` keeps
+    /// its wire shape, and an absent key is the old behaviour exactly.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ff_only: bool,
     /// Optional repair agent for non-agent stages. When the stage fails,
     /// this agent is spawned in the run worktree to fix the tree in place;
     /// the stage is then re-run and its own result check re-applied. The
     /// repair agent never produces the verdict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_fail: Option<OnFail>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A stage's optional repair configuration. It configures the repair worker
@@ -108,6 +121,15 @@ pub enum Builtin {
     /// Passes when Sloop observed at least one new commit on the run
     /// branch. Only ever a check.
     Commits,
+    /// Integrates the default branch into the run branch, inside the run
+    /// worktree. Only ever an action, never a check.
+    ///
+    /// It is the merge builtin's mirror image: the merge stage moves the
+    /// default branch and reads the run branch, and this one moves the run
+    /// branch and only ever reads the default branch. Putting it before the
+    /// stages that judge the work is what makes those stages judge the tree
+    /// the merge will actually land.
+    Sync,
 }
 
 /// How a stage's action is judged.
@@ -261,6 +283,8 @@ impl<'de> Deserialize<'de> for Stage {
             #[serde(default)]
             verdict: Option<SnapshotVerdict>,
             #[serde(default)]
+            ff_only: bool,
+            #[serde(default)]
             on_fail: Option<OnFail>,
         }
 
@@ -287,6 +311,7 @@ impl<'de> Deserialize<'de> for Stage {
             action,
             result_check,
             fail_action: stage.fail_action.unwrap_or(FailAction::Halt),
+            ff_only: stage.ff_only,
             on_fail: stage.on_fail,
         })
     }
@@ -305,7 +330,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Flow, String> {
         if !names.insert(raw.name.clone()) {
             return Err(format!("duplicate stage name `{}`", raw.name));
         }
-        let action = parse_action(&raw.name, raw.action, raw.kind, raw.cmd)?;
+        let (action, ff_only) = parse_action(&raw.name, raw.action, raw.kind, raw.cmd)?;
         let result_check = parse_result_check(&raw.name, &action, raw.result_check, raw.verdict)?;
         let fail_action = parse_fail_action(&raw.name, raw.fail_action)?;
         validate_stage(&raw.name, &action, &result_check)?;
@@ -324,6 +349,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Flow, String> {
             action,
             result_check,
             fail_action,
+            ff_only,
             on_fail,
         });
     }
@@ -335,15 +361,16 @@ pub fn parse(name: &str, contents: &str) -> Result<Flow, String> {
     })
 }
 
-/// Resolves a stage's action from either grammar. The old `kind`/`cmd` pair
-/// is sugar for the same `Actor`s the new `action` key names directly, so
-/// the two are mutually exclusive rather than merged.
+/// Resolves a stage's action from either grammar, along with the `ff_only`
+/// option the merge builtin alone accepts. The old `kind`/`cmd` pair is sugar
+/// for the same `Actor`s the new `action` key names directly, so the two are
+/// mutually exclusive rather than merged.
 fn parse_action(
     stage: &str,
     action: Option<RawActor>,
     kind: Option<String>,
     cmd: Option<Vec<String>>,
-) -> Result<Actor, String> {
+) -> Result<(Actor, bool), String> {
     match (action, kind) {
         (Some(_), Some(_)) => Err(format!(
             "stage `{stage}` must not define both `action` and `kind`"
@@ -356,23 +383,33 @@ fn parse_action(
                 ));
             }
             match action {
-                RawActor::Agent { .. } => Ok(Actor::Agent),
-                RawActor::Exec { exec } => {
+                RawActor::Agent { ff_only, .. } => {
+                    reject_ff_only(stage, ff_only)?;
+                    Ok((Actor::Agent, false))
+                }
+                RawActor::Exec { exec, ff_only } => {
+                    reject_ff_only(stage, ff_only)?;
                     if exec.is_empty() {
                         return Err(format!(
                             "stage `{stage}` exec action must define a non-empty command"
                         ));
                     }
-                    Ok(Actor::Exec { cmd: exec })
+                    Ok((Actor::Exec { cmd: exec }, false))
                 }
-                RawActor::Builtin { builtin } => match builtin.as_str() {
-                    "merge" => Ok(Actor::Builtin(Builtin::Merge)),
+                RawActor::Builtin { builtin, ff_only } => match builtin.as_str() {
+                    // The one action `ff_only` means anything to, so the one
+                    // that does not refuse it.
+                    "merge" => Ok((Actor::Builtin(Builtin::Merge), ff_only.unwrap_or_default())),
+                    "sync" => {
+                        reject_ff_only(stage, ff_only)?;
+                        Ok((Actor::Builtin(Builtin::Sync), false))
+                    }
                     "commits" => Err(format!(
                         "stage `{stage}` builtin `commits` is a result_check, not an action"
                     )),
                     other => Err(format!("stage `{stage}` has unknown builtin `{other}`")),
                 },
-                RawActor::Name(name) if name == "agent" => Ok(Actor::Agent),
+                RawActor::Name(name) if name == "agent" => Ok((Actor::Agent, false)),
                 RawActor::Name(name) => Err(format!("stage `{stage}` has unknown action `{name}`")),
             }
         }
@@ -381,13 +418,19 @@ fn parse_action(
                 if cmd.is_some() {
                     return Err(format!("agent stage `{stage}` must not define `cmd`"));
                 }
-                Ok(Actor::Agent)
+                Ok((Actor::Agent, false))
             }
             "merge" => {
                 if cmd.is_some() {
                     return Err(format!("merge stage `{stage}` must not define `cmd`"));
                 }
-                Ok(Actor::Builtin(Builtin::Merge))
+                Ok((Actor::Builtin(Builtin::Merge), false))
+            }
+            "sync" => {
+                if cmd.is_some() {
+                    return Err(format!("sync stage `{stage}` must not define `cmd`"));
+                }
+                Ok((Actor::Builtin(Builtin::Sync), false))
             }
             "exec" => {
                 let cmd = cmd.unwrap_or_default();
@@ -396,11 +439,23 @@ fn parse_action(
                         "exec stage `{stage}` must define a non-empty `cmd`"
                     ));
                 }
-                Ok(Actor::Exec { cmd })
+                Ok((Actor::Exec { cmd }, false))
             }
             kind => Err(format!("stage `{stage}` has unknown kind `{kind}`")),
         },
         (None, None) => Err(format!("stage `{stage}` must define an `action`")),
+    }
+}
+
+/// `ff_only` describes what the merge stage does to the default branch, so it
+/// says nothing anywhere else. Writing it elsewhere is far more likely to be a
+/// misplaced expectation than a harmless extra key, and is refused as one.
+fn reject_ff_only(stage: &str, ff_only: Option<bool>) -> Result<(), String> {
+    match ff_only {
+        None => Ok(()),
+        Some(_) => Err(format!(
+            "stage `{stage}` may only define `ff_only` on the `merge` builtin"
+        )),
     }
 }
 
@@ -425,13 +480,18 @@ fn parse_result_check(
                 }
                 Ok(Check::Actor(Actor::Exec { cmd: exec }))
             }
-            RawCheck::Builtin { builtin } => match builtin.as_str() {
-                "commits" => Ok(Check::Actor(Actor::Builtin(Builtin::Commits))),
-                "merge" => Err(format!(
-                    "stage `{stage}` result_check may not be the `merge` builtin"
-                )),
-                other => Err(format!("stage `{stage}` has unknown builtin `{other}`")),
-            },
+            RawCheck::Builtin { builtin, ff_only } => {
+                reject_ff_only(stage, ff_only)?;
+                match builtin.as_str() {
+                    "commits" => Ok(Check::Actor(Actor::Builtin(Builtin::Commits))),
+                    // Both builtins that act on git refuse the check position:
+                    // a judge that moves a branch is not judging anything.
+                    "merge" | "sync" => Err(format!(
+                        "stage `{stage}` result_check may not be the `{builtin}` builtin"
+                    )),
+                    other => Err(format!("stage `{stage}` has unknown builtin `{other}`")),
+                }
+            }
             RawCheck::Panel { panel } => Ok(Check::Panel(parse_panel(stage, panel)?)),
             RawCheck::Name(name) => match name.as_str() {
                 "none" => Ok(Check::None),
@@ -561,10 +621,15 @@ fn validate_stage(stage: &str, action: &Actor, result_check: &Check) -> Result<(
             "stage `{stage}`: agentic actions require a result_check or reported"
         ));
     }
-    if *action == Actor::Builtin(Builtin::Merge) && *result_check != Check::None {
-        return Err(format!(
-            "merge stage `{stage}` must have `result_check: none`"
-        ));
+    // Both git builtins are judged by what git did, so there is nothing for a
+    // second opinion to add — and `reported` in particular could only ever
+    // fail, since a builtin runs no worker to report with.
+    for (builtin, name) in [(Builtin::Merge, "merge"), (Builtin::Sync, "sync")] {
+        if *action == Actor::Builtin(builtin) && *result_check != Check::None {
+            return Err(format!(
+                "{name} stage `{stage}` must have `result_check: none`"
+            ));
+        }
     }
     Ok(())
 }
@@ -599,6 +664,7 @@ pub(crate) fn built_in_default() -> Flow {
             action: Actor::Agent,
             result_check: Check::Actor(Actor::Builtin(Builtin::Commits)),
             fail_action: FailAction::Halt,
+            ff_only: false,
             on_fail: None,
         },
         Stage {
@@ -606,6 +672,7 @@ pub(crate) fn built_in_default() -> Flow {
             action: Actor::Builtin(Builtin::Merge),
             result_check: Check::None,
             fail_action: FailAction::Halt,
+            ff_only: false,
             on_fail: None,
         },
     ];
@@ -620,10 +687,24 @@ pub(crate) fn built_in_default() -> Flow {
 /// any position and any number of times, each with its own supervised process.
 fn validate_order(stages: &[Stage]) -> Result<(), String> {
     let merge = Actor::Builtin(Builtin::Merge);
+    let sync = Actor::Builtin(Builtin::Sync);
     let merge_count = stages.iter().filter(|stage| stage.action == merge).count();
     if merge_count > 1 {
         return Err(format!(
             "flow may contain at most one merge stage; found {merge_count}"
+        ));
+    }
+    // Any number of syncs, anywhere before the merge. Integrating the default
+    // branch after it has already been moved would be answering a question the
+    // walk has stopped asking.
+    if let Some(merge_index) = stages.iter().position(|stage| stage.action == merge)
+        && let Some(stray) = stages[merge_index..]
+            .iter()
+            .find(|stage| stage.action == sync)
+    {
+        return Err(format!(
+            "sync stage `{}` must come before the merge stage",
+            stray.name
         ));
     }
     if merge_count == 1 && stages.last().map(|stage| &stage.action) != Some(&merge) {
@@ -1025,8 +1106,12 @@ struct RawStage {
 }
 
 /// `action: agent` | `{ agent: <ignored> }` | `{ exec: [argv] }` |
-/// `{ builtin: merge }`. The `agent` payload is accepted and discarded: an
-/// agent action's prompt comes from the ticket, not the flow file.
+/// `{ builtin: merge | sync }`. The `agent` payload is accepted and discarded:
+/// an agent action's prompt comes from the ticket, not the flow file.
+///
+/// `ff_only` is carried on every mapping variant, not just the builtin one, so
+/// that writing it on an action that cannot honour it is an error the author
+/// sees rather than a key that is silently dropped.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum RawActor {
@@ -1036,12 +1121,15 @@ enum RawActor {
         /// payload is deliberately discarded.
         #[allow(dead_code)]
         agent: IgnoredAny,
+        ff_only: Option<bool>,
     },
     Exec {
         exec: Vec<String>,
+        ff_only: Option<bool>,
     },
     Builtin {
         builtin: String,
+        ff_only: Option<bool>,
     },
 }
 
@@ -1056,9 +1144,16 @@ enum RawActor {
 #[serde(untagged)]
 enum RawCheck {
     Name(String),
-    Exec { exec: Vec<String> },
-    Builtin { builtin: String },
-    Panel { panel: RawPanel },
+    Exec {
+        exec: Vec<String>,
+    },
+    Builtin {
+        builtin: String,
+        ff_only: Option<bool>,
+    },
+    Panel {
+        panel: RawPanel,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -1148,6 +1243,7 @@ mod tests {
                         action: Actor::Agent,
                         result_check: commits(),
                         fail_action: FailAction::Halt,
+                        ff_only: false,
                         on_fail: None,
                     },
                     Stage {
@@ -1157,6 +1253,7 @@ mod tests {
                         },
                         result_check: exec_check(&["cargo", "clippy"]),
                         fail_action: FailAction::Halt,
+                        ff_only: false,
                         on_fail: None,
                     },
                     Stage {
@@ -1164,6 +1261,7 @@ mod tests {
                         action: Actor::Builtin(Builtin::Merge),
                         result_check: Check::None,
                         fail_action: FailAction::Halt,
+                        ff_only: false,
                         on_fail: None,
                     },
                 ],
@@ -1366,6 +1464,140 @@ mod tests {
             judged.contains("must have `result_check: none`"),
             "{judged}"
         );
+    }
+
+    #[test]
+    fn the_sync_builtin_parses_in_both_grammars() {
+        let new = parse(
+            "example",
+            "- { name: build, action: agent }\n- { name: sync, action: { builtin: sync } }\n",
+        )
+        .unwrap();
+        assert_eq!(new.stages[1].action, Actor::Builtin(Builtin::Sync));
+        assert_eq!(new.stages[1].result_check, Check::None);
+
+        let sugared = parse(
+            "example",
+            "- { name: build, kind: agent }\n- { name: sync, kind: sync }\n",
+        )
+        .unwrap();
+        assert_eq!(new, sugared);
+    }
+
+    /// Sync moves the run branch. A judge that moves a branch is not judging
+    /// anything, and a builtin that runs no worker could never report.
+    #[test]
+    fn the_sync_builtin_is_an_action_and_never_a_check() {
+        let as_check = error(
+            "- { name: build, action: agent }\n- { name: gate, action: { exec: ['true'] }, result_check: { builtin: sync } }\n",
+        );
+        assert!(
+            as_check.contains("result_check may not be the `sync` builtin"),
+            "{as_check}"
+        );
+
+        let judged = error(
+            "- { name: build, action: agent }\n- { name: sync, action: { builtin: sync }, result_check: reported }\n",
+        );
+        assert!(
+            judged.contains("sync stage `sync` must have `result_check: none`"),
+            "{judged}"
+        );
+    }
+
+    /// Any number of syncs, anywhere before the merge — but integrating the
+    /// default branch after it has already been moved answers nothing.
+    #[test]
+    fn sync_stages_may_repeat_but_must_precede_the_merge() {
+        let repeated = parse(
+            "example",
+            "- { name: build, action: agent }\n- { name: sync, action: { builtin: sync } }\n- { name: test, action: { exec: ['true'] } }\n- { name: resync, action: { builtin: sync } }\n- { name: merge, action: { builtin: merge } }\n",
+        )
+        .unwrap();
+        assert_eq!(repeated.stages.len(), 5);
+
+        let after = error(
+            "- { name: build, action: agent }\n- { name: merge, action: { builtin: merge } }\n- { name: sync, action: { builtin: sync } }\n",
+        );
+        assert!(
+            after.contains("sync stage `sync` must come before the merge stage"),
+            "{after}"
+        );
+    }
+
+    #[test]
+    fn ff_only_binds_on_the_merge_stage_and_defaults_to_off() {
+        let plain = parse(
+            "example",
+            "- { name: build, action: agent }\n- { name: merge, action: { builtin: merge } }\n",
+        )
+        .unwrap();
+        assert!(!plain.stages[1].ff_only);
+
+        let train = parse(
+            "example",
+            "- { name: build, action: agent }\n- { name: merge, action: { builtin: merge, ff_only: true }, result_check: none }\n",
+        )
+        .unwrap();
+        assert!(train.stages[1].ff_only);
+
+        // Written `false`, it is still the untouched merge policy.
+        let explicit = parse(
+            "example",
+            "- { name: build, action: agent }\n- { name: merge, action: { builtin: merge, ff_only: false } }\n",
+        )
+        .unwrap();
+        assert!(!explicit.stages[1].ff_only);
+    }
+
+    /// A queued run must recover the mode it was admitted with, and a flow
+    /// snapshotted before the option existed must still read as the merge
+    /// policy it was written for.
+    #[test]
+    fn ff_only_survives_a_snapshot_round_trip_and_defaults_on_old_ones() {
+        let flow = parse(
+            "example",
+            "- { name: build, action: agent }\n- { name: merge, action: { builtin: merge, ff_only: true } }\n",
+        )
+        .unwrap();
+        let snapshot = serde_json::to_string(&flow).unwrap();
+        assert!(snapshot.contains("ff_only"), "{snapshot}");
+        assert_eq!(serde_json::from_str::<Flow>(&snapshot).unwrap(), flow);
+
+        let plain = parse(
+            "example",
+            "- { name: build, action: agent }\n- { name: merge, action: { builtin: merge } }\n",
+        )
+        .unwrap();
+        let snapshot = serde_json::to_string(&plain).unwrap();
+        // Off is the absence of the key, so a flow that never asked for the
+        // mode does not start carrying it.
+        assert!(!snapshot.contains("ff_only"), "{snapshot}");
+
+        let old: Flow = serde_json::from_str(
+            r#"{"name":"example","stages":[{"name":"merge","kind":"Merge"}]}"#,
+        )
+        .unwrap();
+        assert!(!old.stages[0].ff_only);
+    }
+
+    /// `ff_only` describes what the merge does to the default branch, so
+    /// anywhere else it is a misplaced expectation rather than an extra key
+    /// worth dropping quietly.
+    #[test]
+    fn ff_only_is_refused_off_the_merge_builtin() {
+        for yaml in [
+            "- { name: build, action: agent }\n- { name: sync, action: { builtin: sync, ff_only: true } }\n",
+            "- { name: test, action: { exec: ['true'], ff_only: true } }\n",
+            "- { name: build, action: { agent: ignored, ff_only: true } }\n",
+            "- { name: build, action: agent, result_check: { builtin: commits, ff_only: true } }\n",
+        ] {
+            let error = error(yaml);
+            assert!(
+                error.contains("may only define `ff_only` on the `merge` builtin"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -1650,6 +1882,7 @@ mod tests {
                     action: Actor::Agent,
                     result_check: commits(),
                     fail_action: FailAction::Halt,
+                    ff_only: false,
                     on_fail: None,
                 },
                 Stage {
@@ -1659,6 +1892,7 @@ mod tests {
                     },
                     result_check: Check::None,
                     fail_action: FailAction::Halt,
+                    ff_only: false,
                     on_fail: None,
                 },
                 Stage {
@@ -1666,6 +1900,7 @@ mod tests {
                     action: Actor::Builtin(Builtin::Merge),
                     result_check: Check::None,
                     fail_action: FailAction::Halt,
+                    ff_only: false,
                     on_fail: None,
                 },
             ],
@@ -1686,6 +1921,7 @@ mod tests {
                     },
                     result_check: Check::None,
                     fail_action: fail_action.clone(),
+                    ff_only: false,
                     on_fail: None,
                 })
                 .collect(),
