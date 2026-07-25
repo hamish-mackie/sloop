@@ -1,6 +1,10 @@
 version: 1
 worktree_dir: .worktrees
 
+# Each settled worktree regrows a multi-GB cargo target dir, so keep the
+# window well under the 7d default to bound disk use.
+worktree_retention: 24h
+
 scheduler:
   max_parallel_tasks: 2
 
@@ -8,9 +12,15 @@ agent:
   default_target: opencode
   targets:
     claude:
+      # stream-json emits output as it arrives. Plain `--print` buffers until
+      # exit, which leaves runs unobservable mid-flight and makes the
+      # scheduler's output-silence detection measure silence-by-design.
       cmd:
         - claude
         - --print
+        - --output-format
+        - stream-json
+        - --verbose
         - --model
         - "{model}"
         - --effort
