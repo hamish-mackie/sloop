@@ -127,6 +127,7 @@ fn run_start(run_id: &str) -> RunStart<'_> {
 fn run_exit(run_id: &str) -> RunExit<'_> {
     RunExit {
         run_id,
+        attempt: 1,
         exit_code: Some(0),
         capture_complete: true,
         commits_json: "{}",

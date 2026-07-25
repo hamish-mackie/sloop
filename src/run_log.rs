@@ -66,6 +66,11 @@ pub struct OutputRecord {
     pub source: OutputSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
+    /// Which execution of `stage` produced the chunk. A backward edge re-runs
+    /// a stage, so the stage name alone no longer identifies whose output this
+    /// is. Absent on records captured before re-runs existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
     pub stream: OutputStream,
     #[serde(flatten)]
     pub chunk: OutputChunk,
@@ -112,6 +117,7 @@ impl RunLogWriter {
         &self,
         source: OutputSource,
         stage: Option<&str>,
+        attempt: Option<u32>,
         stream: OutputStream,
         bytes: &[u8],
     ) -> io::Result<u64> {
@@ -120,6 +126,7 @@ impl RunLogWriter {
             i64::try_from(timestamp_ms).unwrap_or(0),
             source,
             stage,
+            attempt,
             stream,
             bytes,
         )
@@ -128,11 +135,13 @@ impl RunLogWriter {
     /// Appends a chunk with a caller-supplied clock instant. Agent output uses
     /// the daemon clock so scheduler deadlines and persisted output agree in
     /// tests as well as production.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_at(
         &self,
         timestamp_ms: i64,
         source: OutputSource,
         stage: Option<&str>,
+        attempt: Option<u32>,
         stream: OutputStream,
         bytes: &[u8],
     ) -> io::Result<u64> {
@@ -147,6 +156,7 @@ impl RunLogWriter {
             timestamp,
             source,
             stage: stage.map(str::to_owned),
+            attempt,
             stream,
             chunk: OutputChunk::from_bytes(bytes),
         };
@@ -338,6 +348,53 @@ pub fn visit_agent_output(
     Ok(())
 }
 
+/// The trailing `lines` lines one stage execution captured, decoded as text.
+///
+/// This is the only read that narrows to a single *execution* rather than a
+/// stage: it feeds the "previous attempt failed" block a re-entered agent
+/// stage is prompted with, and quoting a different attempt's output there
+/// would send the agent after the wrong failure. Records written before
+/// attempts were tagged carry none and are claimed by the first attempt, which
+/// is the only one such a run ever had.
+pub fn stage_output_tail(
+    path: &Path,
+    stage: &str,
+    attempt: u32,
+    lines: usize,
+) -> io::Result<String> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(error) => return Err(error),
+    };
+    let mut captured = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let Ok(record) = serde_json::from_str::<OutputRecord>(&line?) else {
+            continue;
+        };
+        if record.stage.as_deref() != Some(stage) {
+            continue;
+        }
+        if record.attempt.unwrap_or(1) != attempt {
+            continue;
+        }
+        captured.extend_from_slice(&record.chunk.into_bytes());
+    }
+    // Chunks are pipe reads, not lines, so the text is only split into lines
+    // after reassembly.
+    let text = String::from_utf8_lossy(&captured);
+    let text = text.strip_suffix('\n').unwrap_or(&text);
+    if text.is_empty() {
+        return Ok(String::new());
+    }
+    let total = text.lines().count();
+    Ok(text
+        .lines()
+        .skip(total.saturating_sub(lines))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 /// Selects the records belonging to one flow stage. Stage records carry
 /// their stage name; agent records captured before stages were tagged carry
 /// none, so `agent_fallback` lets the flow's agent stage claim them.
@@ -452,7 +509,13 @@ mod tests {
         let writer = RunLogWriter::open(path).unwrap();
         for (source, stage, text) in records {
             writer
-                .append(*source, *stage, OutputStream::Stdout, text.as_bytes())
+                .append(
+                    *source,
+                    *stage,
+                    Some(1),
+                    OutputStream::Stdout,
+                    text.as_bytes(),
+                )
                 .unwrap();
         }
     }
@@ -601,6 +664,110 @@ mod tests {
         assert_eq!(texts(&capped), ["two"]);
     }
 
+    /// The block a re-entered stage is prompted with quotes one execution, so
+    /// the tail must never mix a stage's attempts together.
+    #[test]
+    fn a_stage_tail_selects_one_execution_and_keeps_its_last_lines() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("output.ndjson");
+        let writer = RunLogWriter::open(&path).unwrap();
+        for attempt in 1..=2 {
+            for index in 0..4 {
+                writer
+                    .append(
+                        OutputSource::Stage,
+                        Some("test"),
+                        Some(attempt),
+                        OutputStream::Stdout,
+                        format!("a{attempt} line {index}\n").as_bytes(),
+                    )
+                    .unwrap();
+            }
+        }
+        writer
+            .append(
+                OutputSource::Agent,
+                Some("build"),
+                Some(1),
+                OutputStream::Stdout,
+                b"not the test stage\n",
+            )
+            .unwrap();
+        drop(writer);
+
+        assert_eq!(
+            super::stage_output_tail(&path, "test", 1, 2).unwrap(),
+            "a1 line 2\na1 line 3"
+        );
+        assert_eq!(
+            super::stage_output_tail(&path, "test", 2, 100).unwrap(),
+            "a2 line 0\na2 line 1\na2 line 2\na2 line 3"
+        );
+        // A stage that never ran, and a run with no output at all, are both
+        // simply nothing to quote rather than an error.
+        assert_eq!(super::stage_output_tail(&path, "test", 3, 10).unwrap(), "");
+        assert_eq!(
+            super::stage_output_tail(&directory.path().join("absent.ndjson"), "test", 1, 10)
+                .unwrap(),
+            ""
+        );
+    }
+
+    /// Chunks are pipe reads, not lines: a line split across two records is
+    /// one line in the tail, and the count applies after reassembly.
+    #[test]
+    fn a_stage_tail_counts_lines_after_reassembling_chunks() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("output.ndjson");
+        let writer = RunLogWriter::open(&path).unwrap();
+        for chunk in ["one\ntw", "o\nthr", "ee\n"] {
+            writer
+                .append(
+                    OutputSource::Stage,
+                    Some("test"),
+                    Some(1),
+                    OutputStream::Stdout,
+                    chunk.as_bytes(),
+                )
+                .unwrap();
+        }
+        drop(writer);
+
+        assert_eq!(
+            super::stage_output_tail(&path, "test", 1, 10).unwrap(),
+            "one\ntwo\nthree"
+        );
+        assert_eq!(
+            super::stage_output_tail(&path, "test", 1, 1).unwrap(),
+            "three"
+        );
+    }
+
+    /// Output captured before attempts were tagged belongs to the only
+    /// execution such a run ever had.
+    #[test]
+    fn untagged_output_is_claimed_by_the_first_attempt() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("output.ndjson");
+        let writer = RunLogWriter::open(&path).unwrap();
+        writer
+            .append(
+                OutputSource::Stage,
+                Some("test"),
+                None,
+                OutputStream::Stdout,
+                b"legacy\n",
+            )
+            .unwrap();
+        drop(writer);
+
+        assert_eq!(
+            super::stage_output_tail(&path, "test", 1, 10).unwrap(),
+            "legacy"
+        );
+        assert_eq!(super::stage_output_tail(&path, "test", 2, 10).unwrap(), "");
+    }
+
     #[test]
     fn utf8_and_binary_chunks_serialize_to_the_documented_shapes() {
         let writer_dir = tempdir().unwrap();
@@ -608,12 +775,19 @@ mod tests {
         let writer = RunLogWriter::open(&path).unwrap();
 
         writer
-            .append(OutputSource::Agent, None, OutputStream::Stdout, b"hello\n")
+            .append(
+                OutputSource::Agent,
+                None,
+                None,
+                OutputStream::Stdout,
+                b"hello\n",
+            )
             .unwrap();
         writer
             .append(
                 OutputSource::Stage,
                 Some("test"),
+                None,
                 OutputStream::Stderr,
                 &[0xff, 0x00],
             )
@@ -655,13 +829,25 @@ mod tests {
 
         let writer = RunLogWriter::open(&path).unwrap();
         writer
-            .append(OutputSource::Agent, None, OutputStream::Stdout, b"one")
+            .append(
+                OutputSource::Agent,
+                None,
+                None,
+                OutputStream::Stdout,
+                b"one",
+            )
             .unwrap();
         drop(writer);
 
         let writer = RunLogWriter::open(&path).unwrap();
         let sequence = writer
-            .append(OutputSource::Agent, None, OutputStream::Stdout, b"two")
+            .append(
+                OutputSource::Agent,
+                None,
+                None,
+                OutputStream::Stdout,
+                b"two",
+            )
             .unwrap();
         assert_eq!(sequence, 2);
 
@@ -683,6 +869,7 @@ mod tests {
                 100_000,
                 OutputSource::Agent,
                 Some("build"),
+                None,
                 OutputStream::Stdout,
                 b"first",
             )
@@ -692,6 +879,7 @@ mod tests {
                 200_000,
                 OutputSource::Stage,
                 Some("test"),
+                None,
                 OutputStream::Stdout,
                 b"ignored",
             )
@@ -710,6 +898,7 @@ mod tests {
                 160_000,
                 OutputSource::Agent,
                 Some("build"),
+                None,
                 OutputStream::Stdout,
                 b"resumed",
             )
@@ -727,7 +916,13 @@ mod tests {
         let path = directory.path().join("output.ndjson");
         let writer = RunLogWriter::open(&path).unwrap();
         writer
-            .append(OutputSource::Agent, None, OutputStream::Stdout, b"kept")
+            .append(
+                OutputSource::Agent,
+                None,
+                None,
+                OutputStream::Stdout,
+                b"kept",
+            )
             .unwrap();
         drop(writer);
 
@@ -747,7 +942,13 @@ mod tests {
         // reuse, and the new record must land on its own line.
         let writer = RunLogWriter::open(&path).unwrap();
         let sequence = writer
-            .append(OutputSource::Agent, None, OutputStream::Stdout, b"next")
+            .append(
+                OutputSource::Agent,
+                None,
+                None,
+                OutputStream::Stdout,
+                b"next",
+            )
             .unwrap();
         assert_eq!(sequence, 2);
 
@@ -770,6 +971,7 @@ mod tests {
             writer
                 .append(
                     OutputSource::Agent,
+                    None,
                     None,
                     OutputStream::Stdout,
                     format!("chunk {index}").as_bytes(),
@@ -798,6 +1000,7 @@ mod tests {
             timestamp: "2026-07-13T20:00:01Z".into(),
             source: OutputSource::Stage,
             stage: Some("test".into()),
+            attempt: Some(2),
             stream: OutputStream::Stderr,
             chunk: OutputChunk::Utf8 { text: "x".into() },
         };
@@ -809,6 +1012,7 @@ mod tests {
                 "timestamp": "2026-07-13T20:00:01Z",
                 "source": "stage",
                 "stage": "test",
+                "attempt": 2,
                 "stream": "stderr",
                 "encoding": "utf8",
                 "text": "x"
@@ -824,12 +1028,19 @@ mod tests {
         let path = directory.path().join("output.ndjson");
         let writer = RunLogWriter::open(&path).unwrap();
         writer
-            .append(OutputSource::Agent, None, OutputStream::Stderr, b"rate li")
+            .append(
+                OutputSource::Agent,
+                None,
+                None,
+                OutputStream::Stderr,
+                b"rate li",
+            )
             .unwrap();
         writer
             .append(
                 OutputSource::Stage,
                 Some("test"),
+                None,
                 OutputStream::Stderr,
                 b"must not match",
             )
@@ -838,12 +1049,19 @@ mod tests {
             .append(
                 OutputSource::Agent,
                 None,
+                None,
                 OutputStream::Stdout,
                 &[0xff, b'o', b'k'],
             )
             .unwrap();
         writer
-            .append(OutputSource::Agent, None, OutputStream::Stderr, b"mited")
+            .append(
+                OutputSource::Agent,
+                None,
+                None,
+                OutputStream::Stderr,
+                b"mited",
+            )
             .unwrap();
         drop(writer);
 

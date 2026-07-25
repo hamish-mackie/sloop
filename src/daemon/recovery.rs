@@ -236,6 +236,23 @@ pub(super) fn executing_stage(
         .map_or_else(|| "agent".to_owned(), |stage| stage.name)
 }
 
+/// Which execution of the executing stage the driver last checkpointed. The
+/// checkpoint is the only durable record of where the interrupted daemon
+/// stood, so an exit recovery credits the execution it was actually watching.
+pub(super) fn executing_attempt(run_store: &RunStore, run_id: &str) -> u32 {
+    run_store
+        .run_evidence(run_id)
+        .ok()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|(kind, _)| kind == STAGE_PROCESS)
+                .and_then(|(_, data)| serde_json::from_str::<serde_json::Value>(data).ok())
+                .and_then(|data| data["attempt"].as_u64())
+        })
+        .and_then(|attempt| u32::try_from(attempt).ok())
+        .unwrap_or(1)
+}
+
 async fn release_interrupted_claims(
     state: &mut DispatcherState,
     log: &OperationalLog,
@@ -665,6 +682,10 @@ fn claim_recovered_exit(
             let run_store = RunStore::from_db(db);
             let exit = RunExit {
                 run_id,
+                // The interrupted execution is the one the driver last
+                // checkpointed a process for; a run with none behind it only
+                // ever had a first.
+                attempt: executing_attempt(&run_store, run_id),
                 exit_code: *exit_code,
                 capture_complete: *capture_complete,
                 commits_json: &json!({"complete": commit_observation_complete, "oids": commits})

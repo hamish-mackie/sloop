@@ -553,18 +553,30 @@ fn stage_strip(stages: &Value) -> String {
             if let Some(silent_for_ms) = stage["silent_for_ms"].as_i64() {
                 return format!(
                     "{}:running (no output {})",
-                    stage["stage"].as_str().unwrap_or("?"),
+                    stage_label(stage),
                     duration(silent_for_ms),
                 );
             }
             format!(
                 "{}:{}",
-                stage["stage"].as_str().unwrap_or("?"),
+                stage_label(stage),
                 stage_marker(stage["state"].as_str().unwrap_or("")),
             )
         })
         .collect::<Vec<_>>()
         .join("  ")
+}
+
+/// How a stage execution is named in output. A backward edge re-enters a
+/// stage, so its name alone stops identifying a row — `build#2` says which
+/// pass it was. The suffix appears only past the first attempt: every stage in
+/// a flow without loops runs once, and saying so would be noise on every line.
+fn stage_label(stage: &Value) -> String {
+    let name = stage["stage"].as_str().unwrap_or("?");
+    match stage["attempt"].as_u64() {
+        Some(attempt) if attempt > 1 => format!("{name}#{attempt}"),
+        _ => name.to_owned(),
+    }
 }
 
 fn stage_marker(state: &str) -> &'static str {
@@ -633,19 +645,13 @@ fn run_stages(stages: &Value) -> String {
     let Some(stages) = stages.as_array().filter(|stages| !stages.is_empty()) else {
         return String::new();
     };
-    let name_width = stages
-        .iter()
-        .filter_map(|stage| stage["stage"].as_str())
-        .map(str::len)
-        .max()
-        .unwrap_or(5)
-        .max(5);
+    let names: Vec<String> = stages.iter().map(stage_label).collect();
+    let name_width = names.iter().map(String::len).max().unwrap_or(5).max(5);
     let mut text = String::from("stages:\n");
-    for stage in stages {
+    for (stage, name) in stages.iter().zip(&names) {
         let state = stage["state"].as_str().unwrap_or("?");
         let mut line = format!(
-            "  {:name_width$}  {state:7}  {}",
-            stage["stage"].as_str().unwrap_or("?"),
+            "  {name:name_width$}  {state:7}  {}",
             span(
                 stage["started_at_ms"].as_i64(),
                 stage["finished_at_ms"].as_i64()
@@ -1228,6 +1234,79 @@ mod tests {
                 clock_at(61_000),
                 clock_at(252_000),
             )
+        );
+    }
+
+    /// A stage a backward edge re-entered appears once per execution, and the
+    /// re-runs are told apart by the attempt suffix. Without it the table
+    /// would show two identically-named `test` rows disagreeing about the
+    /// verdict.
+    #[test]
+    fn run_show_tells_re_runs_apart_by_attempt() {
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "ref": "TICK-1-r1",
+                "kind": "run",
+                "value": {
+                    "id": "R14", "alias": "TICK-1-r1", "ticket": "TICK-1",
+                    "state": "merged", "terminal": true,
+                    "stages": [
+                        {"stage": "build", "state": "passed", "attempt": 1, "attempts": 1},
+                        {"stage": "build", "state": "passed", "attempt": 2, "attempts": 1},
+                        {"stage": "test", "state": "failed", "attempt": 1, "attempts": 1,
+                         "exit_code": 1},
+                        {"stage": "test", "state": "passed", "attempt": 2, "attempts": 1,
+                         "exit_code": 0},
+                        {"stage": "merge", "state": "passed", "attempt": 1, "attempts": 1},
+                    ],
+                }
+            }),
+        );
+
+        assert_eq!(
+            render(Some("show"), &response),
+            concat!(
+                "TICK-1-r1  (merged)\n",
+                "ticket: TICK-1\n",
+                "stages:\n",
+                "  build    passed   -\n",
+                "  build#2  passed   -\n",
+                "  test     failed   -  exit 1\n",
+                "  test#2   passed   -  exit 0\n",
+                "  merge    passed   -\n",
+            )
+        );
+    }
+
+    /// The ticket view's strip carries the same distinction, so a loop is
+    /// visible without opening the run.
+    #[test]
+    fn the_ticket_strip_marks_re_runs_too() {
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "ref": "TICK-1",
+                "kind": "ticket",
+                "value": {
+                    "id": "TICK-1", "name": "loop", "state": "merged", "blocked_by": [],
+                    "runs": [{
+                        "alias": "TICK-1-r1", "state": "merged",
+                        "stages": [
+                            {"stage": "build", "state": "passed", "attempt": 1},
+                            {"stage": "build", "state": "passed", "attempt": 2},
+                            {"stage": "test", "state": "failed", "attempt": 1},
+                            {"stage": "test", "state": "passed", "attempt": 2},
+                        ],
+                    }],
+                }
+            }),
+        );
+
+        assert!(
+            render(Some("show"), &response).contains("build:ok  build#2:ok  test:FAIL  test#2:ok"),
+            "{}",
+            render(Some("show"), &response)
         );
     }
 

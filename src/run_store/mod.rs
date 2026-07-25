@@ -80,6 +80,11 @@ pub struct RunStart<'a> {
 /// driver.
 pub struct RunExit<'a> {
     pub run_id: &'a str,
+    /// Which execution of the run's primary agent stage exited. A backward
+    /// edge can re-enter that stage, and the checkpoint has to say which
+    /// execution it speaks for or a resumed run would resolve a re-entry from
+    /// an earlier attempt's exit.
+    pub attempt: u32,
     pub exit_code: Option<i32>,
     pub capture_complete: bool,
     pub commits_json: &'a str,
@@ -359,6 +364,7 @@ impl RunStore {
     pub(crate) fn record_agent_exit(
         &self,
         run_id: &str,
+        attempt: u32,
         exit_code: Option<i32>,
         capture_complete: bool,
         commits_json: &str,
@@ -381,6 +387,7 @@ impl RunStore {
         evidence::tx::record_agent_exit(
             &transaction,
             run_id,
+            attempt,
             exit_code,
             capture_complete,
             commits_json,
@@ -417,6 +424,7 @@ impl RunStore {
     pub fn record_exit(&self, exit: &RunExit<'_>, now_ms: i64) -> Result<Exit, StoreError> {
         match self.record_agent_exit(
             exit.run_id,
+            exit.attempt,
             exit.exit_code,
             exit.capture_complete,
             exit.commits_json,

@@ -508,6 +508,31 @@ pub(super) async fn reconcile(
                 continue;
             }
         };
+        // `on_fail` predates `fail_action` and does a narrower version of the
+        // same job: a failing stage that gets another chance. It still works,
+        // and is not being removed here, but a flow that uses it is admitted
+        // with a note so the operator learns there is a replacement before the
+        // mechanism goes.
+        let repaired: Vec<&str> = flow
+            .stages
+            .iter()
+            .filter(|stage| stage.on_fail.is_some())
+            .map(|stage| stage.name.as_str())
+            .collect();
+        if !repaired.is_empty() {
+            log.emit_with_fields(
+                LogLevel::Warn,
+                "sloop::dispatcher",
+                "flow_on_fail_deprecated",
+                json!({
+                    "ticket_id": ticket_id,
+                    "run_id": run_id,
+                    "flow": flow.name,
+                    "stages": repaired,
+                    "replacement": "fail_action: { return_to: <stage>, attempts: N }",
+                }),
+            );
+        }
         let Some(activation_id) = ticket.hints.activation_id.as_deref() else {
             release_unrecorded_claim(state, &ticket_ref, &owner, log).await;
             log.emit_with_fields(

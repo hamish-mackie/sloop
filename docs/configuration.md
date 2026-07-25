@@ -273,10 +273,53 @@ An agent action may not use `result_check: none` — grading itself by exiting
 cleanly grades nothing. A merge action must use `result_check: none` because
 the merge result *is* its verdict, and the merge builtin may never be a check.
 
-`fail_action` says what the walk does with a failure. Only `fail` — halt, the
-default — is supported today; `continue` and
-`{ return_to: <stage>, attempts: N }` parse but are rejected until the runner
-records the evidence they need.
+### `fail_action`: what a failure does to the walk
+
+`fail_action` says what the walk does when a stage's result check reads `Fail`.
+The default is `fail`, and most stages want it:
+
+- `fail_action: fail` — halt. Stages after the failed one are never requested,
+  and the run settles on whatever the walk had already produced. This is the
+  default and needs no key.
+- `fail_action: continue` — advisory. The failure is recorded and visible in
+  `sloop show`, and the walk carries on to the next stage. An advisory failure
+  never changes the run's outcome, so a flow can report on something without
+  blocking the merge on it.
+- `fail_action: { return_to: <stage>, attempts: N }` — loop back. The walk
+  re-enters an earlier stage and re-runs the whole span from there through the
+  stage that failed, up to `N` times.
+
+A build→test loop, where a failing test sends the agent back to fix it:
+
+```yaml
+- name: test
+  action: { exec: [cargo, test] }
+  result_check: none
+  fail_action: { return_to: build, attempts: 2 }
+```
+
+`return_to` must name an *earlier* stage: edges only ever point backwards, so a
+flow cannot skip forward past work or loop forever. `attempts` defaults to 1
+and may not exceed 3, and Sloop refuses at parse time any flow whose budgets
+together could execute more than 32 stages in the worst case.
+
+The whole span re-runs, not just the failing stage: a `Pass` recorded inside a
+span the walk went back through is superseded by the re-run, so no stale
+verdict can reach the merge. When the budget runs out, the run lands exactly
+where the same failure would have landed without the edge — a failing `exec` or
+`agent` stage ends it `failed`, a conflicted `merge` parks it `needs_review`.
+
+A re-entered `agent` stage is told why. Sloop appends a delimited
+`previous attempt failed` block to its prompt — after the ticket body and the
+worker instructions — naming the stage that failed, its reason, and the last
+100 lines of its captured output. The block is built from the run's persisted
+evidence, so a daemon that restarts mid-loop composes the same prompt. `exec`
+actions get nothing: their command line is fixed by the flow, so there is
+nowhere for context to go.
+
+`sloop show` renders each execution separately, suffixing re-runs with their
+attempt (`build`, `build#2`), so a converged loop and a stage that only ever
+ran once do not read the same.
 
 The older grammar still parses, as sugar for exactly the same stages:
 `kind: agent` (or the deprecated `kind: build`) is `action: agent`,
@@ -289,7 +332,30 @@ A configured `flow.test_cmd` is inserted as an implicit `result_check:
 none` stage named `test` immediately after the agent action, before the flow's
 own `exec` stages.
 
-### Repairing a failed stage with `on_fail`
+### Repairing a failed stage with `on_fail` (deprecated)
+
+> **Deprecated.** `fail_action: { return_to: <stage> }` does the same job with
+> the flow's own stages, and the daemon logs a `flow_on_fail_deprecated` note
+> when it admits a run whose flow uses `on_fail`. Nothing is removed yet and
+> existing flows keep working, but new flows should prefer a backward edge.
+>
+> The equivalent of a repair block is a failing check stage returning to the
+> stage it guards. Instead of attaching a repair agent to `test`, let `test`
+> send the walk back to `build`:
+>
+> ```yaml
+> - name: build
+>   action: agent
+> - name: test
+>   action: { exec: [cargo, test, --all-targets] }
+>   fail_action: { return_to: build, attempts: 2 }
+> ```
+>
+> The differences are worth knowing. A `return_to` re-runs the ticket's own
+> agent with the failure in its prompt, rather than a separate repair worker
+> with a prompt written into the flow file; and it re-runs every stage in the
+> span, so nothing between `build` and `test` keeps a verdict earned before the
+> fix.
 
 By default a failing `exec` stage ends the run and a conflicted `merge` stage
 parks the ticket in `needs_review`. Both often stem from mechanical problems an

@@ -216,12 +216,21 @@ fn handle_verdict(
         return Err(conflict("the run has no stage currently executing"));
     }
     let rows = run_lookup(state, |run_store| run_store.run_evidence(run_id))?;
-    let stage_name = rows
+    let executing = rows
         .iter()
         .find(|(kind, _)| kind == super::driver::STAGE_PROCESS)
         .and_then(|(_, data)| serde_json::from_str::<serde_json::Value>(data).ok())
-        .and_then(|data| data["stage"].as_str().map(str::to_owned))
         .ok_or_else(|| conflict("the run has no stage process currently executing"))?;
+    let stage_name = executing["stage"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| conflict("the run has no stage process currently executing"))?;
+    // A backward edge can re-enter a reported stage, and each execution is
+    // owed its own report: the attempt is part of what the report is *for*.
+    let attempt = executing["attempt"]
+        .as_u64()
+        .and_then(|attempt| u32::try_from(attempt).ok())
+        .unwrap_or(1);
     let stage = flow
         .stages
         .iter()
@@ -242,6 +251,7 @@ fn handle_verdict(
         .record_stage_verdict(
             run_id,
             &stage_name,
+            attempt,
             verdict,
             args.reason.as_deref(),
             state.clock.now_ms(),

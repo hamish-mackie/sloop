@@ -149,6 +149,18 @@ mod tests {
             "no stage demonstrates an exec result check"
         );
 
+        // The advisory fail action is demonstrated, not merely described in a
+        // comment: a template that only mentions a feature cannot go stale
+        // loudly.
+        use crate::flow::FailAction;
+        assert_eq!(
+            flow.stages
+                .iter()
+                .find(|stage| stage.name == "lint")
+                .map(|stage| &stage.fail_action),
+            Some(&FailAction::Continue)
+        );
+
         // `on_fail` is shown on both stage kinds that accept it.
         let repaired: Vec<&str> = flow
             .stages

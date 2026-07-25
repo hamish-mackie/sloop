@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Flow stages can now bind the two `fail_action` forms that previously parsed
+  but were rejected. `fail_action: continue` makes a stage advisory: its
+  failure is recorded and visible in `sloop show`, the walk carries on, and the
+  run's outcome is unchanged. `fail_action: { return_to: <stage>, attempts: N }`
+  is a bounded backward edge: the walk re-enters an earlier stage and re-runs
+  the whole span from there, so no verdict earned before the loop can reach the
+  merge. Edges must point backwards, `attempts` is capped at 3, and a flow
+  whose budgets could execute more than 32 stages is refused at parse time.
+- A re-entered `agent` stage is told why it is running again. Sloop appends a
+  delimited `previous attempt failed` block to its prompt — after the ticket
+  body and the worker instructions — naming the stage that failed, its resolved
+  reason, and the last 100 lines of that execution's captured output. The block
+  is rebuilt from the run's persisted evidence, so a daemon that restarts
+  mid-loop composes the identical prompt. `exec` actions are handed nothing:
+  their command line is fixed by the flow.
+- `sloop show` renders each stage execution separately, suffixing re-runs with
+  their attempt (`build`, `build#2`), and a non-merged run's derived `reason`
+  names the failure the walk actually stopped on rather than one a later
+  attempt superseded.
+
+### Changed
+
+- Captured output records, stage-process checkpoints, agent-exit checkpoints,
+  and reported verdicts are all scoped to `(stage, attempt)` rather than stage
+  alone, so a re-entered stage gets its own output, its own worker report, and
+  its own exit checkpoint instead of inheriting an earlier attempt's.
+
+### Deprecated
+
+- `on_fail` repair blocks. `fail_action: { return_to: <stage> }` covers the
+  same ground with the flow's own stages — a failing check stage returning to
+  the stage it guards — and the daemon now logs a `flow_on_fail_deprecated`
+  note when it admits a run whose flow uses `on_fail`. Nothing is removed:
+  existing flows keep parsing, repairing, and settling exactly as before.
+
 ## [0.3.0] - 2026-07-21
 
 ### Added
