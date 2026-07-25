@@ -18,7 +18,7 @@ fn configure(world: &World, agent_body: &str, test_cmd: Option<&str>) {
     fs::create_dir_all(world.root().join(".agents/sloop/flows")).expect("create flow directory");
     fs::write(
         world.root().join(".agents/sloop/flows/default.yaml"),
-        "stages:\n  - { name: build, kind: build }\n  - { name: merge, kind: merge }\n",
+        "stages:\n  - { name: build, action: agent }\n  - { name: merge, action: { builtin: merge } }\n",
     )
     .expect("write default test flow");
 
@@ -284,7 +284,7 @@ fn flow_executes_in_order_and_records_one_row_per_stage() {
     write_flow(
         &world,
         &format!(
-            "stages:\n  - {{ name: build, kind: build }}\n  - name: check\n    kind: exec\n    cmd: [\"sh\", {}]\n  - {{ name: merge, kind: merge }}\n",
+            "stages:\n  - {{ name: build, action: agent }}\n  - name: check\n    action: {{ exec: [\"sh\", {}] }}\n  - {{ name: merge, action: {{ builtin: merge }} }}\n",
             serde_json::to_string(&check.to_string_lossy()).unwrap(),
         ),
     );
@@ -360,7 +360,7 @@ fn failed_exec_halts_before_merge_and_preserves_commits_for_review() {
     configure(&world, COMMITTING_AGENT, None);
     write_flow(
         &world,
-        "stages:\n  - { name: build, kind: build }\n  - { name: reject, kind: exec, cmd: ['false'] }\n  - { name: merge, kind: merge }\n",
+        "stages:\n  - { name: build, action: agent }\n  - { name: reject, action: { exec: ['false'] } }\n  - { name: merge, action: { builtin: merge } }\n",
     );
     world.commit_all("initial");
     world.start_daemon();
@@ -388,7 +388,7 @@ fn check_verdict_uses_the_check_commands_exit() {
     configure(&passing, COMMITTING_AGENT, None);
     write_flow(
         &passing,
-        "stages:\n  - { name: build, kind: agent }\n  - { name: verify, kind: exec, cmd: ['true'], verdict: { check: ['true'] } }\n  - { name: merge, kind: merge }\n",
+        "stages:\n  - { name: build, action: agent }\n  - { name: verify, action: { exec: ['true'] }, result_check: { exec: ['true'] } }\n  - { name: merge, action: { builtin: merge } }\n",
     );
     passing.commit_all("initial");
     passing.start_daemon();
@@ -401,7 +401,7 @@ fn check_verdict_uses_the_check_commands_exit() {
     configure(&failing, COMMITTING_AGENT, None);
     write_flow(
         &failing,
-        "stages:\n  - { name: build, kind: agent }\n  - { name: verify, kind: exec, cmd: ['true'], verdict: { check: ['false'] } }\n  - { name: merge, kind: merge }\n",
+        "stages:\n  - { name: build, action: agent }\n  - { name: verify, action: { exec: ['true'] }, result_check: { exec: ['false'] } }\n  - { name: merge, action: { builtin: merge } }\n",
     );
     failing.commit_all("initial");
     failing.start_daemon();
@@ -443,7 +443,7 @@ fn a_check_actor_records_its_own_row_beside_the_action_it_judged() {
     configure(&world, COMMITTING_AGENT, None);
     write_flow(
         &world,
-        "stages:\n  - { name: build, kind: agent }\n  - { name: verify, kind: exec, cmd: ['sh', '-c', 'exit 0'], verdict: { check: ['true'] } }\n  - { name: merge, kind: merge }\n",
+        "stages:\n  - { name: build, action: agent }\n  - { name: verify, action: { exec: ['sh', '-c', 'exit 0'] }, result_check: { exec: ['true'] } }\n  - { name: merge, action: { builtin: merge } }\n",
     );
     world.commit_all("initial");
     world.start_daemon();
@@ -509,7 +509,7 @@ fn reported_stage_without_a_report_fails_with_a_reason() {
     configure(&world, COMMITTING_AGENT, None);
     write_flow(
         &world,
-        "stages:\n  - { name: build, kind: agent }\n  - { name: review, kind: exec, cmd: ['true'], verdict: reported }\n  - { name: merge, kind: merge }\n",
+        "stages:\n  - { name: build, action: agent }\n  - { name: review, action: { exec: ['true'] }, result_check: reported }\n  - { name: merge, action: { builtin: merge } }\n",
     );
     world.commit_all("initial");
     world.start_daemon();
@@ -541,7 +541,7 @@ fn a_reported_review_gates_the_merge_in_both_directions() {
         write_flow(
             world,
             &format!(
-                "stages:\n  - {{ name: build, kind: agent }}\n  - {{ name: review, kind: exec, cmd: ['sh', '{}'], verdict: reported }}\n  - {{ name: merge, kind: merge }}\n",
+                "stages:\n  - {{ name: build, action: agent }}\n  - {{ name: review, action: {{ exec: ['sh', '{}'] }}, result_check: reported }}\n  - {{ name: merge, action: {{ builtin: merge }} }}\n",
                 reviewer.display()
             ),
         );
@@ -687,7 +687,7 @@ fn incomplete_commit_observation_keeps_a_failed_later_stage_for_review() {
     );
     write_flow(
         &world,
-        "stages:\n  - { name: build, kind: build }\n  - { name: reject, kind: exec, cmd: ['false'] }\n  - { name: merge, kind: merge }\n",
+        "stages:\n  - { name: build, action: agent }\n  - { name: reject, action: { exec: ['false'] } }\n  - { name: merge, action: { builtin: merge } }\n",
     );
     world.commit_all("initial");
     world.start_daemon();
@@ -712,7 +712,7 @@ fn exec_stage_order_comes_from_the_flow_file() {
     write_flow(
         &world,
         &format!(
-            "stages:\n  - {{ name: build, kind: build }}\n  - {{ name: first, kind: exec, cmd: [\"sh\", \"-c\", \"printf first, >> {}\"] }}\n  - {{ name: second, kind: exec, cmd: [\"sh\", \"-c\", \"printf second >> {}\"] }}\n  - {{ name: merge, kind: merge }}\n",
+            "stages:\n  - {{ name: build, action: agent }}\n  - {{ name: first, action: {{ exec: [\"sh\", \"-c\", \"printf first, >> {}\"] }} }}\n  - {{ name: second, action: {{ exec: [\"sh\", \"-c\", \"printf second >> {}\"] }} }}\n  - {{ name: merge, action: {{ builtin: merge }} }}\n",
             order.display(),
             order.display(),
         ),
@@ -736,7 +736,7 @@ fn restart_between_exec_stages_skips_the_completed_stage() {
     fs::write(
         world.root().join(".agents/sloop/flows/resume.yaml"),
         format!(
-            "stages:\n  - {{ name: build, kind: build }}\n  - {{ name: first, kind: exec, cmd: [\"sh\", \"-c\", \"printf 1 >> {}\"] }}\n  - {{ name: second, kind: exec, cmd: [\"sh\", \"-c\", \"printf 2 >> {}\"] }}\n  - {{ name: merge, kind: merge }}\n",
+            "stages:\n  - {{ name: build, action: agent }}\n  - {{ name: first, action: {{ exec: [\"sh\", \"-c\", \"printf 1 >> {}\"] }} }}\n  - {{ name: second, action: {{ exec: [\"sh\", \"-c\", \"printf 2 >> {}\"] }} }}\n  - {{ name: merge, action: {{ builtin: merge }} }}\n",
             invocations.display(),
             invocations.display(),
         ),
@@ -836,7 +836,7 @@ fn a_run_planted_in_the_old_stage_shape_migrates_and_resumes_where_it_stood() {
     fs::write(
         world.root().join(".agents/sloop/flows/resume.yaml"),
         format!(
-            "stages:\n  - {{ name: build, kind: build }}\n  - {{ name: first, kind: exec, cmd: [\"sh\", \"-c\", \"printf 1 >> {}\"] }}\n  - {{ name: second, kind: exec, cmd: [\"sh\", \"-c\", \"printf 2 >> {}\"] }}\n  - {{ name: merge, kind: merge }}\n",
+            "stages:\n  - {{ name: build, action: agent }}\n  - {{ name: first, action: {{ exec: [\"sh\", \"-c\", \"printf 1 >> {}\"] }} }}\n  - {{ name: second, action: {{ exec: [\"sh\", \"-c\", \"printf 2 >> {}\"] }} }}\n  - {{ name: merge, action: {{ builtin: merge }} }}\n",
             invocations.display(),
             invocations.display(),
         ),
@@ -914,7 +914,7 @@ fn cancel_kills_a_custom_exec_process_group_and_preserves_the_worktree() {
     write_flow(
         &world,
         &format!(
-            "stages:\n  - {{ name: build, kind: build }}\n  - {{ name: wait, kind: exec, cmd: [\"sh\", \"-c\", \"sleep 1000 & printf '%s %s' $$ $! > {}; wait\"] }}\n  - {{ name: merge, kind: merge }}\n",
+            "stages:\n  - {{ name: build, action: agent }}\n  - {{ name: wait, action: {{ exec: [\"sh\", \"-c\", \"sleep 1000 & printf '%s %s' $$ $! > {}; wait\"] }} }}\n  - {{ name: merge, action: {{ builtin: merge }} }}\n",
             process_ids.display(),
         ),
     );
@@ -946,7 +946,7 @@ fn cancel_never_signals_a_recycled_stage_process_group() {
     write_flow(
         &world,
         &format!(
-            "stages:\n  - {{ name: build, kind: build }}\n  - {{ name: wait, kind: exec, cmd: [\"sh\", \"-c\", \"sleep 1000 & printf '%s %s' $$ $! > {}; wait\"] }}\n  - {{ name: merge, kind: merge }}\n",
+            "stages:\n  - {{ name: build, action: agent }}\n  - {{ name: wait, action: {{ exec: [\"sh\", \"-c\", \"sleep 1000 & printf '%s %s' $$ $! > {}; wait\"] }} }}\n  - {{ name: merge, action: {{ builtin: merge }} }}\n",
             process_ids.display(),
         ),
     );
@@ -1005,7 +1005,7 @@ fn exec_stage_exit_kills_pipe_holding_stragglers() {
     write_flow(
         &world,
         &format!(
-            "stages:\n  - {{ name: build, kind: build }}\n  - {{ name: check, kind: exec, cmd: [\"sh\", \"-c\", \"sleep 600 & echo $! > {}; exit 0\"] }}\n  - {{ name: merge, kind: merge }}\n",
+            "stages:\n  - {{ name: build, action: agent }}\n  - {{ name: check, action: {{ exec: [\"sh\", \"-c\", \"sleep 600 & echo $! > {}; exit 0\"] }} }}\n  - {{ name: merge, action: {{ builtin: merge }} }}\n",
             process_id.display(),
         ),
     );
@@ -1030,7 +1030,7 @@ fn recovery_does_not_signal_a_group_after_the_recorded_leader_exits() {
     write_flow(
         &world,
         &format!(
-            "stages:\n  - {{ name: build, kind: build }}\n  - {{ name: wait, kind: exec, cmd: [\"sh\", \"-c\", \"sleep 1000 & printf '%s %s\\n' $$ $! >> {}; exit 0\"] }}\n  - {{ name: merge, kind: merge }}\n",
+            "stages:\n  - {{ name: build, action: agent }}\n  - {{ name: wait, action: {{ exec: [\"sh\", \"-c\", \"sleep 1000 & printf '%s %s\\n' $$ $! >> {}; exit 0\"] }} }}\n  - {{ name: merge, action: {{ builtin: merge }} }}\n",
             process_ids.display(),
         ),
     );
@@ -1640,7 +1640,7 @@ fn cancellation_at_arbitrary_exec_startup_kills_the_stage_group() {
     write_flow(
         &world,
         &format!(
-            "stages:\n  - {{ name: build, kind: build }}\n  - {{ name: wait, kind: exec, cmd: [\"sh\", \"-c\", \"sleep 1000 & printf '%s %s' $$ $! > {}; wait\"] }}\n  - {{ name: merge, kind: merge }}\n",
+            "stages:\n  - {{ name: build, action: agent }}\n  - {{ name: wait, action: {{ exec: [\"sh\", \"-c\", \"sleep 1000 & printf '%s %s' $$ $! > {}; wait\"] }} }}\n  - {{ name: merge, action: {{ builtin: merge }} }}\n",
             process_ids.display(),
         ),
     );
@@ -2330,7 +2330,7 @@ fn a_target_cooldown_does_not_block_other_agent_targets() {
     fs::create_dir_all(world.root().join(".agents/sloop/flows")).unwrap();
     write_flow(
         &world,
-        "stages:\n  - { name: build, kind: build }\n  - { name: merge, kind: merge }\n",
+        "stages:\n  - { name: build, action: agent }\n  - { name: merge, action: { builtin: merge } }\n",
     );
     let limited = world.root().join("limited.sh");
     let healthy = world.root().join("healthy.sh");
@@ -2505,7 +2505,7 @@ fn a_two_agent_flow_supervises_both_stages_with_separate_worker_tokens() {
     configure(&world, REVIEWING_AGENT, None);
     write_flow(
         &world,
-        "stages:\n  - { name: build, kind: agent }\n  - { name: review, kind: agent, verdict: reported }\n  - { name: merge, kind: merge }\n",
+        "stages:\n  - { name: build, action: agent }\n  - { name: review, action: agent, result_check: reported }\n  - { name: merge, action: { builtin: merge } }\n",
     );
     world.commit_all("initial");
     world.start_daemon();
@@ -2574,7 +2574,7 @@ fn an_agent_stage_after_an_exec_stage_runs_supervised_with_its_own_token() {
     write_flow(
         &world,
         &format!(
-            "stages:\n  - {{ name: prepare, kind: exec, cmd: [\"sh\", \"-c\", \"printf ready > {}\"] }}\n  - {{ name: build, kind: agent }}\n  - {{ name: merge, kind: merge }}\n",
+            "stages:\n  - {{ name: prepare, action: {{ exec: [\"sh\", \"-c\", \"printf ready > {}\"] }} }}\n  - {{ name: build, action: agent }}\n  - {{ name: merge, action: {{ builtin: merge }} }}\n",
             prepared.display(),
         ),
     );
@@ -2617,7 +2617,7 @@ fn restart_during_the_first_stage_resumes_the_flow() {
     write_flow(
         &world,
         &format!(
-            "stages:\n  - {{ name: open, kind: exec, cmd: [\"sh\", \"-c\", \"printf x >> {}\"] }}\n  - {{ name: build, kind: agent }}\n  - {{ name: merge, kind: merge }}\n",
+            "stages:\n  - {{ name: open, action: {{ exec: [\"sh\", \"-c\", \"printf x >> {}\"] }} }}\n  - {{ name: build, action: agent }}\n  - {{ name: merge, action: {{ builtin: merge }} }}\n",
             invocations.display(),
         ),
     );
@@ -2664,7 +2664,7 @@ fn cancel_kills_an_agent_stage_process_group_in_a_later_position() {
     configure(&world, &agent, None);
     write_flow(
         &world,
-        "stages:\n  - { name: prepare, kind: exec, cmd: [\"true\"] }\n  - { name: build, kind: agent }\n  - { name: merge, kind: merge }\n",
+        "stages:\n  - { name: prepare, action: { exec: [\"true\"] } }\n  - { name: build, action: agent }\n  - { name: merge, action: { builtin: merge } }\n",
     );
     world.commit_all("initial");
     world.start_daemon();

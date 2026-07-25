@@ -86,7 +86,7 @@ fn invalid_flow_prevents_daemon_startup_with_a_named_error() {
     fs::create_dir_all(world.root().join(".agents/sloop/flows")).unwrap();
     fs::write(
         world.root().join(".agents/sloop/flows/broken.yaml"),
-        "- { name: build, kind: build }\n- { name: surprise, kind: unknown }\n",
+        "- { name: build, action: agent }\n- { name: surprise, action: unknown }\n",
     )
     .unwrap();
 
@@ -95,7 +95,7 @@ fn invalid_flow_prevents_daemon_startup_with_a_named_error() {
     let response = World::json_stdout_or_stderr(&output);
     let message = response["error"]["message"].as_str().unwrap();
     assert!(message.contains("broken.yaml"), "{message}");
-    assert!(message.contains("unknown kind `unknown`"), "{message}");
+    assert!(message.contains("unknown action `unknown`"), "{message}");
 }
 
 /// The templates are the only grammar documentation an installed binary can
@@ -155,7 +155,7 @@ fn the_printed_templates_post_cleanly_in_a_fresh_repository() {
     // post rather than being discovered when the run is dispatched.
     fs::write(
         world.root().join(".agents/sloop/flows/broken.yaml"),
-        "- { name: build, kind: agent }\n- { name: oops, kind: nonsense }\n",
+        "- { name: build, action: agent }\n- { name: oops, action: nonsense }\n",
     )
     .unwrap();
     let rejected = world.sloop(&[

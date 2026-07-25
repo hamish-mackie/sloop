@@ -109,7 +109,7 @@ fn configure_worker_agent(world: &World, blocking: bool) {
     fs::create_dir_all(world.root().join(".agents/sloop/flows")).unwrap();
     fs::write(
         world.root().join(".agents/sloop/flows/default.yaml"),
-        "stages:\n  - { name: build, kind: build }\n  - { name: merge, kind: merge }\n",
+        "stages:\n  - { name: build, action: agent }\n  - { name: merge, action: { builtin: merge } }\n",
     )
     .unwrap();
     let script = world.root().join("worker-agent.sh");
@@ -320,7 +320,7 @@ fn reported_stage_records_the_first_verdict_and_rejects_the_second() {
     fs::write(
         world.root().join(".agents/sloop/flows/default.yaml"),
         format!(
-            "stages:\n  - {{ name: build, kind: agent }}\n  - name: review\n    kind: exec\n    cmd: [\"sh\", {}]\n    verdict: reported\n  - {{ name: merge, kind: merge }}\n",
+            "stages:\n  - {{ name: build, action: agent }}\n  - name: review\n    action: {{ exec: [\"sh\", {}] }}\n    result_check: reported\n  - {{ name: merge, action: {{ builtin: merge }} }}\n",
             serde_json::to_string(&reviewer.to_string_lossy()).expect("quote reviewer path"),
         ),
     )
@@ -392,7 +392,7 @@ fn a_worker_brief_uses_the_ticket_body_captured_at_claim() {
     });
     fs::write(
         world.root().join(".agents/sloop/flows/default.yaml"),
-        "- { name: build, kind: unknown }\n",
+        "- { name: build, action: unknown }\n",
     )
     .expect("invalidate the flow after admission");
     fs::write(
@@ -421,7 +421,7 @@ fn project_show_groups_notes_and_git_commits_without_writing_source_files() {
     fs::create_dir_all(world.root().join(".agents/sloop/flows")).unwrap();
     fs::write(
         world.root().join(".agents/sloop/flows/default.yaml"),
-        "stages:\n  - { name: build, kind: build }\n  - { name: merge, kind: merge }\n",
+        "stages:\n  - { name: build, action: agent }\n  - { name: merge, action: { builtin: merge } }\n",
     )
     .unwrap();
     let script = world.root().join("activity-agent.sh");

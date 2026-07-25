@@ -148,7 +148,7 @@ fn operational_verbs_survive_an_invalid_flow_and_stop_the_daemon() {
     let run = world.run_id(1);
     fs::write(
         world.root().join(".agents/sloop/flows/default.yaml"),
-        "- { name: build, kind: unknown }\n",
+        "- { name: build, action: unknown }\n",
     )
     .expect("invalidate the flow file");
 
@@ -185,7 +185,7 @@ fn operational_verbs_survive_an_invalid_flow_and_stop_the_daemon() {
     assert_eq!(error["error"]["code"], "invalid_arguments");
     let message = error["error"]["message"].as_str().unwrap();
     assert!(message.contains("default.yaml"), "{message}");
-    assert!(message.contains("unknown kind `unknown`"), "{message}");
+    assert!(message.contains("unknown action `unknown`"), "{message}");
 }
 
 #[test]

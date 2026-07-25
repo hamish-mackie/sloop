@@ -38,9 +38,9 @@ pub struct Flow {
 ///
 /// The split is the point. The action is whatever produces the work and is
 /// never trusted to grade itself; the check is a separate actor (or the
-/// action's own exit, or a worker's report) that decides. The four verdict
-/// policies of the old grammar are now configurations of this shape rather
-/// than concepts of their own.
+/// action's own exit, or a worker's report) that decides. Every judgement a
+/// stage can carry is a configuration of this one shape rather than a policy
+/// of its own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Stage {
     pub name: String,
@@ -329,8 +329,9 @@ pub fn parse(name: &str, contents: &str) -> Result<Flow, String> {
         if !names.insert(raw.name.clone()) {
             return Err(format!("duplicate stage name `{}`", raw.name));
         }
-        let (action, ff_only) = parse_action(&raw.name, raw.action, raw.kind, raw.cmd)?;
-        let result_check = parse_result_check(&raw.name, &action, raw.result_check, raw.verdict)?;
+        reject_removed_keys(&raw)?;
+        let (action, ff_only) = parse_action(&raw.name, raw.action)?;
+        let result_check = parse_result_check(&raw.name, &action, raw.result_check)?;
         let fail_action = parse_fail_action(&raw.name, raw.fail_action)?;
         validate_stage(&raw.name, &action, &result_check)?;
         let on_fail = match raw.on_fail {
@@ -360,89 +361,68 @@ pub fn parse(name: &str, contents: &str) -> Result<Flow, String> {
     })
 }
 
-/// Resolves a stage's action from either grammar, along with the `ff_only`
-/// option the merge builtin alone accepts. The old `kind`/`cmd` pair is sugar
-/// for the same `Actor`s the new `action` key names directly, so the two are
-/// mutually exclusive rather than merged.
-fn parse_action(
-    stage: &str,
-    action: Option<RawActor>,
-    kind: Option<String>,
-    cmd: Option<Vec<String>>,
-) -> Result<(Actor, bool), String> {
-    match (action, kind) {
-        (Some(_), Some(_)) => Err(format!(
-            "stage `{stage}` must not define both `action` and `kind`"
-        )),
-        (Some(action), None) => {
-            if cmd.is_some() {
+/// Refuses the pre-`action` grammar by name. The keys are still read off the
+/// stage (see [`RawStage`]) for exactly this: a `0.3.0` flow file *does* say
+/// what its stages are, in a spelling nothing reads any more, and the error
+/// that names the replacement is the whole migration experience for whoever
+/// wrote it. Silence — or a generic "must define an `action`" — would leave
+/// them to diff against a template.
+fn reject_removed_keys(raw: &RawStage) -> Result<(), String> {
+    let stage = &raw.name;
+    if raw.kind.is_some() {
+        return Err(format!(
+            "stage `{stage}` uses the removed `kind` key; write `action: agent` instead \
+             (see the 0.4.0 migration table in CHANGELOG.md)"
+        ));
+    }
+    if raw.cmd.is_some() {
+        return Err(format!(
+            "stage `{stage}` uses the removed `cmd` key; write `action: {{ exec: [...] }}`"
+        ));
+    }
+    if raw.verdict.is_some() {
+        return Err(format!(
+            "stage `{stage}` uses the removed `verdict` key; write `result_check: ...`"
+        ));
+    }
+    Ok(())
+}
+
+/// Resolves a stage's action, along with the `ff_only` option the merge
+/// builtin alone accepts.
+fn parse_action(stage: &str, action: Option<RawActor>) -> Result<(Actor, bool), String> {
+    let Some(action) = action else {
+        return Err(format!("stage `{stage}` must define an `action`"));
+    };
+    match action {
+        RawActor::Agent { ff_only, .. } => {
+            reject_ff_only(stage, ff_only)?;
+            Ok((Actor::Agent, false))
+        }
+        RawActor::Exec { exec, ff_only } => {
+            reject_ff_only(stage, ff_only)?;
+            if exec.is_empty() {
                 return Err(format!(
-                    "stage `{stage}` must not define `cmd` alongside `action`; \
-                     write `action: {{ exec: [...] }}`"
+                    "stage `{stage}` exec action must define a non-empty command"
                 ));
             }
-            match action {
-                RawActor::Agent { ff_only, .. } => {
-                    reject_ff_only(stage, ff_only)?;
-                    Ok((Actor::Agent, false))
-                }
-                RawActor::Exec { exec, ff_only } => {
-                    reject_ff_only(stage, ff_only)?;
-                    if exec.is_empty() {
-                        return Err(format!(
-                            "stage `{stage}` exec action must define a non-empty command"
-                        ));
-                    }
-                    Ok((Actor::Exec { cmd: exec }, false))
-                }
-                RawActor::Builtin { builtin, ff_only } => match builtin.as_str() {
-                    // The one action `ff_only` means anything to, so the one
-                    // that does not refuse it.
-                    "merge" => Ok((Actor::Builtin(Builtin::Merge), ff_only.unwrap_or_default())),
-                    "sync" => {
-                        reject_ff_only(stage, ff_only)?;
-                        Ok((Actor::Builtin(Builtin::Sync), false))
-                    }
-                    "commits" => Err(format!(
-                        "stage `{stage}` builtin `commits` is a result_check, not an action"
-                    )),
-                    other => Err(format!("stage `{stage}` has unknown builtin `{other}`")),
-                },
-                RawActor::Name(name) if name == "agent" => Ok((Actor::Agent, false)),
-                RawActor::Name(name) => Err(format!("stage `{stage}` has unknown action `{name}`")),
-            }
+            Ok((Actor::Exec { cmd: exec }, false))
         }
-        (None, Some(kind)) => match kind.as_str() {
-            "agent" | "build" => {
-                if cmd.is_some() {
-                    return Err(format!("agent stage `{stage}` must not define `cmd`"));
-                }
-                Ok((Actor::Agent, false))
-            }
-            "merge" => {
-                if cmd.is_some() {
-                    return Err(format!("merge stage `{stage}` must not define `cmd`"));
-                }
-                Ok((Actor::Builtin(Builtin::Merge), false))
-            }
+        RawActor::Builtin { builtin, ff_only } => match builtin.as_str() {
+            // The one action `ff_only` means anything to, so the one that does
+            // not refuse it.
+            "merge" => Ok((Actor::Builtin(Builtin::Merge), ff_only.unwrap_or_default())),
             "sync" => {
-                if cmd.is_some() {
-                    return Err(format!("sync stage `{stage}` must not define `cmd`"));
-                }
+                reject_ff_only(stage, ff_only)?;
                 Ok((Actor::Builtin(Builtin::Sync), false))
             }
-            "exec" => {
-                let cmd = cmd.unwrap_or_default();
-                if cmd.is_empty() {
-                    return Err(format!(
-                        "exec stage `{stage}` must define a non-empty `cmd`"
-                    ));
-                }
-                Ok((Actor::Exec { cmd }, false))
-            }
-            kind => Err(format!("stage `{stage}` has unknown kind `{kind}`")),
+            "commits" => Err(format!(
+                "stage `{stage}` builtin `commits` is a result_check, not an action"
+            )),
+            other => Err(format!("stage `{stage}` has unknown builtin `{other}`")),
         },
-        (None, None) => Err(format!("stage `{stage}` must define an `action`")),
+        RawActor::Name(name) if name == "agent" => Ok((Actor::Agent, false)),
+        RawActor::Name(name) => Err(format!("stage `{stage}` has unknown action `{name}`")),
     }
 }
 
@@ -458,68 +438,45 @@ fn reject_ff_only(stage: &str, ff_only: Option<bool>) -> Result<(), String> {
     }
 }
 
-/// Resolves a stage's result check from either grammar. Each of the four old
-/// verdict policies names one configuration of `Check`.
+/// Resolves a stage's result check, falling back to the check its action
+/// implies when the stage names none.
 fn parse_result_check(
     stage: &str,
     action: &Actor,
     result_check: Option<RawCheck>,
-    verdict: Option<RawVerdict>,
 ) -> Result<Check, String> {
-    match (result_check, verdict) {
-        (Some(_), Some(_)) => Err(format!(
-            "stage `{stage}` must not define both `result_check` and `verdict`"
-        )),
-        (Some(check), None) => match check {
-            RawCheck::Exec { exec } => {
-                if exec.is_empty() {
-                    return Err(format!(
-                        "stage `{stage}` exec result_check must define a non-empty command"
-                    ));
-                }
-                Ok(Check::Actor(Actor::Exec { cmd: exec }))
-            }
-            RawCheck::Builtin { builtin, ff_only } => {
-                reject_ff_only(stage, ff_only)?;
-                match builtin.as_str() {
-                    "commits" => Ok(Check::Actor(Actor::Builtin(Builtin::Commits))),
-                    // Both builtins that act on git refuse the check position:
-                    // a judge that moves a branch is not judging anything.
-                    "merge" | "sync" => Err(format!(
-                        "stage `{stage}` result_check may not be the `{builtin}` builtin"
-                    )),
-                    other => Err(format!("stage `{stage}` has unknown builtin `{other}`")),
-                }
-            }
-            RawCheck::Panel { panel } => Ok(Check::Panel(parse_panel(stage, panel)?)),
-            RawCheck::Name(name) => match name.as_str() {
-                "none" => Ok(Check::None),
-                "reported" => Ok(Check::Reported),
-                other => Err(format!(
-                    "stage `{stage}` has unknown result_check `{other}`"
-                )),
-            },
-        },
-        // A merge's own outcome is its verdict, so the old grammar refuses
-        // the key outright rather than accepting a redundant `exit`.
-        (None, Some(_)) if *action == Actor::Builtin(Builtin::Merge) => {
-            Err(format!("merge stage `{stage}` must not define `verdict`"))
-        }
-        (None, Some(RawVerdict::Name(name))) => match name.as_str() {
-            "exit" => Ok(Check::None),
-            "commits" => Ok(Check::Actor(Actor::Builtin(Builtin::Commits))),
-            "reported" => Ok(Check::Reported),
-            _ => Err(format!("stage `{stage}` has unknown verdict `{name}`")),
-        },
-        (None, Some(RawVerdict::Check { check })) => {
-            if check.is_empty() {
+    let Some(check) = result_check else {
+        return Ok(default_check(action));
+    };
+    match check {
+        RawCheck::Exec { exec } => {
+            if exec.is_empty() {
                 return Err(format!(
-                    "stage `{stage}` check verdict must define a non-empty command"
+                    "stage `{stage}` exec result_check must define a non-empty command"
                 ));
             }
-            Ok(Check::Actor(Actor::Exec { cmd: check }))
+            Ok(Check::Actor(Actor::Exec { cmd: exec }))
         }
-        (None, None) => Ok(default_check(action)),
+        RawCheck::Builtin { builtin, ff_only } => {
+            reject_ff_only(stage, ff_only)?;
+            match builtin.as_str() {
+                "commits" => Ok(Check::Actor(Actor::Builtin(Builtin::Commits))),
+                // Both builtins that act on git refuse the check position:
+                // a judge that moves a branch is not judging anything.
+                "merge" | "sync" => Err(format!(
+                    "stage `{stage}` result_check may not be the `{builtin}` builtin"
+                )),
+                other => Err(format!("stage `{stage}` has unknown builtin `{other}`")),
+            }
+        }
+        RawCheck::Panel { panel } => Ok(Check::Panel(parse_panel(stage, panel)?)),
+        RawCheck::Name(name) => match name.as_str() {
+            "none" => Ok(Check::None),
+            "reported" => Ok(Check::Reported),
+            other => Err(format!(
+                "stage `{stage}` has unknown result_check `{other}`"
+            )),
+        },
     }
 }
 
@@ -611,7 +568,7 @@ fn parse_fail_action(stage: &str, raw: Option<RawFailAction>) -> Result<FailActi
     }
 }
 
-/// Checks the action/check pairing, whichever grammar produced it.
+/// Checks that a stage's action and result check can stand together.
 fn validate_stage(stage: &str, action: &Actor, result_check: &Check) -> Result<(), String> {
     if *action == Actor::Agent && *result_check == Check::None {
         return Err(format!(
@@ -1086,19 +1043,24 @@ enum RawFlowFile {
     Map { stages: Vec<RawStage> },
 }
 
-/// A stage exactly as written. Both grammars are optional here and sorted
-/// out by `parse_action` / `parse_result_check`, so a file mixing them gets
-/// an error naming the conflict rather than a serde message about a shape
-/// nobody wrote.
+/// A stage exactly as written.
+///
+/// The three removed keys are still read — as payloads nobody looks at — so
+/// that `reject_removed_keys` can name them. Unknown fields are otherwise
+/// accepted here, so dropping them outright would turn a `0.3.0` flow file
+/// into a stage that appears to define nothing at all.
 #[derive(Debug, Deserialize)]
 struct RawStage {
     name: String,
     action: Option<RawActor>,
     result_check: Option<RawCheck>,
     fail_action: Option<RawFailAction>,
-    kind: Option<String>,
-    cmd: Option<Vec<String>>,
-    verdict: Option<RawVerdict>,
+    /// Removed in 0.4.0; `action` replaces it.
+    kind: Option<IgnoredAny>,
+    /// Removed in 0.4.0; `action: { exec: [...] }` replaces it.
+    cmd: Option<IgnoredAny>,
+    /// Removed in 0.4.0; `result_check` replaces it.
+    verdict: Option<IgnoredAny>,
     on_fail: Option<RawOnFail>,
 }
 
@@ -1193,13 +1155,6 @@ struct RawOnFail {
     effort: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum RawVerdict {
-    Name(String),
-    Check { check: Vec<String> },
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1226,7 +1181,7 @@ mod tests {
     fn valid_multi_stage_flow_parses_in_order() {
         let flow = parse(
             "release",
-            "stages:\n  - name: build\n    kind: agent\n  - name: test\n    kind: exec\n    cmd: [cargo, test]\n    verdict: { check: [cargo, clippy] }\n  - name: merge\n    kind: merge\n",
+            "stages:\n  - name: build\n    action: agent\n  - name: test\n    action: { exec: [cargo, test] }\n    result_check: { exec: [cargo, clippy] }\n  - name: merge\n    action: { builtin: merge }\n",
         )
         .unwrap();
 
@@ -1266,33 +1221,40 @@ mod tests {
         );
     }
 
+    /// Every part a stage can leave unwritten defaults to the same stage the
+    /// long form spells out, so the two forms are one grammar rather than two.
     #[test]
-    fn the_new_grammar_names_the_same_stages_directly() {
-        let flow = parse(
+    fn a_fully_written_stage_matches_the_defaults_it_restates() {
+        let terse = parse(
             "release",
-            "stages:\n  - name: build\n    action: { agent: ignored }\n    result_check: { builtin: commits }\n  - name: test\n    action: { exec: [cargo, test] }\n    result_check: { exec: [cargo, clippy] }\n    fail_action: fail\n  - name: merge\n    action: { builtin: merge }\n    result_check: none\n",
+            "stages:\n  - name: build\n    action: agent\n  - name: test\n    action: { exec: [cargo, test] }\n    result_check: { exec: [cargo, clippy] }\n  - name: merge\n    action: { builtin: merge }\n",
         )
         .unwrap();
-        let sugared = parse(
+        let explicit = parse(
             "release",
-            "stages:\n  - name: build\n    kind: agent\n  - name: test\n    kind: exec\n    cmd: [cargo, test]\n    verdict: { check: [cargo, clippy] }\n  - name: merge\n    kind: merge\n",
+            "stages:\n  - name: build\n    action: { agent: ignored }\n    result_check: { builtin: commits }\n    fail_action: fail\n  - name: test\n    action: { exec: [cargo, test] }\n    result_check: { exec: [cargo, clippy] }\n    fail_action: fail\n  - name: merge\n    action: { builtin: merge }\n    result_check: none\n    fail_action: fail\n",
         )
         .unwrap();
 
-        // The whole point of the old grammar being sugar: both spellings
-        // produce byte-for-byte the same flow.
-        assert_eq!(flow, sugared);
+        assert_eq!(terse, explicit);
     }
 
+    /// An agent action's prompt comes from the ticket, so the mapping form's
+    /// payload is accepted and discarded rather than read.
     #[test]
     fn a_bare_agent_action_needs_no_payload() {
-        let flow = parse("example", "- { name: build, action: agent }\n").unwrap();
-        assert_eq!(flow.stages[0].action, Actor::Agent);
-        assert_eq!(flow.stages[0].result_check, commits());
+        for yaml in [
+            "- { name: build, action: agent }\n",
+            "- { name: build, action: { agent: ignored } }\n",
+        ] {
+            let flow = parse("example", yaml).unwrap();
+            assert_eq!(flow.stages[0].action, Actor::Agent);
+            assert_eq!(flow.stages[0].result_check, commits());
+        }
     }
 
     #[test]
-    fn new_grammar_result_checks_parse() {
+    fn named_result_checks_parse() {
         let flow = parse(
             "example",
             "- { name: build, action: agent, result_check: reported }\n- { name: test, action: { exec: ['true'] }, result_check: none }\n- { name: gate, action: { exec: ['true'] }, result_check: { builtin: commits } }\n",
@@ -1301,13 +1263,6 @@ mod tests {
         assert_eq!(flow.stages[0].result_check, Check::Reported);
         assert_eq!(flow.stages[1].result_check, Check::None);
         assert_eq!(flow.stages[2].result_check, commits());
-    }
-
-    #[test]
-    fn build_is_a_deprecated_alias_for_agent() {
-        let flow = parse("example", "- { name: build, kind: build }\n").unwrap();
-        assert_eq!(flow.stages[0].action, Actor::Agent);
-        assert_eq!(flow.stages[0].result_check, commits());
     }
 
     #[test]
@@ -1389,11 +1344,13 @@ mod tests {
         assert_eq!(serde_json::from_str::<Flow>(&snapshot).unwrap(), flow);
     }
 
+    /// An omitted `result_check` is the one its action implies, and every
+    /// check a stage can name binds what it says.
     #[test]
-    fn verdict_policies_and_defaults_parse() {
+    fn result_checks_and_their_defaults_parse() {
         let flow = parse(
             "example",
-            "- { name: build, kind: agent, verdict: reported }\n- { name: test, kind: exec, cmd: ['true'], verdict: commits }\n- { name: review, kind: exec, cmd: ['true'], verdict: exit }\n",
+            "- { name: build, action: agent, result_check: reported }\n- { name: test, action: { exec: ['true'] }, result_check: { builtin: commits } }\n- { name: review, action: { exec: ['true'] }, result_check: none }\n",
         )
         .unwrap();
         assert_eq!(flow.stages[0].result_check, Check::Reported);
@@ -1402,7 +1359,7 @@ mod tests {
 
         let defaults = parse(
             "example",
-            "- { name: build, kind: agent }\n- { name: test, kind: exec, cmd: ['true'] }\n- { name: merge, kind: merge }\n",
+            "- { name: build, action: agent }\n- { name: test, action: { exec: ['true'] } }\n- { name: merge, action: { builtin: merge } }\n",
         )
         .unwrap();
         assert_eq!(defaults.stages[0].result_check, commits());
@@ -1410,38 +1367,49 @@ mod tests {
         assert_eq!(defaults.stages[2].result_check, Check::None);
     }
 
+    /// A flow file written for `0.3.0` is refused by name rather than by
+    /// omission: the stage below does say what it is, in a spelling nothing
+    /// reads any more, and the error is the only migration note its author
+    /// gets.
     #[test]
-    fn the_two_grammars_may_not_be_mixed_on_one_stage() {
-        let action_and_kind = error("- { name: build, action: agent, kind: agent }\n");
-        assert!(
-            action_and_kind.contains("both `action` and `kind`"),
-            "{action_and_kind}"
-        );
+    fn the_removed_grammar_is_rejected_by_name() {
+        for (yaml, needle) in [
+            (
+                "- { name: build, kind: agent }\n",
+                "uses the removed `kind` key; write `action: agent` instead",
+            ),
+            (
+                "- { name: test, action: { exec: ['true'] }, cmd: ['true'] }\n",
+                "uses the removed `cmd` key; write `action: { exec: [...] }`",
+            ),
+            (
+                "- { name: test, action: agent, verdict: reported }\n",
+                "uses the removed `verdict` key; write `result_check: ...`",
+            ),
+        ] {
+            let error = error(yaml);
+            assert!(error.contains(needle), "{error}");
+        }
 
-        let both_checks =
-            error("- { name: build, action: agent, result_check: reported, verdict: reported }\n");
+        // The whole of a 0.3.0 stage, refused on the first removed key rather
+        // than on the `action` it never had a chance to define.
+        let legacy = error("- { name: test, kind: exec, cmd: ['true'], verdict: exit }\n");
+        assert!(legacy.contains("stage `test`"), "{legacy}");
+        assert!(legacy.contains("removed `kind` key"), "{legacy}");
         assert!(
-            both_checks.contains("both `result_check` and `verdict`"),
-            "{both_checks}"
+            legacy.contains("see the 0.4.0 migration table in CHANGELOG.md"),
+            "{legacy}"
         );
-
-        let stray_cmd = error("- { name: build, action: { exec: ['true'] }, cmd: ['true'] }\n");
-        assert!(stray_cmd.contains("must not define `cmd`"), "{stray_cmd}");
     }
 
     #[test]
     fn an_agent_action_may_not_go_unjudged() {
-        for yaml in [
-            "- { name: build, kind: agent, verdict: exit }\n",
-            "- { name: build, action: agent, result_check: none }\n",
-        ] {
-            let error = error(yaml);
-            assert!(error.contains("stage `build`"), "{error}");
-            assert!(
-                error.contains("is an agent action, so its result_check may not be `none`"),
-                "{error}"
-            );
-        }
+        let error = error("- { name: build, action: agent, result_check: none }\n");
+        assert!(error.contains("stage `build`"), "{error}");
+        assert!(
+            error.contains("is an agent action, so its result_check may not be `none`"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1464,21 +1432,14 @@ mod tests {
     }
 
     #[test]
-    fn the_sync_builtin_parses_in_both_grammars() {
-        let new = parse(
+    fn the_sync_builtin_parses_as_an_action() {
+        let flow = parse(
             "example",
             "- { name: build, action: agent }\n- { name: sync, action: { builtin: sync } }\n",
         )
         .unwrap();
-        assert_eq!(new.stages[1].action, Actor::Builtin(Builtin::Sync));
-        assert_eq!(new.stages[1].result_check, Check::None);
-
-        let sugared = parse(
-            "example",
-            "- { name: build, kind: agent }\n- { name: sync, kind: sync }\n",
-        )
-        .unwrap();
-        assert_eq!(new, sugared);
+        assert_eq!(flow.stages[1].action, Actor::Builtin(Builtin::Sync));
+        assert_eq!(flow.stages[1].result_check, Check::None);
     }
 
     /// Sync moves the run branch. A judge that moves a branch is not judging
@@ -1607,7 +1568,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_new_grammar_words_are_rejected() {
+    fn unknown_words_are_rejected() {
         for (yaml, needle) in [
             (
                 "- { name: build, action: wizard }\n",
@@ -1632,7 +1593,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_new_grammar_commands_are_rejected() {
+    fn empty_commands_are_rejected() {
         let action = error("- { name: build, action: { exec: [] } }\n");
         assert!(
             action.contains("exec action must define a non-empty command"),
@@ -1739,7 +1700,7 @@ mod tests {
     fn on_fail_parses_with_defaults_and_overrides() {
         let flow = parse(
             "example",
-            "- { name: build, kind: agent }\n- name: test\n  kind: exec\n  cmd: [cargo, test]\n  on_fail:\n    agent: fix the tests\n- name: merge\n  kind: merge\n  on_fail:\n    agent: integrate the default branch\n    attempts: 2\n    target: claude\n    model: haiku\n    effort: low\n",
+            "- { name: build, action: agent }\n- name: test\n  action: { exec: [cargo, test] }\n  on_fail:\n    agent: fix the tests\n- name: merge\n  action: { builtin: merge }\n  on_fail:\n    agent: integrate the default branch\n    attempts: 2\n    target: claude\n    model: haiku\n    effort: low\n",
         )
         .unwrap();
 
@@ -1759,7 +1720,7 @@ mod tests {
     fn on_fail_survives_a_snapshot_round_trip() {
         let flow = parse(
             "example",
-            "- { name: build, kind: agent }\n- name: test\n  kind: exec\n  cmd: [cargo, test]\n  on_fail:\n    agent: fix the tests\n    attempts: 3\n    model: haiku\n",
+            "- { name: build, action: agent }\n- name: test\n  action: { exec: [cargo, test] }\n  on_fail:\n    agent: fix the tests\n    attempts: 3\n    model: haiku\n",
         )
         .unwrap();
         let snapshot = serde_json::to_string(&flow).unwrap();
@@ -1771,7 +1732,7 @@ mod tests {
     #[test]
     fn on_fail_is_rejected_on_agent_stages() {
         let error = error(
-            "- name: build\n  kind: agent\n  on_fail:\n    agent: patch it\n- { name: merge, kind: merge }\n",
+            "- name: build\n  action: agent\n  on_fail:\n    agent: patch it\n- { name: merge, action: { builtin: merge } }\n",
         );
         assert!(error.contains("agent stage `build`"), "{error}");
         assert!(error.contains("must not define `on_fail`"), "{error}");
@@ -1780,7 +1741,7 @@ mod tests {
     #[test]
     fn on_fail_rejects_an_empty_prompt() {
         let error = error(
-            "- { name: build, kind: agent }\n- name: test\n  kind: exec\n  cmd: ['true']\n  on_fail:\n    agent: '   '\n",
+            "- { name: build, action: agent }\n- name: test\n  action: { exec: ['true'] }\n  on_fail:\n    agent: '   '\n",
         );
         assert!(error.contains("stage `test`"), "{error}");
         assert!(error.contains("non-empty `agent` prompt"), "{error}");
@@ -1790,7 +1751,7 @@ mod tests {
     fn on_fail_rejects_out_of_range_attempts() {
         for attempts in ["0", "4"] {
             let error = error(&format!(
-                "- {{ name: build, kind: agent }}\n- name: test\n  kind: exec\n  cmd: ['true']\n  on_fail:\n    agent: fix it\n    attempts: {attempts}\n",
+                "- {{ name: build, action: agent }}\n- name: test\n  action: {{ exec: ['true'] }}\n  on_fail:\n    agent: fix it\n    attempts: {attempts}\n",
             ));
             assert!(error.contains("stage `test`"), "{error}");
             assert!(
@@ -1801,22 +1762,10 @@ mod tests {
     }
 
     #[test]
-    fn merge_stages_reject_verdict_policies() {
-        let error = error(
-            "- { name: build, kind: agent }\n- { name: merge, kind: merge, verdict: exit }\n",
-        );
-        assert!(error.contains("must not define `verdict`"), "{error}");
-    }
-
-    #[test]
-    fn unknown_kinds_are_rejected() {
-        let error = error("- { name: build, kind: build }\n- { name: deploy, kind: magic }\n");
-        assert!(error.contains("unknown kind `magic`"), "{error}");
-    }
-
-    #[test]
     fn duplicate_stage_names_are_rejected() {
-        let error = error("- { name: build, kind: build }\n- { name: build, kind: merge }\n");
+        let error = error(
+            "- { name: build, action: agent }\n- { name: build, action: { builtin: merge } }\n",
+        );
         assert!(error.contains("duplicate stage name `build`"), "{error}");
     }
 
@@ -1826,27 +1775,27 @@ mod tests {
     fn agent_actions_are_legal_in_any_position_and_any_number() {
         let leading_exec = parse(
             "example",
-            "- { name: check, kind: exec, cmd: ['true'] }\n- { name: build, kind: agent }\n",
+            "- { name: check, action: { exec: ['true'] } }\n- { name: build, action: agent }\n",
         )
         .unwrap();
         assert_eq!(leading_exec.stages[1].action, Actor::Agent);
 
         let two_agents = parse(
             "example",
-            "- { name: build, kind: agent }\n- { name: review, kind: agent, verdict: reported }\n",
+            "- { name: build, action: agent }\n- { name: review, action: agent, result_check: reported }\n",
         )
         .unwrap();
         assert_eq!(two_agents.stages[0].action, Actor::Agent);
         assert_eq!(two_agents.stages[1].action, Actor::Agent);
 
-        let no_agent = parse("example", "- { name: check, kind: exec, cmd: ['true'] }\n").unwrap();
+        let no_agent = parse("example", "- { name: check, action: { exec: ['true'] } }\n").unwrap();
         assert_eq!(no_agent.stages.len(), 1);
     }
 
     #[test]
     fn at_most_one_merge_stage_is_allowed() {
         let error = error(
-            "- { name: build, kind: build }\n- { name: merge-one, kind: merge }\n- { name: merge-two, kind: merge }\n",
+            "- { name: build, action: agent }\n- { name: merge-one, action: { builtin: merge } }\n- { name: merge-two, action: { builtin: merge } }\n",
         );
         assert!(error.contains("at most one merge stage"), "{error}");
     }
@@ -1854,20 +1803,9 @@ mod tests {
     #[test]
     fn merge_stage_must_be_last() {
         let error = error(
-            "- { name: build, kind: build }\n- { name: merge, kind: merge }\n- { name: check, kind: exec, cmd: ['true'] }\n",
+            "- { name: build, action: agent }\n- { name: merge, action: { builtin: merge } }\n- { name: check, action: { exec: ['true'] } }\n",
         );
         assert!(error.contains("merge stage must be last"), "{error}");
-    }
-
-    #[test]
-    fn exec_stage_command_must_be_nonempty() {
-        for yaml in [
-            "- { name: build, kind: build }\n- { name: check, kind: exec }\n",
-            "- { name: build, kind: build }\n- { name: check, kind: exec, cmd: [] }\n",
-        ] {
-            let error = error(yaml);
-            assert!(error.contains("non-empty `cmd`"), "{error}");
-        }
     }
 
     fn build_review_merge() -> Flow {

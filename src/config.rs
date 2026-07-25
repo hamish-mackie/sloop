@@ -1577,7 +1577,7 @@ mod tests {
         .unwrap();
         fs::write(
             root.path().join(".agents/sloop/flows/default.yaml"),
-            "- { name: build, kind: build }\n- { name: ship, kind: exec, cmd: [ship] }\n",
+            "- { name: build, action: agent }\n- { name: ship, action: { exec: [ship] } }\n",
         )
         .unwrap();
 
@@ -1604,7 +1604,7 @@ mod tests {
         .unwrap();
         fs::write(
             root.path().join(".agents/sloop/flows/default.yaml"),
-            "- { name: build, kind: agent }\n- name: check\n  kind: exec\n  cmd: ['true']\n  on_fail:\n    agent: fix it\n    target: ghost\n- { name: merge, kind: merge }\n",
+            "- { name: build, action: agent }\n- name: check\n  action: { exec: ['true'] }\n  on_fail:\n    agent: fix it\n    target: ghost\n- { name: merge, action: { builtin: merge } }\n",
         )
         .unwrap();
 
@@ -1651,7 +1651,7 @@ mod tests {
         .unwrap();
         fs::write(
             root.path().join(".agents/sloop/flows/default.yaml"),
-            "- { name: build, kind: agent }\n- name: check\n  kind: exec\n  cmd: ['true']\n  on_fail:\n    agent: fix it\n- { name: merge, kind: merge }\n",
+            "- { name: build, action: agent }\n- name: check\n  action: { exec: ['true'] }\n  on_fail:\n    agent: fix it\n- { name: merge, action: { builtin: merge } }\n",
         )
         .unwrap();
 
@@ -1678,13 +1678,13 @@ mod tests {
         .unwrap();
         fs::write(
             root.path().join(".agents/sloop/flows/broken.yaml"),
-            "- { name: build, kind: build }\n- { name: check, kind: exec, cmd: [] }\n",
+            "- { name: build, action: agent }\n- { name: check, action: { exec: [] } }\n",
         )
         .unwrap();
 
         let repository = Repository::discover(root.path()).unwrap();
         let error = Config::load(&repository).unwrap_err().to_string();
         assert!(error.contains("broken.yaml"), "{error}");
-        assert!(error.contains("non-empty `cmd`"), "{error}");
+        assert!(error.contains("non-empty command"), "{error}");
     }
 }

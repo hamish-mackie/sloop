@@ -284,7 +284,8 @@ mod tests {
     }
 
     /// The shipped review stage must be a real gate. Under the exec default
-    /// (`verdict: exit`) it would pass whenever the reviewer command exits 0,
+    /// (`result_check: none`) it would pass whenever the reviewer command
+    /// exits 0,
     /// which `claude --print` always does — approving every run silently.
     #[test]
     fn the_shipped_review_stage_is_a_reported_gate() {

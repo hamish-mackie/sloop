@@ -12,7 +12,7 @@ fn configure_agent_script(world: &World, script_body: &str) {
     fs::create_dir_all(world.root().join(".agents/sloop/flows")).unwrap();
     fs::write(
         world.root().join(".agents/sloop/flows/default.yaml"),
-        "stages:\n  - { name: build, kind: build }\n  - { name: merge, kind: merge }\n",
+        "stages:\n  - { name: build, action: agent }\n  - { name: merge, action: { builtin: merge } }\n",
     )
     .unwrap();
     let script = world.root().join("fake-agent.sh");

@@ -161,7 +161,7 @@ impl World {
         fs::create_dir_all(&flow_directory).expect("create flow directory");
         fs::write(
             flow_directory.join("default.yaml"),
-            "stages:\n  - { name: build, kind: agent, verdict: { check: ['true'] } }\n  - { name: merge, kind: merge }\n",
+            "stages:\n  - { name: build, action: agent, result_check: { exec: ['true'] } }\n  - { name: merge, action: { builtin: merge } }\n",
         )
         .expect("write default test flow");
         let script = self.root().join("fake-agent.sh");

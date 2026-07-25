@@ -151,7 +151,7 @@ fn a_return_to_loop_re_runs_the_span_with_the_failure_in_the_prompt() {
     configure(
         &world,
         &format!(
-            "- {{ name: build, kind: agent, verdict: {{ check: ['true'] }} }}\n- name: test\n  action: {{ exec: [\"sh\", {command}] }}\n  result_check: none\n  fail_action: {{ return_to: build, attempts: 2 }}\n- {{ name: merge, kind: merge }}\n",
+            "- {{ name: build, action: agent, result_check: {{ exec: ['true'] }} }}\n- name: test\n  action: {{ exec: [\"sh\", {command}] }}\n  result_check: none\n  fail_action: {{ return_to: build, attempts: 2 }}\n- {{ name: merge, action: {{ builtin: merge }} }}\n",
             command = serde_json::to_string(&test_command.to_string_lossy()).unwrap(),
         ),
         &script,
@@ -229,7 +229,7 @@ fn an_exhausted_return_budget_fails_with_every_attempt_visible() {
     configure(
         &world,
         &format!(
-            "- {{ name: build, kind: agent, verdict: {{ check: ['true'] }} }}\n- name: test\n  action: {{ exec: [\"sh\", {command}] }}\n  result_check: none\n  fail_action: {{ return_to: build, attempts: 1 }}\n- {{ name: merge, kind: merge }}\n",
+            "- {{ name: build, action: agent, result_check: {{ exec: ['true'] }} }}\n- name: test\n  action: {{ exec: [\"sh\", {command}] }}\n  result_check: none\n  fail_action: {{ return_to: build, attempts: 1 }}\n- {{ name: merge, action: {{ builtin: merge }} }}\n",
             command = serde_json::to_string(&test_command.to_string_lossy()).unwrap(),
         ),
         &script,
@@ -285,7 +285,7 @@ fn an_advisory_failure_is_visible_but_does_not_block_the_merge() {
     let script = recording_agent(&world, &prompt_log);
     configure(
         &world,
-        "- { name: build, kind: agent, verdict: { check: ['true'] } }\n- name: lint\n  action: { exec: [\"false\"] }\n  result_check: none\n  fail_action: continue\n- { name: merge, kind: merge }\n",
+        "- { name: build, action: agent, result_check: { exec: ['true'] } }\n- name: lint\n  action: { exec: [\"false\"] }\n  result_check: none\n  fail_action: continue\n- { name: merge, action: { builtin: merge } }\n",
         &script,
     );
     world.commit_all("initial");
@@ -344,7 +344,7 @@ fn the_derived_reason_names_the_halting_failure_not_the_advisory_one() {
     let script = recording_agent(&world, &prompt_log);
     configure(
         &world,
-        "- { name: build, kind: agent, verdict: { check: ['true'] } }\n- name: lint\n  action: { exec: [\"false\"] }\n  result_check: none\n  fail_action: continue\n- name: test\n  action: { exec: [\"false\"] }\n  result_check: none\n  fail_action: fail\n- { name: merge, kind: merge }\n",
+        "- { name: build, action: agent, result_check: { exec: ['true'] } }\n- name: lint\n  action: { exec: [\"false\"] }\n  result_check: none\n  fail_action: continue\n- name: test\n  action: { exec: [\"false\"] }\n  result_check: none\n  fail_action: fail\n- { name: merge, action: { builtin: merge } }\n",
         &script,
     );
     world.commit_all("initial");
@@ -404,7 +404,7 @@ fn a_restart_mid_loop_resumes_the_same_attempt_with_the_same_prompt() {
     configure(
         &world,
         &format!(
-            "- {{ name: build, kind: agent, verdict: {{ check: ['true'] }} }}\n- name: test\n  action: {{ exec: [\"sh\", {command}] }}\n  result_check: none\n  fail_action: {{ return_to: build, attempts: 2 }}\n- {{ name: merge, kind: merge }}\n",
+            "- {{ name: build, action: agent, result_check: {{ exec: ['true'] }} }}\n- name: test\n  action: {{ exec: [\"sh\", {command}] }}\n  result_check: none\n  fail_action: {{ return_to: build, attempts: 2 }}\n- {{ name: merge, action: {{ builtin: merge }} }}\n",
             command = serde_json::to_string(&test_command.to_string_lossy()).unwrap(),
         ),
         &script,
@@ -481,7 +481,7 @@ fn a_re_entered_reported_stage_is_judged_again() {
     configure(
         &world,
         &format!(
-            "- {{ name: build, kind: agent, verdict: {{ check: ['true'] }} }}\n- name: review\n  action: {{ exec: [\"sh\", {command}] }}\n  result_check: reported\n  fail_action: {{ return_to: build, attempts: 2 }}\n- {{ name: merge, kind: merge }}\n",
+            "- {{ name: build, action: agent, result_check: {{ exec: ['true'] }} }}\n- name: review\n  action: {{ exec: [\"sh\", {command}] }}\n  result_check: reported\n  fail_action: {{ return_to: build, attempts: 2 }}\n- {{ name: merge, action: {{ builtin: merge }} }}\n",
             command = serde_json::to_string(&review.to_string_lossy()).unwrap(),
         ),
         &script,
@@ -537,7 +537,7 @@ fn a_re_entered_exec_stage_is_handed_no_context() {
     configure(
         &world,
         &format!(
-            "- {{ name: build, kind: agent, verdict: {{ check: ['true'] }} }}\n- name: probe\n  action: {{ exec: [\"sh\", {probe}, \"fixed-argument\"] }}\n  result_check: none\n- name: test\n  action: {{ exec: [\"sh\", {command}] }}\n  result_check: none\n  fail_action: {{ return_to: probe, attempts: 2 }}\n- {{ name: merge, kind: merge }}\n",
+            "- {{ name: build, action: agent, result_check: {{ exec: ['true'] }} }}\n- name: probe\n  action: {{ exec: [\"sh\", {probe}, \"fixed-argument\"] }}\n  result_check: none\n- name: test\n  action: {{ exec: [\"sh\", {command}] }}\n  result_check: none\n  fail_action: {{ return_to: probe, attempts: 2 }}\n- {{ name: merge, action: {{ builtin: merge }} }}\n",
             probe = serde_json::to_string(&probe.to_string_lossy()).unwrap(),
             command = serde_json::to_string(&test_command.to_string_lossy()).unwrap(),
         ),
@@ -578,7 +578,7 @@ fn a_legacy_on_fail_flow_still_repairs_and_logs_the_deprecation() {
     );
     configure(
         &world,
-        "- { name: build, kind: agent, verdict: { check: ['true'] } }\n- name: test\n  kind: exec\n  cmd: [\"sh\", \"-c\", \"test -f fixed.txt\"]\n  on_fail:\n    agent: \"REPAIR make the test pass\"\n    attempts: 2\n- { name: merge, kind: merge }\n",
+        "- { name: build, action: agent, result_check: { exec: ['true'] } }\n- name: test\n  action: { exec: [\"sh\", \"-c\", \"test -f fixed.txt\"] }\n  on_fail:\n    agent: \"REPAIR make the test pass\"\n    attempts: 2\n- { name: merge, action: { builtin: merge } }\n",
         &script,
     );
     world.commit_all("initial");
@@ -613,7 +613,7 @@ fn a_legacy_on_fail_flow_still_repairs_and_logs_the_deprecation() {
 fn a_flow_whose_return_budgets_exceed_the_cap_is_rejected_at_post_time() {
     let world = World::configured();
     let script = write_script(&world, "fake-agent.sh", "exit 0\n");
-    let mut flow = String::from("- { name: build, kind: agent }\n");
+    let mut flow = String::from("- { name: build, action: agent }\n");
     for index in 1..9 {
         flow.push_str(&format!(
             "- {{ name: s{index}, action: {{ exec: ['true'] }} }}\n"

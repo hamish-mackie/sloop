@@ -9,7 +9,7 @@ use support::{World, wait_until};
 fn configure_agent_script(world: &World, script_body: &str) {
     configure_flow(
         world,
-        "  - { name: build, kind: build }\n  - { name: merge, kind: merge }\n",
+        "  - { name: build, action: agent }\n  - { name: merge, action: { builtin: merge } }\n",
         script_body,
     );
 }
@@ -132,7 +132,7 @@ fn logs_for_a_missing_run_names_the_run_id_shape() {
 
 /// The stage names an operator reads in a flow are the names `--stage`
 /// accepts, for the agent stage as much as for exec stages.
-const MULTI_STAGE_FLOW: &str = "  - { name: build, kind: agent, verdict: { check: ['true'] } }\n  - { name: check, kind: exec, cmd: [\"sh\", \"-c\", \"echo exec stage speaking\"] }\n  - { name: merge, kind: merge }\n";
+const MULTI_STAGE_FLOW: &str = "  - { name: build, action: agent, result_check: { exec: ['true'] } }\n  - { name: check, action: { exec: [\"sh\", \"-c\", \"echo exec stage speaking\"] } }\n  - { name: merge, action: { builtin: merge } }\n";
 
 fn settled_multi_stage_run(world: &World, ticket: &str) -> String {
     configure_flow(
@@ -206,7 +206,7 @@ fn stage_selects_one_execution_of_a_re_run_stage() {
     fs::write(&counter, b"").unwrap();
     configure_flow(
         &world,
-        "  - name: build\n    action: agent\n    result_check: { builtin: commits }\n  - name: gate\n    action: { exec: [\"sh\", \"-c\", \"test -f second\"] }\n    result_check: none\n    fail_action: { return_to: build, attempts: 1 }\n  - { name: merge, kind: merge }\n",
+        "  - name: build\n    action: agent\n    result_check: { builtin: commits }\n  - name: gate\n    action: { exec: [\"sh\", \"-c\", \"test -f second\"] }\n    result_check: none\n    fail_action: { return_to: build, attempts: 1 }\n  - { name: merge, action: { builtin: merge } }\n",
         &format!(
             "printf x >> {counter}\npass=$(wc -c < {counter} | tr -d ' ')\necho \"agent speaking on pass $pass\"\nif [ \"$pass\" -gt 1 ]; then touch second; fi\ngit -c user.name=a -c user.email=a@example.invalid commit --quiet --allow-empty -m work\nexit 0\n",
             counter = counter.display(),

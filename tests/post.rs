@@ -539,7 +539,7 @@ fn explicit_flow_flag_is_honored_and_stamped() {
     fs::create_dir_all(world.root().join(".agents/sloop/flows")).unwrap();
     fs::write(
         world.root().join(".agents/sloop/flows/hotfix.yaml"),
-        "- { name: build, kind: build }\n",
+        "- { name: build, action: agent }\n",
     )
     .unwrap();
     world.start_daemon();
@@ -593,7 +593,7 @@ fn a_flag_conflicting_with_the_stamped_flow_is_rejected() {
     fs::create_dir_all(world.root().join(".agents/sloop/flows")).unwrap();
     fs::write(
         world.root().join(".agents/sloop/flows/hotfix.yaml"),
-        "- { name: build, kind: build }\n",
+        "- { name: build, action: agent }\n",
     )
     .unwrap();
     world.start_daemon();
@@ -626,7 +626,7 @@ fn unknown_flow_is_rejected_and_names_known_flows() {
     fs::create_dir_all(world.root().join(".agents/sloop/flows")).unwrap();
     fs::write(
         world.root().join(".agents/sloop/flows/hotfix.yaml"),
-        "- { name: build, kind: build }\n",
+        "- { name: build, action: agent }\n",
     )
     .unwrap();
     world.start_daemon();
@@ -661,7 +661,7 @@ fn invalid_flow_is_rejected_without_registering_the_ticket() {
     fs::create_dir_all(world.root().join(".agents/sloop/flows")).unwrap();
     fs::write(
         world.root().join(".agents/sloop/flows/broken.yaml"),
-        "- { name: build, kind: unknown }\n",
+        "- { name: build, action: unknown }\n",
     )
     .unwrap();
     let ticket = world.write_ticket("unregistered.md", "# Must not register\n");
@@ -673,7 +673,7 @@ fn invalid_flow_is_rejected_without_registering_the_ticket() {
     assert_eq!(error["error"]["code"], "invalid_arguments");
     let message = error["error"]["message"].as_str().unwrap();
     assert!(message.contains("broken.yaml"), "{message}");
-    assert!(message.contains("unknown kind `unknown`"), "{message}");
+    assert!(message.contains("unknown action `unknown`"), "{message}");
     let status = World::json_stdout(&world.sloop(&["status"]));
     assert_eq!(status["data"]["tickets"]["ready"], 0);
     assert!(

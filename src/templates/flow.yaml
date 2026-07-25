@@ -186,15 +186,6 @@ stages:
     result_check: none
     fail_action: fail
 
-# ---- legacy spellings, still accepted ----------------------------------
-# The pre-`action` grammar parses as sugar for exactly the stages above,
-# and the two spellings may not be mixed on one stage:
-#   kind: agent | build -> action: agent      verdict: exit     -> result_check: none
-#   kind: exec + cmd    -> action: { exec: }  verdict: commits  -> result_check: { builtin: commits }
-#   kind: merge         -> action: { builtin: merge }
-#                                             verdict: { check: [argv] } -> result_check: { exec: [argv] }
-#                                             verdict: reported -> result_check: reported
-#
 # `on_fail: { agent: <prompt>, attempts: N }` spawns a repair agent and
 # re-runs the stage, and is superseded by `fail_action: return_to`, which
 # re-runs the ticket's own agent instead. It is still accepted on any

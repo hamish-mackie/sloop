@@ -2,43 +2,86 @@
 //!
 //! The generator mirrors the validation rules in `flow::parse`: the first
 //! stage is the only agent stage, at most one merge stage and only in last
-//! position, exec stages carry a non-empty `cmd`, merge stages define no
-//! verdict, agent stages define no `on_fail`, and an agent stage never
-//! writes `verdict: exit` because an agent may not go unjudged.
+//! position, exec actions carry a non-empty command, a merge stage's check is
+//! either omitted or `none`, agent stages define no `on_fail`, and an agent
+//! stage never writes `result_check: none` because an agent may not go
+//! unjudged.
 
 use proptest::prelude::*;
 use sloop::flow::{Actor, Builtin, Check, FailAction, Flow, OnFail, Stage};
 
-/// A stage's verdict as written in YAML, `None` meaning "omitted".
+/// A stage's action as written in YAML.
 #[derive(Debug, Clone)]
-pub enum WrittenVerdict {
-    Omitted,
-    Exit,
-    Commits,
-    Reported,
-    Check(Vec<String>),
+pub enum WrittenAction {
+    /// The bare `action: agent`.
+    Agent,
+    /// `action: { agent: <prompt> }`, whose payload the parser discards.
+    AgentMapping(String),
+    Exec(Vec<String>),
+    Merge,
 }
 
-impl WrittenVerdict {
+impl WrittenAction {
+    fn expected(&self) -> Actor {
+        match self {
+            Self::Agent | Self::AgentMapping(_) => Actor::Agent,
+            Self::Exec(cmd) => Actor::Exec { cmd: cmd.clone() },
+            Self::Merge => Actor::Builtin(Builtin::Merge),
+        }
+    }
+
+    fn render(&self) -> String {
+        match self {
+            Self::Agent => "agent".to_owned(),
+            Self::AgentMapping(prompt) => format!("{{ agent: {} }}", quote(prompt)),
+            Self::Exec(cmd) => format!("{{ exec: {} }}", render_command(cmd)),
+            Self::Merge => "{ builtin: merge }".to_owned(),
+        }
+    }
+}
+
+/// A stage's result check as written in YAML, `Omitted` meaning "absent", in
+/// which case the action decides the default.
+#[derive(Debug, Clone)]
+pub enum WrittenCheck {
+    Omitted,
+    None,
+    Commits,
+    Reported,
+    Exec(Vec<String>),
+}
+
+impl WrittenCheck {
     fn expected(&self, action: &Actor) -> Check {
         match self {
             Self::Omitted => match action {
                 Actor::Agent => Check::Actor(Actor::Builtin(Builtin::Commits)),
                 Actor::Exec { .. } | Actor::Builtin(_) => Check::None,
             },
-            Self::Exit => Check::None,
+            Self::None => Check::None,
             Self::Commits => Check::Actor(Actor::Builtin(Builtin::Commits)),
             Self::Reported => Check::Reported,
-            Self::Check(cmd) => Check::Actor(Actor::Exec { cmd: cmd.clone() }),
+            Self::Exec(cmd) => Check::Actor(Actor::Exec { cmd: cmd.clone() }),
+        }
+    }
+
+    /// The value the `result_check` key takes, or `None` when the stage
+    /// writes no key at all.
+    fn render(&self) -> Option<String> {
+        match self {
+            Self::Omitted => None,
+            Self::None => Some("none".to_owned()),
+            Self::Commits => Some("{ builtin: commits }".to_owned()),
+            Self::Reported => Some("reported".to_owned()),
+            Self::Exec(cmd) => Some(format!("{{ exec: {} }}", render_command(cmd))),
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct WrittenStage {
-    pub kind_word: &'static str,
-    pub cmd: Option<Vec<String>>,
-    pub verdict: WrittenVerdict,
+    pub action: WrittenAction,
+    pub result_check: WrittenCheck,
     pub on_fail: Option<OnFail>,
 }
 
@@ -46,13 +89,13 @@ fn command() -> impl Strategy<Value = Vec<String>> {
     prop::collection::vec("[a-zA-Z0-9./_-]{1,8}", 1..4)
 }
 
-fn verdict() -> impl Strategy<Value = WrittenVerdict> {
+fn result_check() -> impl Strategy<Value = WrittenCheck> {
     prop_oneof![
-        Just(WrittenVerdict::Omitted),
-        Just(WrittenVerdict::Exit),
-        Just(WrittenVerdict::Commits),
-        Just(WrittenVerdict::Reported),
-        command().prop_map(WrittenVerdict::Check),
+        Just(WrittenCheck::Omitted),
+        Just(WrittenCheck::None),
+        Just(WrittenCheck::Commits),
+        Just(WrittenCheck::Reported),
+        command().prop_map(WrittenCheck::Exec),
     ]
 }
 
@@ -75,40 +118,44 @@ fn on_fail() -> impl Strategy<Value = Option<OnFail>> {
     )
 }
 
-/// Every verdict an agent stage may write. `exit` is excluded: it maps to
-/// `Check::None`, and an agent that grades itself by exiting is rejected.
-fn agent_verdict() -> impl Strategy<Value = WrittenVerdict> {
+/// Every check an agent stage may write. `none` is excluded: an agent that
+/// grades itself by exiting cleanly is rejected.
+fn agent_check() -> impl Strategy<Value = WrittenCheck> {
     prop_oneof![
-        Just(WrittenVerdict::Omitted),
-        Just(WrittenVerdict::Commits),
-        Just(WrittenVerdict::Reported),
-        command().prop_map(WrittenVerdict::Check),
+        Just(WrittenCheck::Omitted),
+        Just(WrittenCheck::Commits),
+        Just(WrittenCheck::Reported),
+        command().prop_map(WrittenCheck::Exec),
     ]
 }
 
 fn agent_stage() -> impl Strategy<Value = WrittenStage> {
-    agent_verdict().prop_map(|verdict| WrittenStage {
-        kind_word: "agent",
-        cmd: None,
-        verdict,
+    let action = prop_oneof![
+        Just(WrittenAction::Agent),
+        "[a-z][a-z ]{0,15}".prop_map(WrittenAction::AgentMapping),
+    ];
+    (action, agent_check()).prop_map(|(action, result_check)| WrittenStage {
+        action,
+        result_check,
         on_fail: None,
     })
 }
 
 fn exec_stage() -> impl Strategy<Value = WrittenStage> {
-    (command(), verdict(), on_fail()).prop_map(|(cmd, verdict, on_fail)| WrittenStage {
-        kind_word: "exec",
-        cmd: Some(cmd),
-        verdict,
+    (command(), result_check(), on_fail()).prop_map(|(cmd, result_check, on_fail)| WrittenStage {
+        action: WrittenAction::Exec(cmd),
+        result_check,
         on_fail,
     })
 }
 
+/// A merge stage's own outcome is its verdict, so the only checks it may
+/// write are the absent one and the `none` that spells the same thing out.
 fn merge_stage() -> impl Strategy<Value = WrittenStage> {
-    on_fail().prop_map(|on_fail| WrittenStage {
-        kind_word: "merge",
-        cmd: None,
-        verdict: WrittenVerdict::Omitted,
+    let check = prop_oneof![Just(WrittenCheck::Omitted), Just(WrittenCheck::None)];
+    (check, on_fail()).prop_map(|(result_check, on_fail)| WrittenStage {
+        action: WrittenAction::Merge,
+        result_check,
         on_fail,
     })
 }
@@ -129,22 +176,12 @@ fn render_command(cmd: &[String]) -> String {
 
 fn render_stage(name: &str, stage: &WrittenStage, indent: &str) -> String {
     let mut yaml = format!(
-        "{indent}- name: {}\n{indent}  kind: {}\n",
+        "{indent}- name: {}\n{indent}  action: {}\n",
         quote(name),
-        stage.kind_word
+        stage.action.render()
     );
-    if let Some(cmd) = &stage.cmd {
-        yaml.push_str(&format!("{indent}  cmd: {}\n", render_command(cmd)));
-    }
-    match &stage.verdict {
-        WrittenVerdict::Omitted => {}
-        WrittenVerdict::Exit => yaml.push_str(&format!("{indent}  verdict: exit\n")),
-        WrittenVerdict::Commits => yaml.push_str(&format!("{indent}  verdict: commits\n")),
-        WrittenVerdict::Reported => yaml.push_str(&format!("{indent}  verdict: reported\n")),
-        WrittenVerdict::Check(cmd) => yaml.push_str(&format!(
-            "{indent}  verdict: {{ check: {} }}\n",
-            render_command(cmd)
-        )),
+    if let Some(check) = stage.result_check.render() {
+        yaml.push_str(&format!("{indent}  result_check: {check}\n"));
     }
     if let Some(on_fail) = &stage.on_fail {
         yaml.push_str(&format!(
@@ -166,15 +203,8 @@ fn render_stage(name: &str, stage: &WrittenStage, indent: &str) -> String {
 }
 
 fn expected_stage(name: &str, stage: &WrittenStage) -> Stage {
-    let action = match stage.kind_word {
-        "agent" => Actor::Agent,
-        "merge" => Actor::Builtin(Builtin::Merge),
-        "exec" => Actor::Exec {
-            cmd: stage.cmd.clone().expect("exec stages carry a cmd"),
-        },
-        other => unreachable!("generator produced kind {other}"),
-    };
-    let result_check = stage.verdict.expected(&action);
+    let action = stage.action.expected();
+    let result_check = stage.result_check.expected(&action);
     Stage {
         name: name.to_owned(),
         action,

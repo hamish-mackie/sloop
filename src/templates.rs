@@ -193,14 +193,14 @@ mod tests {
         );
 
         // The canonical example is entirely in the current grammar: the
-        // deprecated `on_fail` survives only as a note under "legacy
-        // spellings", where a reader looking it up will find it and a reader
-        // learning the grammar will not copy it.
+        // deprecated `on_fail` survives only as a trailing note, where a
+        // reader looking it up will find it and a reader learning the grammar
+        // will not copy it.
         assert!(
             flow.stages.iter().all(|stage| stage.on_fail.is_none()),
             "the canonical example must not use the deprecated `on_fail`"
         );
-        assert!(FLOW.contains("legacy spellings"));
+        assert!(FLOW.contains("`on_fail: { agent: <prompt>, attempts: N }`"));
     }
 
     #[test]

@@ -101,7 +101,7 @@ fn exec_repair_fixes_the_tree_and_the_run_merges() {
     );
     configure(
         &world,
-        "- { name: build, kind: agent, verdict: { check: ['true'] } }\n- name: test\n  kind: exec\n  cmd: [\"sh\", \"-c\", \"test -f fixed.txt\"]\n  on_fail:\n    agent: \"REPAIR make the test pass\"\n    attempts: 2\n- { name: merge, kind: merge }\n",
+        "- { name: build, action: agent, result_check: { exec: ['true'] } }\n- name: test\n  action: { exec: [\"sh\", \"-c\", \"test -f fixed.txt\"] }\n  on_fail:\n    agent: \"REPAIR make the test pass\"\n    attempts: 2\n- { name: merge, action: { builtin: merge } }\n",
         &target("fake", &script),
     );
     world.commit_all("initial");
@@ -140,7 +140,7 @@ fn exec_repair_that_does_not_fix_exhausts_attempts_and_fails() {
     );
     configure(
         &world,
-        "- { name: build, kind: agent, verdict: { check: ['true'] } }\n- name: test\n  kind: exec\n  cmd: [\"false\"]\n  on_fail:\n    agent: \"REPAIR (cannot help)\"\n    attempts: 2\n- { name: merge, kind: merge }\n",
+        "- { name: build, action: agent, result_check: { exec: ['true'] } }\n- name: test\n  action: { exec: [\"false\"] }\n  on_fail:\n    agent: \"REPAIR (cannot help)\"\n    attempts: 2\n- { name: merge, action: { builtin: merge } }\n",
         &target("fake", &script),
     );
     world.commit_all("initial");
@@ -190,7 +190,7 @@ fn repair_honors_target_model_and_effort_overrides() {
     );
     configure(
         &world,
-        "- { name: build, kind: agent, verdict: { check: ['true'] } }\n- name: test\n  kind: exec\n  cmd: [\"sh\", \"-c\", \"test -f fixed.txt\"]\n  on_fail:\n    agent: \"REPAIR with overrides\"\n    attempts: 1\n    target: special\n    model: haiku\n    effort: low\n- { name: merge, kind: merge }\n",
+        "- { name: build, action: agent, result_check: { exec: ['true'] } }\n- name: test\n  action: { exec: [\"sh\", \"-c\", \"test -f fixed.txt\"] }\n  on_fail:\n    agent: \"REPAIR with overrides\"\n    attempts: 1\n    target: special\n    model: haiku\n    effort: low\n- { name: merge, action: { builtin: merge } }\n",
         &targets,
     );
     world.commit_all("initial");
@@ -231,7 +231,7 @@ fn a_closed_gate_skips_repair_and_settles_as_if_absent() {
     );
     configure(
         &world,
-        "- { name: build, kind: agent, verdict: { check: ['true'] } }\n- name: test\n  kind: exec\n  cmd: [\"false\"]\n  on_fail:\n    agent: \"REPAIR should be gated out\"\n    attempts: 2\n- { name: merge, kind: merge }\n",
+        "- { name: build, action: agent, result_check: { exec: ['true'] } }\n- name: test\n  action: { exec: [\"false\"] }\n  on_fail:\n    agent: \"REPAIR should be gated out\"\n    attempts: 2\n- { name: merge, action: { builtin: merge } }\n",
         &target("fake", &script),
     );
     world.commit_all("initial");
@@ -280,7 +280,7 @@ fn merge_repair_integrates_the_default_branch_and_merges() {
     configure(
         &world,
         &format!(
-            "- {{ name: build, kind: agent, verdict: {{ check: ['true'] }} }}\n- name: merge\n  kind: merge\n  on_fail:\n    agent: \"REPAIR integrate {default}\"\n    attempts: 2\n"
+            "- {{ name: build, action: agent, result_check: {{ exec: ['true'] }} }}\n- name: merge\n  action: {{ builtin: merge }}\n  on_fail:\n    agent: \"REPAIR integrate {default}\"\n    attempts: 2\n"
         ),
         &target("fake", &script),
     );
@@ -351,7 +351,7 @@ fn merge_repair_that_leaves_conflicts_parks_needs_review() {
     configure(
         &world,
         &format!(
-            "- {{ name: build, kind: agent, verdict: {{ check: ['true'] }} }}\n- name: merge\n  kind: merge\n  on_fail:\n    agent: \"REPAIR integrate {default}\"\n    attempts: 1\n"
+            "- {{ name: build, action: agent, result_check: {{ exec: ['true'] }} }}\n- name: merge\n  action: {{ builtin: merge }}\n  on_fail:\n    agent: \"REPAIR integrate {default}\"\n    attempts: 1\n"
         ),
         &target("fake", &script),
     );
@@ -418,7 +418,7 @@ fn a_restart_mid_repair_resumes_without_double_spawning() {
     );
     configure(
         &world,
-        "- { name: build, kind: agent, verdict: { check: ['true'] } }\n- name: test\n  kind: exec\n  cmd: [\"false\"]\n  on_fail:\n    agent: \"REPAIR (blocks)\"\n    attempts: 1\n- { name: merge, kind: merge }\n",
+        "- { name: build, action: agent, result_check: { exec: ['true'] } }\n- name: test\n  action: { exec: [\"false\"] }\n  on_fail:\n    agent: \"REPAIR (blocks)\"\n    attempts: 1\n- { name: merge, action: { builtin: merge } }\n",
         &target("fake", &script),
     );
     world.commit_all("initial");
