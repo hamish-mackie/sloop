@@ -136,8 +136,8 @@ Patterns that fall out of the verbs:
   The two attempt counters mean different things. `attempt` is which
   *execution* of the stage the row is: a `return_to` edge re-enters a stage and
   each re-entry is its own row, numbered from `1`. `attempts` is how many tries
-  one execution cost, counting the deprecated `on_fail` retries, which record
-  no row of their own. A row for a stage the walk has not reached has
+  one execution cost, counting the retries a deprecated repair block makes,
+  which record no row of their own. A row for a stage the walk has not reached has
   `attempt: 0`.
 
   `advisory` is `true` when the stage's `fail_action` is `continue`, so a

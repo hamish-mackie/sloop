@@ -71,8 +71,9 @@ With `--json`, the template text is returned as `data.template` alongside
 available from an installed binary. It prints the current grammar — `action`,
 `result_check`, and `fail_action` written out on every stage, one `return_to`
 edge, one advisory stage, and a commented `panel` block — with the pre-`action`
-`kind:`/`verdict:` spelling and the deprecated `on_fail` reduced to a short
-"legacy spellings" note at the end, since both still parse.
+stage spellings reduced to a short "legacy spellings" note at the end, since
+those still parse too. They are documented in
+[the legacy grammar appendix](configuration.md#appendix-the-legacy-grammar).
 
 `sloop template ticket`'s `flow:` comment names the two flows that ship inside
 the binary and are written out by `sloop init`: `default` (build, review,
@@ -287,8 +288,8 @@ Stage names come from the run's admitted flow snapshot, so a run still shows
 the stages it actually had even if the flow file changed afterwards. Two
 different budgets can be spent on one stage and they are reported separately:
 `return_to` re-enters the stage and gets a row per execution with a `#N`
-label, while a deprecated `on_fail` retries *within* one execution and reports
-the total as `N attempts` on that one row.
+label, while a deprecated repair block retries *within* one execution and
+reports the total as `N attempts` on that one row.
 
 A stage judged by a `reported` check shows the worker's `--confidence` beside
 its verdict source. A stage judged by a `panel` lists every seat under it —

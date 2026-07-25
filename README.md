@@ -31,9 +31,10 @@ project says which work belongs together.
   <a href="docs/assets/help.png">CLI help</a>
 </p>
 
-Under the hood it's a small Rust daemon — an agent harness that supervises
-each run, enforces shared rate limits, and judges outcomes from process exit
-and tests rather than trusting the agent's word.
+Under the hood it's a small deterministic kernel that checks what untrusted
+processes propose. A Rust daemon supervises each run, enforces shared rate
+limits, and derives every verdict from evidence it observed itself — process
+exit, commits, tests — rather than from the agent's word.
 
 Full documentation lives in [docs/](docs/).
 
@@ -114,52 +115,48 @@ and `effort:` defaults. Keep secrets in environment variables.
 
 ## Flows
 
-Flows define the steps a ticket must pass before its work is merged. `sloop init`
-creates `.agents/sloop/flows/default.yaml`:
+A flow is the ordered list of stages a ticket walks before its work can merge.
+Every stage is three things: an `action` that does the work, a `result_check`
+that judges it, and a `fail_action` saying what a failure does to the walk.
 
 ```yaml
 stages:
   - name: build
-    kind: agent
-  - name: review
-    kind: exec
-    verdict: reported
-    cmd:
-      - claude
-      - --print
-      - --allowedTools
-      - Bash
-      - --
-      - "Read .agents/sloop/prompts/review.md and follow its instructions."
+    action: agent
+    result_check: { builtin: commits }
+  - name: test
+    action: { exec: [cargo, test] }
+    result_check: none
   - name: merge
-    kind: merge
+    action: { builtin: merge }
+    result_check: none
 ```
 
-The review stage is `verdict: reported`, so the reviewer decides the stage by
-calling `sloop verdict pass|fail --reason <text>` — its exit code is not the
-verdict. `--allowedTools Bash` is what lets the reviewer run tests and make
-that call at all.
+The split is the whole idea: an action never grades itself. `build` spawns the
+ticket's agent, and `{ builtin: commits }` passes it only when Sloop observes a
+new commit on the run branch — an agent that exits cleanly having written
+nothing has not passed. `test` runs an argv in the run worktree and is judged by
+its exit status. `merge` applies the branch using Sloop's merge policy.
+
+`fail_action` defaults to `fail`, which halts the walk and leaves the branch for
+review. `fail_action: continue` instead records the failure and carries on, for
+advisory stages that report without blocking the merge;
+`fail_action: { return_to: build, attempts: 2 }` sends the walk back to an
+earlier stage and re-runs the span from there, handing the re-entered agent the
+failure it has to fix. Both are covered in
+[docs/configuration.md](docs/configuration.md#fail_action-what-a-failure-does-to-the-walk).
 
 The filename is the flow name. Select one with `flow: <name>` in the ticket or
 with `sloop post my-ticket.md --flow <name>`.
 
-An `agent` stage is a supervised coding agent — in any position, any number of
-times; `exec` stages run their argv in the run worktree, and `merge` applies
-the branch. Every non-merge stage has a verdict policy:
+`sloop init` writes two flows. `default.yaml` is build → review → merge, where
+review is a second agent that reports its own verdict with `sloop verdict`;
+`train.yaml` is an opt-in merge train that syncs the default branch in and
+verifies the result before a fast-forward-only merge, so nothing lands that the
+verify stage did not run against. See
+[docs/configuration.md](docs/configuration.md#the-merge-train).
 
-- `commits` requires exit 0 and at least one observed commit.
-- `exit` requires exit 0.
-- `{ check: [cargo, test] }` requires exit 0, then uses the check command's
-  exit code.
-- `reported` requires the process to call
-  `sloop verdict pass|fail [--reason <text>]` exactly once.
-
-```yaml
-verdict: { check: [cargo, test] }
-```
-
-`agent` defaults to `commits`; `exec` defaults to `exit`. A failed verdict
-stops the flow before merge. To add a test gate to every flow, set:
+To add a test gate to every flow without editing each one, set:
 
 ```yaml
 flow:
@@ -168,14 +165,6 @@ flow:
 
 This command runs as an implicit `test` stage at index 1, before the flow's
 own later stages.
-
-`init` also writes `.agents/sloop/flows/train.yaml`, an opt-in merge train:
-`build → sync → verify → merge`, where `{ builtin: sync }` merges the default
-branch into the run branch and `{ builtin: merge, ff_only: true }` refuses to
-land anything the verify stage did not run against. If the default branch moves
-in between, the fast-forward fails without side effects and
-`fail_action: { return_to: sync }` runs the train around again. See
-[docs/configuration.md](docs/configuration.md#the-merge-train).
 
 ## Logs
 

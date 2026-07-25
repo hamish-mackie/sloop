@@ -31,7 +31,8 @@ This scaffolds committed configuration under `.agents/sloop/`:
 - `tickets/` — where your ticket files live
 - `flows/default.yaml` — the default flow (build → review → merge)
 - `flows/train.yaml` — the opt-in merge train (build → sync → verify →
-  fast-forward merge); bind a ticket to it with `flow: train`
+  fast-forward merge); bind a ticket to it with `flow: train`. See
+  [the merge train](configuration.md#the-merge-train).
 - `prompts/review.md` — the prompt used by the default review stage
 
 `init` never edits `.gitignore`; whether worktrees and tickets are committed
@@ -127,12 +128,37 @@ sloop logs <run-id>                      # a run's captured output
 sloop show <run-id> --follow --quiet     # block until the run finishes; exit 0 only on merge
 ```
 
-When the agent exits, Sloop evaluates its stage verdict, runs the bound flow's
-`exec` stages in order, and performs its `merge` stage if they pass. A
-configured test command runs immediately after the agent, before other flow
-stages. The default agent verdict requires exit 0 and at least one observed
-commit, so an unchanged run branch is retained for review rather than silently
-merged.
+The ticket's flow is a list of stages, and Sloop walks them in order. Each stage
+runs its `action`, judges it with an independent `result_check`, and records the
+verdict; a failure halts the walk unless the stage says otherwise. The
+scaffolded `default` flow is:
+
+```yaml
+stages:
+  - name: build
+    action: agent
+    result_check: { builtin: commits }
+  - name: review
+    action:
+      exec:
+        - claude
+        - --print
+        - --allowedTools
+        - Bash
+        - --
+        - "Read .agents/sloop/prompts/review.md and follow its instructions."
+    result_check: reported
+  - name: merge
+    action: { builtin: merge }
+    result_check: none
+```
+
+So the agent's own exit code is never the last word. `build` passes only when
+Sloop observes a new commit on the run branch, which is why an unchanged branch
+is kept for review rather than silently merged. `review` must call
+`sloop verdict pass|fail --reason <text>` — a reviewer that merely exits 0 has
+approved nothing. Only then does `merge` apply the branch. A configured
+`flow.test_cmd` is spliced in as an extra stage immediately after the first one.
 
 ## Everyday controls
 

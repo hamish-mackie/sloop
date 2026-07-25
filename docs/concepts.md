@@ -45,6 +45,73 @@ run drivers send it requests; they never admit anything themselves.
 That single ownership — not politeness between callers — is what makes
 gate-then-claim atomic.
 
+## Stages and flows
+
+A **flow** is the ordered list of stages a run walks. A **stage** is three
+things:
+
+- an **action** — the work: the ticket's agent, an argv in the run worktree, or
+  one of Sloop's git builtins;
+- a **result check** — what decides the stage's verdict: the action's own exit
+  status, a new commit Sloop observed, a separate command, a `sloop verdict`
+  report made over credentials scoped to that one stage, or a panel of
+  reviewers whose reports a quorum rule counts;
+- a **fail action** — what a failing verdict does to the walk: halt it, record
+  the failure and continue, or return to an earlier stage and re-run the span.
+
+The split between the first two is the design. An action is an untrusted
+process; the check is the part Sloop decides for itself. A stage whose action is
+an agent may not be judged by its own exit status, because "the process exited
+0" is a claim the agent controls. Everything that decides an outcome is
+deterministic code over evidence Sloop observed.
+
+Because a check is a separate step, the vocabulary composes rather than
+multiplying: the same `exec` that can be an action can be a check, an agent can
+appear in any position any number of times, and a backward `return_to` edge
+turns a linear list into a bounded loop without any stage learning about
+looping. The [configuration guide](configuration.md#flows) has the grammar.
+
+## Attempts and the evidence log
+
+Every stage execution appends one row to the run's evidence log: which stage,
+which attempt, the verdict, where the verdict came from, and why. The log is
+append-only and ordered, and the walk's position is *always recomputed by
+replaying it* rather than read from a stored cursor. That is what makes a run
+resumable — a daemon that died mid-flow replays the same rows, derives the same
+next stage, and re-runs the interrupted one idempotently.
+
+`sloop show <run>` is that log, read back:
+
+```
+stages:
+  build    passed   19:02-19:05  3m0s  exit 0  verdict from exit_code
+  test     failed   19:05-19:08  3m11s  exit 1  verdict from exit_code
+  build#2  passed   19:08-19:14  6m0s  exit 0  verdict from exit_code
+  test#2   passed   19:14-19:17  2m40s  exit 0  verdict from exit_code
+  merge    passed   19:17-19:17  0s  verdict from exit_code
+```
+
+Two different counters both get called attempts, and they mean different things:
+
+- A **re-entry** is a whole new execution of the stage, caused by a `return_to`
+  edge. It gets its own row, labelled `#2`, `#3`, and so on. The rows above show
+  a `test` failure sending the walk back to `build`, and the second lap passing.
+- **Retries within one execution** leave no row of their own and are reported as
+  `N attempts` on the one row they belong to. Only the deprecated repair blocks
+  in the [legacy grammar](configuration.md#appendix-the-legacy-grammar) produce
+  them.
+
+A failing stage marked `advisory` was recorded and stepped over rather than
+ending the walk; the run's own reason names the stage that actually halted it,
+and adds a clause when the ending needs one — `return_to budget spent` when a
+backward edge ran out of laps, or `the stage log does not replay against this
+flow` when the recorded history no longer describes a walk over the run's flow.
+
+Stage names come from the flow snapshot admitted with the run, so a finished run
+still shows the stages it actually had even after the flow file changes.
+`--json` returns the same rows structurally; see the
+[protocol reference](protocol.md).
+
 ## Outcomes come from process and stage evidence
 
 Sloop never trusts what the agent says in free-form output or notes. It derives
@@ -71,8 +138,9 @@ the matched class, vendor, rule ID, and catalog-authored diagnostic as evidence.
 Raw output remains in the run log rather than being copied into diagnostics.
 
 Commit OIDs are recorded using the run branch's creation point as their
-baseline. They feed the default agent-stage `commits` verdict and the project
-activity view. When evidence is incomplete, Sloop does not infer a pass.
+baseline. They feed the `{ builtin: commits }` check an agent action gets by
+default, and the project activity view. When evidence is incomplete, Sloop does
+not infer a pass.
 
 A `needs_review` ticket is resolved by merging its preserved run branch into the
 default branch by hand. The running daemon now notices this: on each periodic
@@ -102,8 +170,8 @@ Two verb sets, enforced by two sockets rather than documentation:
 The daemon rejects operator verbs on worker connections, scopes a worker's
 reads and notes to its own run, and invalidates the token when the run ends.
 The worker's vocabulary is `brief`, `show`, `note`, and `verdict`. The last is
-accepted only while that worker's current stage uses the `reported` policy,
-and its first persisted report is final. A worker cannot claim work, change
+accepted only while that worker's current stage uses a `reported` or `panel`
+result check, and its first persisted report is final. A worker cannot claim work, change
 status directly, or merge, even at 3am, even if it tries.
 
 `show` is the one verb both sockets answer. On the worker socket it is
