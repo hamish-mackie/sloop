@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -47,7 +47,12 @@ impl ExecTicketSource {
             .take()
             .expect("piped source stdin is available")
             .write_all(&input);
-        if let Err(error) = write_result {
+        // A source that answers without reading its request closes the pipe
+        // under us. That is not a failure of its own: the exit status and
+        // stderr hold the answer, so reap the child and let those speak.
+        if let Err(error) = write_result
+            && error.kind() != io::ErrorKind::BrokenPipe
+        {
             let _ = child.kill();
             let _ = child.wait();
             return Err(TicketFeedError::new(format!(
@@ -143,7 +148,49 @@ fn command_failed(argv: &[String], output: &std::process::Output) -> TicketFeedE
 
 #[cfg(test)]
 mod tests {
-    use super::parse_tickets;
+    use tempfile::tempdir;
+
+    use super::{ExecTicketSource, parse_tickets};
+
+    /// A failing source almost never reads the request it was handed, which
+    /// breaks the request pipe. The exit status and stderr must survive that.
+    #[test]
+    fn a_source_that_fails_without_reading_its_request_still_reports_its_stderr() {
+        let directory = tempdir().unwrap();
+        let source = ExecTicketSource::new(
+            directory.path(),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "exec 0<&-; printf 'pull failed' >&2; exit 3".into(),
+            ],
+        );
+
+        let error = source.pull().unwrap_err().to_string();
+
+        assert!(error.contains("pull failed"), "{error}");
+        assert!(error.contains("exit status: 3"), "{error}");
+    }
+
+    /// The counterpart: a source is free to ignore its request entirely, and a
+    /// broken request pipe must not condemn an answer that arrived anyway.
+    #[test]
+    fn a_source_that_answers_without_reading_its_request_is_accepted() {
+        let directory = tempdir().unwrap();
+        let source = ExecTicketSource::new(
+            directory.path(),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                r#"exec 0<&-; printf '[{"name":"One","body":"work"}]'"#.into(),
+            ],
+        );
+
+        let tickets = source.pull().unwrap();
+
+        assert_eq!(tickets.len(), 1);
+        assert_eq!(tickets[0].source_ref, "row:0");
+    }
 
     #[test]
     fn valid_rows_map_fields_and_apply_defaults() {
