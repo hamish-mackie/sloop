@@ -142,6 +142,20 @@ Time-based activations use the same scheduler gates as an immediate run:
 - `--overnight` queues one run for the next open `running_hours` window. If
   no window is configured, it is dispatchable immediately.
 
+A queued run pinned to a ticket is retired the moment that ticket merges,
+including a merge reconciled from an external branch. Dispatch only ever
+selects a `ready` ticket and `merged` is terminal, so such a run could never
+start; leaving it queued would overstate pending work in `sloop show`. This
+applies to `--every` as well — a recurring run pinned to a merged ticket has
+nothing left to recur on. Runs that are not pinned to a ticket are demand for
+whatever is ready and survive the merge of any ticket they selected. Other
+outcomes leave queued runs alone: `failed`, `held`, and `needs_review` can all
+return to `ready`.
+
+A daemon started against state left by an older version completes any queued
+run still pinned to an already-merged ticket, logging one
+`activation_completed_on_merged_ticket` record per run it retired.
+
 ### sloop retry <TICKET>
 
 Return a failed ticket to ready and reset its attempt counter.

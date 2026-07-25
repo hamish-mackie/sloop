@@ -1207,6 +1207,42 @@ pub(super) fn restore_reported_output_stalls(state: &mut DispatcherState) {
     }
 }
 
+/// Retires activations pinned to a ticket that is already `merged`. Settling
+/// now completes them in the same transaction as the merge, but that rule is
+/// not retroactive and a merged ticket never settles again, so rows stranded
+/// before it existed need this one-off sweep. Without it they stay `queued`
+/// forever, unfireable but still counted as pending demand.
+///
+/// Runs once per daemon lifetime, and only reports what it actually changed: a
+/// clean database selects nothing, writes nothing, and logs nothing.
+pub(super) fn reconcile_merged_ticket_activations(state: &DispatcherState, log: &OperationalLog) {
+    let now_ms = state.clock.now_ms();
+    match state
+        .local_work_state
+        .complete_merged_ticket_activations(now_ms)
+    {
+        Ok(completed) => {
+            for (activation_id, ticket_id) in completed {
+                log.emit_with_fields(
+                    LogLevel::Info,
+                    "sloop::daemon",
+                    "activation_completed_on_merged_ticket",
+                    json!({"activation_id": activation_id, "ticket_id": ticket_id}),
+                );
+            }
+        }
+        Err(error) => {
+            mark_storage_full(state, &error);
+            log.emit_with_fields(
+                LogLevel::Error,
+                "sloop::daemon",
+                "merged_ticket_activation_sweep_failed",
+                json!({"error": error.to_string()}),
+            );
+        }
+    }
+}
+
 fn eligible_ticket(
     local_work_state: &LocalSqlite,
     run_store: &RunStore,

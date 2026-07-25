@@ -464,14 +464,25 @@ impl Harness {
             self.model.leases.remove(&ticket);
         }
         if self.model.tickets[ticket.as_str()] == "claimed" {
-            *self.model.tickets.get_mut(&ticket).expect("known ticket") =
-                match TicketState::after_outcome(outcome) {
-                    TicketState::Ready => "ready",
-                    TicketState::Merged => "merged",
-                    TicketState::Failed => "failed",
-                    TicketState::NeedsReview => "needs_review",
-                    state => panic!("unexpected post-outcome ticket state {state:?}"),
-                };
+            let settled_state = match TicketState::after_outcome(outcome) {
+                TicketState::Ready => "ready",
+                TicketState::Merged => "merged",
+                TicketState::Failed => "failed",
+                TicketState::NeedsReview => "needs_review",
+                state => panic!("unexpected post-outcome ticket state {state:?}"),
+            };
+            *self.model.tickets.get_mut(&ticket).expect("known ticket") = settled_state;
+            if settled_state == "merged" {
+                // Settling to `merged` retires the ticket's remaining
+                // activations in the same transaction. Every activation here
+                // is pinned to its ticket, and dispatch only ever selects a
+                // `ready` one, so none of them could fire again.
+                self.model
+                    .queued
+                    .get_mut(&ticket)
+                    .expect("known ticket")
+                    .clear();
+            }
         }
         if outcome == Outcome::RateLimited {
             // A delayed retry re-queues the activation it consumed.

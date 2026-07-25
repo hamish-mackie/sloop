@@ -399,6 +399,31 @@ pub(crate) mod tx {
         )
     }
 
+    /// Retires the activations pinned to a ticket that has just settled to
+    /// `merged`. A pinned activation resolves through `ticket_is_dispatchable`,
+    /// which demands `state = 'ready'`, and a merged ticket never returns
+    /// there: leaving it queued is demand that can never be met but is still
+    /// counted. Running this in the settle transaction means the activation
+    /// dies at the instant the ticket merges, with no window where the two
+    /// disagree.
+    ///
+    /// Kind is deliberately not consulted. An `every` activation pinned to a
+    /// merged ticket is as unfireable as a `once`; its rearm arithmetic in
+    /// `advance_activation` is untouched and simply has nothing left to rearm.
+    /// An unpinned activation is demand for whatever is ready, so it is out of
+    /// scope by construction — the `ticket_id` match excludes it.
+    pub(crate) fn complete_ticket_activations(
+        transaction: &Transaction<'_>,
+        ticket_id: &str,
+        now_ms: i64,
+    ) -> rusqlite::Result<usize> {
+        transaction.execute(
+            "UPDATE activations SET state = 'completed', updated_at_ms = ?2
+             WHERE ticket_id = ?1 AND state = 'queued'",
+            params![ticket_id, now_ms],
+        )
+    }
+
     pub(crate) fn replace_ticket_blockers(
         transaction: &Transaction<'_>,
         ticket_id: &str,
@@ -632,6 +657,46 @@ impl LocalSqlite {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(activations)
+    }
+
+    /// Retires activations left queued against a ticket that merged before the
+    /// settle path knew to retire them. The rule in `tx::complete_ticket_activations`
+    /// only applies from the next settlement onwards, and a merged ticket never
+    /// settles again, so anything already stranded needs this one-off sweep.
+    ///
+    /// Returns the `(activation_id, ticket_id)` pairs it completed, so the
+    /// caller can report a startup mutation rather than perform it silently. A
+    /// database with nothing stranded selects no rows and writes nothing, which
+    /// makes repeated runs free.
+    pub fn complete_merged_ticket_activations(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stranded = {
+            let mut statement = transaction.prepare(
+                "SELECT a.id, a.ticket_id
+                 FROM activations a
+                 JOIN tickets t ON t.id = a.ticket_id
+                 WHERE a.state = 'queued' AND t.state = 'merged'
+                 ORDER BY a.created_at_ms, a.id",
+            )?;
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<(String, String)>, _>>()?
+        };
+        if stranded.is_empty() {
+            return Ok(Vec::new());
+        }
+        transaction.execute(
+            "UPDATE activations SET state = 'completed', updated_at_ms = ?1
+             WHERE state = 'queued'
+               AND ticket_id IN (SELECT id FROM tickets WHERE state = 'merged')",
+            params![now_ms],
+        )?;
+        transaction.commit()?;
+        Ok(stranded)
     }
 
     pub fn next_activation_eligible_at_ms(&self, now_ms: i64) -> Result<Option<i64>, StoreError> {
@@ -2243,9 +2308,14 @@ impl WorkState for LocalSqlite {
                 if matches!(disposition, Disposition::Complete)
                     && state == TicketState::NeedsReview.as_str()
                 {
-                    tx::settle_external_merge(&transaction, &ticket.id, now_ms)
+                    let changed = tx::settle_external_merge(&transaction, &ticket.id, now_ms)
                         .map_err(StoreError::from)
                         .map_err(source_error)?;
+                    if changed == 1 {
+                        tx::complete_ticket_activations(&transaction, &ticket.id, now_ms)
+                            .map_err(StoreError::from)
+                            .map_err(source_error)?;
+                    }
                     transaction
                         .commit()
                         .map_err(StoreError::from)
@@ -2267,9 +2337,16 @@ impl WorkState for LocalSqlite {
 
         let changed = match disposition {
             Disposition::Complete => {
-                tx::settle_ticket(&transaction, &ticket.id, TicketState::Merged, now_ms)
-                    .map_err(StoreError::from)
-                    .map_err(source_error)?
+                let changed =
+                    tx::settle_ticket(&transaction, &ticket.id, TicketState::Merged, now_ms)
+                        .map_err(StoreError::from)
+                        .map_err(source_error)?;
+                if changed == 1 {
+                    tx::complete_ticket_activations(&transaction, &ticket.id, now_ms)
+                        .map_err(StoreError::from)
+                        .map_err(source_error)?;
+                }
+                changed
             }
             Disposition::Retry { not_before_ms } => {
                 let changed = tx::abort_ticket(&transaction, &ticket.id, now_ms)
@@ -2734,6 +2811,192 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(review.ticket("T1").unwrap().unwrap().state, "needs_review");
+    }
+
+    fn insert_ready_ticket(local: &LocalSqlite, id: &str, now_ms: i64) {
+        local
+            .insert_local_ticket(
+                id,
+                "default",
+                &format!(".agents/sloop/tickets/{}.md", id.to_lowercase()),
+                "Another ticket",
+                &[],
+                &format!("sloop/{id}"),
+                Some("claude"),
+                Some("sonnet"),
+                Some("medium"),
+                "default",
+                TicketState::Ready,
+                now_ms,
+            )
+            .unwrap();
+    }
+
+    fn insert_queued_activation(
+        local: &LocalSqlite,
+        id: &str,
+        kind: ActivationKind,
+        ticket_id: Option<&str>,
+        project_id: Option<&str>,
+    ) {
+        local
+            .insert_activation(
+                &NewActivation {
+                    id,
+                    kind,
+                    ticket_id,
+                    project_id,
+                    eligible_at_ms: None,
+                    interval_ms: None,
+                },
+                1_000,
+            )
+            .unwrap();
+    }
+
+    fn queued_activation_ids(local: &LocalSqlite) -> Vec<String> {
+        local
+            .queued_activations()
+            .unwrap()
+            .into_iter()
+            .map(|activation| activation.id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn local_work_state_complete_retires_activations_pinned_to_the_merged_ticket() {
+        let (_directory, local) = open_seeded_local();
+        insert_ready_ticket(&local, "T2", 1_000);
+        // A2 is a recurring trigger pinned to the merging ticket: not yet
+        // eligible, so the claim leaves it alone, and unfireable forever once
+        // T1 merges. A3 is pinned elsewhere and A4 is unpinned demand, so both
+        // must survive.
+        local
+            .insert_activation(
+                &NewActivation {
+                    id: "A2",
+                    kind: ActivationKind::Every,
+                    ticket_id: Some("T1"),
+                    project_id: None,
+                    eligible_at_ms: Some(50_000),
+                    interval_ms: Some(60_000),
+                },
+                1_000,
+            )
+            .unwrap();
+        insert_queued_activation(&local, "A3", ActivationKind::Immediate, Some("T2"), None);
+        insert_queued_activation(&local, "A4", ActivationKind::Auto, None, Some("default"));
+
+        claim_local(&local, "R1").await;
+        local
+            .release(&ticket_ref(), &OwnerId("R1".into()), Disposition::Complete)
+            .await
+            .unwrap();
+
+        assert_eq!(local.ticket("T1").unwrap().unwrap().state, "merged");
+        assert_eq!(queued_activation_ids(&local), vec!["A3", "A4"]);
+        // The surviving unpinned activation still resolves to whatever is ready.
+        assert_eq!(
+            local
+                .select_ready_ticket(Some("default"), "A4", 2_000)
+                .unwrap(),
+            Some("T2".to_owned())
+        );
+        assert_eq!(
+            local
+                .pull_ready()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|ticket| ticket.id)
+                .collect::<Vec<_>>(),
+            vec!["T2".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn local_work_state_external_merge_retires_pinned_activations() {
+        let (_directory, local) = open_seeded_local();
+        insert_queued_activation(&local, "A2", ActivationKind::Immediate, Some("T1"), None);
+        claim_local(&local, "R1").await;
+        local
+            .release(
+                &ticket_ref(),
+                &OwnerId("R1".into()),
+                Disposition::Park {
+                    reason: "needs-review".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued_activation_ids(&local), vec!["A2"]);
+
+        // A settled review branch merged outside the run reaches release with
+        // no lease left to consume; the pinned activation dies there too.
+        local
+            .release(&ticket_ref(), &OwnerId("R1".into()), Disposition::Complete)
+            .await
+            .unwrap();
+
+        assert_eq!(local.ticket("T1").unwrap().unwrap().state, "merged");
+        assert!(queued_activation_ids(&local).is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_work_state_non_merge_dispositions_leave_pinned_activations_queued() {
+        // `failed`, `held` and `needs_review` are not final the way `merged`
+        // is: the ticket can return to `ready`, so its triggers must survive.
+        for disposition in [
+            Disposition::Abandon,
+            Disposition::Park {
+                reason: "operator review".into(),
+            },
+            Disposition::Park {
+                reason: "needs-review".into(),
+            },
+            Disposition::Retry {
+                not_before_ms: None,
+            },
+        ] {
+            let (_directory, local) = open_seeded_local();
+            insert_queued_activation(&local, "A2", ActivationKind::Immediate, Some("T1"), None);
+            claim_local(&local, "R1").await;
+            local
+                .release(&ticket_ref(), &OwnerId("R1".into()), disposition)
+                .await
+                .unwrap();
+            assert_eq!(queued_activation_ids(&local), vec!["A2"]);
+        }
+    }
+
+    #[test]
+    fn complete_merged_ticket_activations_sweeps_only_stranded_pinned_rows() {
+        let (_directory, local) = open_seeded_local();
+        insert_ready_ticket(&local, "T2", 1_000);
+        insert_queued_activation(&local, "A2", ActivationKind::Immediate, Some("T2"), None);
+        insert_queued_activation(&local, "A3", ActivationKind::Auto, None, Some("default"));
+        // A1 is pinned to T1, which reached `merged` without the settle-time
+        // rule ever running — exactly the row the sweep exists for.
+        local
+            .db
+            .lock()
+            .execute("UPDATE tickets SET state = 'merged' WHERE id = 'T1'", [])
+            .unwrap();
+
+        assert_eq!(
+            local.complete_merged_ticket_activations(2_000).unwrap(),
+            vec![("A1".to_owned(), "T1".to_owned())]
+        );
+        assert_eq!(queued_activation_ids(&local), vec!["A2", "A3"]);
+
+        // Idempotent: a database with nothing stranded reports nothing.
+        assert!(
+            local
+                .complete_merged_ticket_activations(3_000)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(queued_activation_ids(&local), vec!["A2", "A3"]);
     }
 
     #[tokio::test]

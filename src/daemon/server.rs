@@ -38,7 +38,10 @@ use super::dispatcher::{
     run_dispatcher, unauthorized,
 };
 use super::recovery::recover_inflight_runs;
-use super::scheduler::{index_projects, reconcile_tickets, restore_reported_output_stalls};
+use super::scheduler::{
+    index_projects, reconcile_merged_ticket_activations, reconcile_tickets,
+    restore_reported_output_stalls,
+};
 
 const MAX_ENVELOPE_BYTES: u64 = 1024 * 1024;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -377,6 +380,7 @@ async fn serve(
         shutdown_flag: shutdown_flag.clone(),
     };
     restore_reported_output_stalls(&mut state);
+    reconcile_merged_ticket_activations(&state, &log);
     recover_inflight_runs(&mut state, &events_tx, &log).await?;
     let dispatcher_task = tokio::spawn(run_dispatcher(
         state,

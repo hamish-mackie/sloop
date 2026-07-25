@@ -16,6 +16,16 @@ fn status(world: &World) -> Value {
     World::json_stdout(&output)["data"].clone()
 }
 
+fn stop_daemon(world: &World, pid: u32) {
+    let output = world.sloop(&["stop"]);
+    assert!(
+        output.status.success(),
+        "stop failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_until("the daemon stops", || !process_alive(pid));
+}
+
 fn log_event_count(world: &World, event: &str) -> usize {
     fs::read_to_string(world.daemon_log())
         .unwrap_or_default()
@@ -749,5 +759,67 @@ fn worker_verbs_on_the_operator_socket_point_at_an_alternative() {
     assert!(
         message.contains("sloop show"),
         "remedy does not name an operator alternative: {message}"
+    );
+}
+
+/// A trigger pinned to a merged ticket can never fire: dispatch requires the
+/// ticket to be `ready`, and `merged` is terminal. Settling now retires such a
+/// trigger in the same transaction as the merge, but rows stranded before that
+/// rule existed outlive every future settlement, so startup sweeps them.
+#[test]
+fn startup_completes_activations_pinned_to_an_already_merged_ticket() {
+    let world = World::configured();
+    let ticket = world.write_ticket("stranded.md", "# Stranded\n");
+    world.commit_all("initial");
+    let pid = world.start_daemon()["data"]["pid"].as_u64().unwrap() as u32;
+    let posted = world.sloop(&["post", ticket.to_str().unwrap(), "--manual"]);
+    assert!(
+        posted.status.success(),
+        "post failed: {}",
+        String::from_utf8_lossy(&posted.stderr)
+    );
+    let ticket_id = World::json_stdout(&posted)["data"]["ticket"]["id"]
+        .as_str()
+        .expect("posted ticket id")
+        .to_owned();
+    stop_daemon(&world, pid);
+
+    // Forge exactly what an older daemon left behind: a queued trigger pinned
+    // to a ticket that has since merged.
+    let connection = rusqlite::Connection::open(world.db_path()).unwrap();
+    connection
+        .execute(
+            "UPDATE tickets SET state = 'merged' WHERE id = ?1",
+            [&ticket_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO activations
+                 (id, kind, state, ticket_id, created_at_ms, updated_at_ms)
+             VALUES ('A68', 'immediate', 'queued', ?1, 1, 1)",
+            [&ticket_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let pid = world.start_daemon()["data"]["pid"].as_u64().unwrap() as u32;
+    assert_eq!(
+        status(&world)["queued_activations"],
+        serde_json::json!([]),
+        "the dead trigger is still counted as pending demand"
+    );
+    assert_eq!(
+        log_event_count(&world, "activation_completed_on_merged_ticket"),
+        1,
+        "the sweep mutated rows without saying so"
+    );
+
+    // Idempotent: the next start finds nothing left to complete.
+    stop_daemon(&world, pid);
+    world.start_daemon();
+    assert_eq!(
+        log_event_count(&world, "activation_completed_on_merged_ticket"),
+        1
     );
 }
