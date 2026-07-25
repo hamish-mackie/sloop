@@ -13,6 +13,10 @@ pub mod local;
 pub struct StageOrder {
     pub run_id: String,
     pub stage: String,
+    /// Which execution of `stage` this order is. A backward edge re-runs a
+    /// stage, so everything the execution produces — captured output above
+    /// all — is tagged with the attempt as well as the name.
+    pub attempt: u32,
     pub execution: StageExecution,
     pub worktree: PathBuf,
     pub branch: String,
@@ -71,6 +75,7 @@ pub struct ExecutionEvidence {
 pub struct AgentProcessCheckpoint {
     pub run_id: String,
     pub stage: String,
+    pub attempt: u32,
     pub branch: String,
     pub worktree: PathBuf,
     pub process: ProcessIdentity,
@@ -82,6 +87,7 @@ pub struct AgentProcessCheckpoint {
 pub struct ExecProcessCheckpoint {
     pub run_id: String,
     pub stage: String,
+    pub attempt: u32,
     pub process: ProcessIdentity,
     pub started_at_ms: i64,
 }

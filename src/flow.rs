@@ -110,7 +110,7 @@ pub enum Check {
 /// What the walk does when a stage's reading is `Fail`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailAction {
-    /// Stop the walk here. The only variant the walk supports today.
+    /// Stop the walk here, leaving the stages after it unrequested.
     Halt,
     /// Record the failure and carry on to the next stage.
     Continue,
@@ -481,29 +481,6 @@ fn validate_order(stages: &[Stage]) -> Result<(), String> {
     }
 
     validate_return_edges(stages)?;
-
-    // `next_step` folds these edges and the stage log now carries the real
-    // attempt behind every row, but nothing drives a backward edge yet: no
-    // execution records an attempt past its first. Parsing the vocabulary now
-    // and refusing it here keeps flow files from depending on behaviour that
-    // has not landed.
-    for stage in stages {
-        match &stage.fail_action {
-            FailAction::Halt => {}
-            FailAction::Continue => {
-                return Err(format!(
-                    "stage `{}` fail_action `continue` is not yet supported",
-                    stage.name
-                ));
-            }
-            FailAction::ReturnTo { .. } => {
-                return Err(format!(
-                    "stage `{}` fail_action `return_to` is not yet supported",
-                    stage.name
-                ));
-            }
-        }
-    }
     Ok(())
 }
 
@@ -713,6 +690,31 @@ pub fn next_step<'a>(flow: &'a Flow, evidence: &[StageEvidence]) -> Step<'a> {
     }
 }
 
+/// The failure that most recently sent the walk backwards, as the `(stage
+/// index, attempt)` key of its evidence row — the row a re-entered stage is
+/// being re-run *because of*.
+///
+/// Every backward edge leaves a `Fail` row on the stage that owns it, so the
+/// last such row in the log is the jump the walk is still inside. Reading it
+/// from the persisted log rather than from a live counter is what makes a
+/// re-run prompt reproducible: a resumed run derives the same trigger, and so
+/// composes the same prompt, as the daemon that first took the jump.
+pub fn return_trigger(flow: &Flow, evidence: &[StageEvidence]) -> Option<(usize, u32)> {
+    evidence
+        .iter()
+        .rev()
+        .find(|row| {
+            row.verdict == Verdict::Fail
+                && matches!(
+                    flow.stages
+                        .get(row.stage_index)
+                        .map(|stage| &stage.fail_action),
+                    Some(FailAction::ReturnTo { .. })
+                )
+        })
+        .map(|row| (row.stage_index, row.attempt))
+}
+
 fn corrupt(failed_stage: String) -> Step<'static> {
     Step::Halted {
         failed_stage,
@@ -831,7 +833,7 @@ enum RawVerdict {
 mod tests {
     use super::{
         Actor, Builtin, Check, FailAction, Flow, HaltReason, Reported, Stage, StageEvidence, Step,
-        Verdict, VerdictSource, next_step, parse, resolve_verdict,
+        Verdict, VerdictSource, next_step, parse, resolve_verdict, return_trigger,
     };
 
     fn error(yaml: &str) -> String {
@@ -1135,24 +1137,43 @@ mod tests {
         );
     }
 
-    /// The walk is still linear halt-on-fail, so a flow may not bind an edge
-    /// the walk cannot honour — even though the vocabulary parses.
+    /// Both advisory failures and backward edges are live: the walk honours
+    /// what the fold returns, so the vocabulary binds rather than parsing into
+    /// a rejection.
     #[test]
-    fn continue_and_return_to_parse_but_are_not_yet_supported() {
-        let continues = error(
-            "- { name: build, action: agent }\n- { name: test, action: { exec: ['true'] }, fail_action: continue }\n",
-        );
-        assert!(
-            continues.contains("`continue` is not yet supported"),
-            "{continues}"
+    fn continue_and_return_to_bind_the_edges_they_name() {
+        let advisory = parse(
+            "example",
+            "- { name: build, action: agent }\n- { name: lint, action: { exec: ['true'] }, fail_action: continue }\n",
+        )
+        .unwrap();
+        assert_eq!(advisory.stages[1].fail_action, FailAction::Continue);
+
+        let looping = parse(
+            "example",
+            "- { name: build, action: agent }\n- { name: test, action: { exec: ['true'] }, fail_action: { return_to: build, attempts: 2 } }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            looping.stages[1].fail_action,
+            FailAction::ReturnTo {
+                stage: "build".into(),
+                attempts: 2,
+            }
         );
 
-        let returns = error(
-            "- { name: build, action: agent }\n- { name: test, action: { exec: ['true'] }, fail_action: { return_to: build, attempts: 2 } }\n",
-        );
-        assert!(
-            returns.contains("`return_to` is not yet supported"),
-            "{returns}"
+        // An omitted budget is one attempt, not an unbounded loop.
+        let defaulted = parse(
+            "example",
+            "- { name: build, action: agent }\n- { name: test, action: { exec: ['true'] }, fail_action: { return_to: build } }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            defaulted.stages[1].fail_action,
+            FailAction::ReturnTo {
+                stage: "build".into(),
+                attempts: 1,
+            }
         );
     }
 
@@ -1372,8 +1393,7 @@ mod tests {
     }
 
     /// A flow of exec stages with the given names and fail actions, built by
-    /// hand rather than parsed: `parse` still refuses `continue` and
-    /// `return_to`, but the fold that will execute them lands first.
+    /// hand so a fold test can name an edge without spelling out YAML.
     fn flow_with(stages: &[(&str, FailAction)]) -> Flow {
         Flow {
             name: "example".into(),
@@ -1634,6 +1654,39 @@ mod tests {
             next_step(&flow, &[passed(&flow, 0), failed(&flow, 1)]),
             halted("test", HaltReason::CorruptLog)
         );
+    }
+
+    /// A re-entered stage must be able to say *why*, and the answer is a row
+    /// in the log rather than anything the driver remembers.
+    #[test]
+    fn the_return_trigger_is_the_failure_the_walk_jumped_on() {
+        let flow = flow_with(&[
+            ("build", FailAction::Halt),
+            ("lint", FailAction::Halt),
+            ("test", return_to("build", 2)),
+        ]);
+
+        // Nothing has jumped yet, so nothing triggered a re-entry.
+        assert_eq!(return_trigger(&flow, &[]), None);
+        assert_eq!(return_trigger(&flow, &[pass(&flow, 0, 1)]), None);
+
+        // `lint` fails with a halting edge: a failure, but not a jump.
+        assert_eq!(
+            return_trigger(&flow, &[pass(&flow, 0, 1), fail(&flow, 1, 1)]),
+            None
+        );
+
+        let mut log = vec![pass(&flow, 0, 1), pass(&flow, 1, 1), fail(&flow, 2, 1)];
+        assert_eq!(return_trigger(&flow, &log), Some((2, 1)));
+
+        // The whole span re-runs, and every stage inside it is re-entered
+        // because of the same failure.
+        log.push(pass(&flow, 0, 2));
+        assert_eq!(return_trigger(&flow, &log), Some((2, 1)));
+
+        // A second jump supersedes the first.
+        log.extend([pass(&flow, 1, 2), fail(&flow, 2, 2)]);
+        assert_eq!(return_trigger(&flow, &log), Some((2, 2)));
     }
 
     #[test]

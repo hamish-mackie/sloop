@@ -30,10 +30,11 @@ use crate::db::{Db, StoreError};
 use crate::domain::ticket::TicketSnapshot;
 use crate::flow::{
     Actor, Builtin, Check, FailAction, Flow, OnFail, Reported, Stage, StageEvidence, Step, Verdict,
-    VerdictSource, next_step, resolve_verdict,
+    VerdictSource, next_step, resolve_verdict, return_trigger,
 };
 use crate::logging::{LogLevel, OperationalLog};
 use crate::outcome::{ExitClass, FlowHalt, MergeOutcome, classify_exit};
+use crate::run_log::stage_output_tail;
 use crate::run_store::{
     Exit, ExitDenial, RunExit, RunStart, RunState, RunStore, StagePhase, StageRecord, Start,
     StartDenial,
@@ -77,6 +78,7 @@ impl<'a> StoreStageHooks<'a> {
         &self,
         run_id: &str,
         stage: &str,
+        attempt: u32,
         process: ProcessIdentity,
         started_at_ms: i64,
     ) -> Result<(), StoreError> {
@@ -85,6 +87,7 @@ impl<'a> StoreStageHooks<'a> {
             STAGE_PROCESS,
             &json!({
                 "stage": stage,
+                "attempt": attempt,
                 "pid": process.pid,
                 "pid_start_time": process.start_time,
                 "process_group_id": process.process_group_id,
@@ -133,6 +136,7 @@ impl StageHooks for StoreStageHooks<'_> {
         self.record_stage_process(
             &checkpoint.run_id,
             &checkpoint.stage,
+            checkpoint.attempt,
             checkpoint.process,
             checkpoint.started_at_ms,
         )
@@ -142,10 +146,65 @@ impl StageHooks for StoreStageHooks<'_> {
         self.record_stage_process(
             &checkpoint.run_id,
             &checkpoint.stage,
+            checkpoint.attempt,
             checkpoint.process,
             checkpoint.started_at_ms,
         )
     }
+}
+
+/// How many lines of a failed stage's output a re-entered stage is shown. Long
+/// enough for a test failure's tail, short enough that the block cannot crowd
+/// the ticket out of the prompt.
+const BACKWARD_CONTEXT_LINES: usize = 100;
+
+/// One stage execution the driver is about to perform, as the walk named it.
+///
+/// `index` and `attempt` together are the log key the execution will record
+/// under; `context` is present only on a re-entry and says which failure sent
+/// the walk back here.
+struct StageRun {
+    stage: Stage,
+    index: usize,
+    attempt: u32,
+    context: Option<FailureContext>,
+}
+
+/// The failure a backward edge jumped on, recovered from the run's persisted
+/// evidence.
+///
+/// A re-entered agent must be told why it is running again or the loop cannot
+/// converge — it would reproduce the same work and fail the same check. The
+/// facts are read back from the stage log and the captured output rather than
+/// carried in memory, so a daemon that resumes mid-loop composes byte-for-byte
+/// the prompt the daemon that took the jump would have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailureContext {
+    stage: String,
+    attempt: u32,
+    reason: String,
+    /// The tail of that execution's captured output, already capped.
+    output: String,
+}
+
+/// The "previous attempt failed" block appended to a re-entered agent's
+/// prompt. Delimited on both sides because everything inside it is untrusted
+/// process output that must not read as further instructions.
+fn previous_attempt_block(context: &FailureContext) -> String {
+    let mut block = format!(
+        "--- previous attempt failed ---\n\
+         Stage `{}` (attempt {}) failed: {}\n\
+         You are running again to address that failure.",
+        context.stage, context.attempt, context.reason,
+    );
+    if !context.output.is_empty() {
+        block.push_str(&format!(
+            "\n\nThe last {BACKWARD_CONTEXT_LINES} lines of that stage's output:\n{}",
+            context.output,
+        ));
+    }
+    block.push_str("\n--- end previous attempt ---");
+    block
 }
 
 /// One thing the driver ran and watched: a stage's action, or the independent
@@ -175,9 +234,11 @@ struct AgentFacts {
     commit_observation_complete: bool,
     vendor_error: Option<VendorErrorMatch>,
     cooldown_until_ms: Option<i64>,
-    /// The exit checkpoint is already durable, so the agent stage resolves
-    /// from it rather than launching a second process for the same execution.
-    checkpointed: bool,
+    /// The execution of the primary agent stage whose exit checkpoint is
+    /// already durable. That stage resolves from the checkpoint rather than
+    /// launching a second process for the *same* execution — but a backward
+    /// edge re-entering it is a different execution, and does launch.
+    checkpointed_attempt: Option<u32>,
 }
 
 impl Default for AgentFacts {
@@ -189,7 +250,7 @@ impl Default for AgentFacts {
             commit_observation_complete: true,
             vendor_error: None,
             cooldown_until_ms: None,
-            checkpointed: false,
+            checkpointed_attempt: None,
         }
     }
 }
@@ -225,7 +286,14 @@ impl AgentFacts {
                 .and_then(|data| serde_json::from_value::<VendorErrorMatch>(data).ok()),
             cooldown_until_ms: value("vendor_error_classified")
                 .and_then(|data| data["cooldown_until_ms"].as_i64()),
-            checkpointed: true,
+            // Checkpoints written before re-entries existed name no attempt,
+            // and such a run only ever had a first.
+            checkpointed_attempt: Some(
+                value("exit_classified")
+                    .and_then(|data| data["attempt"].as_u64())
+                    .and_then(|attempt| u32::try_from(attempt).ok())
+                    .unwrap_or(1),
+            ),
         }
     }
 }
@@ -384,13 +452,14 @@ impl RunDriver<'_> {
             if cancelled(&self.run_store, self.run_id(), self.log()) {
                 return Some(self.exited(None));
             }
-            let log = match self.run_store.stage_log(self.run_id()) {
-                Ok(rows) => replayable(&rows),
+            let rows = match self.run_store.stage_log(self.run_id()) {
+                Ok(rows) => rows,
                 Err(error) => {
                     return Some(self.abandoned(WalkError::Stage(error.to_string()), usize::MAX));
                 }
             };
-            let (stage, attempt, stage_index) = match next_step(&self.flow, &log) {
+            let log = replayable(&rows);
+            let run = match next_step(&self.flow, &log) {
                 Step::Run { stage, attempt } => {
                     let index = self
                         .flow
@@ -398,8 +467,21 @@ impl RunDriver<'_> {
                         .iter()
                         .position(|candidate| candidate.name == stage.name)
                         .expect("next_step returned a stage from this flow");
-                    (stage.clone(), attempt, index)
+                    StageRun {
+                        // Only a re-entry has a failure behind it; a stage's
+                        // first execution answers for nothing.
+                        context: (attempt > 1)
+                            .then(|| self.failure_context(&rows, &log))
+                            .flatten(),
+                        stage: stage.clone(),
+                        index,
+                        attempt,
+                    }
                 }
+                // Every halt lands the ticket where the same failure would
+                // have without an edge: a spent `return_to` budget is the
+                // failure it could not repair, and says so through the stage
+                // it stopped on.
                 Step::Halted { failed_stage, .. } => {
                     let halt = self
                         .flow
@@ -411,14 +493,16 @@ impl RunDriver<'_> {
                 }
                 Step::Complete => return Some(self.exited(None)),
             };
-            match self.execute(&stage, stage_index, attempt) {
+            let stage_name = run.stage.name.clone();
+            let index = run.index;
+            match self.execute(&run) {
                 Ok(true) => {}
                 // The stage resolved into another owner's hands: the agent
                 // exit was claimed elsewhere, so that owner settles the run.
                 Ok(false) => return None,
-                Err(error) => return Some(self.abandoned(error, stage_index)),
+                Err(error) => return Some(self.abandoned(error, index)),
             }
-            wait_for_test_hook(&format!("after-stage-{}", stage.name));
+            wait_for_test_hook(&format!("after-stage-{stage_name}"));
         }
     }
 
@@ -535,16 +619,44 @@ impl RunDriver<'_> {
             })
     }
 
+    /// Why the walk came back to a stage, read entirely out of the run's
+    /// persisted log.
+    ///
+    /// `return_trigger` names the failure the fold jumped on; the log row and
+    /// the captured output under that same `(stage, attempt)` key supply the
+    /// rest. Nothing here consults live state, so a resumed run re-derives the
+    /// identical context — which is what lets a re-run prompt survive a
+    /// daemon restart unchanged.
+    fn failure_context(
+        &self,
+        rows: &[StageRecord],
+        log: &[StageEvidence],
+    ) -> Option<FailureContext> {
+        let (stage_index, attempt) = return_trigger(&self.flow, log)?;
+        let record = rows.iter().rev().find(|row| {
+            row.stage_index == stage_index && row.attempt == attempt && row.state.is_some()
+        })?;
+        let output = stage_output_tail(
+            &self.output_path,
+            &record.stage,
+            attempt,
+            BACKWARD_CONTEXT_LINES,
+        )
+        .unwrap_or_default();
+        Some(FailureContext {
+            stage: record.stage.clone(),
+            attempt,
+            reason: failure_reason(record),
+            output,
+        })
+    }
+
     /// Executes one stage: its action, then the independent check that judges
     /// it, then any repair-and-retry cycles its `on_fail` allows, and finally
     /// the row (or rows) the execution earned. `false` means another owner
     /// claimed the run mid-stage.
-    fn execute(
-        &mut self,
-        stage: &Stage,
-        stage_index: usize,
-        attempt: u32,
-    ) -> Result<bool, WalkError> {
+    fn execute(&mut self, run: &StageRun) -> Result<bool, WalkError> {
+        let stage = &run.stage;
         let interrupted = self
             .run_store
             .run_evidence(self.run_id())
@@ -560,7 +672,7 @@ impl RunDriver<'_> {
         let mut repair_used = repair_attempts_used(&interrupted, &stage.name);
         let mut pending_repair: Option<(u32, ProcessIdentity, String)> = None;
         let (verdict, source, reason, action, check) = loop {
-            let Some(action) = self.run_action(stage, stage_index, merge_recovery)? else {
+            let Some(action) = self.run_action(run, merge_recovery)? else {
                 return Ok(false);
             };
             // The action's own reading, before the result check has a say.
@@ -579,7 +691,7 @@ impl RunDriver<'_> {
                     }
                 }
                 Check::Actor(Actor::Exec { cmd }) if reading == Verdict::Pass => {
-                    let judged = self.run_exec(&stage.name, cmd, None);
+                    let judged = self.run_exec(&stage.name, run.attempt, cmd, None);
                     reading = judged.verdict;
                     check = Some(judged);
                 }
@@ -592,7 +704,7 @@ impl RunDriver<'_> {
                 }
             }
             let reported = if stage.result_check == Check::Reported {
-                reported_verdict(&self.run_store, self.run_id(), &stage.name)
+                reported_verdict(&self.run_store, self.run_id(), &stage.name, run.attempt)
                     .map_err(WalkError::Stage)?
             } else {
                 None
@@ -617,7 +729,7 @@ impl RunDriver<'_> {
             if verdict == Verdict::Pass {
                 break (verdict, source, reason, action, check);
             }
-            match self.repair(stage, repair_used).map_err(WalkError::Stage)? {
+            match self.repair(run, repair_used).map_err(WalkError::Stage)? {
                 Some((repair_attempt, identity, target)) => {
                     repair_used = repair_attempt;
                     pending_repair = Some((repair_attempt, identity, target));
@@ -628,17 +740,8 @@ impl RunDriver<'_> {
                 None => break (verdict, source, reason, action, check),
             }
         };
-        self.append_rows(
-            stage,
-            stage_index,
-            attempt,
-            verdict,
-            source,
-            reason,
-            &action,
-            check.as_ref(),
-        )
-        .map_err(WalkError::Stage)?;
+        self.append_rows(run, verdict, source, reason, &action, check.as_ref())
+            .map_err(WalkError::Stage)?;
         Ok(true)
     }
 
@@ -691,13 +794,13 @@ impl RunDriver<'_> {
     /// Runs a stage's action. `None` means the run left this driver's hands.
     fn run_action(
         &mut self,
-        stage: &Stage,
-        stage_index: usize,
+        run: &StageRun,
         merge_recovery: Option<super::recovery::MergeRecovery>,
     ) -> Result<Option<StageResult>, WalkError> {
+        let stage = &run.stage;
         let now = || self.environment.clock.now_ms();
         Ok(Some(match &stage.action {
-            Actor::Agent => match self.run_agent(stage, stage_index)? {
+            Actor::Agent => match self.run_agent(run)? {
                 Some(result) => result,
                 None => return Ok(None),
             },
@@ -707,7 +810,7 @@ impl RunDriver<'_> {
                 } else {
                     None
                 };
-                self.run_exec(&stage.name, cmd, worker)
+                self.run_exec(&stage.name, run.attempt, cmd, worker)
             }
             // `Commits` never reaches here: parsing refuses it as an action,
             // so the only builtin that acts is `Merge`.
@@ -729,14 +832,13 @@ impl RunDriver<'_> {
     /// the walk to exactly one caller. Once that checkpoint exists the stage is
     /// resolved from it: a daemon that crashed between the exit and the log row
     /// must not run the agent twice for one execution.
-    fn run_agent(
-        &mut self,
-        stage: &Stage,
-        stage_index: usize,
-    ) -> Result<Option<StageResult>, WalkError> {
-        let primary = self.is_primary_agent_stage(stage_index);
-        if primary && self.agent.checkpointed {
-            self.agent.checkpointed = false;
+    fn run_agent(&mut self, run: &StageRun) -> Result<Option<StageResult>, WalkError> {
+        let stage = &run.stage;
+        let primary = self.is_primary_agent_stage(run.index);
+        // The checkpoint speaks for one execution. A re-entry is a different
+        // execution, so an earlier attempt's exit never stands in for it.
+        if primary && self.agent.checkpointed_attempt == Some(run.attempt) {
+            self.agent.checkpointed_attempt = None;
             let now = self.clock().now_ms();
             return Ok(Some(StageResult {
                 verdict: self.agent_verdict(),
@@ -747,7 +849,7 @@ impl RunDriver<'_> {
         }
         let worker = self.issue_worker_credentials().map_err(WalkError::Stage)?;
         let order = self
-            .agent_stage_order(stage, worker)
+            .agent_stage_order(run, worker)
             .map_err(WalkError::Stage)?;
         let started_at_ms = self.clock().now_ms();
         let hooks = StoreStageHooks::new(&self.run_store, self.log());
@@ -763,7 +865,7 @@ impl RunDriver<'_> {
             Err(error) => {
                 // A first stage that cannot launch has recorded nothing, so
                 // the claim can still roll back and the ticket be retried whole.
-                if stage_index == 0 {
+                if run.index == 0 {
                     return Err(WalkError::Admission(error.to_string()));
                 }
                 self.log().emit_with_fields(
@@ -840,9 +942,12 @@ impl RunDriver<'_> {
                 commit_observation_complete,
                 vendor_error,
                 cooldown_until_ms,
-                checkpointed: false,
+                checkpointed_attempt: None,
             };
-            if !self.checkpoint_agent_exit().map_err(WalkError::Stage)? {
+            if !self
+                .checkpoint_agent_exit(run.attempt)
+                .map_err(WalkError::Stage)?
+            {
                 return Ok(None);
             }
         } else {
@@ -901,7 +1006,7 @@ impl RunDriver<'_> {
     /// Checkpoints the run's agent exit, which is also the handoff that grants
     /// exactly one caller ownership of the rest of the walk. `false` means
     /// another one already holds it.
-    fn checkpoint_agent_exit(&mut self) -> Result<bool, String> {
+    fn checkpoint_agent_exit(&mut self, attempt: u32) -> Result<bool, String> {
         wait_for_test_hook("before-agent-exit-checkpoint");
         let commits_json = json!({
             "complete": self.agent.commit_observation_complete,
@@ -910,6 +1015,7 @@ impl RunDriver<'_> {
         .to_string();
         let exit = RunExit {
             run_id: self.run_id(),
+            attempt,
             exit_code: self.agent.exit_code,
             capture_complete: self.agent.capture_complete,
             commits_json: &commits_json,
@@ -948,7 +1054,7 @@ impl RunDriver<'_> {
     /// ticket, so a resumed run spawns exactly what the original would have.
     fn agent_stage_order(
         &self,
-        stage: &Stage,
+        run: &StageRun,
         worker: WorkerCredentials,
     ) -> Result<StageOrder, String> {
         let ticket = self
@@ -971,7 +1077,17 @@ impl RunDriver<'_> {
                 ticket.id
             )
         })?;
-        let prompt = compose_worker_prompt(&self.environment.root)?;
+        // The failure block lands after the bootstrap and the repository's
+        // own instructions: it is the most recent thing that happened, not a
+        // standing rule, and the ticket still frames the work.
+        let prompt = match run.context.as_ref() {
+            Some(context) => format!(
+                "{}\n\n{}",
+                compose_worker_prompt(&self.environment.root)?,
+                previous_attempt_block(context),
+            ),
+            None => compose_worker_prompt(&self.environment.root)?,
+        };
         let argv = expand_agent_cmd(
             template,
             ticket.model.as_deref(),
@@ -981,7 +1097,8 @@ impl RunDriver<'_> {
         .map_err(|message| format!("ticket `{}` {message}", ticket.id))?;
         Ok(StageOrder {
             run_id: self.plan.run_id.clone(),
-            stage: stage.name.clone(),
+            stage: run.stage.name.clone(),
+            attempt: run.attempt,
             execution: StageExecution::Agent(AgentLaunch {
                 argv,
                 environment: agent_environment(&ticket.id, self.run_id())?,
@@ -998,12 +1115,14 @@ impl RunDriver<'_> {
     fn run_exec(
         &self,
         stage: &str,
+        attempt: u32,
         cmd: &[String],
         worker: Option<WorkerCredentials>,
     ) -> StageResult {
         let order = StageOrder {
             run_id: self.plan.run_id.clone(),
             stage: stage.into(),
+            attempt,
             execution: StageExecution::Exec(ExecLaunch {
                 argv: cmd.to_vec(),
                 worker,
@@ -1114,9 +1233,10 @@ impl RunDriver<'_> {
     /// the caller can re-run the stage and record what the retry decided.
     fn repair(
         &self,
-        stage: &Stage,
+        run: &StageRun,
         repair_used: u32,
     ) -> Result<Option<(u32, ProcessIdentity, String)>, String> {
+        let stage = &run.stage;
         let (Some(on_fail), Some(agent)) =
             (stage.on_fail.as_ref(), self.environment.agent.as_ref())
         else {
@@ -1162,7 +1282,7 @@ impl RunDriver<'_> {
                 self.clock().now_ms(),
             )
             .map_err(|error| error.to_string())?;
-        match self.run_repair_agent(on_fail, &target, &stage.name, attempt) {
+        match self.run_repair_agent(on_fail, &target, run, attempt) {
             Ok(identity) => Ok(Some((attempt, identity, target))),
             Err(error) => {
                 self.log().emit_with_fields(
@@ -1213,9 +1333,10 @@ impl RunDriver<'_> {
         &self,
         on_fail: &OnFail,
         target: &str,
-        stage: &str,
+        run: &StageRun,
         attempt: u32,
     ) -> Result<ProcessIdentity, String> {
+        let stage = run.stage.name.as_str();
         let agent = self
             .environment
             .agent
@@ -1237,6 +1358,7 @@ impl RunDriver<'_> {
         let order = StageOrder {
             run_id: self.plan.run_id.clone(),
             stage: stage.into(),
+            attempt: run.attempt,
             execution: StageExecution::Exec(ExecLaunch {
                 argv,
                 worker: None,
@@ -1290,9 +1412,7 @@ impl RunDriver<'_> {
     #[allow(clippy::too_many_arguments)]
     fn append_rows(
         &self,
-        stage: &Stage,
-        stage_index: usize,
-        attempt: u32,
+        run: &StageRun,
         verdict: Verdict,
         source: VerdictSource,
         reason: Option<String>,
@@ -1301,9 +1421,9 @@ impl RunDriver<'_> {
     ) -> Result<(), String> {
         let output_ref = format!("runs/{}/output.ndjson", self.run_id());
         let row = |phase: StagePhase, result: &StageResult, resolved: bool| StageRecord {
-            stage_index,
-            stage: stage.name.clone(),
-            attempt,
+            stage_index: run.index,
+            stage: run.stage.name.clone(),
+            attempt: run.attempt,
             phase,
             state: resolved.then(|| match verdict {
                 Verdict::Pass => "passed".to_owned(),
@@ -1395,6 +1515,19 @@ pub(super) fn cancelled(run_store: &RunStore, run_id: &str, log: &OperationalLog
     }
 }
 
+/// How a resolved stage row failed, in one clause fit to quote back to an
+/// agent. A reported verdict carries the reviewer's own words; everything else
+/// is judged by an exit status, and the status is what there is to say.
+fn failure_reason(row: &StageRecord) -> String {
+    match row.reason.as_deref().filter(|text| !text.trim().is_empty()) {
+        Some(reason) => reason.to_owned(),
+        None => match row.exit_code {
+            Some(code) => format!("exit {code}"),
+            None => "the process was killed before it exited".to_owned(),
+        },
+    }
+}
+
 /// The fold's view of a run's stage-evidence log: the rows that resolved an
 /// execution, in log order.
 ///
@@ -1403,7 +1536,7 @@ pub(super) fn cancelled(run_store: &RunStore, run_id: &str, log: &OperationalLog
 /// and the stage re-runs whole. That is exactly what a crash between an action
 /// and its check should cost: the check never judged anything, so the walk
 /// cannot stand past it.
-fn replayable(log: &[StageRecord]) -> Vec<StageEvidence> {
+pub(super) fn replayable(log: &[StageRecord]) -> Vec<StageEvidence> {
     log.iter()
         .filter_map(|row| {
             Some(StageEvidence {
@@ -1482,6 +1615,7 @@ fn reported_verdict(
     run_store: &RunStore,
     run_id: &str,
     stage: &str,
+    attempt: u32,
 ) -> Result<Option<Reported>, String> {
     let rows = run_store
         .run_evidence(run_id)
@@ -1492,7 +1626,10 @@ fn reported_verdict(
         .filter(|(kind, _)| kind == "stage_verdict")
         .find_map(|(_, data)| {
             let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
-            (value["stage"] == stage).then_some(value)
+            // A report written before re-entries existed names no attempt and
+            // belongs to the only execution its stage had.
+            let reported = value["attempt"].as_u64().unwrap_or(1);
+            (value["stage"] == stage && reported == u64::from(attempt)).then_some(value)
         })
     else {
         return Ok(None);
@@ -1804,7 +1941,10 @@ pub(super) fn shared_checkout_has_git_operation(root: &Path) -> Result<bool, Str
 
 #[cfg(test)]
 mod tests {
-    use super::{FlowHalt, flow_with_implicit_test};
+    use super::{
+        FailureContext, FlowHalt, StagePhase, StageRecord, failure_reason, flow_with_implicit_test,
+        previous_attempt_block,
+    };
     use crate::flow::{Actor, Flow, Stage};
 
     fn flow(names: &[&str]) -> Flow {
@@ -1860,5 +2000,86 @@ mod tests {
     #[test]
     fn an_unknown_halt_position_counts_as_a_later_stage() {
         assert_eq!(FlowHalt::at_stage(usize::MAX), FlowHalt::LaterStage);
+    }
+
+    fn resolved(exit_code: Option<i32>, reason: Option<&str>) -> StageRecord {
+        StageRecord {
+            stage_index: 1,
+            stage: "test".into(),
+            attempt: 1,
+            phase: StagePhase::Action,
+            state: Some("failed".into()),
+            started_at_ms: 0,
+            finished_at_ms: 0,
+            exit_code,
+            output_ref: String::new(),
+            verdict_source: Some("exit_code".into()),
+            reason: reason.map(str::to_owned),
+        }
+    }
+
+    /// A reviewer's words outrank an exit status, but a stage judged only by
+    /// its exit still has something to say — and a killed process says so
+    /// rather than passing off a missing code as success.
+    #[test]
+    fn a_failure_reason_falls_back_to_what_the_exit_said() {
+        assert_eq!(
+            failure_reason(&resolved(Some(0), Some("changes requested"))),
+            "changes requested"
+        );
+        assert_eq!(failure_reason(&resolved(Some(1), None)), "exit 1");
+        assert_eq!(failure_reason(&resolved(Some(1), Some("  "))), "exit 1");
+        assert_eq!(
+            failure_reason(&resolved(None, None)),
+            "the process was killed before it exited"
+        );
+    }
+
+    /// The block is delimited on both sides because everything between the
+    /// markers is untrusted process output.
+    #[test]
+    fn the_previous_attempt_block_names_the_failure_and_fences_its_output() {
+        let block = previous_attempt_block(&FailureContext {
+            stage: "test".into(),
+            attempt: 2,
+            reason: "exit 101".into(),
+            output: "assertion failed\n  left: 1".into(),
+        });
+
+        assert_eq!(
+            block,
+            concat!(
+                "--- previous attempt failed ---\n",
+                "Stage `test` (attempt 2) failed: exit 101\n",
+                "You are running again to address that failure.\n",
+                "\n",
+                "The last 100 lines of that stage's output:\n",
+                "assertion failed\n",
+                "  left: 1\n",
+                "--- end previous attempt ---",
+            )
+        );
+    }
+
+    /// A stage that failed silently still explains itself; an empty output
+    /// section would only be noise.
+    #[test]
+    fn the_previous_attempt_block_omits_an_empty_output_section() {
+        let block = previous_attempt_block(&FailureContext {
+            stage: "review".into(),
+            attempt: 1,
+            reason: "no verdict reported".into(),
+            output: String::new(),
+        });
+
+        assert_eq!(
+            block,
+            concat!(
+                "--- previous attempt failed ---\n",
+                "Stage `review` (attempt 1) failed: no verdict reported\n",
+                "You are running again to address that failure.\n",
+                "--- end previous attempt ---",
+            )
+        );
     }
 }

@@ -349,6 +349,7 @@ impl Harness {
     fn record_exit(&mut self, run_id: &str, exit_code: i32) {
         let exit = RunExit {
             run_id,
+            attempt: 1,
             exit_code: Some(exit_code),
             capture_complete: true,
             commits_json: "{}",

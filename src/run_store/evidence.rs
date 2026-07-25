@@ -109,10 +109,23 @@ pub(crate) mod tx {
         Ok(())
     }
 
+    /// Records what the run's primary agent stage did on its `attempt`-th
+    /// execution.
+    ///
+    /// These rows are the run's exit *story*, not a log of exits: they carry
+    /// the code the run settles on, the commits the ticket is credited with,
+    /// and the rejection that puts a target on cooldown. A backward edge can
+    /// re-enter the agent stage, so each execution overwrites the last rather
+    /// than being ignored behind it — a resumed run must settle on what the
+    /// most recent agent actually did, and `attempt` says which execution that
+    /// was. Rows whose fact no longer holds (a vendor rejection the re-run did
+    /// not repeat) are removed rather than left to speak for an exit that
+    /// never had them.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_agent_exit(
         transaction: &Transaction<'_>,
         run_id: &str,
+        attempt: u32,
         exit_code: Option<i32>,
         capture_complete: bool,
         commits_json: &str,
@@ -123,36 +136,45 @@ pub(crate) mod tx {
         let evidence = [
             EvidenceRecord {
                 kind: "exit_classified",
-                data_json: serde_json::json!({"exit_code": exit_code}).to_string(),
+                data_json: serde_json::json!({"exit_code": exit_code, "attempt": attempt})
+                    .to_string(),
             },
             EvidenceRecord {
                 kind: "commits_observed",
                 data_json: commits_json.to_owned(),
             },
         ];
-        record_settlement(transaction, run_id, &evidence, now_ms)?;
-        if let Some(vendor_error) = vendor_error {
-            transaction.execute(
-                "INSERT OR IGNORE INTO run_evidence
-                     (run_id, kind, observed_at_ms, dedupe_key, data_json)
-                 VALUES (?1, 'vendor_error_classified', ?2,
-                         'settlement:' || ?1 || ':vendor_error_classified', ?3)",
-                params![
-                    run_id,
-                    now_ms,
-                    vendor_error.evidence_json(cooldown_until_ms)
-                ],
-            )?;
+        for record in evidence {
+            record_stage_evidence(transaction, run_id, record.kind, &record.data_json, now_ms)?;
         }
-        if !capture_complete {
-            transaction.execute(
-                "INSERT OR IGNORE INTO run_evidence
-                     (run_id, kind, observed_at_ms, dedupe_key, data_json)
-                 VALUES (?1, 'capture_incomplete', ?2,
-                         'settlement:' || ?1 || ':capture_incomplete', '{}')",
-                params![run_id, now_ms],
-            )?;
+        match vendor_error {
+            Some(vendor_error) => record_stage_evidence(
+                transaction,
+                run_id,
+                "vendor_error_classified",
+                &vendor_error.evidence_json(cooldown_until_ms),
+                now_ms,
+            )?,
+            None => delete_settlement(transaction, run_id, "vendor_error_classified")?,
         }
+        if capture_complete {
+            delete_settlement(transaction, run_id, "capture_incomplete")?;
+        } else {
+            record_stage_evidence(transaction, run_id, "capture_incomplete", "{}", now_ms)?;
+        }
+        Ok(())
+    }
+
+    fn delete_settlement(
+        transaction: &Transaction<'_>,
+        run_id: &str,
+        kind: &str,
+    ) -> rusqlite::Result<()> {
+        transaction.execute(
+            "DELETE FROM run_evidence
+             WHERE run_id = ?1 AND dedupe_key = 'settlement:' || ?1 || ':' || ?2",
+            params![run_id, kind],
+        )?;
         Ok(())
     }
 
@@ -268,17 +290,29 @@ pub(crate) mod tx {
         Ok(inserted == 1)
     }
 
+    /// Records a worker's self-reported verdict for the execution it is
+    /// running. The key carries the attempt as well as the stage: a stage a
+    /// backward edge re-enters gets one report per execution, and without the
+    /// attempt the second worker's report would be discarded as a duplicate of
+    /// the first.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_stage_verdict(
         transaction: &Transaction<'_>,
         run_id: &str,
         stage: &str,
+        attempt: u32,
         verdict: &str,
         reason: Option<&str>,
         now_ms: i64,
     ) -> rusqlite::Result<bool> {
-        let dedupe_key = format!("verdict:{run_id}:{stage}");
-        let data_json =
-            serde_json::json!({"stage": stage, "verdict": verdict, "reason": reason}).to_string();
+        let dedupe_key = format!("verdict:{run_id}:{stage}:{attempt}");
+        let data_json = serde_json::json!({
+            "stage": stage,
+            "attempt": attempt,
+            "verdict": verdict,
+            "reason": reason,
+        })
+        .to_string();
         let inserted = transaction.execute(
             "INSERT OR IGNORE INTO run_evidence
                  (run_id, kind, observed_at_ms, dedupe_key, data_json)
@@ -527,12 +561,13 @@ impl RunStore {
         &self,
         run_id: &str,
         stage: &str,
+        attempt: u32,
         verdict: &str,
         reason: Option<&str>,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
         self.write(TransactionBehavior::Deferred, |transaction| {
-            tx::record_stage_verdict(transaction, run_id, stage, verdict, reason, now_ms)
+            tx::record_stage_verdict(transaction, run_id, stage, attempt, verdict, reason, now_ms)
         })
     }
 
@@ -673,6 +708,7 @@ mod tests {
             store
                 .record_agent_exit(
                     "R1",
+                    1,
                     Some(0),
                     true,
                     r#"{"count":1,"oids":["abc"]}"#,
@@ -725,6 +761,7 @@ mod tests {
 
         let exit = RunExit {
             run_id: "R1",
+            attempt: 1,
             exit_code: Some(0),
             capture_complete: true,
             commits_json: r#"{"oids":["abc"]}"#,
@@ -759,6 +796,7 @@ mod tests {
         let claim = store
             .record_agent_exit(
                 "R1",
+                1,
                 Some(0),
                 true,
                 r#"{"count":0,"oids":[]}"#,
@@ -777,6 +815,7 @@ mod tests {
 
         let missing = store.record_agent_exit(
             "R9",
+            1,
             Some(0),
             true,
             r#"{"count":0,"oids":[]}"#,
@@ -1000,6 +1039,7 @@ mod tests {
         store
             .record_agent_exit(
                 "R1",
+                1,
                 Some(1),
                 true,
                 r#"{"oids":["abc"]}"#,

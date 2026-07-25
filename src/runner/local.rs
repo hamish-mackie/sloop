@@ -155,6 +155,7 @@ pub fn launch_agent<H: StageHooks>(
             output_log.clone(),
             OutputSource::Agent,
             Some(order.stage.clone()),
+            order.attempt,
             OutputStream::Stdout,
             Some(clock.clone()),
             Some(output_observer.clone()),
@@ -164,6 +165,7 @@ pub fn launch_agent<H: StageHooks>(
             output_log,
             OutputSource::Agent,
             Some(order.stage.clone()),
+            order.attempt,
             OutputStream::Stderr,
             Some(clock.clone()),
             Some(output_observer),
@@ -179,6 +181,7 @@ pub fn launch_agent<H: StageHooks>(
     let started_at_ms = clock.now_ms();
     let checkpoint = AgentProcessCheckpoint {
         run_id: order.run_id,
+        attempt: order.attempt,
         stage: order.stage,
         branch: order.branch,
         worktree: order.worktree,
@@ -304,6 +307,7 @@ pub fn run_exec_stage<H: StageHooks>(
             output_log.clone(),
             OutputSource::Stage,
             Some(order.stage.clone()),
+            order.attempt,
             OutputStream::Stdout,
             None,
             None,
@@ -313,6 +317,7 @@ pub fn run_exec_stage<H: StageHooks>(
             output_log,
             OutputSource::Stage,
             Some(order.stage.clone()),
+            order.attempt,
             OutputStream::Stderr,
             None,
             None,
@@ -325,6 +330,7 @@ pub fn run_exec_stage<H: StageHooks>(
     let checkpoint = ExecProcessCheckpoint {
         run_id: order.run_id.clone(),
         stage: order.stage.clone(),
+        attempt: order.attempt,
         process: ProcessIdentity {
             start_time: Some(start_time),
             ..process
@@ -402,11 +408,13 @@ pub fn run_exec_stage<H: StageHooks>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_output_reader(
     pipe: impl Read + Send + 'static,
     log: RunLogWriter,
     source: OutputSource,
     stage: Option<String>,
+    attempt: u32,
     stream: OutputStream,
     clock: Option<Arc<dyn Clock>>,
     output_observer: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -423,10 +431,17 @@ fn spawn_output_reader(
                             clock.now_ms(),
                             source,
                             stage.as_deref(),
+                            Some(attempt),
                             stream,
                             &buffer[..read],
                         ),
-                        None => log.append(source, stage.as_deref(), stream, &buffer[..read]),
+                        None => log.append(
+                            source,
+                            stage.as_deref(),
+                            Some(attempt),
+                            stream,
+                            &buffer[..read],
+                        ),
                     };
                     if appended.is_err() {
                         return false;
@@ -680,6 +695,7 @@ mod tests {
         let order = StageOrder {
             run_id: "R1".into(),
             stage: "check".into(),
+            attempt: 1,
             execution: StageExecution::Exec(ExecLaunch {
                 argv: vec!["sh".into(), "-c".into(), "printf runner-output".into()],
                 worker: None,

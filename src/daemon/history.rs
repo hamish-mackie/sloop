@@ -39,7 +39,14 @@ struct Stage {
     name: String,
     /// `passed`, `failed`, `running`, or `pending`.
     state: &'static str,
-    /// Total tries the stage cost, counting `on_fail` repair-then-retry cycles.
+    /// Which execution of the stage this row is. A `return_to` edge re-enters
+    /// a stage, and each re-entry is a row of its own rather than an overwrite
+    /// — a loop that converged and one that never ran twice must not read the
+    /// same. `0` on a stage the walk has not reached.
+    attempt: u32,
+    /// Total tries the execution cost, counting `on_fail` repair-then-retry
+    /// cycles. Distinct from `attempt`: a repair retries a stage *within* one
+    /// execution and records no row of its own.
     attempts: u32,
     started_at_ms: Option<i64>,
     finished_at_ms: Option<i64>,
@@ -47,6 +54,10 @@ struct Stage {
     verdict_source: Option<String>,
     reason: Option<String>,
     silent_for_ms: Option<i64>,
+    /// Where the execution sits in the run's log. Rows are rendered in flow
+    /// order, but "which failure ended the run" is a question about log order,
+    /// and a loop makes the two differ. `0` on a stage with no row.
+    log_position: usize,
 }
 
 impl Stage {
@@ -54,6 +65,7 @@ impl Stage {
         json!({
             "stage": self.name,
             "state": self.state,
+            "attempt": self.attempt,
             "attempts": self.attempts,
             "started_at_ms": self.started_at_ms,
             "finished_at_ms": self.finished_at_ms,
@@ -160,6 +172,7 @@ impl RunHistory {
                 json!({
                     "stage": stage.name,
                     "state": stage.state,
+                    "attempt": stage.attempt,
                     "silent_for_ms": stage.silent_for_ms,
                 })
             })
@@ -170,13 +183,14 @@ impl RunHistory {
     /// and evidence rows.
     ///
     /// `merged` runs need no explanation and live runs have not earned one yet,
-    /// so both return `None`. Everything else names the first stage that failed
-    /// — the first, because later stages never ran and the first failure is the
-    /// cause — and then, when the failure came after the agent, says what the
-    /// agent itself did. That trailing clause is the whole point: the smoke
-    /// test that motivated this feature saw `exit: 0` and concluded the run had
-    /// succeeded, when in fact the agent had succeeded and a later stage had
-    /// not.
+    /// so both return `None`. Everything else names the failure the run ended
+    /// on — the *last* one recorded, because a walk stops on the failure it
+    /// cannot get past, and any earlier one was either advisory or superseded
+    /// by a re-run that followed it — and then, when the failure came after
+    /// the agent, says what the agent itself did. That trailing clause is the
+    /// whole point: the smoke test that motivated this feature saw `exit: 0`
+    /// and concluded the run had succeeded, when in fact the agent had
+    /// succeeded and a later stage had not.
     pub(super) fn derived_reason(&self) -> Option<String> {
         if self.state == "merged" || !is_terminal(&self.state) {
             return None;
@@ -187,7 +201,12 @@ impl RunHistory {
                 format_duration(stall.threshold_ms)
             ));
         }
-        let Some(failed) = self.stages.iter().find(|stage| stage.state == "failed") else {
+        let Some(failed) = self
+            .stages
+            .iter()
+            .filter(|stage| stage.state == "failed")
+            .max_by_key(|stage| stage.log_position)
+        else {
             return Some(format!(
                 "run ended as {} with no failing stage recorded",
                 self.state
@@ -199,6 +218,12 @@ impl RunHistory {
         }
         if let Some(detail) = failed.reason.as_deref().filter(|text| !text.is_empty()) {
             reason.push_str(&format!(": {detail}"));
+        }
+        // Two different budgets can be spent on one stage: `return_to` gives
+        // it whole re-entries, `on_fail` retries within one. Each is only
+        // worth saying when it was actually used.
+        if failed.attempt > 1 {
+            reason.push_str(&format!(" on attempt {}", failed.attempt));
         }
         if failed.attempts > 1 {
             reason.push_str(&format!(" after {} attempts", failed.attempts));
@@ -253,6 +278,11 @@ fn format_duration(milliseconds: i64) -> String {
 /// Recorded rows win wherever they exist; snapshot stages with no row are
 /// `pending`, or — for the stage a live run is sitting in — `running`.
 ///
+/// A stage a backward edge re-entered gets one row per execution, in attempt
+/// order under its name. Collapsing them onto the last would erase exactly the
+/// thing worth reading: that the walk went round, and what it saw the first
+/// time.
+///
 /// Recorded rows for stages the snapshot does not name (the implicit `test`
 /// stage that `flow.test_cmd` splices in at index 1) are inserted at their
 /// recorded index, which is where the flow driver actually put them.
@@ -262,14 +292,16 @@ fn stages(
     evidence: &[(String, String)],
     terminal: bool,
 ) -> Vec<Stage> {
-    let mut names = run
+    let flow = run
         .flow_json
         .as_deref()
-        .and_then(|json| serde_json::from_str::<crate::flow::Flow>(json).ok())
+        .and_then(|json| serde_json::from_str::<crate::flow::Flow>(json).ok());
+    let mut names = flow
+        .as_ref()
         .map(|flow| {
             flow.stages
-                .into_iter()
-                .map(|stage| stage.name)
+                .iter()
+                .map(|stage| stage.name.clone())
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -279,47 +311,35 @@ fn stages(
         }
     }
 
+    // Where the walk stands is the fold's answer, not a guess: with loops, an
+    // already-recorded stage can be the one running right now, so "the first
+    // stage with no row" no longer finds it. Only a run still in flight has a
+    // running stage at all.
+    let running = flow.filter(|_| !terminal).and_then(|flow| {
+        match crate::flow::next_step(&flow, &super::driver::replayable(recorded)) {
+            crate::flow::Step::Run { stage, attempt } => Some((stage.name.clone(), attempt)),
+            _ => None,
+        }
+    });
     let mut running_claimed = false;
-    names
-        .into_iter()
-        .map(|name| {
-            // The log's last resolved row for the stage is its standing
-            // outcome: earlier ones were superseded by the execution that
-            // followed, and rows carrying no verdict are an execution's
-            // action, already answered for by the check row behind it.
-            let Some(row) = recorded
-                .iter()
-                .rev()
-                .find(|row| row.stage == name && row.state.is_some())
-            else {
-                // The first unrecorded stage of a run still in flight is the
-                // one executing now; the rest genuinely have not started. A
-                // terminal run has no running stage at all — its unrecorded
-                // stages were skipped when an earlier one failed.
-                let state = if !terminal && !running_claimed {
-                    running_claimed = true;
-                    "running"
-                } else {
-                    "pending"
-                };
-                return Stage {
-                    name,
-                    state,
-                    attempts: 0,
-                    started_at_ms: None,
-                    finished_at_ms: None,
-                    exit_code: None,
-                    verdict_source: None,
-                    reason: None,
-                    silent_for_ms: None,
-                };
-            };
-            Stage {
+
+    let mut stages = Vec::with_capacity(names.len());
+    for name in names {
+        // Rows carrying no verdict are an execution's action, already answered
+        // for by the check row behind it.
+        let executions = recorded
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.stage == name && row.state.is_some());
+        for (log_position, row) in executions {
+            stages.push(Stage {
+                log_position,
                 state: if row.state.as_deref() == Some("passed") {
                     "passed"
                 } else {
                     "failed"
                 },
+                attempt: row.attempt,
                 attempts: 1 + repair_attempts(evidence, &name),
                 started_at_ms: positive(row.started_at_ms),
                 finished_at_ms: positive(row.finished_at_ms),
@@ -327,10 +347,43 @@ fn stages(
                 verdict_source: row.verdict_source.clone(),
                 reason: row.reason.clone(),
                 silent_for_ms: None,
-                name,
-            }
-        })
-        .collect()
+                name: name.clone(),
+            });
+        }
+        let executed = stages.iter().any(|stage| stage.name == name);
+        let running_here = match &running {
+            Some((stage, attempt)) if *stage == name => Some(*attempt),
+            // Without a readable flow snapshot the fold cannot say, so the
+            // first unrecorded stage of a live run stands in as it always did.
+            None if !terminal && !executed && !running_claimed => Some(1),
+            _ => None,
+        };
+        if let Some(attempt) = running_here {
+            running_claimed = true;
+            stages.push(pending(name, "running", attempt));
+        } else if !executed {
+            stages.push(pending(name, "pending", 0));
+        }
+    }
+    stages
+}
+
+/// A stage the walk has not resolved: either the one executing now or one it
+/// has not reached.
+fn pending(name: String, state: &'static str, attempt: u32) -> Stage {
+    Stage {
+        name,
+        state,
+        attempt,
+        attempts: 0,
+        started_at_ms: None,
+        finished_at_ms: None,
+        exit_code: None,
+        verdict_source: None,
+        reason: None,
+        silent_for_ms: None,
+        log_position: 0,
+    }
 }
 
 /// Repair cycles a stage consumed, counted from the durable `repair_attempt`
