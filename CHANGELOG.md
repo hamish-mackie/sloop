@@ -7,17 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- A daemon spawned by a client command now calls `setsid`, so it leads its own
-  session and process group instead of inheriting them from that client. The
-  client exits as soon as its request is answered, so a daemon that stayed in
-  its session died to any signal aimed at that short-lived process — a terminal
-  hangup, or a supervisor reaping a finished command's process group — and the
-  next client command silently started a replacement. The symptom was a daemon
-  that vanished with no `daemon_stopped` record, and, if a run was in flight at
-  the time, lost work.
-
 ## [0.4.0-rc.1] - 2026-07-25
 
 ### Added
@@ -155,6 +144,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A daemon spawned by a client command now calls `setsid`, so it leads its own
+  session and process group instead of inheriting them from that client. The
+  client exits as soon as its request is answered, so a daemon that stayed in
+  its session died to any signal aimed at that short-lived process — a terminal
+  hangup, or a supervisor reaping a finished command's process group — and the
+  next client command silently started a replacement. The symptom was a daemon
+  that vanished with no `daemon_stopped` record, and, if a run was in flight at
+  the time, lost work.
 - `sloop post` accepts an absolute path to a ticket that reaches the repository
   through a symlink. The repository root is always canonicalized, but the path
   the operator typed was compared to it unresolved, so on macOS — where `/tmp`
