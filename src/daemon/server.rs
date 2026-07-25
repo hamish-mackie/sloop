@@ -640,15 +640,29 @@ fn acquire_daemon_lock(path: &Path) -> Result<File, DaemonError> {
 
 fn spawn_daemon(repository: &Repository) -> Result<(), DaemonError> {
     let executable = std::env::current_exe().map_err(DaemonError::CurrentExecutable)?;
-    Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .args(["daemon", "--foreground"])
         .current_dir(&repository.root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map(|_| ())
-        .map_err(DaemonError::Spawn)
+        .stderr(Stdio::null());
+    // The spawning client exits as soon as its request is answered, so the
+    // daemon must not stay in that client's session or process group: a signal
+    // delivered to either -- a terminal hangup, a supervisor reaping a finished
+    // command's group -- would take the daemon down with an unrelated
+    // short-lived process, which reads as an unexplained crash. `setsid` leaves
+    // both in one call, and it cannot fail here because a freshly forked child
+    // is never already a process group leader.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.spawn().map(|_| ()).map_err(DaemonError::Spawn)
 }
 
 fn send_existing(

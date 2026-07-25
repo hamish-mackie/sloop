@@ -453,6 +453,32 @@ fn machine_local_files_live_outside_the_repository() {
 }
 
 #[test]
+fn the_spawned_daemon_leads_its_own_session() {
+    let world = World::configured();
+    let daemon = world.start_daemon();
+    let pid = daemon["data"]["pid"].as_u64().expect("daemon pid") as libc::pid_t;
+
+    // Any client command spawns the daemon and then exits, so the daemon has to
+    // outlive whichever short-lived process happened to start it. Inheriting
+    // that client's session or process group makes a signal aimed at the client
+    // -- a terminal hangup, a supervisor reaping a finished command's group --
+    // kill the daemon too, which reads as an unexplained crash.
+    let session = unsafe { libc::getsid(pid) };
+    assert_ne!(session, -1, "the daemon's session id is readable");
+    assert_eq!(session, pid, "the daemon leads its own session");
+    assert_eq!(
+        unsafe { libc::getpgid(pid) },
+        pid,
+        "the daemon leads its own process group"
+    );
+    assert_ne!(
+        session,
+        unsafe { libc::getsid(0) },
+        "the daemon left the session of the process that spawned it"
+    );
+}
+
+#[test]
 fn malformed_requests_return_errors_without_stopping_the_daemon() {
     let world = World::configured();
     world.start_daemon();
