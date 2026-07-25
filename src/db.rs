@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 // `synchronous = NORMAL` is the standard WAL pairing: commits skip the
 // per-transaction fsync (durability moves to checkpoints), which keeps the
@@ -161,17 +161,32 @@ CREATE TABLE run_evidence (
 
 CREATE INDEX evidence_by_run ON run_evidence(run_id, sequence);
 
+-- A run's stage-evidence log: append-only, and replayed by `next_step` to
+-- derive where the walk stands. `seq` is per-run monotonic and assigned at
+-- insert, so it — not `stage_index` — is the authoritative replay order once a
+-- stage can hold more than one row. `attempt` counts a stage's executions and
+-- `phase` separates an action's own evidence from that of the independent
+-- `result_check` that judged it, so one execution may append two rows sharing
+-- `(stage_index, attempt)`.
+--
+-- The resolved stage verdict rides on the last row of an execution and lives in
+-- `state`; earlier rows hold only what their own actor produced and leave it
+-- NULL. A row rewritten under the natural key keeps its original `seq`, so the
+-- log's order is fixed by first insert.
 CREATE TABLE aftercare_stages (
     run_id          TEXT NOT NULL REFERENCES runs(id),
+    seq             INTEGER NOT NULL,
     stage_index     INTEGER NOT NULL,
     stage           TEXT NOT NULL,
-    state           TEXT NOT NULL,
+    state           TEXT,
     attempt         INTEGER NOT NULL DEFAULT 1,
+    phase           TEXT NOT NULL DEFAULT 'action',
     started_at_ms   INTEGER,
     finished_at_ms  INTEGER,
     exit_code       INTEGER,
     evidence_json   TEXT,
-    PRIMARY KEY (run_id, stage_index, attempt)
+    PRIMARY KEY (run_id, seq),
+    UNIQUE (run_id, stage_index, attempt, phase)
 );
 
 CREATE TABLE cooldowns (
@@ -251,6 +266,45 @@ ALTER TABLE runs ADD COLUMN cleanup_eligible_at_ms INTEGER;
 ALTER TABLE runs ADD COLUMN cleaned_at_ms INTEGER;
 ";
 
+// Turns the stage table into the ordered evidence log described above. The
+// primary key moves from the natural key to `(run_id, seq)`, and `state`
+// becomes nullable, so the table is rebuilt rather than altered in place.
+//
+// Every pre-existing row is one whole stage execution, judged and resolved, so
+// each backfills as an `action` row carrying its verdict. Numbering them by
+// `(stage_index, attempt)` reproduces the order the linear walk wrote them in,
+// which is what makes a run queued before the migration replay to the same
+// `Step` afterwards.
+const STAGE_EVIDENCE_LOG: &str = "
+CREATE TABLE stage_evidence_log (
+    run_id          TEXT NOT NULL REFERENCES runs(id),
+    seq             INTEGER NOT NULL,
+    stage_index     INTEGER NOT NULL,
+    stage           TEXT NOT NULL,
+    state           TEXT,
+    attempt         INTEGER NOT NULL DEFAULT 1,
+    phase           TEXT NOT NULL DEFAULT 'action',
+    started_at_ms   INTEGER,
+    finished_at_ms  INTEGER,
+    exit_code       INTEGER,
+    evidence_json   TEXT,
+    PRIMARY KEY (run_id, seq),
+    UNIQUE (run_id, stage_index, attempt, phase)
+);
+
+INSERT INTO stage_evidence_log
+    (run_id, seq, stage_index, stage, state, attempt, phase,
+     started_at_ms, finished_at_ms, exit_code, evidence_json)
+SELECT run_id,
+       ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY stage_index, attempt),
+       stage_index, stage, state, attempt, 'action',
+       started_at_ms, finished_at_ms, exit_code, evidence_json
+FROM aftercare_stages;
+
+DROP TABLE aftercare_stages;
+ALTER TABLE stage_evidence_log RENAME TO aftercare_stages;
+";
+
 #[derive(Clone)]
 pub struct Db(Arc<Mutex<Connection>>);
 
@@ -315,6 +369,7 @@ fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), DbError> {
             transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
             transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
+            transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -342,6 +397,7 @@ fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), DbError> {
             transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
             transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
+            transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -368,6 +424,7 @@ fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), DbError> {
             transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
             transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
+            transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -386,6 +443,7 @@ fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), DbError> {
             transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
             transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
+            transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -403,6 +461,7 @@ fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), DbError> {
             transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
             transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
+            transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -417,6 +476,7 @@ fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), DbError> {
             transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
             transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
+            transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -430,6 +490,7 @@ fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), DbError> {
             transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
             transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
+            transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -442,6 +503,7 @@ fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), DbError> {
             transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
             transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
+            transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -453,6 +515,7 @@ fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), DbError> {
             transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
             transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
+            transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -463,6 +526,7 @@ fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), DbError> {
             transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
             transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
+            transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -472,6 +536,7 @@ fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), DbError> {
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
+            transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -480,6 +545,15 @@ fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), DbError> {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
+            transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+            Ok(())
+        }
+        13 => {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())

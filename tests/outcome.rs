@@ -79,13 +79,16 @@ fn write_flow(world: &World, contents: &str) {
     .expect("write test flow");
 }
 
+/// The resolved stage verdicts a run recorded, in log order. Rows carrying no
+/// verdict are an execution's action, answered for by the check row behind it.
 fn aftercare_stages(world: &World, position: usize) -> Vec<(i64, String, String, String)> {
     let run_id = world.run_id(position);
     let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
     let mut statement = connection
         .prepare(
             "SELECT stage_index, stage, state, evidence_json
-             FROM aftercare_stages WHERE run_id = ?1 ORDER BY stage_index",
+             FROM aftercare_stages
+             WHERE run_id = ?1 AND state IS NOT NULL ORDER BY seq",
         )
         .expect("prepare aftercare stage query");
     statement
@@ -104,12 +107,44 @@ fn aftercare_stages(world: &World, position: usize) -> Vec<(i64, String, String,
         .expect("read aftercare stages")
 }
 
+/// The run's whole stage-evidence log as stored, keyed the way the walk reads
+/// it: `(seq, stage_index, stage, attempt, phase, state)`.
+fn stage_log(
+    world: &World,
+    position: usize,
+) -> Vec<(i64, i64, String, i64, String, Option<String>)> {
+    let run_id = world.run_id(position);
+    let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
+    let mut statement = connection
+        .prepare(
+            "SELECT seq, stage_index, stage, attempt, phase, state
+             FROM aftercare_stages WHERE run_id = ?1 ORDER BY seq",
+        )
+        .expect("prepare stage log query");
+    statement
+        .query_map([&run_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .expect("query stage log")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read stage log")
+}
+
 fn aftercare_stage_evidence(world: &World, position: usize, stage: &str) -> serde_json::Value {
     let run_id = world.run_id(position);
     let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
     let evidence: String = connection
         .query_row(
-            "SELECT evidence_json FROM aftercare_stages WHERE run_id = ?1 AND stage = ?2",
+            "SELECT evidence_json FROM aftercare_stages
+             WHERE run_id = ?1 AND stage = ?2 AND state IS NOT NULL
+             ORDER BY seq DESC LIMIT 1",
             [run_id.as_str(), stage],
             |row| row.get(0),
         )
@@ -276,6 +311,37 @@ fn flow_executes_in_order_and_records_one_row_per_stage() {
             .iter()
             .all(|(_, _, _, output)| *output == format!("runs/{}/output.ndjson", world.run_id(1)))
     );
+    // Each stage is judged without a second process, so each appends exactly
+    // one action row, and `seq` numbers them in the order they executed.
+    assert_eq!(
+        stage_log(&world, 1),
+        [
+            (
+                1,
+                0,
+                "build".into(),
+                1,
+                "action".into(),
+                Some("passed".into())
+            ),
+            (
+                2,
+                1,
+                "check".into(),
+                1,
+                "action".into(),
+                Some("passed".into())
+            ),
+            (
+                3,
+                2,
+                "merge".into(),
+                1,
+                "action".into(),
+                Some("passed".into())
+            ),
+        ]
+    );
     let logs = world.sloop(&["logs", &world.run_id(1)]);
     let entries = World::json_stdout(&logs)["data"]["entries"]
         .as_array()
@@ -351,6 +417,88 @@ fn check_verdict_uses_the_check_commands_exit() {
         [
             ("build".into(), "passed".into()),
             ("verify".into(), "failed".into())
+        ]
+    );
+    // The action exited clean and the check is what rejected it, so the two
+    // readings sit on separate rows and only the check's is the verdict.
+    assert_eq!(
+        stage_log(&failing, 1)
+            .into_iter()
+            .map(|(_, _, stage, _, phase, state)| (stage, phase, state))
+            .collect::<Vec<_>>(),
+        [
+            ("build".into(), "action".into(), Some("passed".into())),
+            ("verify".into(), "action".into(), None),
+            ("verify".into(), "check".into(), Some("failed".into())),
+        ]
+    );
+}
+
+/// A stage judged by an independent actor has two things to account for, and
+/// records both: the action's own exit, and the check's. The resolved verdict
+/// rides on the check, because that is where the execution ended.
+#[test]
+fn a_check_actor_records_its_own_row_beside_the_action_it_judged() {
+    let world = World::configured();
+    configure(&world, COMMITTING_AGENT, None);
+    write_flow(
+        &world,
+        "stages:\n  - { name: build, kind: agent }\n  - { name: verify, kind: exec, cmd: ['sh', '-c', 'exit 0'], verdict: { check: ['true'] } }\n  - { name: merge, kind: merge }\n",
+    );
+    world.commit_all("initial");
+    world.start_daemon();
+    post_and_run(&world, "check-phases.md");
+    wait_until("the checked flow merges", || tickets(&world)["merged"] == 1);
+
+    assert_eq!(
+        stage_log(&world, 1),
+        [
+            (
+                1,
+                0,
+                "build".into(),
+                1,
+                "action".into(),
+                Some("passed".into())
+            ),
+            (2, 1, "verify".into(), 1, "action".into(), None),
+            (
+                3,
+                1,
+                "verify".into(),
+                1,
+                "check".into(),
+                Some("passed".into())
+            ),
+            (
+                4,
+                2,
+                "merge".into(),
+                1,
+                "action".into(),
+                Some("passed".into())
+            ),
+        ]
+    );
+    // Two rows for one stage, and `show` still reports the three stages the
+    // flow declares — one line each, judged by the row the verdict rode on.
+    let shown = world.show_snapshot(&world.run_id(1));
+    assert_eq!(
+        shown["stages"]
+            .as_array()
+            .expect("stages array")
+            .iter()
+            .map(|stage| {
+                (
+                    stage["stage"].as_str().unwrap_or_default().to_owned(),
+                    stage["state"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        [
+            ("build".to_owned(), "passed".to_owned()),
+            ("verify".to_owned(), "passed".to_owned()),
+            ("merge".to_owned(), "passed".to_owned()),
         ]
     );
 }
@@ -618,6 +766,138 @@ fn restart_between_exec_stages_skips_the_completed_stage() {
     });
     assert_eq!(fs::read_to_string(invocations).unwrap(), "12");
     assert_eq!(aftercare_stages(&world, 1).len(), 4);
+    // Recovery folded the log and stood where it left off: four executions in
+    // the order they ran, no stage repeated.
+    assert_eq!(
+        stage_log(&world, 1)
+            .into_iter()
+            .map(|(seq, index, stage, _, _, _)| (seq, index, stage))
+            .collect::<Vec<_>>(),
+        [
+            (1, 0, "build".into()),
+            (2, 1, "first".into()),
+            (3, 2, "second".into()),
+            (4, 3, "merge".into()),
+        ]
+    );
+}
+
+/// Rewrites the run's stage rows into the shape they had before the table
+/// became a log — no `seq`, no `phase`, a verdict on every row — and puts the
+/// schema version back, so the next open has a genuine pre-migration database
+/// to migrate.
+fn plant_old_stage_shape(world: &World) {
+    let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
+    connection
+        .execute_batch(
+            "CREATE TABLE old_aftercare_stages (
+                 run_id          TEXT NOT NULL REFERENCES runs(id),
+                 stage_index     INTEGER NOT NULL,
+                 stage           TEXT NOT NULL,
+                 state           TEXT NOT NULL,
+                 attempt         INTEGER NOT NULL DEFAULT 1,
+                 started_at_ms   INTEGER,
+                 finished_at_ms  INTEGER,
+                 exit_code       INTEGER,
+                 evidence_json   TEXT,
+                 PRIMARY KEY (run_id, stage_index, attempt)
+             );
+             INSERT INTO old_aftercare_stages
+                 (run_id, stage_index, stage, state, attempt, started_at_ms,
+                  finished_at_ms, exit_code, evidence_json)
+             SELECT run_id, stage_index, stage, state, attempt, started_at_ms,
+                    finished_at_ms, exit_code, evidence_json
+             FROM aftercare_stages WHERE state IS NOT NULL;
+             DROP TABLE aftercare_stages;
+             ALTER TABLE old_aftercare_stages RENAME TO aftercare_stages;
+             PRAGMA user_version = 13;",
+        )
+        .expect("plant pre-log stage rows");
+}
+
+/// A run queued before the stage table became a log must recover to the same
+/// `Step` afterwards. The migration numbers the rows it finds in
+/// `(stage_index, attempt)` order — the order the linear walk wrote them — so
+/// the fold that replays them stands exactly where it stood before.
+#[test]
+fn a_run_planted_in_the_old_stage_shape_migrates_and_resumes_where_it_stood() {
+    const HOOK: &str = "after-aftercare-stage-first";
+
+    let world = World::configured();
+    configure(&world, COMMITTING_AGENT, None);
+    world.arm_test_hook(HOOK);
+    let invocations = world.root().join("flow-invocations");
+    fs::write(
+        world.root().join(".agents/sloop/flows/resume.yaml"),
+        format!(
+            "stages:\n  - {{ name: build, kind: build }}\n  - {{ name: first, kind: exec, cmd: [\"sh\", \"-c\", \"printf 1 >> {}\"] }}\n  - {{ name: second, kind: exec, cmd: [\"sh\", \"-c\", \"printf 2 >> {}\"] }}\n  - {{ name: merge, kind: merge }}\n",
+            invocations.display(),
+            invocations.display(),
+        ),
+    )
+    .expect("write named recovery flow");
+    world.commit_all("initial");
+    let daemon_pid = world.start_daemon()["data"]["pid"].as_u64().unwrap() as u32;
+    let ticket_path = world.write_ticket("old-shape-flow.md", "---\nflow: resume\n---\n# Work\n");
+    let output = world.sloop(&["post", ticket_path.to_str().unwrap(), "--manual"]);
+    assert!(output.status.success());
+    let ticket = World::json_stdout(&output)["data"]["ticket"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(world.sloop(&["run", &ticket]).status.success());
+    wait_until("the first stage is durably complete", || {
+        world.test_hook_reached(HOOK)
+            && fs::read_to_string(&invocations).is_ok_and(|value| value == "1")
+    });
+
+    world.kill_daemon(daemon_pid);
+    plant_old_stage_shape(&world);
+    world.start_daemon();
+    wait_until("the migrated run completes the remaining flow", || {
+        tickets(&world)["merged"] == 1
+    });
+
+    // `first` is not re-run: the fold read the backfilled rows and resumed at
+    // `second`, exactly as it would have without the migration.
+    assert_eq!(fs::read_to_string(invocations).unwrap(), "12");
+    assert_eq!(
+        stage_log(&world, 1),
+        [
+            (
+                1,
+                0,
+                "build".into(),
+                1,
+                "action".into(),
+                Some("passed".into())
+            ),
+            (
+                2,
+                1,
+                "first".into(),
+                1,
+                "action".into(),
+                Some("passed".into())
+            ),
+            (
+                3,
+                2,
+                "second".into(),
+                1,
+                "action".into(),
+                Some("passed".into())
+            ),
+            (
+                4,
+                3,
+                "merge".into(),
+                1,
+                "action".into(),
+                Some("passed".into())
+            ),
+        ]
+    );
 }
 
 #[test]

@@ -496,10 +496,11 @@ fn validate_order(stages: &[Stage]) -> Result<(), String> {
 
     validate_return_edges(stages)?;
 
-    // `next_step` folds these edges, but nothing drives them yet: the runner
-    // still records one row per stage and no return budget survives a
-    // restart. Parsing the vocabulary now and refusing it here keeps flow
-    // files from depending on behaviour that has not landed.
+    // `next_step` folds these edges and the stage log now carries the real
+    // attempt behind every row, but nothing drives a backward edge yet: no
+    // execution records an attempt past its first. Parsing the vocabulary now
+    // and refusing it here keeps flow files from depending on behaviour that
+    // has not landed.
     for stage in stages {
         match &stage.fail_action {
             FailAction::Halt => {}

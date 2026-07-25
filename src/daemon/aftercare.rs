@@ -17,7 +17,8 @@ use crate::flow::{
 use crate::logging::{LogLevel, OperationalLog};
 use crate::outcome::{ExitClass, MergeOutcome, classify_exit};
 use crate::run_store::{
-    Exit, ExitDenial, RunExit, RunStart, RunState, RunStore, StageRecord, Start, StartDenial,
+    Exit, ExitDenial, RunExit, RunStart, RunState, RunStore, StagePhase, StageRecord, Start,
+    StartDenial,
 };
 use crate::runner::local::{process_start_time, run_exec_stage, wait_for_test_hook};
 use crate::runner::{
@@ -94,7 +95,9 @@ impl StageHooks for StoreStageHooks<'_> {
     }
 }
 
-/// One executed flow stage as observed by the supervisor.
+/// One thing the supervisor ran and watched: a stage's action, or the
+/// independent check that judges it. Each is evidence in its own right, and
+/// each appends its own row to the run's stage log.
 pub(super) struct StageResult {
     pub(super) verdict: Verdict,
     pub(super) exit_code: Option<i32>,
@@ -675,6 +678,37 @@ fn run_repair_agent(
         .ok_or_else(|| format!("repair agent for stage `{stage}` produced no process identity"))
 }
 
+/// The fold's view of a run's stage-evidence log: the rows that resolved an
+/// execution, in log order.
+///
+/// A row without a resolved verdict is an execution's earlier phase — its
+/// action, with the check that judges it still to come — so the fold skips it
+/// and the stage re-runs whole. That is exactly what a crash between an
+/// action and its check should cost: the check never judged anything, so the
+/// walk cannot stand past it.
+fn replayable(log: &[StageRecord]) -> Vec<StageEvidence> {
+    log.iter()
+        .filter_map(|row| {
+            Some(StageEvidence {
+                stage: row.stage.clone(),
+                stage_index: row.stage_index,
+                attempt: row.attempt,
+                verdict: if row.state.as_deref()? == "passed" {
+                    Verdict::Pass
+                } else {
+                    Verdict::Fail
+                },
+                source: if row.verdict_source.as_deref() == Some("reported") {
+                    VerdictSource::Reported
+                } else {
+                    VerdictSource::ExitCode
+                },
+                reason: row.reason.clone(),
+            })
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn drive_flow(
     root: &Path,
@@ -696,45 +730,28 @@ pub(super) fn drive_flow(
     log: &OperationalLog,
 ) -> Result<FlowRunResult, String> {
     let flow = flow_with_implicit_test(bound_flow, test_cmd)?;
-    let rows = run_store
-        .aftercare_stages(run_id)
-        .map_err(|error| error.to_string())?;
-    let mut evidence = rows
+    let mut evidence = replayable(
+        &run_store
+            .stage_log(run_id)
+            .map_err(|error| error.to_string())?,
+    );
+    let mut merge = flow
+        .stages
         .iter()
-        .map(|row| StageEvidence {
-            stage: row.stage.clone(),
-            stage_index: row.stage_index,
-            // The runner records one row per stage and never re-enters one,
-            // so every recovered row is a first attempt.
-            attempt: 1,
-            verdict: if row.state == "passed" {
-                Verdict::Pass
-            } else {
-                Verdict::Fail
-            },
-            source: if row.verdict_source == "reported" {
-                VerdictSource::Reported
-            } else {
-                VerdictSource::ExitCode
-            },
-            reason: row.reason.clone(),
+        .position(|stage| stage.action == Actor::Builtin(Builtin::Merge))
+        .and_then(|index| {
+            // The log is ordered, so the merge's last resolved row is the one
+            // that still stands; any earlier one was superseded by the
+            // execution that followed it.
+            evidence.iter().rev().find(|row| row.stage_index == index)
         })
-        .collect::<Vec<_>>();
-    let mut merge = flow.stages.iter().find_map(|stage| {
-        if stage.action != Actor::Builtin(Builtin::Merge) {
-            return None;
-        }
-        evidence
-            .iter()
-            .find(|row| row.stage == stage.name)
-            .map(|row| {
-                if row.verdict == Verdict::Pass {
-                    MergeOutcome::Merged
-                } else {
-                    MergeOutcome::Diverged
-                }
-            })
-    });
+        .map(|row| {
+            if row.verdict == Verdict::Pass {
+                MergeOutcome::Merged
+            } else {
+                MergeOutcome::Diverged
+            }
+        });
     let interrupted = run_store
         .run_evidence(run_id)
         .map_err(|error| error.to_string())?;
@@ -750,8 +767,8 @@ pub(super) fn drive_flow(
                 merge,
             });
         }
-        let stage = match next_step(&flow, &evidence) {
-            Step::Run { stage, attempt: _ } => stage,
+        let (stage, attempt) = match next_step(&flow, &evidence) {
+            Step::Run { stage, attempt } => (stage, attempt),
             Step::Halted {
                 failed_stage,
                 reason: _,
@@ -820,8 +837,8 @@ pub(super) fn drive_flow(
         // re-run is the only evidence.
         let mut repair_used = repair_attempts_used(&interrupted, &stage.name);
         let mut pending_repair: Option<(u32, ProcessIdentity, String)> = None;
-        let (verdict, source, reason, result) = loop {
-            let mut result = match &stage.action {
+        let (verdict, source, reason, action, check) = loop {
+            let action = match &stage.action {
                 Actor::Agent => {
                     let now = clock.now_ms();
                     StageResult {
@@ -914,18 +931,23 @@ pub(super) fn drive_flow(
                     }
                 }
             };
+            // The action's own reading, before the result check has a say.
+            // Only an independent actor that actually runs produces evidence
+            // of its own, and so a second log row; the rest judge in place.
+            let mut reading = action.verdict;
+            let mut check = None;
             match &stage.result_check {
                 Check::None | Check::Reported => {}
                 Check::Actor(Actor::Builtin(Builtin::Commits)) => {
-                    if result.verdict != Verdict::Pass
+                    if reading != Verdict::Pass
                         || !commit_observation_complete
                         || commits.is_empty()
                     {
-                        result.verdict = Verdict::Fail;
+                        reading = Verdict::Fail;
                     }
                 }
-                Check::Actor(Actor::Exec { cmd }) if result.verdict == Verdict::Pass => {
-                    result = execute_stage_order(
+                Check::Actor(Actor::Exec { cmd }) if reading == Verdict::Pass => {
+                    let judged = execute_stage_order(
                         worktree,
                         branch,
                         &stage.name,
@@ -937,13 +959,15 @@ pub(super) fn drive_flow(
                         log,
                         None,
                     );
+                    reading = judged.verdict;
+                    check = Some(judged);
                 }
                 Check::Actor(Actor::Exec { .. }) => {}
                 // Parsing refuses an agent judge and the merge builtin as a
                 // check, so neither can reach a run. Fail closed rather than
                 // pass a stage nothing actually judged.
                 Check::Actor(Actor::Agent) | Check::Actor(Actor::Builtin(Builtin::Merge)) => {
-                    result.verdict = Verdict::Fail;
+                    reading = Verdict::Fail;
                 }
             }
             let reported = if stage.result_check == Check::Reported {
@@ -951,17 +975,16 @@ pub(super) fn drive_flow(
             } else {
                 None
             };
-            let (verdict, source, reason) =
-                resolve_verdict(&stage.result_check, result.verdict, reported);
+            let (verdict, source, reason) = resolve_verdict(&stage.result_check, reading, reported);
             // Fill in the verdict of the re-run that followed the last repair.
-            if let Some((attempt, identity, target)) = pending_repair.take() {
+            if let Some((repair_attempt, identity, target)) = pending_repair.take() {
                 let _ = run_store.record_repair_attempt(
                     run_id,
                     &stage.name,
-                    attempt,
+                    repair_attempt,
                     &repair_attempt_json(
                         &stage.name,
-                        attempt,
+                        repair_attempt,
                         &target,
                         Some(identity),
                         Some(verdict),
@@ -970,7 +993,7 @@ pub(super) fn drive_flow(
                 );
             }
             if verdict == Verdict::Pass {
-                break (verdict, source, reason, result);
+                break (verdict, source, reason, action, check);
             }
             // The stage failed. If it has a repair worker, attempts remain, and
             // every spawn gate is open, repair in place and re-run the stage.
@@ -994,7 +1017,7 @@ pub(super) fn drive_flow(
                     if stage.action == Actor::Builtin(Builtin::Merge) {
                         abort_conflicted_merge(root);
                     }
-                    let attempt = repair_used + 1;
+                    let repair_attempt = repair_used + 1;
                     // Record the attempt before spawning so a crash mid-repair
                     // still counts it: recovery re-runs the stage, never the
                     // repair, so the attempt is neither repeated nor lost.
@@ -1002,8 +1025,8 @@ pub(super) fn drive_flow(
                         .record_repair_attempt(
                             run_id,
                             &stage.name,
-                            attempt,
-                            &repair_attempt_json(&stage.name, attempt, &target, None, None),
+                            repair_attempt,
+                            &repair_attempt_json(&stage.name, repair_attempt, &target, None, None),
                             clock.now_ms(),
                         )
                         .map_err(|error| error.to_string())?;
@@ -1016,13 +1039,13 @@ pub(super) fn drive_flow(
                         run_store,
                         run_id,
                         &stage.name,
-                        attempt,
+                        repair_attempt,
                         clock,
                         log,
                     ) {
                         Ok(identity) => {
-                            repair_used = attempt;
-                            pending_repair = Some((attempt, identity, target));
+                            repair_used = repair_attempt;
+                            pending_repair = Some((repair_attempt, identity, target));
                             // A fresh retry: any interrupted-merge recovery from
                             // a crash applied only to the first execution.
                             merge_recovery = None;
@@ -1046,30 +1069,43 @@ pub(super) fn drive_flow(
                     );
                 }
             }
-            break (verdict, source, reason, result);
+            break (verdict, source, reason, action, check);
         };
-        if let Err(error) = run_store.record_aftercare_stage(
-            run_id,
-            &StageRecord {
-                stage_index,
-                stage: stage.name.clone(),
-                state: if verdict == Verdict::Pass {
-                    "passed".into()
-                } else {
-                    "failed".into()
-                },
-                started_at_ms: result.started_at_ms,
-                finished_at_ms: result.finished_at_ms,
-                exit_code: result.exit_code,
-                output_ref: format!("runs/{run_id}/output.ndjson"),
-                verdict_source: match source {
+        // The execution's rows, in the order it produced them. The resolved
+        // verdict rides on the last of them, so a check that ran carries it
+        // and the action it judged keeps only its own exit; a stage judged
+        // without a second process records one row that carries both.
+        let output_ref = format!("runs/{run_id}/output.ndjson");
+        let row = |phase: StagePhase, result: &StageResult, resolved: bool| StageRecord {
+            stage_index,
+            stage: stage.name.clone(),
+            attempt,
+            phase,
+            state: resolved.then(|| match verdict {
+                Verdict::Pass => "passed".to_owned(),
+                Verdict::Fail => "failed".to_owned(),
+            }),
+            started_at_ms: result.started_at_ms,
+            finished_at_ms: result.finished_at_ms,
+            exit_code: result.exit_code,
+            output_ref: output_ref.clone(),
+            verdict_source: resolved.then(|| {
+                match source {
                     VerdictSource::ExitCode => "exit_code",
                     VerdictSource::Reported => "reported",
                 }
-                .into(),
-                reason: reason.clone(),
-            },
-        ) {
+                .to_owned()
+            }),
+            reason: resolved.then(|| reason.clone()).flatten(),
+        };
+        let rows = match &check {
+            Some(check) => vec![
+                row(StagePhase::Action, &action, false),
+                row(StagePhase::Check, check, true),
+            ],
+            None => vec![row(StagePhase::Action, &action, true)],
+        };
+        if let Err(error) = run_store.append_stage_rows(run_id, &rows) {
             log.emit_with_fields(
                 LogLevel::Error,
                 "sloop::supervisor",
@@ -1096,7 +1132,7 @@ pub(super) fn drive_flow(
         evidence.push(StageEvidence {
             stage: stage.name.clone(),
             stage_index,
-            attempt: 1,
+            attempt,
             verdict,
             source,
             reason,

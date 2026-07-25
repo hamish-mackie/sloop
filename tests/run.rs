@@ -1393,9 +1393,12 @@ fn periodic_reconciliation_does_not_duplicate_supervisor_aftercare() {
     });
 
     let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
+    // Resolved rows, not raw ones: `build`'s exec check records evidence of
+    // its own beside the action's, so one execution of it is two log rows.
     let stage_count: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM aftercare_stages WHERE run_id = ?1",
+            "SELECT COUNT(*) FROM aftercare_stages
+             WHERE run_id = ?1 AND state IS NOT NULL",
             [world.run_id(1)],
             |row| row.get(0),
         )

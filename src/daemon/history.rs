@@ -114,7 +114,7 @@ fn history_with_timeline(
     run: &RunRecord,
     timeline: RunTimeline,
 ) -> Result<RunHistory, ErrorBody> {
-    let recorded = run_lookup(state, |run_store| run_store.aftercare_stages(&run.id))?;
+    let recorded = run_lookup(state, |run_store| run_store.stage_log(&run.id))?;
     let evidence = run_lookup(state, |run_store| run_store.run_evidence(&run.id))?;
     let stall = evidence.iter().rev().find_map(|(kind, data)| {
         (kind == "output_stall")
@@ -283,7 +283,15 @@ fn stages(
     names
         .into_iter()
         .map(|name| {
-            let Some(row) = recorded.iter().find(|row| row.stage == name) else {
+            // The log's last resolved row for the stage is its standing
+            // outcome: earlier ones were superseded by the execution that
+            // followed, and rows carrying no verdict are an execution's
+            // action, already answered for by the check row behind it.
+            let Some(row) = recorded
+                .iter()
+                .rev()
+                .find(|row| row.stage == name && row.state.is_some())
+            else {
                 // The first unrecorded stage of a run still in flight is the
                 // one executing now; the rest genuinely have not started. A
                 // terminal run has no running stage at all — its unrecorded
@@ -307,7 +315,7 @@ fn stages(
                 };
             };
             Stage {
-                state: if row.state == "passed" {
+                state: if row.state.as_deref() == Some("passed") {
                     "passed"
                 } else {
                     "failed"
@@ -316,7 +324,7 @@ fn stages(
                 started_at_ms: positive(row.started_at_ms),
                 finished_at_ms: positive(row.finished_at_ms),
                 exit_code: row.exit_code,
-                verdict_source: Some(row.verdict_source.clone()),
+                verdict_source: row.verdict_source.clone(),
                 reason: row.reason.clone(),
                 silent_for_ms: None,
                 name,

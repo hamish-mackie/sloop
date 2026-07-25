@@ -11,17 +11,57 @@ pub struct EvidenceRecord {
     pub data_json: String,
 }
 
-/// One executed aftercare stage, persisted alongside the run's outcome.
+/// Where in a stage execution a log row was written. An execution whose
+/// `result_check` runs an independent actor records both phases as two rows
+/// sharing `stage_index` and `attempt`; every other execution is judged
+/// without a second process and records its action alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagePhase {
+    Action,
+    Check,
+}
+
+impl StagePhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Action => "action",
+            Self::Check => "check",
+        }
+    }
+
+    /// Anything that is not the check phase is the action phase: rows written
+    /// before the split carry no phase of their own and are all actions.
+    fn parse(value: &str) -> Self {
+        match value {
+            "check" => Self::Check,
+            _ => Self::Action,
+        }
+    }
+}
+
+/// One row of a run's ordered stage-evidence log.
+///
+/// Rows are produced and read in log order — the storage assigns each a
+/// per-run `seq` at insert and hands them back in it — because the walk
+/// replays them rather than looking them up by stage. The resolved stage
+/// verdict rides on the last row of an execution; earlier rows carry only what
+/// their own actor produced and leave `state` absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageRecord {
     pub stage_index: usize,
     pub stage: String,
-    pub state: String,
+    /// 1 for a stage's first execution, incrementing each time the walk
+    /// re-enters it.
+    pub attempt: u32,
+    pub phase: StagePhase,
+    /// `passed` or `failed` once the execution resolved; absent on a row the
+    /// resolution does not ride on.
+    pub state: Option<String>,
     pub started_at_ms: i64,
     pub finished_at_ms: i64,
     pub exit_code: Option<i32>,
     pub output_ref: String,
-    pub verdict_source: String,
+    pub verdict_source: Option<String>,
     pub reason: Option<String>,
 }
 
@@ -118,40 +158,53 @@ pub(crate) mod tx {
         Ok(())
     }
 
-    pub(crate) fn record_aftercare_stage(
+    /// Appends one stage execution's rows to the run's log, in the order
+    /// given. `seq` is read off the run's own tail inside this transaction, so
+    /// two executions racing to append can never claim the same position.
+    pub(crate) fn append_stage_rows(
         transaction: &Transaction<'_>,
         run_id: &str,
-        stage: &StageRecord,
+        rows: &[StageRecord],
     ) -> rusqlite::Result<()> {
-        let evidence_json = serde_json::json!({
-            "output": stage.output_ref,
-            "verdict_source": stage.verdict_source,
-            "reason": stage.reason,
-        })
-        .to_string();
-        transaction.execute(
-            "INSERT INTO aftercare_stages
-                 (run_id, stage_index, stage, state, started_at_ms, finished_at_ms, exit_code,
-                  evidence_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(run_id, stage_index, attempt) DO UPDATE SET
-                 stage = excluded.stage,
-                 state = excluded.state,
-                 started_at_ms = excluded.started_at_ms,
-                 finished_at_ms = excluded.finished_at_ms,
-                 exit_code = excluded.exit_code,
-                 evidence_json = excluded.evidence_json",
-            params![
-                run_id,
-                stage.stage_index as i64,
-                stage.stage,
-                stage.state,
-                stage.started_at_ms,
-                stage.finished_at_ms,
-                stage.exit_code,
-                evidence_json,
-            ],
-        )?;
+        for row in rows {
+            let evidence_json = serde_json::json!({
+                "output": row.output_ref,
+                "verdict_source": row.verdict_source,
+                "reason": row.reason,
+            })
+            .to_string();
+            // A re-executed stage overwrites its own row rather than
+            // duplicating it, and `seq` is deliberately absent from the update
+            // so the rewrite keeps the log position it first took.
+            transaction.execute(
+                "INSERT INTO aftercare_stages
+                     (run_id, seq, stage_index, stage, state, attempt, phase,
+                      started_at_ms, finished_at_ms, exit_code, evidence_json)
+                 VALUES (?1,
+                         (SELECT COALESCE(MAX(seq), 0) + 1
+                          FROM aftercare_stages WHERE run_id = ?1),
+                         ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(run_id, stage_index, attempt, phase) DO UPDATE SET
+                     stage = excluded.stage,
+                     state = excluded.state,
+                     started_at_ms = excluded.started_at_ms,
+                     finished_at_ms = excluded.finished_at_ms,
+                     exit_code = excluded.exit_code,
+                     evidence_json = excluded.evidence_json",
+                params![
+                    run_id,
+                    row.stage_index as i64,
+                    row.stage,
+                    row.state,
+                    row.attempt,
+                    row.phase.as_str(),
+                    row.started_at_ms,
+                    row.finished_at_ms,
+                    row.exit_code,
+                    evidence_json,
+                ],
+            )?;
+        }
         Ok(())
     }
 
@@ -274,40 +327,42 @@ pub(crate) mod tx {
     }
 }
 
-fn aftercare_stages(connection: &Connection, run_id: &str) -> rusqlite::Result<Vec<StageRecord>> {
+/// The run's whole stage-evidence log, in `seq` order. Callers replay it; none
+/// of them look a stage up by name.
+fn stage_log(connection: &Connection, run_id: &str) -> rusqlite::Result<Vec<StageRecord>> {
     let mut statement = connection.prepare(
-        "SELECT stage_index, stage, state, started_at_ms, finished_at_ms, exit_code,
-                evidence_json
-         FROM aftercare_stages WHERE run_id = ?1 ORDER BY stage_index",
+        "SELECT stage_index, stage, attempt, phase, state, started_at_ms, finished_at_ms,
+                exit_code, evidence_json
+         FROM aftercare_stages WHERE run_id = ?1 ORDER BY seq",
     )?;
     statement
         .query_map(params![run_id], |row| {
-            let evidence_json: Option<String> = row.get(6)?;
-            let output_ref = evidence_json
-                .as_deref()
-                .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-                .and_then(|value| value["output"].as_str().map(str::to_owned))
-                .unwrap_or_default();
-            let evidence = evidence_json
+            let evidence = row
+                .get::<_, Option<String>>(8)?
                 .as_deref()
                 .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
+            let field = |name: &str| {
+                evidence
+                    .as_ref()
+                    .and_then(|value| value[name].as_str())
+                    .map(str::to_owned)
+            };
+            let state: Option<String> = row.get(4)?;
             Ok(StageRecord {
                 stage_index: row.get::<_, i64>(0)? as usize,
                 stage: row.get(1)?,
-                state: row.get(2)?,
-                started_at_ms: row.get(3)?,
-                finished_at_ms: row.get(4)?,
-                exit_code: row.get(5)?,
-                output_ref,
-                verdict_source: evidence
-                    .as_ref()
-                    .and_then(|value| value["verdict_source"].as_str())
-                    .unwrap_or("exit_code")
-                    .to_owned(),
-                reason: evidence
-                    .as_ref()
-                    .and_then(|value| value["reason"].as_str())
-                    .map(str::to_owned),
+                attempt: row.get(2)?,
+                phase: StagePhase::parse(&row.get::<_, String>(3)?),
+                started_at_ms: row.get(5)?,
+                finished_at_ms: row.get(6)?,
+                exit_code: row.get(7)?,
+                output_ref: field("output").unwrap_or_default(),
+                // A resolved row written before the source was recorded was
+                // judged by its own exit, which is what the old default said.
+                verdict_source: field("verdict_source")
+                    .or_else(|| state.is_some().then(|| "exit_code".to_owned())),
+                reason: field("reason"),
+                state,
             })
         })?
         .collect::<Result<Vec<_>, _>>()
@@ -404,18 +459,20 @@ fn latest_vendor_error_for_ticket(
 }
 
 impl RunStore {
-    pub(crate) fn record_aftercare_stage(
+    /// Appends one stage execution's rows atomically: a crash can leave the
+    /// execution unrecorded, never half-recorded.
+    pub(crate) fn append_stage_rows(
         &self,
         run_id: &str,
-        stage: &StageRecord,
+        rows: &[StageRecord],
     ) -> Result<(), StoreError> {
         self.write(TransactionBehavior::Deferred, |transaction| {
-            tx::record_aftercare_stage(transaction, run_id, stage)
+            tx::append_stage_rows(transaction, run_id, rows)
         })
     }
 
-    pub(crate) fn aftercare_stages(&self, run_id: &str) -> Result<Vec<StageRecord>, StoreError> {
-        aftercare_stages(&self.db.lock(), run_id).map_err(StoreError::from)
+    pub(crate) fn stage_log(&self, run_id: &str) -> Result<Vec<StageRecord>, StoreError> {
+        stage_log(&self.db.lock(), run_id).map_err(StoreError::from)
     }
 
     pub(crate) fn record_aftercare_evidence(
@@ -524,15 +581,63 @@ impl RunStore {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use tempfile::tempdir;
 
-    use crate::db::StoreError;
+    use crate::db::{Db, StoreError};
     use crate::outcome::Outcome;
     use crate::run_store::test_support::{claim_run, open_seeded, settle_run};
     use crate::run_store::{
-        Exit, ExitClaim, ExitDenial, RunExit, RunStart, RunState, RunStore, Start,
+        Exit, ExitClaim, ExitDenial, RunExit, RunStart, RunState, RunStore, StagePhase,
+        StageRecord, Start,
     };
     use crate::vendor_error::{VendorErrorClass, VendorErrorMatch};
+
+    fn stage_row(
+        stage_index: usize,
+        stage: &str,
+        attempt: u32,
+        phase: StagePhase,
+        state: Option<&str>,
+    ) -> StageRecord {
+        StageRecord {
+            stage_index,
+            stage: stage.to_owned(),
+            attempt,
+            phase,
+            state: state.map(str::to_owned),
+            started_at_ms: 3_000,
+            finished_at_ms: 3_100,
+            exit_code: Some(0),
+            output_ref: "runs/R1/output.ndjson".into(),
+            verdict_source: state.map(|_| "exit_code".to_owned()),
+            reason: None,
+        }
+    }
+
+    /// `(stage_index, stage, attempt, phase, state)` for every row of the log,
+    /// in the order the storage hands them back.
+    fn log_shape(store: &RunStore) -> Vec<(usize, String, u32, StagePhase, Option<String>)> {
+        store
+            .stage_log("R1")
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.stage_index,
+                    row.stage,
+                    row.attempt,
+                    row.phase,
+                    row.state,
+                )
+            })
+            .collect()
+    }
+
+    fn reopen(path: &Path) -> RunStore {
+        RunStore::from_db(Db::open(path, 4_000).unwrap())
+    }
 
     fn running_r1(store: &RunStore) {
         claim_run(store, "R1", "{}", "{}", 2_000);
@@ -678,6 +783,204 @@ mod tests {
             2_300,
         );
         assert!(matches!(missing, Err(StoreError::RunNotFound { .. })));
+    }
+
+    /// The log's order is the order rows were appended, not the order of any
+    /// key on them: a stage re-entered later reads back after the stages that
+    /// ran in between, which is what makes the fold's replay faithful.
+    #[test]
+    fn the_stage_log_reads_back_in_append_order() {
+        let directory = tempdir().unwrap();
+        let store = open_seeded(&directory.path().join("sloop.db"));
+        running_r1(&store);
+
+        store
+            .append_stage_rows(
+                "R1",
+                &[stage_row(0, "build", 1, StagePhase::Action, Some("passed"))],
+            )
+            .unwrap();
+        // One execution of `verify`, judged by an independent actor: two rows
+        // sharing a stage and an attempt, and only the last carries a verdict.
+        store
+            .append_stage_rows(
+                "R1",
+                &[
+                    stage_row(1, "verify", 1, StagePhase::Action, None),
+                    stage_row(1, "verify", 1, StagePhase::Check, Some("failed")),
+                ],
+            )
+            .unwrap();
+        store
+            .append_stage_rows(
+                "R1",
+                &[stage_row(0, "build", 2, StagePhase::Action, Some("passed"))],
+            )
+            .unwrap();
+
+        assert_eq!(
+            log_shape(&store),
+            [
+                (
+                    0,
+                    "build".into(),
+                    1,
+                    StagePhase::Action,
+                    Some("passed".into())
+                ),
+                (1, "verify".into(), 1, StagePhase::Action, None),
+                (
+                    1,
+                    "verify".into(),
+                    1,
+                    StagePhase::Check,
+                    Some("failed".into())
+                ),
+                (
+                    0,
+                    "build".into(),
+                    2,
+                    StagePhase::Action,
+                    Some("passed".into())
+                ),
+            ]
+        );
+        let unresolved = &store.stage_log("R1").unwrap()[1];
+        assert_eq!(unresolved.verdict_source, None);
+        assert_eq!(unresolved.output_ref, "runs/R1/output.ndjson");
+    }
+
+    /// Re-appending a row the natural key already holds corrects it in place.
+    /// It must not take a new position: a rewrite that jumped to the tail
+    /// would reorder history the fold has already replayed.
+    #[test]
+    fn rewriting_a_stage_row_keeps_the_position_it_first_took() {
+        let directory = tempdir().unwrap();
+        let store = open_seeded(&directory.path().join("sloop.db"));
+        running_r1(&store);
+
+        store
+            .append_stage_rows(
+                "R1",
+                &[
+                    stage_row(0, "build", 1, StagePhase::Action, Some("passed")),
+                    stage_row(1, "test", 1, StagePhase::Action, Some("failed")),
+                ],
+            )
+            .unwrap();
+        store
+            .append_stage_rows(
+                "R1",
+                &[stage_row(0, "build", 1, StagePhase::Action, Some("failed"))],
+            )
+            .unwrap();
+
+        assert_eq!(
+            log_shape(&store),
+            [
+                (
+                    0,
+                    "build".into(),
+                    1,
+                    StagePhase::Action,
+                    Some("failed".into())
+                ),
+                (
+                    1,
+                    "test".into(),
+                    1,
+                    StagePhase::Action,
+                    Some("failed".into())
+                ),
+            ]
+        );
+    }
+
+    /// Rows written before the table became a log are one whole execution
+    /// each. They backfill in the order the linear walk produced them, so a
+    /// run planted in the old shape replays to the same position afterwards.
+    #[test]
+    fn version_thirteen_backfills_the_stage_log_in_walk_order() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("sloop.db");
+        let store = open_seeded(&path);
+        running_r1(&store);
+        drop(store);
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE aftercare_stages;
+                 CREATE TABLE aftercare_stages (
+                     run_id          TEXT NOT NULL REFERENCES runs(id),
+                     stage_index     INTEGER NOT NULL,
+                     stage           TEXT NOT NULL,
+                     state           TEXT NOT NULL,
+                     attempt         INTEGER NOT NULL DEFAULT 1,
+                     started_at_ms   INTEGER,
+                     finished_at_ms  INTEGER,
+                     exit_code       INTEGER,
+                     evidence_json   TEXT,
+                     PRIMARY KEY (run_id, stage_index, attempt)
+                 );
+                 INSERT INTO aftercare_stages
+                     (run_id, stage_index, stage, state, attempt, started_at_ms,
+                      finished_at_ms, exit_code, evidence_json)
+                 VALUES
+                     ('R1', 1, 'test', 'passed', 1, 3000, 3100, 0, NULL),
+                     ('R1', 0, 'build', 'passed', 1, 2900, 3000, 0,
+                      '{\"output\":\"runs/R1/output.ndjson\",\"verdict_source\":\"reported\"}');
+                 PRAGMA user_version = 13;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = reopen(&path);
+        assert_eq!(
+            log_shape(&store),
+            [
+                (
+                    0,
+                    "build".into(),
+                    1,
+                    StagePhase::Action,
+                    Some("passed".into())
+                ),
+                (
+                    1,
+                    "test".into(),
+                    1,
+                    StagePhase::Action,
+                    Some("passed".into())
+                ),
+            ]
+        );
+        let migrated = store.stage_log("R1").unwrap();
+        assert_eq!(migrated[0].verdict_source.as_deref(), Some("reported"));
+        // A row that never recorded a source was judged by its own exit, which
+        // is what the pre-log reader assumed.
+        assert_eq!(migrated[1].verdict_source.as_deref(), Some("exit_code"));
+
+        // The migrated log still appends: the next row takes the position
+        // after the two that were backfilled.
+        store
+            .append_stage_rows(
+                "R1",
+                &[stage_row(2, "merge", 1, StagePhase::Action, Some("passed"))],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .db()
+                .lock()
+                .query_row(
+                    "SELECT seq FROM aftercare_stages WHERE run_id = 'R1' AND stage = 'merge'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            3
+        );
     }
 
     #[test]
