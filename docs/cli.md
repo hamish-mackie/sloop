@@ -128,6 +128,20 @@ ticket TICK-43 updated from .agents/sloop/tickets/cooldown.md (project default, 
 no trigger queued: TICK-43 is merged
 ```
 
+`failed` is the one of the three a single verb undoes, so its line names that
+verb:
+
+```
+ticket TICK-44 updated from .agents/sloop/tickets/broken.md (project default, failed)
+no trigger queued: TICK-44 is failed; `sloop retry TICK-44` returns it to ready
+```
+
+With `--json` the same distinction is `trigger_suppressed`:
+`{"reason": "terminal_ticket", "state": "<ticket state>"}` when a trigger was
+asked for and refused, and `null` when none was asked for at all — which is
+what `--manual` and `--hold` produce. Read that field rather than a null
+`trigger`, which cannot tell the two apart.
+
 ### sloop run [TICKET] [--project P] [--only T1,T2] [--at TIME | --every INTERVAL | --overnight]
 
 Enqueue a run. Naming a ticket or a project says *which* work, not
@@ -169,6 +183,15 @@ run still pinned to an already-merged ticket, logging one
 
 Return a failed ticket to ready and reset its attempt counter.
 
+It queues nothing. A failed run consumes the trigger that started it, so a
+retried ticket is `ready` with no queued trigger and does not run by itself;
+follow it with `sloop run <TICKET>`. `sloop show` says as much on the ticket's
+row:
+
+```
+TICK-4  ready  (default)  Broken ticket  — ready but no queued trigger; enqueue with `sloop run`
+```
+
 ### sloop hold <TICKET> / sloop ready <TICKET>
 
 Hold a ready ticket so it cannot be dispatched; release it again. Held
@@ -181,8 +204,11 @@ sloop show [REF_OR_PATTERN] [-N] [--follow] [--quiet]
 ```
 
 Without an argument, `sloop show` is a dashboard with daemon and gate
-state, active runs, queued triggers, ticket counts, the next wake time, and
-the 10 newest tickets. `sloop show -N` changes the number of recent tickets;
+state, ticket counts, the next wake time, active runs, and the 10 newest
+tickets. Queue depth is not a line of its own: each recent ticket carries the
+scheduler's reason instead, so a ticket with no queued trigger says so where you
+are already looking. The `--json` payload does carry the full
+`queued_triggers` list. `sloop show -N` changes the number of recent tickets;
 `-n N` and `--limit N` are equivalent. A limit of zero or a non-numeric limit
 is a usage error.
 
@@ -245,7 +271,8 @@ runs:
 ```
 TICK-5-r1  (needs_review)
 ticket: TICK-5  Persist cooldowns
-branch: sloop/TICK-5-r1
+branch: sloop/TICK-5-a1-9c82d4e1
+worktree: <repository>/.worktrees/9c82d4e1
 timeline: claimed 19:02  started 19:02  finished 19:09
 agent exit: 0
 reason: stage `test` failed (exit 1) after agent completed with commits
@@ -255,6 +282,10 @@ stages:
   test   failed   19:05-19:09  4m12s  exit 1  verdict from exit_code
   merge  pending  -
 ```
+
+`branch` and `worktree` are the run's own, not the ticket's: each run gets a
+fresh branch named `sloop/<ticket>-a<attempt>-<short run id>` and a worktree
+under `worktree_dir`, so two attempts at one ticket never share either.
 
 Two things about that output are deliberate. `agent exit` is labeled rather
 than bare, because `exit: 0` on a run whose later stage failed reads as "the

@@ -58,7 +58,7 @@ After installing a new binary, ask the current daemon to drain and replace
 itself with that binary:
 
 ```sh
-./install
+# ...install the new binary over the old one, however you installed it...
 sloop daemon restart
 ```
 
@@ -120,10 +120,16 @@ branch, and spawns the agent there.
 Editing the file and posting it again updates the ticket in place — same ID,
 refreshed name, blockers, and worktree — without queuing a duplicate run.
 
+That queued run is a **trigger**, and it is what actually makes the ticket run.
+A ticket registered with `--manual` is `ready` but has no trigger, so it waits;
+so does a ticket whose run failed and which `sloop retry` returned to `ready`.
+`sloop run <ticket>` queues one whenever you want it. See
+[Concepts](concepts.md#tickets-runs-and-triggers).
+
 ## Watch it run
 
 ```sh
-sloop show                               # dashboard: running work, queue depth, next wake
+sloop show                               # dashboard: running work, ticket counts, next wake
 sloop logs <run-id>                      # a run's captured output
 sloop show <run-id> --follow --quiet     # block until the run finishes; exit 0 only on merge
 ```
@@ -163,6 +169,7 @@ approved nothing. Only then does `merge` apply the branch. A configured
 ## Everyday controls
 
 ```sh
+sloop run [ticket]      # queue a run: this ticket, or whatever is ready
 sloop hold <ticket>     # keep a ready ticket from being dispatched
 sloop ready <ticket>    # release it again
 sloop retry <ticket>    # return a failed ticket to ready, reset attempts

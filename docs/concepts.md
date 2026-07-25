@@ -12,15 +12,82 @@ There is no planning, no agent-to-agent coordination, no memory, and no
 chat. Higher-level systems that want those things can build them on top of
 Sloop's socket API.
 
+## Tickets, runs, and triggers
+
+Three words carry the whole model:
+
+- A **ticket** is *what to do*. You write it as a Markdown file and
+  `sloop post` registers it.
+- A **run** is *one attempt at it*. Sloop creates it, walks it through a flow,
+  and derives its outcome from the evidence.
+- A **trigger** is the durable record that *demand exists*. It is the only
+  thing that makes the dispatcher pick work up.
+
+That third one is the piece most people are missing, so it is worth stating
+flatly:
+
+> **A `ready` ticket does not run until something queues a trigger for it.**
+> `ready` means "nothing about this ticket is stopping it", not "this ticket is
+> about to run".
+
+Exactly two commands queue a trigger:
+
+- `sloop post <file>` queues one for the ticket it registers — unless you pass
+  `--manual` or `--hold`, or the ticket is already in a terminal state.
+- `sloop run` queues one at any time: for a named ticket, for a project, or for
+  whatever is ready.
+
+Nothing else does. In particular `sloop retry` returns a failed ticket to
+`ready` and stops there — the failed run consumed its trigger, so a retried
+ticket waits for a `sloop run` like any other. (`sloop hold` and `sloop ready`
+only park and release a ticket; a trigger queued before the hold is still
+queued after the release, and fires then.)
+
+When a ticket is sitting in `ready` with nothing happening, `sloop show` says so
+on the ticket's own row:
+
+```
+TICK-1  ready  (default)  Add request logging  — ready but no queued trigger; enqueue with `sloop run`
+```
+
+### Ticket states
+
+| state | meaning |
+| ----- | ------- |
+| `ready` | Nothing about the ticket is stopping it. It runs once a trigger is queued for it and the gates are open — and not before. |
+| `held` | An operator parked it; `sloop ready` releases it. |
+| `blocked` | Some ticket in its `blocked_by` list has not merged yet. Derived, not stored, so it clears the moment the last blocker merges. |
+| `claimed` | An active run owns it. |
+| `merged` | Terminal: the work was integrated into the default branch. |
+| `failed` | Terminal: the run did not succeed; `sloop retry` returns it to `ready`. |
+| `needs_review` | Terminal: the run left a branch a human has to judge. |
+
+A post cannot move a ticket out of the three terminal states, so reposting a
+settled file refreshes its indexed content and queues nothing.
+
+### When a trigger comes due
+
+A trigger carries a schedule, and its kind is what decides when it fires:
+
+- `sloop post --auto` (the default) and a plain `sloop run` are due on sight —
+  the next moment the gates allow.
+- `--at HH:MM`, on either command, is due at the next occurrence of that local
+  time.
+- `sloop run --overnight` is due at the next opening of the configured
+  `running_hours`.
+- `sloop run --every <interval>` is due repeatedly, rearming each time it fires.
+  Missed intervals collapse into one step, so a daemon asleep for an hour on a
+  one-minute cadence owes one run, not sixty.
+
+Coming due is not the same as running. A due trigger still passes every gate
+below before anything spawns, and a one-shot trigger is retired when it fires
+while a recurring one is rearmed. A trigger pinned to a ticket that merges is
+completed rather than left as demand that can never be met.
+
 ## The life of a run
 
 1. **Select.** The dispatcher pulls ready, unblocked work — a pure function
-   of the queue, optionally scoped to a ticket or project. What sits in that
-   queue is a **trigger**: the durable record that demand exists. A ticket is
-   *what* to do and a run is one attempt at it; a trigger is *when and
-   whether*. `sloop run` and `sloop post` queue them, `--at`/`--every`/
-   `--overnight` say when they come due, and a recurring one rearms itself
-   each time it fires.
+   of the queue of triggers, optionally scoped to a ticket or project.
 2. **Gate.** Every spawn, including explicitly named runs, must pass the
    same checks: not paused, inside running hours, below
    `max_parallel_tasks`.
@@ -90,11 +157,15 @@ next stage, and re-runs the interrupted one idempotently.
 ```
 stages:
   build    passed   19:02-19:05  3m0s  exit 0  verdict from exit_code
-  test     failed   19:05-19:08  3m11s  exit 1  verdict from exit_code
   build#2  passed   19:08-19:14  6m0s  exit 0  verdict from exit_code
+  test     failed   19:05-19:08  3m11s  exit 1  verdict from exit_code
   test#2   passed   19:14-19:17  2m40s  exit 0  verdict from exit_code
-  merge    passed   19:17-19:17  0s  verdict from exit_code
+  merge    passed   19:17-19:17  0s  exit 0  verdict from exit_code
 ```
+
+Rows are in flow order, and every execution of one stage sits together under its
+name — so the table reads as the flow, not as a clock. The timestamps are what
+tell you the walk actually went `build`, `test`, `build#2`, `test#2`.
 
 Two different counters both get called attempts, and they mean different things:
 
@@ -161,7 +232,8 @@ A worker's `sloop note "done, merged, ship it"` stores a note and moves
 nothing.
 
 Failed tickets keep an attempt count as evidence; `sloop retry` resets it
-and returns the ticket to ready.
+and returns the ticket to ready. It queues nothing, so the ticket sits there
+until a `sloop run` gives it a trigger.
 
 ## The operator/worker split
 

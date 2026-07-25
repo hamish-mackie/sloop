@@ -20,13 +20,18 @@ use crate::protocol::{
 };
 use crate::templates::TemplateKind;
 
+/// `ready` is the line people misread: it is a precondition, not a promise.
+/// Nothing dispatches until a trigger is queued for the ticket, so the state
+/// says that before it says anything else.
 const TICKET_STATES_HELP: &str = "Ticket states:
-  ready         Eligible for dispatch once a run is queued and gates are open.
+  ready         Nothing is stopping it - but it runs only once a trigger is
+                queued for it and the gates are open. `sloop run` queues one.
   held          Prevented from running by an operator; release with `sloop ready`.
   blocked       Waiting for every ticket in `blocked_by` to be merged.
   claimed       Owned by an active run, including recovery.
   merged        Terminal: completed work was integrated into the default branch.
-  failed        Terminal: the agent exited unsuccessfully; requeue with `sloop retry`.
+  failed        Terminal: the run did not succeed; `sloop retry` returns it to
+                ready, and `sloop run` is what starts it again.
   needs_review  Terminal: the run could not be merged; inspect manually.";
 
 const SHOW_LONG_ABOUT: &str =

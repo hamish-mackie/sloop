@@ -115,6 +115,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Denials and parse errors use one vocabulary for one concept: a stage that
   cannot take a report says it does not use `result_check: reported` rather
   than naming a "verdict policy".
+- The ticket-state table in `sloop --help --all` states the trigger
+  precondition first: `ready` said it was "eligible for dispatch once a run is
+  queued", which reads as a caveat on a state that sounds like a promise. It
+  now leads with the fact that a `ready` ticket runs only once a trigger is
+  queued for it, and `failed` names both halves of the recovery — `sloop retry`
+  returns it to ready, `sloop run` starts it again.
 
 - Captured output records, stage-process checkpoints, agent-exit checkpoints,
   and reported verdicts are all scoped to `(stage, attempt)` rather than stage
