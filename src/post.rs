@@ -17,17 +17,15 @@ use crate::domain::ticket::TicketState;
 use crate::domain::work::{ExecutionHints, SourceVersion, TicketRef, WorkTicket, WorkTicketState};
 use crate::flow::Flow;
 use crate::frontmatter::{self, FrontmatterError};
-use crate::ids::{IdError, next_id};
-use crate::protocol::{PostActivation, PostArgs};
+use crate::ids::{IdError, TRIGGER_ID_PREFIX, next_id};
+use crate::protocol::{PostArgs, PostTrigger};
 use crate::run_store;
-use crate::work_state::local::{
-    self, ActivationKind, LocalSqlite, LocalTicketWrite, NewActivation,
-};
+use crate::work_state::local::{self, LocalSqlite, LocalTicketWrite, NewTrigger, TriggerKind};
 use crate::work_state::{SourceError, WorkStateAuthor};
 
 #[derive(Clone, Copy)]
-struct ActivationRequest {
-    kind: ActivationKind,
+struct TriggerRequest {
+    kind: TriggerKind,
     eligible_at_ms: Option<i64>,
 }
 
@@ -100,9 +98,9 @@ struct MarkdownWorkStateAuthor<'a> {
     original_content: &'a str,
     final_content: &'a str,
     original_version: SourceVersion,
-    activation: Option<ActivationRequest>,
+    trigger: Option<TriggerRequest>,
     now_ms: i64,
-    activation_result: Mutex<Value>,
+    trigger_result: Mutex<Value>,
 }
 
 impl MarkdownWorkStateAuthor<'_> {
@@ -167,8 +165,8 @@ impl MarkdownWorkStateAuthor<'_> {
         } else {
             local::tx::insert_authored_ticket(&transaction, &write).map_err(source_store_error)?;
         }
-        let activation =
-            queue_activation_transaction(&transaction, &ticket.id, self.activation, self.now_ms)
+        let trigger =
+            queue_trigger_transaction(&transaction, &ticket.id, self.trigger, self.now_ms)
                 .map_err(source_store_error)?;
         self.ensure_source_version(expected)?;
         transaction
@@ -183,14 +181,14 @@ impl MarkdownWorkStateAuthor<'_> {
             })?;
         }
         *self
-            .activation_result
+            .trigger_result
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = activation;
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = trigger;
         Ok(())
     }
 
-    fn activation_result(&self) -> Value {
-        self.activation_result
+    fn trigger_result(&self) -> Value {
+        self.trigger_result
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
@@ -225,13 +223,13 @@ impl WorkStateAuthor for MarkdownWorkStateAuthor<'_> {
 }
 
 /// Registers a ticket file: validates and stamps frontmatter, indexes the
-/// ticket, and for `auto` and `at` creates one queued activation. Reposting
+/// ticket, and for `auto` and `at` creates one queued trigger. Reposting
 /// a stamped file is idempotent; reposting with a different `--at` time
-/// reschedules the queued activation. The dispatcher is the only caller and
+/// reschedules the queued trigger. The dispatcher is the only caller and
 /// computes `at_eligible_ms` from its injected clock, so plain reads before
 /// writes here cannot race another writer.
 ///
-/// An activation is queued only when the post leaves the ticket in `ready`.
+/// A trigger is queued only when the post leaves the ticket in `ready`.
 /// Reposting a settled ticket still refreshes the indexed content — editing
 /// a merged ticket's file must keep working — but queues nothing.
 #[allow(clippy::too_many_arguments)]
@@ -247,8 +245,8 @@ pub async fn handle(
     flows: &BTreeMap<String, Flow>,
     default_flow: &str,
 ) -> Result<Value, PostError> {
-    let initial_state = match args.activation {
-        PostActivation::Hold => TicketState::Held,
+    let initial_state = match args.trigger {
+        PostTrigger::Hold => TicketState::Held,
         _ => TicketState::Ready,
     };
     let relative = repository_relative(root, ticket_dir, &args.file)?;
@@ -398,29 +396,29 @@ pub async fn handle(
         .unwrap_or_else(|| content.clone());
     // A repost cannot move a settled ticket: `update_authored_ticket` omits
     // `state` from its `SET`, so `merged`, `failed`, and `needs_review` all
-    // survive the write. Dispatch requires `ready`, so an activation queued
-    // here could never fire; it would only sit in `queued_activations` as
+    // survive the write. Dispatch requires `ready`, so a trigger queued
+    // here could never fire; it would only sit in `queued_triggers` as
     // phantom demand and skew every gate that reads that count. `failed` is
-    // included even though `sloop retry` revives it: a lingering activation
+    // included even though `sloop retry` revives it: a lingering trigger
     // would make one failed ticket spawn on `retry` while every other one
     // waits for `sloop run`.
     let terminal_state = existing
         .as_ref()
         .map(|ticket| ticket.state.clone())
         .filter(|state| matches!(state.as_str(), "merged" | "failed" | "needs_review"));
-    let activation_request = if terminal_state.is_some() {
+    let trigger_request = if terminal_state.is_some() {
         None
     } else {
-        match &args.activation {
-            PostActivation::Manual | PostActivation::Hold => None,
-            PostActivation::Auto => Some(ActivationRequest {
-                kind: ActivationKind::Auto,
+        match &args.trigger {
+            PostTrigger::Manual | PostTrigger::Hold => None,
+            PostTrigger::Auto => Some(TriggerRequest {
+                kind: TriggerKind::Auto,
                 eligible_at_ms: None,
             }),
-            PostActivation::At { .. } => Some(ActivationRequest {
-                kind: ActivationKind::At,
+            PostTrigger::At { .. } => Some(TriggerRequest {
+                kind: TriggerKind::At,
                 eligible_at_ms: Some(
-                    at_eligible_ms.expect("the dispatcher computes eligibility for at activations"),
+                    at_eligible_ms.expect("the dispatcher computes eligibility for at triggers"),
                 ),
             }),
         }
@@ -442,7 +440,7 @@ pub async fn handle(
         attempts: existing.as_ref().map_or(0, |ticket| ticket.attempts as u32),
         hints: ExecutionHints {
             worktree: Some(worktree.clone()),
-            activation_id: None,
+            trigger_id: None,
             target,
             model: stamped.model.clone(),
             effort: stamped.effort.clone(),
@@ -458,9 +456,9 @@ pub async fn handle(
         original_content: &content,
         final_content: &final_content,
         original_version: source_version(&content),
-        activation: activation_request,
+        trigger: trigger_request,
         now_ms,
-        activation_result: Mutex::new(Value::Null),
+        trigger_result: Mutex::new(Value::Null),
     };
     let ticket_ref = TicketRef {
         id: ticket_id,
@@ -475,7 +473,7 @@ pub async fn handle(
             .update(&ticket_ref, &work_ticket, &author.original_version)
             .await?;
     }
-    let activation = author.activation_result();
+    let trigger = author.trigger_result();
     let ticket = work_state
         .ticket(&work_ticket.id)?
         .expect("registered ticket still exists");
@@ -495,11 +493,11 @@ pub async fn handle(
             "flow": ticket.flow,
         },
         "created": created,
-        "activation": activation,
-        // `activation` alone cannot tell a machine consumer why it is null:
+        "trigger": trigger,
+        // `trigger` alone cannot tell a machine consumer why it is null:
         // `--manual` and `--hold` never asked for one, while a terminal
         // ticket asked and was refused. Only the second sets this.
-        "activation_suppressed": terminal_state.map(|state| json!({
+        "trigger_suppressed": terminal_state.map(|state| json!({
             "reason": "terminal_ticket",
             "state": state,
         })),
@@ -564,35 +562,40 @@ pub(crate) fn parse_ticket_frontmatter(
     }
 }
 
-/// Reuses an existing queued activation of the same kind so reposting cannot
+/// Reuses an existing queued trigger of the same kind so reposting cannot
 /// enqueue duplicate work. Ticket registration, counter reservation, and this
 /// queue operation share one transaction.
 ///
 /// `request` is `None` for a settled ticket, which is what keeps the reschedule
-/// branch below from re-timing a stale `--at` activation onto one: the caller
+/// branch below from re-timing a stale `--at` trigger onto one: the caller
 /// decides eligibility, this function only carries it out.
-fn queue_activation_transaction(
+fn queue_trigger_transaction(
     transaction: &Transaction<'_>,
     ticket_id: &str,
-    request: Option<ActivationRequest>,
+    request: Option<TriggerRequest>,
     now_ms: i64,
 ) -> Result<Value, StoreError> {
     let Some(request) = request else {
         return Ok(Value::Null);
     };
-    let id = match local::tx::queued_ticket_activation(transaction, ticket_id, request.kind)? {
+    let id = match local::tx::queued_ticket_trigger(transaction, ticket_id, request.kind)? {
         Some(id) => {
             if let Some(eligible_at_ms) = request.eligible_at_ms {
-                local::tx::reschedule_activation(transaction, &id, eligible_at_ms, now_ms)?;
+                local::tx::reschedule_trigger(transaction, &id, eligible_at_ms, now_ms)?;
             }
             id
         }
         None => {
-            let ordinal = run_store::tx::reserve_ordinal(transaction, "activation", "activations")?;
-            let id = format!("A{ordinal}");
-            local::tx::insert_activation(
+            let ordinal = run_store::tx::reserve_ordinal(
                 transaction,
-                &NewActivation {
+                "trigger",
+                "triggers",
+                TRIGGER_ID_PREFIX,
+            )?;
+            let id = format!("{TRIGGER_ID_PREFIX}{ordinal}");
+            local::tx::insert_trigger(
+                transaction,
+                &NewTrigger {
                     id: &id,
                     kind: request.kind,
                     ticket_id: Some(ticket_id),
@@ -605,16 +608,16 @@ fn queue_activation_transaction(
             id
         }
     };
-    let mut activation = json!({
+    let mut trigger = json!({
         "id": id,
         "kind": request.kind.as_str(),
         "state": "queued",
         "ticket": ticket_id,
     });
     if let Some(eligible_at_ms) = request.eligible_at_ms {
-        activation["eligible_at_ms"] = json!(eligible_at_ms);
+        trigger["eligible_at_ms"] = json!(eligible_at_ms);
     }
-    Ok(activation)
+    Ok(trigger)
 }
 
 fn source_store_error(error: StoreError) -> SourceError {
@@ -882,7 +885,7 @@ mod tests {
     use crate::db::Db;
     use crate::domain::work::{ExecutionHints, TicketRef, WorkTicket, WorkTicketState};
     use crate::flow::{Actor, Builtin, Check, FailAction, Flow, Stage};
-    use crate::protocol::{PostActivation, PostArgs};
+    use crate::protocol::{PostArgs, PostTrigger};
     use crate::work_state::local::LocalSqlite;
     use crate::work_state::{SourceError, WorkStateAuthor};
 
@@ -951,12 +954,12 @@ mod tests {
             ))
     }
 
-    fn post(file: &str, activation: PostActivation) -> PostArgs {
+    fn post(file: &str, trigger: PostTrigger) -> PostArgs {
         PostArgs {
             file: file.into(),
             project: None,
             flow: None,
-            activation,
+            trigger,
         }
     }
 
@@ -1042,7 +1045,7 @@ mod tests {
     }
 
     #[test]
-    fn reposting_a_settled_ticket_refreshes_content_without_queuing_an_activation() {
+    fn reposting_a_settled_ticket_refreshes_content_without_queuing_an_trigger() {
         for state in ["merged", "failed", "needs_review"] {
             let (root, store) = world();
             let relative = ".agents/sloop/tickets/settled.md";
@@ -1051,7 +1054,7 @@ mod tests {
             handle(
                 root.path(),
                 &store,
-                &post(relative, PostActivation::Manual),
+                &post(relative, PostTrigger::Manual),
                 2_000,
                 "TICK",
                 None,
@@ -1066,7 +1069,7 @@ mod tests {
             let response = handle(
                 root.path(),
                 &store,
-                &post(relative, PostActivation::Auto),
+                &post(relative, PostTrigger::Auto),
                 3_000,
                 "TICK",
                 None,
@@ -1075,7 +1078,7 @@ mod tests {
             )
             .unwrap();
 
-            // The edit lands; only the activation is withheld.
+            // The edit lands; only the trigger is withheld.
             assert_eq!(response["ticket"]["id"], "TICK-1");
             assert_eq!(response["created"], false);
             assert_eq!(
@@ -1091,50 +1094,50 @@ mod tests {
                     .unwrap()
                     .contains("# Edited")
             );
-            assert!(response["activation"].is_null());
+            assert!(response["trigger"].is_null());
             assert_eq!(
-                response["activation_suppressed"],
+                response["trigger_suppressed"],
                 serde_json::json!({"reason": "terminal_ticket", "state": state})
             );
-            assert!(store.queued_activations().unwrap().is_empty());
+            assert!(store.queued_triggers().unwrap().is_empty());
         }
     }
 
     #[test]
-    fn reposting_a_settled_ticket_with_at_neither_creates_nor_reschedules_an_activation() {
+    fn reposting_a_settled_ticket_with_at_neither_creates_nor_reschedules_an_trigger() {
         let (root, store) = world();
         let relative = ".agents/sloop/tickets/timed.md";
         std::fs::write(root.path().join(relative), ticket("", "# Timed\n")).unwrap();
         let args = post(
             relative,
-            PostActivation::At {
+            PostTrigger::At {
                 time: "03:00".into(),
             },
         );
         let first = handle_at(root.path(), &store, &args, 2_000, 10_000).unwrap();
-        assert_eq!(first["activation"]["eligible_at_ms"], 10_000);
+        assert_eq!(first["trigger"]["eligible_at_ms"], 10_000);
         settle(&store, "TICK-1", "merged");
 
         let second = handle_at(root.path(), &store, &args, 3_000, 20_000).unwrap();
 
-        assert!(second["activation"].is_null());
-        assert_eq!(second["activation_suppressed"]["state"], "merged");
-        // The activation left over from before the merge keeps its original
+        assert!(second["trigger"].is_null());
+        assert_eq!(second["trigger_suppressed"]["state"], "merged");
+        // The trigger left over from before the merge keeps its original
         // time: the reschedule branch must not run for a settled ticket.
-        let queued = store.queued_activations().unwrap();
+        let queued = store.queued_triggers().unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].eligible_at_ms, Some(10_000));
     }
 
     #[test]
-    fn posting_twice_reuses_the_registration_and_activation() {
+    fn posting_twice_reuses_the_registration_and_trigger() {
         let (root, store) = world();
         std::fs::write(
             root.path().join(".agents/sloop/tickets/cooldown.md"),
             ticket("", "# Cooldowns\n"),
         )
         .unwrap();
-        let args = post(".agents/sloop/tickets/cooldown.md", PostActivation::Auto);
+        let args = post(".agents/sloop/tickets/cooldown.md", PostTrigger::Auto);
 
         let first = handle(
             root.path(),
@@ -1159,17 +1162,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first["ticket"]["id"], second["ticket"]["id"]);
-        assert_eq!(first["activation"]["id"], second["activation"]["id"]);
+        assert_eq!(first["trigger"]["id"], second["trigger"]["id"]);
         let db = store.db();
         let connection = db.lock();
         let tickets: i64 = connection
             .query_row("SELECT COUNT(*) FROM tickets", [], |row| row.get(0))
             .unwrap();
-        let activations: i64 = connection
-            .query_row("SELECT COUNT(*) FROM activations", [], |row| row.get(0))
+        let triggers: i64 = connection
+            .query_row("SELECT COUNT(*) FROM triggers", [], |row| row.get(0))
             .unwrap();
         assert_eq!(tickets, 1);
-        assert_eq!(activations, 1);
+        assert_eq!(triggers, 1);
     }
 
     #[test]
@@ -1181,7 +1184,7 @@ mod tests {
         handle(
             root.path(),
             &store,
-            &post(relative, PostActivation::Manual),
+            &post(relative, PostTrigger::Manual),
             2_000,
             "TICK",
             None,
@@ -1202,9 +1205,9 @@ mod tests {
             original_content: &original,
             final_content: &replacement,
             original_version: expected.clone(),
-            activation: None,
+            trigger: None,
             now_ms: 3_000,
-            activation_result: std::sync::Mutex::new(serde_json::Value::Null),
+            trigger_result: std::sync::Mutex::new(serde_json::Value::Null),
         };
         let content = WorkTicket {
             id: "TICK-1".into(),
@@ -1216,7 +1219,7 @@ mod tests {
             attempts: 0,
             hints: ExecutionHints {
                 worktree: Some("sloop/TICK-1".into()),
-                activation_id: None,
+                trigger_id: None,
                 target: None,
                 model: None,
                 effort: None,
@@ -1244,7 +1247,7 @@ mod tests {
     }
 
     #[test]
-    fn activation_insert_failure_leaves_idless_file_and_database_unchanged() {
+    fn trigger_insert_failure_leaves_idless_file_and_database_unchanged() {
         let (root, store) = world();
         let relative = ".agents/sloop/tickets/fail.md";
         let path = root.path().join(relative);
@@ -1254,15 +1257,15 @@ mod tests {
             .db()
             .lock()
             .execute_batch(
-                "CREATE TRIGGER reject_activation BEFORE INSERT ON activations
-                 BEGIN SELECT RAISE(ABORT, 'forced activation failure'); END;",
+                "CREATE TRIGGER reject_trigger BEFORE INSERT ON triggers
+                 BEGIN SELECT RAISE(ABORT, 'forced trigger failure'); END;",
             )
             .unwrap();
 
         let error = handle(
             root.path(),
             &store,
-            &post(relative, PostActivation::Auto),
+            &post(relative, PostTrigger::Auto),
             2_000,
             "TICK",
             None,
@@ -1271,15 +1274,15 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("forced activation failure"));
+        assert!(error.to_string().contains("forced trigger failure"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), original);
         assert!(store.ticket_ids().unwrap().is_empty());
-        assert!(store.queued_activations().unwrap().is_empty());
+        assert!(store.queued_triggers().unwrap().is_empty());
         let next_ordinal: i64 = store
             .db()
             .lock()
             .query_row(
-                "SELECT next_ordinal FROM id_counters WHERE kind = 'activation'",
+                "SELECT next_ordinal FROM id_counters WHERE kind = 'trigger'",
                 [],
                 |row| row.get(0),
             )
@@ -1288,7 +1291,7 @@ mod tests {
     }
 
     #[test]
-    fn posting_at_queues_a_timed_activation_and_reposting_reschedules_it() {
+    fn posting_at_queues_a_timed_trigger_and_reposting_reschedules_it() {
         let (root, store) = world();
         std::fs::write(
             root.path().join(".agents/sloop/tickets/timed.md"),
@@ -1297,21 +1300,21 @@ mod tests {
         .unwrap();
         let args = post(
             ".agents/sloop/tickets/timed.md",
-            PostActivation::At {
+            PostTrigger::At {
                 time: "03:00".into(),
             },
         );
 
         let first = handle_at(root.path(), &store, &args, 2_000, 10_000).unwrap();
         assert_eq!(first["ticket"]["state"], "ready");
-        assert_eq!(first["activation"]["kind"], "at");
-        assert_eq!(first["activation"]["eligible_at_ms"], 10_000);
+        assert_eq!(first["trigger"]["kind"], "at");
+        assert_eq!(first["trigger"]["eligible_at_ms"], 10_000);
 
         let second = handle_at(root.path(), &store, &args, 3_000, 20_000).unwrap();
-        assert_eq!(second["activation"]["id"], first["activation"]["id"]);
-        assert_eq!(second["activation"]["eligible_at_ms"], 20_000);
+        assert_eq!(second["trigger"]["id"], first["trigger"]["id"]);
+        assert_eq!(second["trigger"]["eligible_at_ms"], 20_000);
 
-        let queued = store.queued_activations().unwrap();
+        let queued = store.queued_triggers().unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].eligible_at_ms, Some(20_000));
     }
@@ -1321,7 +1324,7 @@ mod tests {
         let (root, store) = world();
         let path = root.path().join(".agents/sloop/tickets/work.md");
         std::fs::write(&path, ticket("model: sonnet\neffort: medium\n", "# Work\n")).unwrap();
-        let args = post(".agents/sloop/tickets/work.md", PostActivation::Manual);
+        let args = post(".agents/sloop/tickets/work.md", PostTrigger::Manual);
         let agent = agent();
 
         let first = handle(
@@ -1363,21 +1366,21 @@ mod tests {
     }
 
     #[test]
-    fn unknown_targets_are_rejected_before_registration_or_activation() {
+    fn unknown_targets_are_rejected_before_registration_or_trigger() {
         let (root, store) = world();
         std::fs::write(
             root.path().join(".agents/sloop/tickets/work.md"),
             ticket("target: missing\n", "# Work\n"),
         )
         .unwrap();
-        let args = post(".agents/sloop/tickets/work.md", PostActivation::Auto);
+        let args = post(".agents/sloop/tickets/work.md", PostTrigger::Auto);
 
         assert!(matches!(
             handle(root.path(), &store, &args, 2_000, "TICK", Some(&agent()), &flows(), "default"),
             Err(PostError::UnknownTarget(target)) if target == "missing"
         ));
         assert!(store.ticket_ids().unwrap().is_empty());
-        assert!(store.queued_activations().unwrap().is_empty());
+        assert!(store.queued_triggers().unwrap().is_empty());
     }
 
     #[test]
@@ -1388,7 +1391,7 @@ mod tests {
             ticket("target: codex\neffort: high\n", "# Work\n"),
         )
         .unwrap();
-        let args = post(".agents/sloop/tickets/work.md", PostActivation::Manual);
+        let args = post(".agents/sloop/tickets/work.md", PostTrigger::Manual);
 
         let error = handle(
             root.path(),
@@ -1419,7 +1422,7 @@ mod tests {
             file: ".agents/sloop/tickets/t.md".into(),
             project: Some("other".into()),
             flow: None,
-            activation: PostActivation::Manual,
+            trigger: PostTrigger::Manual,
         };
 
         assert!(matches!(
@@ -1449,7 +1452,7 @@ mod tests {
             file: ".agents/sloop/tickets/t.md".into(),
             project: Some("missing".into()),
             flow: None,
-            activation: PostActivation::Manual,
+            trigger: PostTrigger::Manual,
         };
 
         assert!(matches!(
@@ -1463,7 +1466,7 @@ mod tests {
         let (root, store) = world();
         let path = root.path().join(".agents/sloop/tickets/t.md");
         std::fs::write(&path, ticket("", "# T\n")).unwrap();
-        let args = post(".agents/sloop/tickets/t.md", PostActivation::Manual);
+        let args = post(".agents/sloop/tickets/t.md", PostTrigger::Manual);
 
         let response = handle(
             root.path(),
@@ -1493,7 +1496,7 @@ mod tests {
             ticket("flow: release\n", "# T\n"),
         )
         .unwrap();
-        let args = post(".agents/sloop/tickets/t.md", PostActivation::Manual);
+        let args = post(".agents/sloop/tickets/t.md", PostTrigger::Manual);
 
         let response = handle(
             root.path(),
@@ -1522,7 +1525,7 @@ mod tests {
             file: ".agents/sloop/tickets/t.md".into(),
             project: None,
             flow: Some("default".into()),
-            activation: PostActivation::Manual,
+            trigger: PostTrigger::Manual,
         };
 
         assert!(matches!(
@@ -1548,7 +1551,7 @@ mod tests {
             ticket("flow: bogus\n", "# T\n"),
         )
         .unwrap();
-        let args = post(".agents/sloop/tickets/t.md", PostActivation::Manual);
+        let args = post(".agents/sloop/tickets/t.md", PostTrigger::Manual);
 
         let error = handle(
             root.path(),
@@ -1576,7 +1579,7 @@ mod tests {
             ticket("", "# T\n"),
         )
         .unwrap();
-        let args = post(".agents/sloop/tickets/t.md", PostActivation::Manual);
+        let args = post(".agents/sloop/tickets/t.md", PostTrigger::Manual);
         handle(
             root.path(),
             &store,
@@ -1636,7 +1639,7 @@ mod tests {
         let first = handle(
             root.path(),
             &store,
-            &post(".agents/sloop/tickets/fix.md", PostActivation::Manual),
+            &post(".agents/sloop/tickets/fix.md", PostTrigger::Manual),
             2_000,
             "TICK",
             None,
@@ -1647,10 +1650,7 @@ mod tests {
         let second = handle(
             root.path(),
             &store,
-            &post(
-                ".agents/sloop/tickets/nested/fix.md",
-                PostActivation::Manual,
-            ),
+            &post(".agents/sloop/tickets/nested/fix.md", PostTrigger::Manual),
             2_100,
             "TICK",
             None,
@@ -1674,7 +1674,7 @@ mod tests {
         handle(
             root.path(),
             &store,
-            &post(".agents/sloop/tickets/explicit.md", PostActivation::Manual),
+            &post(".agents/sloop/tickets/explicit.md", PostTrigger::Manual),
             2_000,
             "WORK",
             None,
@@ -1692,7 +1692,7 @@ mod tests {
         handle(
             root.path(),
             &store,
-            &post(".agents/sloop/tickets/unrelated.md", PostActivation::Manual),
+            &post(".agents/sloop/tickets/unrelated.md", PostTrigger::Manual),
             2_100,
             "WORK",
             None,
@@ -1709,7 +1709,7 @@ mod tests {
         let generated = handle(
             root.path(),
             &store,
-            &post(".agents/sloop/tickets/generated.md", PostActivation::Manual),
+            &post(".agents/sloop/tickets/generated.md", PostTrigger::Manual),
             2_200,
             "WORK",
             None,
@@ -1723,7 +1723,7 @@ mod tests {
     #[test]
     fn paths_escaping_the_repository_are_rejected() {
         let (root, store) = world();
-        let args = post("../outside.md", PostActivation::Manual);
+        let args = post("../outside.md", PostTrigger::Manual);
 
         assert!(matches!(
             handle(
@@ -1749,7 +1749,7 @@ mod tests {
             handle(
                 root.path(),
                 &store,
-                &post("elsewhere.md", PostActivation::Manual),
+                &post("elsewhere.md", PostTrigger::Manual),
                 2_000,
                 "TICK",
                 None,

@@ -32,7 +32,7 @@ const TICKET_RECORD_SELECT: &str =
      FROM tickets";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActivationKind {
+pub enum TriggerKind {
     Immediate,
     Auto,
     At,
@@ -40,7 +40,7 @@ pub enum ActivationKind {
     Overnight,
 }
 
-impl ActivationKind {
+impl TriggerKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Immediate => "immediate",
@@ -53,13 +53,13 @@ impl ActivationKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActivationState {
+pub enum TriggerState {
     Queued,
     Completed,
     Cancelled,
 }
 
-impl ActivationState {
+impl TriggerState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
@@ -70,9 +70,9 @@ impl ActivationState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewActivation<'a> {
+pub struct NewTrigger<'a> {
     pub id: &'a str,
-    pub kind: ActivationKind,
+    pub kind: TriggerKind,
     pub ticket_id: Option<&'a str>,
     pub project_id: Option<&'a str>,
     pub eligible_at_ms: Option<i64>,
@@ -83,14 +83,14 @@ pub struct NewActivation<'a> {
 pub(crate) struct ClaimTransaction<'a> {
     pub(crate) ticket_id: &'a str,
     pub(crate) run_id: &'a str,
-    pub(crate) activation_id: &'a str,
+    pub(crate) trigger_id: &'a str,
     pub(crate) owner_id: &'a str,
     pub(crate) lease_ms: i64,
-    pub(crate) next_activation_eligible_at_ms: Option<i64>,
+    pub(crate) next_trigger_eligible_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueuedActivation {
+pub struct QueuedTrigger {
     pub id: String,
     pub kind: String,
     pub ticket_id: Option<String>,
@@ -279,14 +279,14 @@ pub(crate) mod tx {
         Ok(())
     }
 
-    pub(crate) fn queued_ticket_activation(
+    pub(crate) fn queued_ticket_trigger(
         transaction: &Transaction<'_>,
         ticket_id: &str,
-        kind: ActivationKind,
+        kind: TriggerKind,
     ) -> rusqlite::Result<Option<String>> {
         transaction
             .query_row(
-                "SELECT id FROM activations
+                "SELECT id FROM triggers
                  WHERE ticket_id = ?1 AND kind = ?2 AND state = 'queued'
                  ORDER BY created_at_ms LIMIT 1",
                 params![ticket_id, kind.as_str()],
@@ -295,14 +295,14 @@ pub(crate) mod tx {
             .optional()
     }
 
-    pub(crate) fn reschedule_activation(
+    pub(crate) fn reschedule_trigger(
         transaction: &Transaction<'_>,
         id: &str,
         eligible_at_ms: i64,
         now_ms: i64,
     ) -> rusqlite::Result<()> {
         transaction.execute(
-            "UPDATE activations
+            "UPDATE triggers
              SET eligible_at_ms = ?2, updated_at_ms = ?3
              WHERE id = ?1 AND state = 'queued'",
             params![id, eligible_at_ms, now_ms],
@@ -310,51 +310,51 @@ pub(crate) mod tx {
         Ok(())
     }
 
-    pub(crate) fn insert_activation(
+    pub(crate) fn insert_trigger(
         transaction: &Transaction<'_>,
-        activation: &NewActivation<'_>,
+        trigger: &NewTrigger<'_>,
         now_ms: i64,
     ) -> rusqlite::Result<()> {
         transaction.execute(
-            "INSERT INTO activations
+            "INSERT INTO triggers
                  (id, kind, state, ticket_id, project_id, eligible_at_ms, interval_ms,
                   created_at_ms, updated_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
             params![
-                activation.id,
-                activation.kind.as_str(),
-                ActivationState::Queued.as_str(),
-                activation.ticket_id,
-                activation.project_id,
-                activation.eligible_at_ms,
-                activation.interval_ms,
+                trigger.id,
+                trigger.kind.as_str(),
+                TriggerState::Queued.as_str(),
+                trigger.ticket_id,
+                trigger.project_id,
+                trigger.eligible_at_ms,
+                trigger.interval_ms,
                 now_ms,
             ],
         )?;
         Ok(())
     }
 
-    pub(crate) fn advance_activation(
+    pub(crate) fn advance_trigger(
         transaction: &Transaction<'_>,
         claim: &ClaimTransaction<'_>,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        let activation_changed = match claim.next_activation_eligible_at_ms {
+        let trigger_changed = match claim.next_trigger_eligible_at_ms {
             Some(eligible_at_ms) => transaction.execute(
-                "UPDATE activations
+                "UPDATE triggers
                  SET eligible_at_ms = ?2, updated_at_ms = ?3
                  WHERE id = ?1 AND state = 'queued' AND kind = 'every'",
-                params![claim.activation_id, eligible_at_ms, now_ms],
+                params![claim.trigger_id, eligible_at_ms, now_ms],
             )?,
             None => transaction.execute(
-                "UPDATE activations SET state = 'completed', updated_at_ms = ?2
+                "UPDATE triggers SET state = 'completed', updated_at_ms = ?2
                  WHERE id = ?1 AND state = 'queued' AND kind != 'every'",
-                params![claim.activation_id, now_ms],
+                params![claim.trigger_id, now_ms],
             )?,
         };
-        if activation_changed != 1 {
-            return Err(StoreError::ActivationNotQueued {
-                activation_id: claim.activation_id.into(),
+        if trigger_changed != 1 {
+            return Err(StoreError::TriggerNotQueued {
+                trigger_id: claim.trigger_id.into(),
             });
         }
         Ok(())
@@ -388,37 +388,37 @@ pub(crate) mod tx {
         transaction.execute("DELETE FROM leases WHERE run_id = ?1", params![run_id])
     }
 
-    pub(crate) fn requeue_activation(
+    pub(crate) fn requeue_trigger(
         transaction: &Transaction<'_>,
-        activation_id: &str,
+        trigger_id: &str,
         now_ms: i64,
     ) -> rusqlite::Result<usize> {
         transaction.execute(
-            "UPDATE activations SET state = 'queued', updated_at_ms = ?2 WHERE id = ?1",
-            params![activation_id, now_ms],
+            "UPDATE triggers SET state = 'queued', updated_at_ms = ?2 WHERE id = ?1",
+            params![trigger_id, now_ms],
         )
     }
 
-    /// Retires the activations pinned to a ticket that has just settled to
-    /// `merged`. A pinned activation resolves through `ticket_is_dispatchable`,
+    /// Retires the triggers pinned to a ticket that has just settled to
+    /// `merged`. A pinned trigger resolves through `ticket_is_dispatchable`,
     /// which demands `state = 'ready'`, and a merged ticket never returns
     /// there: leaving it queued is demand that can never be met but is still
-    /// counted. Running this in the settle transaction means the activation
+    /// counted. Running this in the settle transaction means the trigger
     /// dies at the instant the ticket merges, with no window where the two
     /// disagree.
     ///
-    /// Kind is deliberately not consulted. An `every` activation pinned to a
+    /// Kind is deliberately not consulted. An `every` trigger pinned to a
     /// merged ticket is as unfireable as a `once`; its rearm arithmetic in
-    /// `advance_activation` is untouched and simply has nothing left to rearm.
-    /// An unpinned activation is demand for whatever is ready, so it is out of
+    /// `advance_trigger` is untouched and simply has nothing left to rearm.
+    /// An unpinned trigger is demand for whatever is ready, so it is out of
     /// scope by construction — the `ticket_id` match excludes it.
-    pub(crate) fn complete_ticket_activations(
+    pub(crate) fn complete_ticket_triggers(
         transaction: &Transaction<'_>,
         ticket_id: &str,
         now_ms: i64,
     ) -> rusqlite::Result<usize> {
         transaction.execute(
-            "UPDATE activations SET state = 'completed', updated_at_ms = ?2
+            "UPDATE triggers SET state = 'completed', updated_at_ms = ?2
              WHERE ticket_id = ?1 AND state = 'queued'",
             params![ticket_id, now_ms],
         )
@@ -574,52 +574,48 @@ impl LocalSqlite {
         }
     }
 
-    pub fn insert_activation(
-        &self,
-        activation: &NewActivation<'_>,
-        now_ms: i64,
-    ) -> Result<(), StoreError> {
+    pub fn insert_trigger(&self, trigger: &NewTrigger<'_>, now_ms: i64) -> Result<(), StoreError> {
         self.db.lock().execute(
-            "INSERT INTO activations
+            "INSERT INTO triggers
                  (id, kind, state, ticket_id, project_id, eligible_at_ms, interval_ms,
                   created_at_ms, updated_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
             params![
-                activation.id,
-                activation.kind.as_str(),
-                ActivationState::Queued.as_str(),
-                activation.ticket_id,
-                activation.project_id,
-                activation.eligible_at_ms,
-                activation.interval_ms,
+                trigger.id,
+                trigger.kind.as_str(),
+                TriggerState::Queued.as_str(),
+                trigger.ticket_id,
+                trigger.project_id,
+                trigger.eligible_at_ms,
+                trigger.interval_ms,
                 now_ms,
             ],
         )?;
         Ok(())
     }
 
-    pub fn insert_activation_filter(
+    pub fn insert_trigger_filter(
         &self,
-        activation_id: &str,
+        trigger_id: &str,
         ticket_id: &str,
     ) -> Result<(), StoreError> {
         self.db.lock().execute(
-            "INSERT OR IGNORE INTO activation_filters (activation_id, ticket_id) VALUES (?1, ?2)",
-            params![activation_id, ticket_id],
+            "INSERT OR IGNORE INTO trigger_filters (trigger_id, ticket_id) VALUES (?1, ?2)",
+            params![trigger_id, ticket_id],
         )?;
         Ok(())
     }
 
-    pub fn queued_activations(&self) -> Result<Vec<QueuedActivation>, StoreError> {
+    pub fn queued_triggers(&self) -> Result<Vec<QueuedTrigger>, StoreError> {
         let connection = self.db.lock();
         let mut statement = connection.prepare(
             "SELECT id, kind, ticket_id, project_id, eligible_at_ms, interval_ms
-             FROM activations WHERE state = 'queued'
+             FROM triggers WHERE state = 'queued'
              ORDER BY created_at_ms, id",
         )?;
-        let activations = statement
+        let triggers = statement
             .query_map([], |row| {
-                Ok(QueuedActivation {
+                Ok(QueuedTrigger {
                     id: row.get(0)?,
                     kind: row.get(1)?,
                     ticket_id: row.get(2)?,
@@ -629,36 +625,29 @@ impl LocalSqlite {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(activations)
+        Ok(triggers)
     }
 
-    /// Whether any queued activation could select this ticket: the reporting
+    /// Whether any queued trigger could select this ticket: the reporting
     /// mirror of the claim path's selection, asked per ticket rather than as
     /// "does the queue hold anything at all".
-    pub fn has_claimable_activation(
-        &self,
-        ticket_id: &str,
-        now_ms: i64,
-    ) -> Result<bool, StoreError> {
+    pub fn has_claimable_trigger(&self, ticket_id: &str, now_ms: i64) -> Result<bool, StoreError> {
         let connection = self.db.lock();
-        Ok(Self::claimable_activation_on(&connection, ticket_id, now_ms)?.is_some())
+        Ok(Self::claimable_trigger_on(&connection, ticket_id, now_ms)?.is_some())
     }
 
-    pub fn dispatchable_activations(
-        &self,
-        now_ms: i64,
-    ) -> Result<Vec<QueuedActivation>, StoreError> {
+    pub fn dispatchable_triggers(&self, now_ms: i64) -> Result<Vec<QueuedTrigger>, StoreError> {
         let connection = self.db.lock();
         let mut statement = connection.prepare(
             "SELECT id, kind, ticket_id, project_id, eligible_at_ms, interval_ms
-             FROM activations
+             FROM triggers
              WHERE state = 'queued'
                AND (kind IN ('immediate', 'auto') OR eligible_at_ms <= ?1)
              ORDER BY created_at_ms, id",
         )?;
-        let activations = statement
+        let triggers = statement
             .query_map(params![now_ms], |row| {
-                Ok(QueuedActivation {
+                Ok(QueuedTrigger {
                     id: row.get(0)?,
                     kind: row.get(1)?,
                     ticket_id: row.get(2)?,
@@ -668,19 +657,19 @@ impl LocalSqlite {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(activations)
+        Ok(triggers)
     }
 
-    /// Retires activations left queued against a ticket that merged before the
-    /// settle path knew to retire them. The rule in `tx::complete_ticket_activations`
+    /// Retires triggers left queued against a ticket that merged before the
+    /// settle path knew to retire them. The rule in `tx::complete_ticket_triggers`
     /// only applies from the next settlement onwards, and a merged ticket never
     /// settles again, so anything already stranded needs this one-off sweep.
     ///
-    /// Returns the `(activation_id, ticket_id)` pairs it completed, so the
+    /// Returns the `(trigger_id, ticket_id)` pairs it completed, so the
     /// caller can report a startup mutation rather than perform it silently. A
     /// database with nothing stranded selects no rows and writes nothing, which
     /// makes repeated runs free.
-    pub fn complete_merged_ticket_activations(
+    pub fn complete_merged_ticket_triggers(
         &self,
         now_ms: i64,
     ) -> Result<Vec<(String, String)>, StoreError> {
@@ -688,11 +677,11 @@ impl LocalSqlite {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let stranded = {
             let mut statement = transaction.prepare(
-                "SELECT a.id, a.ticket_id
-                 FROM activations a
-                 JOIN tickets t ON t.id = a.ticket_id
-                 WHERE a.state = 'queued' AND t.state = 'merged'
-                 ORDER BY a.created_at_ms, a.id",
+                "SELECT tr.id, tr.ticket_id
+                 FROM triggers tr
+                 JOIN tickets t ON t.id = tr.ticket_id
+                 WHERE tr.state = 'queued' AND t.state = 'merged'
+                 ORDER BY tr.created_at_ms, tr.id",
             )?;
             statement
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -702,7 +691,7 @@ impl LocalSqlite {
             return Ok(Vec::new());
         }
         transaction.execute(
-            "UPDATE activations SET state = 'completed', updated_at_ms = ?1
+            "UPDATE triggers SET state = 'completed', updated_at_ms = ?1
              WHERE state = 'queued'
                AND ticket_id IN (SELECT id FROM tickets WHERE state = 'merged')",
             params![now_ms],
@@ -711,11 +700,11 @@ impl LocalSqlite {
         Ok(stranded)
     }
 
-    pub fn next_activation_eligible_at_ms(&self, now_ms: i64) -> Result<Option<i64>, StoreError> {
+    pub fn next_trigger_eligible_at_ms(&self, now_ms: i64) -> Result<Option<i64>, StoreError> {
         self.db
             .lock()
             .query_row(
-                "SELECT MIN(eligible_at_ms) FROM activations
+                "SELECT MIN(eligible_at_ms) FROM triggers
                  WHERE state = 'queued' AND eligible_at_ms > ?1",
                 params![now_ms],
                 |row| row.get(0),
@@ -723,15 +712,15 @@ impl LocalSqlite {
             .map_err(StoreError::from)
     }
 
-    pub fn queued_ticket_activation(
+    pub fn queued_ticket_trigger(
         &self,
         ticket_id: &str,
-        kind: ActivationKind,
+        kind: TriggerKind,
     ) -> Result<Option<String>, StoreError> {
         self.db
             .lock()
             .query_row(
-                "SELECT id FROM activations
+                "SELECT id FROM triggers
                  WHERE ticket_id = ?1 AND kind = ?2 AND state = 'queued'
                  ORDER BY created_at_ms LIMIT 1",
                 params![ticket_id, kind.as_str()],
@@ -741,14 +730,14 @@ impl LocalSqlite {
             .map_err(StoreError::from)
     }
 
-    pub fn reschedule_activation(
+    pub fn reschedule_trigger(
         &self,
         id: &str,
         eligible_at_ms: i64,
         now_ms: i64,
     ) -> Result<(), StoreError> {
         self.db.lock().execute(
-            "UPDATE activations
+            "UPDATE triggers
              SET eligible_at_ms = ?2, updated_at_ms = ?3
              WHERE id = ?1 AND state = 'queued'",
             params![id, eligible_at_ms, now_ms],
@@ -756,22 +745,24 @@ impl LocalSqlite {
         Ok(())
     }
 
-    pub fn next_activation_ordinal(&self) -> Result<i64, StoreError> {
+    pub fn next_trigger_ordinal(&self) -> Result<i64, StoreError> {
         let mut connection = self.db.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let reserved: i64 = transaction.query_row(
-            "SELECT next_ordinal FROM id_counters WHERE kind = 'activation'",
+            "SELECT next_ordinal FROM id_counters WHERE kind = 'trigger'",
             [],
             |row| row.get(0),
         )?;
+        // `SUBSTR` skips the two-character `TR` prefix; see
+        // `run_store::tx::reserve_ordinal`, which does the same for `notes`.
         let existing: i64 = transaction.query_row(
-            "SELECT COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) + 1 FROM activations",
+            "SELECT COALESCE(MAX(CAST(SUBSTR(id, 3) AS INTEGER)), 0) + 1 FROM triggers",
             [],
             |row| row.get(0),
         )?;
         let ordinal = reserved.max(existing);
         transaction.execute(
-            "UPDATE id_counters SET next_ordinal = ?1 WHERE kind = 'activation'",
+            "UPDATE id_counters SET next_ordinal = ?1 WHERE kind = 'trigger'",
             params![ordinal + 1],
         )?;
         transaction.commit()?;
@@ -1230,52 +1221,50 @@ impl LocalSqlite {
                 .collect::<Vec<_>>()
         };
 
-        let mut doomed_activations = BTreeSet::new();
+        let mut doomed_triggers = BTreeSet::new();
         for ticket_id in &stale_tickets {
             let mut statement =
-                transaction.prepare("SELECT id FROM activations WHERE ticket_id = ?1")?;
-            doomed_activations.extend(
+                transaction.prepare("SELECT id FROM triggers WHERE ticket_id = ?1")?;
+            doomed_triggers.extend(
                 statement
                     .query_map(params![ticket_id], |row| row.get::<_, String>(0))?
                     .collect::<Result<Vec<_>, _>>()?,
             );
         }
         for project_id in &stale_projects {
-            let activations = {
-                let mut statement = transaction
-                    .prepare("SELECT id, state FROM activations WHERE project_id = ?1")?;
+            let triggers = {
+                let mut statement =
+                    transaction.prepare("SELECT id, state FROM triggers WHERE project_id = ?1")?;
                 statement
                     .query_map(params![project_id], |row| {
                         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                     })?
                     .collect::<Result<Vec<_>, _>>()?
             };
-            for (activation_id, activation_state) in activations {
-                if activation_state == "queued" {
-                    doomed_activations.insert(activation_id);
+            for (trigger_id, trigger_state) in triggers {
+                if trigger_state == "queued" {
+                    doomed_triggers.insert(trigger_id);
                 } else {
                     transaction.execute(
-                        "UPDATE activations SET project_id = NULL WHERE id = ?1",
-                        params![activation_id],
+                        "UPDATE triggers SET project_id = NULL WHERE id = ?1",
+                        params![trigger_id],
                     )?;
                 }
             }
         }
 
-        let mut rows_dropped = drop_runs(&transaction, &stale_tickets, &doomed_activations)?;
-        for activation_id in &doomed_activations {
+        let mut rows_dropped = drop_runs(&transaction, &stale_tickets, &doomed_triggers)?;
+        for trigger_id in &doomed_triggers {
             rows_dropped += transaction.execute(
-                "DELETE FROM activation_filters WHERE activation_id = ?1",
-                params![activation_id],
+                "DELETE FROM trigger_filters WHERE trigger_id = ?1",
+                params![trigger_id],
             )?;
-            rows_dropped += transaction.execute(
-                "DELETE FROM activations WHERE id = ?1",
-                params![activation_id],
-            )?;
+            rows_dropped +=
+                transaction.execute("DELETE FROM triggers WHERE id = ?1", params![trigger_id])?;
         }
         for ticket_id in &stale_tickets {
             rows_dropped += transaction.execute(
-                "DELETE FROM activation_filters WHERE ticket_id = ?1",
+                "DELETE FROM trigger_filters WHERE ticket_id = ?1",
                 params![ticket_id],
             )?;
             rows_dropped += transaction.execute(
@@ -1534,7 +1523,7 @@ impl LocalSqlite {
     pub fn select_ready_ticket(
         &self,
         project_id: Option<&str>,
-        activation_id: &str,
+        trigger_id: &str,
         now_ms: i64,
     ) -> Result<Option<String>, StoreError> {
         self.db
@@ -1548,16 +1537,16 @@ impl LocalSqlite {
                                    JOIN tickets bt ON bt.id = b.blocker_id
                                    WHERE b.ticket_id = t.id
                                      AND bt.state != 'merged')
-                    AND (NOT EXISTS (SELECT 1 FROM activation_filters f
-                                    WHERE f.activation_id = ?2)
-                        OR EXISTS (SELECT 1 FROM activation_filters f
-                                    WHERE f.activation_id = ?2 AND f.ticket_id = t.id))
+                    AND (NOT EXISTS (SELECT 1 FROM trigger_filters f
+                                    WHERE f.trigger_id = ?2)
+                        OR EXISTS (SELECT 1 FROM trigger_filters f
+                                    WHERE f.trigger_id = ?2 AND f.ticket_id = t.id))
                    AND NOT EXISTS (SELECT 1 FROM cooldowns c
                                    WHERE c.key = 'agent_target:' || t.target
                                      AND c.until_ms > ?3)
                   ORDER BY t.created_at_ms, t.id
                   LIMIT 1",
-                params![project_id, activation_id, now_ms],
+                params![project_id, trigger_id, now_ms],
                 |row| row.get(0),
             )
             .optional()
@@ -1716,8 +1705,8 @@ impl LocalSqlite {
     ) -> rusqlite::Result<bool> {
         connection.query_row(
             "SELECT EXISTS (SELECT 1 FROM leases WHERE ticket_id = ?1)
-                 OR EXISTS (SELECT 1 FROM activations WHERE ticket_id = ?1)
-                 OR EXISTS (SELECT 1 FROM activation_filters WHERE ticket_id = ?1)
+                 OR EXISTS (SELECT 1 FROM triggers WHERE ticket_id = ?1)
+                 OR EXISTS (SELECT 1 FROM trigger_filters WHERE ticket_id = ?1)
                  OR EXISTS (SELECT 1 FROM ticket_blockers WHERE blocker_id = ?1)",
             params![id],
             |row| row.get(0),
@@ -1884,32 +1873,32 @@ impl LocalSqlite {
     }
 
     /// Shared by the claim path, which asks inside its transaction, and by
-    /// `has_claimable_activation`, which asks read-only. `Transaction` derefs
+    /// `has_claimable_trigger`, which asks read-only. `Transaction` derefs
     /// to `Connection`, so one statement serves both.
-    fn claimable_activation_on(
+    fn claimable_trigger_on(
         connection: &Connection,
         ticket_id: &str,
         now_ms: i64,
-    ) -> Result<Option<QueuedActivation>, StoreError> {
+    ) -> Result<Option<QueuedTrigger>, StoreError> {
         connection
             .query_row(
-                "SELECT a.id, a.kind, a.ticket_id, a.project_id, a.eligible_at_ms, a.interval_ms
-                 FROM activations a
+                "SELECT tr.id, tr.kind, tr.ticket_id, tr.project_id, tr.eligible_at_ms, tr.interval_ms
+                 FROM triggers tr
                  JOIN tickets t ON t.id = ?1
-                 WHERE a.state = 'queued'
-                   AND (a.kind IN ('immediate', 'auto') OR a.eligible_at_ms <= ?2)
-                   AND (a.ticket_id = t.id
-                        OR (a.ticket_id IS NULL
-                            AND (a.project_id IS NULL OR a.project_id = t.project_id)))
-                   AND (NOT EXISTS (SELECT 1 FROM activation_filters f
-                                    WHERE f.activation_id = a.id)
-                        OR EXISTS (SELECT 1 FROM activation_filters f
-                                   WHERE f.activation_id = a.id AND f.ticket_id = t.id))
-                 ORDER BY a.created_at_ms, a.id
+                 WHERE tr.state = 'queued'
+                   AND (tr.kind IN ('immediate', 'auto') OR tr.eligible_at_ms <= ?2)
+                   AND (tr.ticket_id = t.id
+                        OR (tr.ticket_id IS NULL
+                            AND (tr.project_id IS NULL OR tr.project_id = t.project_id)))
+                   AND (NOT EXISTS (SELECT 1 FROM trigger_filters f
+                                    WHERE f.trigger_id = tr.id)
+                        OR EXISTS (SELECT 1 FROM trigger_filters f
+                                   WHERE f.trigger_id = tr.id AND f.ticket_id = t.id))
+                 ORDER BY tr.created_at_ms, tr.id
                  LIMIT 1",
                 params![ticket_id, now_ms],
                 |row| {
-                    Ok(QueuedActivation {
+                    Ok(QueuedTrigger {
                         id: row.get(0)?,
                         kind: row.get(1)?,
                         ticket_id: row.get(2)?,
@@ -1923,24 +1912,24 @@ impl LocalSqlite {
             .map_err(StoreError::from)
     }
 
-    fn activation_for_release_on(
+    fn trigger_for_release_on(
         transaction: &Transaction<'_>,
         ticket_id: &str,
     ) -> Result<Option<String>, StoreError> {
         transaction
             .query_row(
-                "SELECT a.id
-                 FROM activations a
+                "SELECT tr.id
+                 FROM triggers tr
                  JOIN tickets t ON t.id = ?1
-                 WHERE (a.state = 'completed' OR (a.state = 'queued' AND a.kind = 'every'))
-                   AND (a.ticket_id = t.id
-                        OR (a.ticket_id IS NULL
-                            AND (a.project_id IS NULL OR a.project_id = t.project_id)))
-                   AND (NOT EXISTS (SELECT 1 FROM activation_filters f
-                                    WHERE f.activation_id = a.id)
-                        OR EXISTS (SELECT 1 FROM activation_filters f
-                                   WHERE f.activation_id = a.id AND f.ticket_id = t.id))
-                 ORDER BY a.updated_at_ms DESC, a.created_at_ms, a.id
+                 WHERE (tr.state = 'completed' OR (tr.state = 'queued' AND tr.kind = 'every'))
+                   AND (tr.ticket_id = t.id
+                        OR (tr.ticket_id IS NULL
+                            AND (tr.project_id IS NULL OR tr.project_id = t.project_id)))
+                   AND (NOT EXISTS (SELECT 1 FROM trigger_filters f
+                                    WHERE f.trigger_id = tr.id)
+                        OR EXISTS (SELECT 1 FROM trigger_filters f
+                                   WHERE f.trigger_id = tr.id AND f.ticket_id = t.id))
+                 ORDER BY tr.updated_at_ms DESC, tr.created_at_ms, tr.id
                  LIMIT 1",
                 params![ticket_id],
                 |row| row.get(0),
@@ -1954,7 +1943,7 @@ fn source_error(error: StoreError) -> SourceError {
     match error {
         StoreError::TicketNotFound { .. }
         | StoreError::TicketStateConflict { .. }
-        | StoreError::ActivationNotQueued { .. }
+        | StoreError::TriggerNotQueued { .. }
         | StoreError::LeaseNotHeld { .. }
         | StoreError::TicketNotReady { .. } => SourceError::Rejected {
             message: error.to_string(),
@@ -1963,8 +1952,8 @@ fn source_error(error: StoreError) -> SourceError {
     }
 }
 
-fn lease_owner(owner: &OwnerId, activation_id: &str) -> String {
-    json!({"owner": owner.0, "activation": activation_id}).to_string()
+fn lease_owner(owner: &OwnerId, trigger_id: &str) -> String {
+    json!({"owner": owner.0, "trigger": trigger_id}).to_string()
 }
 
 fn decode_lease_owner(stored: &str) -> (OwnerId, Option<String>) {
@@ -1973,11 +1962,11 @@ fn decode_lease_owner(stored: &str) -> (OwnerId, Option<String>) {
         .as_ref()
         .and_then(|value| value["owner"].as_str())
         .unwrap_or(stored);
-    let activation = parsed
+    let trigger = parsed
         .as_ref()
-        .and_then(|value| value["activation"].as_str())
+        .and_then(|value| value["trigger"].as_str())
         .map(str::to_owned);
-    (OwnerId(owner.into()), activation)
+    (OwnerId(owner.into()), trigger)
 }
 
 fn lease_ms(ttl: Duration) -> Result<i64, SourceError> {
@@ -2035,7 +2024,7 @@ fn work_ticket(
         attempts,
         hints: ExecutionHints {
             worktree: record.worktree,
-            activation_id: None,
+            trigger_id: None,
             target: record.target,
             model: record.model,
             effort: record.effort,
@@ -2059,19 +2048,17 @@ impl WorkState for LocalSqlite {
 
     async fn pull_ready(&self) -> Result<Vec<WorkTicket>, SourceError> {
         let now_ms = self.clock.now_ms();
-        let activations = self
-            .dispatchable_activations(now_ms)
-            .map_err(source_error)?;
+        let triggers = self.dispatchable_triggers(now_ms).map_err(source_error)?;
         let mut seen = BTreeSet::new();
         let mut selected = Vec::new();
-        for activation in activations {
-            let ticket_id = match activation.ticket_id {
+        for trigger in triggers {
+            let ticket_id = match trigger.ticket_id {
                 Some(ticket_id) => self
                     .ticket_is_dispatchable(&ticket_id)
                     .map_err(source_error)?
                     .then_some(ticket_id),
                 None => self
-                    .select_ready_ticket(activation.project_id.as_deref(), &activation.id, now_ms)
+                    .select_ready_ticket(trigger.project_id.as_deref(), &trigger.id, now_ms)
                     .map_err(source_error)?,
             };
             if let Some(ticket_id) = ticket_id
@@ -2144,13 +2131,13 @@ impl WorkState for LocalSqlite {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(StoreError::from)
                 .map_err(source_error)?;
-            let Some(activation) = Self::claimable_activation_on(&transaction, &ticket.id, now_ms)
+            let Some(trigger) = Self::claimable_trigger_on(&transaction, &ticket.id, now_ms)
                 .map_err(source_error)?
             else {
                 return Ok(ClaimResult::Lost { held_by: None });
             };
-            let next_activation_eligible_at_ms = if activation.kind == "every" {
-                match (activation.eligible_at_ms, activation.interval_ms) {
+            let next_trigger_eligible_at_ms = if trigger.kind == "every" {
+                match (trigger.eligible_at_ms, trigger.interval_ms) {
                     (Some(eligible_at_ms), Some(interval_ms)) => {
                         rearm_every_at(eligible_at_ms, interval_ms, now_ms)
                     }
@@ -2159,22 +2146,19 @@ impl WorkState for LocalSqlite {
             } else {
                 None
             };
-            if activation.kind == "every" && next_activation_eligible_at_ms.is_none() {
+            if trigger.kind == "every" && next_trigger_eligible_at_ms.is_none() {
                 return Err(SourceError::Corrupt {
-                    message: format!(
-                        "recurring activation `{}` has an invalid cadence",
-                        activation.id
-                    ),
+                    message: format!("recurring trigger `{}` has an invalid cadence", trigger.id),
                 });
             }
-            let stored_owner = lease_owner(owner, &activation.id);
+            let stored_owner = lease_owner(owner, &trigger.id);
             let claim = ClaimTransaction {
                 ticket_id: &ticket.id,
                 run_id: &owner.0,
-                activation_id: &activation.id,
+                trigger_id: &trigger.id,
                 owner_id: &stored_owner,
                 lease_ms,
-                next_activation_eligible_at_ms,
+                next_trigger_eligible_at_ms,
             };
 
             match tx::claim_ticket(&transaction, &claim, now_ms) {
@@ -2194,7 +2178,7 @@ impl WorkState for LocalSqlite {
                 }
                 Err(error) => return Err(source_error(error)),
             }
-            tx::advance_activation(&transaction, &claim, now_ms).map_err(source_error)?;
+            tx::advance_trigger(&transaction, &claim, now_ms).map_err(source_error)?;
             tx::insert_lease(&transaction, &claim, now_ms).map_err(source_error)?;
             let record = Self::ticket_on(&transaction, &ticket.id)
                 .map_err(source_error)?
@@ -2202,7 +2186,7 @@ impl WorkState for LocalSqlite {
                     message: format!("claimed ticket `{}` no longer exists", ticket.id),
                 })?;
             let mut ticket = work_ticket(record, false, owner.clone())?;
-            ticket.hints.activation_id = Some(activation.id.clone());
+            ticket.hints.trigger_id = Some(trigger.id.clone());
             transaction
                 .commit()
                 .map_err(StoreError::from)
@@ -2275,7 +2259,7 @@ impl WorkState for LocalSqlite {
             .optional()
             .map_err(StoreError::from)
             .map_err(source_error)?;
-        let claimed_activation_id = match lease {
+        let claimed_trigger_id = match lease {
             Some((run_id, stored_owner)) if run_id == owner.0 => {
                 decode_lease_owner(&stored_owner).1
             }
@@ -2327,7 +2311,7 @@ impl WorkState for LocalSqlite {
                         .map_err(StoreError::from)
                         .map_err(source_error)?;
                     if changed == 1 {
-                        tx::complete_ticket_activations(&transaction, &ticket.id, now_ms)
+                        tx::complete_ticket_triggers(&transaction, &ticket.id, now_ms)
                             .map_err(StoreError::from)
                             .map_err(source_error)?;
                     }
@@ -2357,7 +2341,7 @@ impl WorkState for LocalSqlite {
                         .map_err(StoreError::from)
                         .map_err(source_error)?;
                 if changed == 1 {
-                    tx::complete_ticket_activations(&transaction, &ticket.id, now_ms)
+                    tx::complete_ticket_triggers(&transaction, &ticket.id, now_ms)
                         .map_err(StoreError::from)
                         .map_err(source_error)?;
                 }
@@ -2368,26 +2352,23 @@ impl WorkState for LocalSqlite {
                     .map_err(StoreError::from)
                     .map_err(source_error)?;
                 if let Some(eligible_at_ms) = not_before_ms {
-                    let activation_id = match claimed_activation_id {
-                        Some(activation_id) => activation_id,
-                        None => Self::activation_for_release_on(&transaction, &ticket.id)
+                    let trigger_id = match claimed_trigger_id {
+                        Some(trigger_id) => trigger_id,
+                        None => Self::trigger_for_release_on(&transaction, &ticket.id)
                             .map_err(source_error)?
                             .ok_or_else(|| SourceError::Corrupt {
-                                message: format!(
-                                    "ticket `{}` has no activation to retry",
-                                    ticket.id
-                                ),
+                                message: format!("ticket `{}` has no trigger to retry", ticket.id),
                             })?,
                     };
-                    tx::requeue_activation(&transaction, &activation_id, now_ms)
+                    tx::requeue_trigger(&transaction, &trigger_id, now_ms)
                         .map_err(StoreError::from)
                         .map_err(source_error)?;
                     transaction
                         .execute(
-                            "UPDATE activations
+                            "UPDATE triggers
                              SET eligible_at_ms = ?2, updated_at_ms = ?3
                              WHERE id = ?1 AND state = 'queued'",
-                            params![activation_id, eligible_at_ms, now_ms],
+                            params![trigger_id, eligible_at_ms, now_ms],
                         )
                         .map_err(StoreError::from)
                         .map_err(source_error)?;
@@ -2458,15 +2439,14 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::db::{Db, StoreError};
+    use crate::db::{Db, REVERT_TRIGGER_RENAME, StoreError};
     use crate::domain::ticket::TicketState;
     use crate::domain::work::{Disposition, OwnerId, TicketRef, WorkOutcome, WorkTicket};
     use crate::outcome::Outcome;
     use crate::work_state::{ClaimResult, TicketFeeder, WorkState};
 
     use super::{
-        ActivationKind, ClaimTransaction, LocalSqlite, NewActivation, QueuedActivation,
-        ReindexTicket,
+        ClaimTransaction, LocalSqlite, NewTrigger, QueuedTrigger, ReindexTicket, TriggerKind,
     };
 
     fn open_seeded(path: &std::path::Path) -> LocalSqlite {
@@ -2496,10 +2476,10 @@ mod tests {
             )
             .unwrap();
         store
-            .insert_activation(
-                &NewActivation {
-                    id: "A1",
-                    kind: ActivationKind::Immediate,
+            .insert_trigger(
+                &NewTrigger {
+                    id: "TR1",
+                    kind: TriggerKind::Immediate,
                     ticket_id: Some("T1"),
                     project_id: None,
                     eligible_at_ms: None,
@@ -2523,12 +2503,12 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO runs
-                     (id, activation_id, ticket_id, state, attempt, flow_json, ticket_json,
+                     (id, trigger_id, ticket_id, state, attempt, flow_json, ticket_json,
                       created_at_ms, updated_at_ms)
                  VALUES (?1, ?2, ?3, 'claimed', ?4, '{}', '{}', ?5, ?5)",
                 rusqlite::params![
                     claim.run_id,
-                    claim.activation_id,
+                    claim.trigger_id,
                     claim.ticket_id,
                     attempt,
                     now_ms
@@ -2548,7 +2528,7 @@ mod tests {
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .unwrap();
             super::tx::claim_ticket(&transaction, claim, now_ms).unwrap();
-            super::tx::advance_activation(&transaction, claim, now_ms).unwrap();
+            super::tx::advance_trigger(&transaction, claim, now_ms).unwrap();
             super::tx::insert_lease(&transaction, claim, now_ms).unwrap();
             transaction.commit().unwrap();
         }
@@ -2590,11 +2570,11 @@ mod tests {
 
     fn select_ready_ticket(
         store: &LocalSqlite,
-        activation: &QueuedActivation,
+        trigger: &QueuedTrigger,
         now_ms: i64,
     ) -> Option<String> {
         store
-            .select_ready_ticket(activation.project_id.as_deref(), &activation.id, now_ms)
+            .select_ready_ticket(trigger.project_id.as_deref(), &trigger.id, now_ms)
             .unwrap()
     }
 
@@ -2639,10 +2619,10 @@ mod tests {
             )
             .unwrap();
         local
-            .insert_activation(
-                &super::NewActivation {
-                    id: "A1",
-                    kind: super::ActivationKind::Immediate,
+            .insert_trigger(
+                &super::NewTrigger {
+                    id: "TR1",
+                    kind: super::TriggerKind::Immediate,
                     ticket_id: Some("T1"),
                     project_id: None,
                     eligible_at_ms: None,
@@ -2713,10 +2693,10 @@ mod tests {
             &ClaimTransaction {
                 ticket_id: "T1",
                 run_id: "R1",
-                activation_id: "A1",
+                trigger_id: "TR1",
                 owner_id: "R1",
                 lease_ms: 60_000,
-                next_activation_eligible_at_ms: None,
+                next_trigger_eligible_at_ms: None,
             },
             2_000,
         );
@@ -2757,10 +2737,10 @@ mod tests {
         assert_eq!(retried.attempts, 1);
         assert_eq!(
             local
-                .queued_activations()
+                .queued_triggers()
                 .unwrap()
                 .first()
-                .and_then(|activation| activation.eligible_at_ms),
+                .and_then(|trigger| trigger.eligible_at_ms),
             Some(2_000)
         );
 
@@ -2847,16 +2827,16 @@ mod tests {
             .unwrap();
     }
 
-    fn insert_queued_activation(
+    fn insert_queued_trigger(
         local: &LocalSqlite,
         id: &str,
-        kind: ActivationKind,
+        kind: TriggerKind,
         ticket_id: Option<&str>,
         project_id: Option<&str>,
     ) {
         local
-            .insert_activation(
-                &NewActivation {
+            .insert_trigger(
+                &NewTrigger {
                     id,
                     kind,
                     ticket_id,
@@ -2869,28 +2849,28 @@ mod tests {
             .unwrap();
     }
 
-    fn queued_activation_ids(local: &LocalSqlite) -> Vec<String> {
+    fn queued_trigger_ids(local: &LocalSqlite) -> Vec<String> {
         local
-            .queued_activations()
+            .queued_triggers()
             .unwrap()
             .into_iter()
-            .map(|activation| activation.id)
+            .map(|trigger| trigger.id)
             .collect()
     }
 
     #[tokio::test]
-    async fn local_work_state_complete_retires_activations_pinned_to_the_merged_ticket() {
+    async fn local_work_state_complete_retires_triggers_pinned_to_the_merged_ticket() {
         let (_directory, local) = open_seeded_local();
         insert_ready_ticket(&local, "T2", 1_000);
-        // A2 is a recurring trigger pinned to the merging ticket: not yet
+        // TR2 is a recurring trigger pinned to the merging ticket: not yet
         // eligible, so the claim leaves it alone, and unfireable forever once
-        // T1 merges. A3 is pinned elsewhere and A4 is unpinned demand, so both
+        // T1 merges. TR3 is pinned elsewhere and TR4 is unpinned demand, so both
         // must survive.
         local
-            .insert_activation(
-                &NewActivation {
-                    id: "A2",
-                    kind: ActivationKind::Every,
+            .insert_trigger(
+                &NewTrigger {
+                    id: "TR2",
+                    kind: TriggerKind::Every,
                     ticket_id: Some("T1"),
                     project_id: None,
                     eligible_at_ms: Some(50_000),
@@ -2899,8 +2879,8 @@ mod tests {
                 1_000,
             )
             .unwrap();
-        insert_queued_activation(&local, "A3", ActivationKind::Immediate, Some("T2"), None);
-        insert_queued_activation(&local, "A4", ActivationKind::Auto, None, Some("default"));
+        insert_queued_trigger(&local, "TR3", TriggerKind::Immediate, Some("T2"), None);
+        insert_queued_trigger(&local, "TR4", TriggerKind::Auto, None, Some("default"));
 
         claim_local(&local, "R1").await;
         local
@@ -2909,11 +2889,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(local.ticket("T1").unwrap().unwrap().state, "merged");
-        assert_eq!(queued_activation_ids(&local), vec!["A3", "A4"]);
-        // The surviving unpinned activation still resolves to whatever is ready.
+        assert_eq!(queued_trigger_ids(&local), vec!["TR3", "TR4"]);
+        // The surviving unpinned trigger still resolves to whatever is ready.
         assert_eq!(
             local
-                .select_ready_ticket(Some("default"), "A4", 2_000)
+                .select_ready_ticket(Some("default"), "TR4", 2_000)
                 .unwrap(),
             Some("T2".to_owned())
         );
@@ -2930,9 +2910,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_work_state_external_merge_retires_pinned_activations() {
+    async fn local_work_state_external_merge_retires_pinned_triggers() {
         let (_directory, local) = open_seeded_local();
-        insert_queued_activation(&local, "A2", ActivationKind::Immediate, Some("T1"), None);
+        insert_queued_trigger(&local, "TR2", TriggerKind::Immediate, Some("T1"), None);
         claim_local(&local, "R1").await;
         local
             .release(
@@ -2944,21 +2924,21 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(queued_activation_ids(&local), vec!["A2"]);
+        assert_eq!(queued_trigger_ids(&local), vec!["TR2"]);
 
         // A settled review branch merged outside the run reaches release with
-        // no lease left to consume; the pinned activation dies there too.
+        // no lease left to consume; the pinned trigger dies there too.
         local
             .release(&ticket_ref(), &OwnerId("R1".into()), Disposition::Complete)
             .await
             .unwrap();
 
         assert_eq!(local.ticket("T1").unwrap().unwrap().state, "merged");
-        assert!(queued_activation_ids(&local).is_empty());
+        assert!(queued_trigger_ids(&local).is_empty());
     }
 
     #[tokio::test]
-    async fn local_work_state_non_merge_dispositions_leave_pinned_activations_queued() {
+    async fn local_work_state_non_merge_dispositions_leave_pinned_triggers_queued() {
         // `failed`, `held` and `needs_review` are not final the way `merged`
         // is: the ticket can return to `ready`, so its triggers must survive.
         for disposition in [
@@ -2974,23 +2954,23 @@ mod tests {
             },
         ] {
             let (_directory, local) = open_seeded_local();
-            insert_queued_activation(&local, "A2", ActivationKind::Immediate, Some("T1"), None);
+            insert_queued_trigger(&local, "TR2", TriggerKind::Immediate, Some("T1"), None);
             claim_local(&local, "R1").await;
             local
                 .release(&ticket_ref(), &OwnerId("R1".into()), disposition)
                 .await
                 .unwrap();
-            assert_eq!(queued_activation_ids(&local), vec!["A2"]);
+            assert_eq!(queued_trigger_ids(&local), vec!["TR2"]);
         }
     }
 
     #[test]
-    fn complete_merged_ticket_activations_sweeps_only_stranded_pinned_rows() {
+    fn complete_merged_ticket_triggers_sweeps_only_stranded_pinned_rows() {
         let (_directory, local) = open_seeded_local();
         insert_ready_ticket(&local, "T2", 1_000);
-        insert_queued_activation(&local, "A2", ActivationKind::Immediate, Some("T2"), None);
-        insert_queued_activation(&local, "A3", ActivationKind::Auto, None, Some("default"));
-        // A1 is pinned to T1, which reached `merged` without the settle-time
+        insert_queued_trigger(&local, "TR2", TriggerKind::Immediate, Some("T2"), None);
+        insert_queued_trigger(&local, "TR3", TriggerKind::Auto, None, Some("default"));
+        // TR1 is pinned to T1, which reached `merged` without the settle-time
         // rule ever running — exactly the row the sweep exists for.
         local
             .db
@@ -2999,19 +2979,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            local.complete_merged_ticket_activations(2_000).unwrap(),
-            vec![("A1".to_owned(), "T1".to_owned())]
+            local.complete_merged_ticket_triggers(2_000).unwrap(),
+            vec![("TR1".to_owned(), "T1".to_owned())]
         );
-        assert_eq!(queued_activation_ids(&local), vec!["A2", "A3"]);
+        assert_eq!(queued_trigger_ids(&local), vec!["TR2", "TR3"]);
 
         // Idempotent: a database with nothing stranded reports nothing.
         assert!(
             local
-                .complete_merged_ticket_activations(3_000)
+                .complete_merged_ticket_triggers(3_000)
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(queued_activation_ids(&local), vec!["A2", "A3"]);
+        assert_eq!(queued_trigger_ids(&local), vec!["TR2", "TR3"]);
     }
 
     #[tokio::test]
@@ -3171,10 +3151,10 @@ mod tests {
         ClaimTransaction {
             ticket_id: "T1",
             run_id,
-            activation_id: "A1",
+            trigger_id: "TR1",
             owner_id: "daemon-1",
             lease_ms: 60_000,
-            next_activation_eligible_at_ms: None,
+            next_trigger_eligible_at_ms: None,
         }
     }
 
@@ -3259,25 +3239,25 @@ mod tests {
     }
 
     #[test]
-    fn an_activation_pinned_to_another_ticket_does_not_answer_for_this_one() {
+    fn an_trigger_pinned_to_another_ticket_does_not_answer_for_this_one() {
         let directory = tempdir().unwrap();
         let store = open_seeded(&directory.path().join("sloop.db"));
         insert_ready_t0(&store, 2_000);
 
-        // A1 is pinned to T1, so only T1 has demand behind it.
-        assert!(store.has_claimable_activation("T1", 2_000).unwrap());
-        assert!(!store.has_claimable_activation("T0", 2_000).unwrap());
+        // TR1 is pinned to T1, so only T1 has demand behind it.
+        assert!(store.has_claimable_trigger("T1", 2_000).unwrap());
+        assert!(!store.has_claimable_trigger("T0", 2_000).unwrap());
 
-        // The masking case: T1 merges and is then pinned by an activation that
+        // The masking case: T1 merges and is then pinned by a trigger that
         // can never fire. The queue is non-empty, so the global question
         // answers `true` for T0 — the misreport this method exists to avoid.
         granted_claim(&store, &claim_t1("R1"), 2_000);
         settle_for_test(&store, "R1", Outcome::Merged, 3_000);
         store
-            .insert_activation(
-                &NewActivation {
-                    id: "A2",
-                    kind: ActivationKind::Immediate,
+            .insert_trigger(
+                &NewTrigger {
+                    id: "TR2",
+                    kind: TriggerKind::Immediate,
                     ticket_id: Some("T1"),
                     project_id: None,
                     eligible_at_ms: None,
@@ -3287,20 +3267,20 @@ mod tests {
             )
             .unwrap();
 
-        assert!(!store.queued_activations().unwrap().is_empty());
-        assert!(!store.has_claimable_activation("T0", 3_000).unwrap());
+        assert!(!store.queued_triggers().unwrap().is_empty());
+        assert!(!store.has_claimable_trigger("T0", 3_000).unwrap());
     }
 
     #[test]
-    fn an_unpinned_activation_answers_for_every_ticket_it_could_select() {
+    fn an_unpinned_trigger_answers_for_every_ticket_it_could_select() {
         let directory = tempdir().unwrap();
         let store = open_seeded(&directory.path().join("sloop.db"));
         insert_ready_t0(&store, 2_000);
         store
-            .insert_activation(
-                &NewActivation {
-                    id: "A2",
-                    kind: ActivationKind::Immediate,
+            .insert_trigger(
+                &NewTrigger {
+                    id: "TR2",
+                    kind: TriggerKind::Immediate,
                     ticket_id: None,
                     project_id: None,
                     eligible_at_ms: None,
@@ -3309,8 +3289,8 @@ mod tests {
                 2_000,
             )
             .unwrap();
-        let unpinned = QueuedActivation {
-            id: "A2".into(),
+        let unpinned = QueuedTrigger {
+            id: "TR2".into(),
             kind: "immediate".into(),
             ticket_id: None,
             project_id: None,
@@ -3324,13 +3304,13 @@ mod tests {
             select_ready_ticket(&store, &unpinned, 2_000).as_deref(),
             Some("T1")
         );
-        assert!(store.has_claimable_activation("T1", 2_000).unwrap());
-        assert!(store.has_claimable_activation("T0", 2_000).unwrap());
+        assert!(store.has_claimable_trigger("T1", 2_000).unwrap());
+        assert!(store.has_claimable_trigger("T0", 2_000).unwrap());
 
-        // An activation restricted with `--only` stops answering for the
+        // A trigger restricted with `--only` stops answering for the
         // tickets it excludes, exactly as selection ignores them.
-        store.insert_activation_filter("A2", "T1").unwrap();
-        assert!(!store.has_claimable_activation("T0", 2_000).unwrap());
+        store.insert_trigger_filter("TR2", "T1").unwrap();
+        assert!(!store.has_claimable_trigger("T0", 2_000).unwrap());
     }
 
     #[test]
@@ -3354,10 +3334,10 @@ mod tests {
             )
             .unwrap();
         store
-            .insert_activation(
-                &NewActivation {
-                    id: "A2",
-                    kind: ActivationKind::Immediate,
+            .insert_trigger(
+                &NewTrigger {
+                    id: "TR2",
+                    kind: TriggerKind::Immediate,
                     ticket_id: None,
                     project_id: None,
                     eligible_at_ms: None,
@@ -3366,8 +3346,8 @@ mod tests {
                 2_000,
             )
             .unwrap();
-        let activation = QueuedActivation {
-            id: "A2".into(),
+        let trigger = QueuedTrigger {
+            id: "TR2".into(),
             kind: "immediate".into(),
             ticket_id: None,
             project_id: None,
@@ -3377,19 +3357,19 @@ mod tests {
 
         // T1 was registered first, so it wins despite T0 sorting lower.
         assert_eq!(
-            select_ready_ticket(&store, &activation, 2_000).as_deref(),
+            select_ready_ticket(&store, &trigger, 2_000).as_deref(),
             Some("T1")
         );
 
-        store.insert_activation_filter("A2", "T0").unwrap();
+        store.insert_trigger_filter("TR2", "T0").unwrap();
         assert_eq!(
-            select_ready_ticket(&store, &activation, 2_000).as_deref(),
+            select_ready_ticket(&store, &trigger, 2_000).as_deref(),
             Some("T0")
         );
 
-        let scoped = QueuedActivation {
+        let scoped = QueuedTrigger {
             project_id: Some("elsewhere".into()),
-            ..activation
+            ..trigger
         };
         assert_eq!(select_ready_ticket(&store, &scoped, 2_000), None);
     }
@@ -3416,8 +3396,8 @@ mod tests {
             .unwrap();
         granted_claim(&store, &claim_t1("R1"), 2_000);
 
-        let activation = QueuedActivation {
-            id: "A1".into(),
+        let trigger = QueuedTrigger {
+            id: "TR1".into(),
             kind: "immediate".into(),
             ticket_id: None,
             project_id: None,
@@ -3425,11 +3405,11 @@ mod tests {
             interval_ms: None,
         };
         // T1 is claimed and T2's blocker has not merged: nothing is ready.
-        assert_eq!(select_ready_ticket(&store, &activation, 2_000), None);
+        assert_eq!(select_ready_ticket(&store, &trigger, 2_000), None);
 
         settle_for_test(&store, "R1", Outcome::Merged, 3_000);
         assert_eq!(
-            select_ready_ticket(&store, &activation, 3_000).as_deref(),
+            select_ready_ticket(&store, &trigger, 3_000).as_deref(),
             Some("T2")
         );
     }
@@ -3439,15 +3419,15 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = open_seeded(&directory.path().join("sloop.db"));
         store.mark_ticket_missing("T1", 2_000).unwrap();
-        let activation = QueuedActivation {
-            id: "A1".into(),
+        let trigger = QueuedTrigger {
+            id: "TR1".into(),
             kind: "immediate".into(),
             ticket_id: None,
             project_id: None,
             eligible_at_ms: None,
             interval_ms: None,
         };
-        assert_eq!(select_ready_ticket(&store, &activation, 2_000), None);
+        assert_eq!(select_ready_ticket(&store, &trigger, 2_000), None);
         assert_eq!(store.ticket("T1").unwrap().unwrap().attempts, 0);
 
         store.mark_ticket_missing("T1", 5_000).unwrap();
@@ -3457,7 +3437,7 @@ mod tests {
         );
         store.clear_ticket_missing("T1", 6_000).unwrap();
         assert_eq!(
-            select_ready_ticket(&store, &activation, 6_000).as_deref(),
+            select_ready_ticket(&store, &trigger, 6_000).as_deref(),
             Some("T1")
         );
     }
@@ -3482,8 +3462,8 @@ mod tests {
                 1_500,
             )
             .unwrap();
-        let activation = QueuedActivation {
-            id: "A1".into(),
+        let trigger = QueuedTrigger {
+            id: "TR1".into(),
             kind: "immediate".into(),
             ticket_id: None,
             project_id: None,
@@ -3493,7 +3473,7 @@ mod tests {
 
         assert_eq!(store.unmerged_blockers("T2").unwrap(), ["T1"]);
         assert_eq!(
-            select_ready_ticket(&store, &activation, 2_000).as_deref(),
+            select_ready_ticket(&store, &trigger, 2_000).as_deref(),
             Some("T1")
         );
         assert_eq!(store.ticket_counts().unwrap().blocked, 1);
@@ -3503,7 +3483,7 @@ mod tests {
             .lock()
             .execute("UPDATE tickets SET state = 'failed' WHERE id = 'T1'", [])
             .unwrap();
-        assert_eq!(select_ready_ticket(&store, &activation, 2_000), None);
+        assert_eq!(select_ready_ticket(&store, &trigger, 2_000), None);
         assert_eq!(store.ticket("T2").unwrap().unwrap().attempts, 0);
 
         store
@@ -3513,7 +3493,7 @@ mod tests {
             .unwrap();
         assert!(store.unmerged_blockers("T2").unwrap().is_empty());
         assert_eq!(
-            select_ready_ticket(&store, &activation, 2_000).as_deref(),
+            select_ready_ticket(&store, &trigger, 2_000).as_deref(),
             Some("T2")
         );
         let counts = store.ticket_counts().unwrap();
@@ -3708,10 +3688,10 @@ mod tests {
             "failed"
         );
         store
-            .insert_activation(
-                &NewActivation {
-                    id: "A2",
-                    kind: ActivationKind::Immediate,
+            .insert_trigger(
+                &NewTrigger {
+                    id: "TR2",
+                    kind: TriggerKind::Immediate,
                     ticket_id: Some("T1"),
                     project_id: None,
                     eligible_at_ms: None,
@@ -3724,7 +3704,7 @@ mod tests {
             granted_claim(
                 &store,
                 &ClaimTransaction {
-                    activation_id: "A2",
+                    trigger_id: "TR2",
                     ..claim_t1("R2")
                 },
                 2_300,
@@ -3755,5 +3735,141 @@ mod tests {
             Some("codex")
         );
         assert_eq!(store.backfill_ticket_targets("claude", 4_000).unwrap(), 0);
+    }
+
+    /// The rename migration must be lossless. A queued trigger is the durable
+    /// record that someone asked for work; it is in no committed file and in no
+    /// commit, so `reindex` cannot rebuild one and a migration that dropped it
+    /// would silently cancel a scheduled run. The ids move too, which means
+    /// every column pointing at one has to move with them — SQLite propagates a
+    /// table rename into a `REFERENCES` clause but never propagates an `UPDATE`
+    /// to the rows that reference it.
+    #[test]
+    fn the_rename_migration_carries_every_trigger_id_and_reference_across() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("sloop.db");
+
+        // Everything a trigger can be: queued and pinned, queued recurring and
+        // scoped by `--only`, and already completed. Plus the two rows that
+        // name a trigger from outside its own table.
+        {
+            let local = open_seeded(&path);
+            insert_ready_ticket(&local, "T2", 1_000);
+            local
+                .insert_trigger(
+                    &NewTrigger {
+                        id: "TR2",
+                        kind: TriggerKind::Every,
+                        ticket_id: None,
+                        project_id: Some("default"),
+                        eligible_at_ms: Some(5_000),
+                        interval_ms: Some(60_000),
+                    },
+                    1_100,
+                )
+                .unwrap();
+            local.insert_trigger_filter("TR2", "T2").unwrap();
+            insert_queued_trigger(&local, "TR3", TriggerKind::Auto, Some("T2"), None);
+            local
+                .db
+                .lock()
+                .execute_batch(
+                    "UPDATE triggers SET state = 'completed' WHERE id = 'TR3';
+                     INSERT INTO runs
+                         (id, trigger_id, ticket_id, state, attempt, flow_json, ticket_json,
+                          created_at_ms, updated_at_ms)
+                     VALUES ('R1', 'TR1', 'T1', 'claimed', 1, '{}', '{}', 1200, 1200);
+                     INSERT INTO leases
+                         (ticket_id, run_id, owner_id, acquired_at_ms, renewed_at_ms,
+                          expires_at_ms)
+                     VALUES ('T1', 'R1', '{\"owner\":\"R1\",\"trigger\":\"TR1\"}',
+                             1200, 1200, 601200);",
+                )
+                .unwrap();
+        }
+
+        // Now make it genuinely pre-rename and reopen, which migrates it.
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection.execute_batch(REVERT_TRIGGER_RENAME).unwrap();
+            connection.pragma_update(None, "user_version", 15).unwrap();
+        }
+        let local = LocalSqlite::from_db(Db::open(&path, 2_000).unwrap());
+
+        // Both queued triggers survive, keep their order, and answer to the
+        // widened prefix. The completed one is still completed rather than
+        // resurrected or dropped.
+        let queued = local.queued_triggers().unwrap();
+        assert_eq!(
+            queued.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            ["TR1", "TR2"]
+        );
+        let recurring = &queued[1];
+        assert_eq!(recurring.kind, "every");
+        assert_eq!(recurring.project_id.as_deref(), Some("default"));
+        assert_eq!(recurring.eligible_at_ms, Some(5_000));
+        assert_eq!(recurring.interval_ms, Some(60_000));
+
+        let connection = local.db.lock();
+        let states: Vec<(String, String)> = connection
+            .prepare("SELECT id, state FROM triggers ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            states,
+            [
+                ("TR1".to_owned(), "queued".to_owned()),
+                ("TR2".to_owned(), "queued".to_owned()),
+                ("TR3".to_owned(), "completed".to_owned()),
+            ]
+        );
+
+        // The three referencing columns were rewritten with the ids they point
+        // at, so nothing dangles.
+        let filter: (String, String) = connection
+            .query_row(
+                "SELECT trigger_id, ticket_id FROM trigger_filters",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(filter, ("TR2".to_owned(), "T2".to_owned()));
+        let run_trigger: String = connection
+            .query_row("SELECT trigger_id FROM runs WHERE id = 'R1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(run_trigger, "TR1");
+        let stored_owner: String = connection
+            .query_row(
+                "SELECT owner_id FROM leases WHERE ticket_id = 'T1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (owner, claimed_trigger) = super::decode_lease_owner(&stored_owner);
+        assert_eq!(owner.0, "R1");
+        assert_eq!(claimed_trigger.as_deref(), Some("TR1"));
+        assert_eq!(stored_owner, super::lease_owner(&owner, "TR1"));
+
+        // The engine's own verdict on whether the graph still hangs together.
+        assert_eq!(
+            connection
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query_map([], |_| Ok(()))
+                .unwrap()
+                .count(),
+            0
+        );
+        drop(connection);
+
+        // The counter row came across under its new key, and the high-water
+        // mark still reads an ordinal out of the two-letter prefix: reading
+        // `TR3` as anything but 3 would hand out a colliding id.
+        assert_eq!(local.next_trigger_ordinal().unwrap(), 4);
     }
 }

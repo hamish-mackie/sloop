@@ -695,8 +695,8 @@ async fn dispatch(
                 );
             }
             let now_ms = state.clock.now_ms();
-            let at_eligible_ms = match &args.activation {
-                crate::protocol::PostActivation::At { time } => {
+            let at_eligible_ms = match &args.trigger {
+                crate::protocol::PostTrigger::At { time } => {
                     let Some(minute) = parse_local_time(time) else {
                         return ResponseEnvelope::failure(
                             Some(id),

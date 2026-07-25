@@ -238,7 +238,7 @@ fn restart_drains_active_stages_before_resuming_the_queue() {
     let draining = status(&world);
     assert_eq!(draining["daemon"]["draining"], true);
     assert_eq!(draining["gate"]["active_agents"], 1);
-    assert_eq!(draining["queued_activations"].as_array().unwrap().len(), 1);
+    assert_eq!(draining["queued_triggers"].as_array().unwrap().len(), 1);
     assert!(!world.run_worktree(2).exists());
     let human = world.sloop_plain(&["status"]);
     assert!(String::from_utf8_lossy(&human.stdout).contains("draining - 1/1 agents active"));
@@ -767,7 +767,7 @@ fn worker_verbs_on_the_operator_socket_point_at_an_alternative() {
 /// trigger in the same transaction as the merge, but rows stranded before that
 /// rule existed outlive every future settlement, so startup sweeps them.
 #[test]
-fn startup_completes_activations_pinned_to_an_already_merged_ticket() {
+fn startup_completes_triggers_pinned_to_an_already_merged_ticket() {
     let world = World::configured();
     let ticket = world.write_ticket("stranded.md", "# Stranded\n");
     world.commit_all("initial");
@@ -795,9 +795,9 @@ fn startup_completes_activations_pinned_to_an_already_merged_ticket() {
         .unwrap();
     connection
         .execute(
-            "INSERT INTO activations
+            "INSERT INTO triggers
                  (id, kind, state, ticket_id, created_at_ms, updated_at_ms)
-             VALUES ('A68', 'immediate', 'queued', ?1, 1, 1)",
+             VALUES ('TR68', 'immediate', 'queued', ?1, 1, 1)",
             [&ticket_id],
         )
         .unwrap();
@@ -805,12 +805,12 @@ fn startup_completes_activations_pinned_to_an_already_merged_ticket() {
 
     let pid = world.start_daemon()["data"]["pid"].as_u64().unwrap() as u32;
     assert_eq!(
-        status(&world)["queued_activations"],
+        status(&world)["queued_triggers"],
         serde_json::json!([]),
         "the dead trigger is still counted as pending demand"
     );
     assert_eq!(
-        log_event_count(&world, "activation_completed_on_merged_ticket"),
+        log_event_count(&world, "trigger_completed_on_merged_ticket"),
         1,
         "the sweep mutated rows without saying so"
     );
@@ -819,7 +819,7 @@ fn startup_completes_activations_pinned_to_an_already_merged_ticket() {
     stop_daemon(&world, pid);
     world.start_daemon();
     assert_eq!(
-        log_event_count(&world, "activation_completed_on_merged_ticket"),
+        log_event_count(&world, "trigger_completed_on_merged_ticket"),
         1
     );
 }

@@ -14,8 +14,9 @@ use serde_json::json;
 
 use crate::protocol::{
     ConfidenceValue, EmptyArgs, ErrorBody, ErrorCode, EventsArgs, ListArgs, LogsArgs, NoteArgs,
-    PostActivation, PostArgs, Request, RequestEnvelope, RequestId, ResponseEnvelope, RunActivation,
-    RunArgs, RunReferenceArgs, ShowArgs, StopArgs, TicketReferenceArgs, VerdictArgs, VerdictValue,
+    PostArgs, PostTrigger, Request, RequestEnvelope, RequestId, ResponseEnvelope, RunArgs,
+    RunReferenceArgs, RunTrigger, ShowArgs, StopArgs, TicketReferenceArgs, VerdictArgs,
+    VerdictValue,
 };
 use crate::templates::TemplateKind;
 
@@ -305,7 +306,7 @@ enum DaemonAction {
 `sloop template ticket` for a commented example of every frontmatter field, or \
 `sloop template flow` for the flow grammar that `--flow` selects.",
     group(
-        ArgGroup::new("activation")
+        ArgGroup::new("trigger")
             .args(["auto", "at", "manual", "hold"])
             .multiple(false)
     )
@@ -358,7 +359,7 @@ pub struct ShowCliArgs {
 
 #[derive(Debug, Args)]
 #[command(group(
-    ArgGroup::new("activation")
+    ArgGroup::new("trigger")
         .args(["at", "every", "overnight"])
         .multiple(false)
 ))]
@@ -478,43 +479,43 @@ impl TryFrom<PostCliArgs> for PostArgs {
             .into_os_string()
             .into_string()
             .map_err(|_| RequestConstructionError("ticket path must be valid UTF-8".into()))?;
-        let activation = if let Some(time) = args.at {
-            PostActivation::At { time: time.0 }
+        let trigger = if let Some(time) = args.at {
+            PostTrigger::At { time: time.0 }
         } else if args.manual {
-            PostActivation::Manual
+            PostTrigger::Manual
         } else if args.hold {
-            PostActivation::Hold
+            PostTrigger::Hold
         } else {
-            PostActivation::Auto
+            PostTrigger::Auto
         };
 
         Ok(Self {
             file,
             project: args.project,
             flow: args.flow,
-            activation,
+            trigger,
         })
     }
 }
 
 impl From<RunCliArgs> for RunArgs {
     fn from(args: RunCliArgs) -> Self {
-        let activation = if let Some(time) = args.at {
-            RunActivation::At { local_time: time.0 }
+        let trigger = if let Some(time) = args.at {
+            RunTrigger::At { local_time: time.0 }
         } else if let Some(interval) = args.every {
-            RunActivation::Every {
+            RunTrigger::Every {
                 interval_ms: interval.0,
             }
         } else if args.overnight {
-            RunActivation::Overnight
+            RunTrigger::Overnight
         } else {
-            RunActivation::Now
+            RunTrigger::Now
         };
 
         Self {
             ticket: args.ticket,
             project: args.project,
-            activation,
+            trigger,
             only: args.only.unwrap_or_default(),
         }
     }
@@ -1800,7 +1801,7 @@ mod tests {
             json!({
                 "verb": "run",
                 "args": {
-                    "activation": {"kind": "every", "interval_ms": 1_800_000},
+                    "trigger": {"kind": "every", "interval_ms": 1_800_000},
                     "only": ["T1", "T7"]
                 }
             })
@@ -1808,7 +1809,7 @@ mod tests {
     }
 
     #[test]
-    fn hold_becomes_a_distinct_post_activation() {
+    fn hold_becomes_a_distinct_post_trigger() {
         let request = Cli::try_parse_from(["sloop", "post", "ticket.md", "--hold"])
             .unwrap()
             .into_request()
@@ -1820,7 +1821,7 @@ mod tests {
                 "verb": "post",
                 "args": {
                     "file": "ticket.md",
-                    "activation": {"kind": "hold"}
+                    "trigger": {"kind": "hold"}
                 }
             })
         );
@@ -1960,13 +1961,13 @@ mod tests {
     }
 
     #[test]
-    fn run_accepts_only_one_activation_mode() {
+    fn run_accepts_only_one_trigger_mode() {
         let result = Cli::try_parse_from(["sloop", "run", "--at", "03:00", "--every", "30m"]);
         assert!(result.is_err());
     }
 
     #[test]
-    fn post_defaults_to_auto_and_accepts_only_one_explicit_activation_mode() {
+    fn post_defaults_to_auto_and_accepts_only_one_explicit_trigger_mode() {
         let request = Cli::try_parse_from(["sloop", "post", "ticket.md"])
             .unwrap()
             .into_request()
@@ -1977,7 +1978,7 @@ mod tests {
                 "verb": "post",
                 "args": {
                     "file": "ticket.md",
-                    "activation": {"kind": "auto"}
+                    "trigger": {"kind": "auto"}
                 }
             })
         );

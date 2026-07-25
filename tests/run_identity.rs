@@ -207,9 +207,9 @@ fn a_unique_hex_prefix_resolves_and_an_ambiguous_one_lists_the_candidates() {
     let twin = format!("{}ffffffffffffffffffffffffffff", &id[..4]);
     store
         .execute(
-            "INSERT INTO runs (id, activation_id, ticket_id, state, attempt, created_at_ms,
+            "INSERT INTO runs (id, trigger_id, ticket_id, state, attempt, created_at_ms,
                                updated_at_ms)
-             SELECT ?1, activation_id, ticket_id, state, 2, created_at_ms, updated_at_ms
+             SELECT ?1, trigger_id, ticket_id, state, 2, created_at_ms, updated_at_ms
              FROM runs WHERE id = ?2",
             rusqlite::params![twin, id],
         )

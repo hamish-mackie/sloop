@@ -39,7 +39,7 @@ use super::dispatcher::{
 };
 use super::recovery::recover_inflight_runs;
 use super::scheduler::{
-    index_projects, reconcile_merged_ticket_activations, reconcile_tickets,
+    index_projects, reconcile_merged_ticket_triggers, reconcile_tickets,
     restore_reported_output_stalls,
 };
 
@@ -380,7 +380,7 @@ async fn serve(
         shutdown_flag: shutdown_flag.clone(),
     };
     restore_reported_output_stalls(&mut state);
-    reconcile_merged_ticket_activations(&state, &log);
+    reconcile_merged_ticket_triggers(&state, &log);
     recover_inflight_runs(&mut state, &events_tx, &log).await?;
     let dispatcher_task = tokio::spawn(run_dispatcher(
         state,

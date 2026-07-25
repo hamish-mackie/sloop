@@ -22,7 +22,7 @@ use crate::run_store::{
 };
 use crate::runner::local::{run_output_path, wait_for_test_hook};
 use crate::work_state::ClaimResult;
-use crate::work_state::local::{LocalSqlite, QueuedActivation};
+use crate::work_state::local::{LocalSqlite, QueuedTrigger};
 
 use super::dispatcher::{
     DispatcherState, RunEvent, close_worker_socket, disposition_for_outcome, mark_storage_full,
@@ -348,7 +348,7 @@ async fn renew_supervised_leases(state: &mut DispatcherState, log: &OperationalL
     }
 }
 
-/// The single spawn decision point: every queued activation passes the same
+/// The single spawn decision point: every queued trigger passes the same
 /// pause and capacity gates, selects deterministically, claims conditionally,
 /// and only then touches Git and processes.
 pub(super) async fn reconcile(
@@ -380,13 +380,13 @@ pub(super) async fn reconcile(
     {
         return;
     }
-    let activations = match state.local_work_state.dispatchable_activations(now_ms) {
-        Ok(activations) => activations,
+    let triggers = match state.local_work_state.dispatchable_triggers(now_ms) {
+        Ok(triggers) => triggers,
         Err(error) => {
             log.emit_with_fields(
                 LogLevel::Error,
                 "sloop::dispatcher",
-                "activation_scan_failed",
+                "trigger_scan_failed",
                 json!({"error": error.to_string()}),
             );
             return;
@@ -396,8 +396,8 @@ pub(super) async fn reconcile(
     // A durable lease missing from memory must consume capacity before the
     // dispatcher can use an apparently free slot. The periodic pass remains
     // responsible for idle reconciliation; this extra scan only runs when a
-    // queued activation could otherwise spawn now.
-    if !activations.is_empty() && state.active.len() < state.max_agents {
+    // queued trigger could otherwise spawn now.
+    if !triggers.is_empty() && state.active.len() < state.max_agents {
         wait_for_test_hook("before-spawn-capacity-reconciliation");
         reconcile_run_liveness(state, events, log).await;
         if state.reconciliation_blocked {
@@ -405,16 +405,13 @@ pub(super) async fn reconcile(
         }
     }
 
-    for activation in activations {
+    for trigger in triggers {
         if state.active.len() >= state.max_agents {
             break;
         }
-        let Some(ticket_id) = eligible_ticket(
-            &state.local_work_state,
-            &state.run_store,
-            &activation,
-            now_ms,
-        ) else {
+        let Some(ticket_id) =
+            eligible_ticket(&state.local_work_state, &state.run_store, &trigger, now_ms)
+        else {
             continue;
         };
 
@@ -486,7 +483,7 @@ pub(super) async fn reconcile(
                     "sloop::dispatcher",
                     "claim_failed",
                     json!({
-                        "activation_id": activation.id,
+                        "trigger_id": trigger.id,
                         "ticket_id": ticket_id,
                         "run_id": run_id,
                         "error": format!("{error:?}"),
@@ -533,12 +530,12 @@ pub(super) async fn reconcile(
                 }),
             );
         }
-        let Some(activation_id) = ticket.hints.activation_id.as_deref() else {
+        let Some(trigger_id) = ticket.hints.trigger_id.as_deref() else {
             release_unrecorded_claim(state, &ticket_ref, &owner, log).await;
             log.emit_with_fields(
                 LogLevel::Error,
                 "sloop::dispatcher",
-                "claim_missing_activation",
+                "claim_missing_trigger",
                 json!({"ticket_id": ticket_id, "run_id": run_id}),
             );
             continue;
@@ -563,7 +560,7 @@ pub(super) async fn reconcile(
         let admission = RunAdmission {
             ticket_id: &ticket_id,
             run_id: &run_id,
-            activation_id,
+            trigger_id,
             flow_json: &flow_json,
             ticket_json: &ticket_json,
         };
@@ -577,7 +574,7 @@ pub(super) async fn reconcile(
                     "sloop::dispatcher",
                     "claim_failed",
                     json!({
-                        "activation_id": activation.id,
+                        "trigger_id": trigger.id,
                         "ticket_id": ticket_id,
                         "run_id": run_id,
                         "error": error.to_string(),
@@ -994,7 +991,7 @@ pub(super) fn next_dispatch_deadline(state: &DispatcherState) -> Option<i64> {
     let cooldown_deadline = state.run_store.next_active_cooldown(now_ms).ok().flatten();
     let next_eligible = state
         .local_work_state
-        .next_activation_eligible_at_ms(now_ms)
+        .next_trigger_eligible_at_ms(now_ms)
         .ok()
         .flatten();
     let hours_deadline = 'hours: {
@@ -1007,8 +1004,8 @@ pub(super) fn next_dispatch_deadline(state: &DispatcherState) -> Option<i64> {
         let opening = hours.next_opening_ms(state.clock.as_ref(), now_ms);
         let has_due_demand = state
             .local_work_state
-            .dispatchable_activations(now_ms)
-            .is_ok_and(|activations| !activations.is_empty());
+            .dispatchable_triggers(now_ms)
+            .is_ok_and(|triggers| !triggers.is_empty());
         if has_due_demand || next_eligible.is_some_and(|deadline| deadline <= opening) {
             Some(opening)
         } else {
@@ -1232,7 +1229,7 @@ pub(super) fn restore_reported_output_stalls(state: &mut DispatcherState) {
     }
 }
 
-/// Retires activations pinned to a ticket that is already `merged`. Settling
+/// Retires triggers pinned to a ticket that is already `merged`. Settling
 /// now completes them in the same transaction as the merge, but that rule is
 /// not retroactive and a merged ticket never settles again, so rows stranded
 /// before it existed need this one-off sweep. Without it they stay `queued`
@@ -1240,19 +1237,19 @@ pub(super) fn restore_reported_output_stalls(state: &mut DispatcherState) {
 ///
 /// Runs once per daemon lifetime, and only reports what it actually changed: a
 /// clean database selects nothing, writes nothing, and logs nothing.
-pub(super) fn reconcile_merged_ticket_activations(state: &DispatcherState, log: &OperationalLog) {
+pub(super) fn reconcile_merged_ticket_triggers(state: &DispatcherState, log: &OperationalLog) {
     let now_ms = state.clock.now_ms();
     match state
         .local_work_state
-        .complete_merged_ticket_activations(now_ms)
+        .complete_merged_ticket_triggers(now_ms)
     {
         Ok(completed) => {
-            for (activation_id, ticket_id) in completed {
+            for (trigger_id, ticket_id) in completed {
                 log.emit_with_fields(
                     LogLevel::Info,
                     "sloop::daemon",
-                    "activation_completed_on_merged_ticket",
-                    json!({"activation_id": activation_id, "ticket_id": ticket_id}),
+                    "trigger_completed_on_merged_ticket",
+                    json!({"trigger_id": trigger_id, "ticket_id": ticket_id}),
                 );
             }
         }
@@ -1261,7 +1258,7 @@ pub(super) fn reconcile_merged_ticket_activations(state: &DispatcherState, log: 
             log.emit_with_fields(
                 LogLevel::Error,
                 "sloop::daemon",
-                "merged_ticket_activation_sweep_failed",
+                "merged_ticket_trigger_sweep_failed",
                 json!({"error": error.to_string()}),
             );
         }
@@ -1271,10 +1268,10 @@ pub(super) fn reconcile_merged_ticket_activations(state: &DispatcherState, log: 
 fn eligible_ticket(
     local_work_state: &LocalSqlite,
     run_store: &RunStore,
-    activation: &QueuedActivation,
+    trigger: &QueuedTrigger,
     now_ms: i64,
 ) -> Option<String> {
-    match &activation.ticket_id {
+    match &trigger.ticket_id {
         Some(ticket)
             if local_work_state
                 .ticket_is_dispatchable(ticket)
@@ -1291,7 +1288,7 @@ fn eligible_ticket(
         }
         Some(_) => None,
         None => local_work_state
-            .select_ready_ticket(activation.project_id.as_deref(), &activation.id, now_ms)
+            .select_ready_ticket(trigger.project_id.as_deref(), &trigger.id, now_ms)
             .ok()
             .flatten(),
     }

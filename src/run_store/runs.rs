@@ -149,7 +149,7 @@ pub struct RunRecord {
 
 pub struct RunAdmission<'a> {
     pub run_id: &'a str,
-    pub activation_id: &'a str,
+    pub trigger_id: &'a str,
     pub ticket_id: &'a str,
     pub flow_json: &'a str,
     pub ticket_json: &'a str,
@@ -418,13 +418,13 @@ pub(crate) mod tx {
             .collect::<Result<Vec<_>, _>>()
     }
 
-    pub(crate) fn ids_for_activation(
+    pub(crate) fn ids_for_trigger(
         transaction: &Transaction<'_>,
-        activation_id: &str,
+        trigger_id: &str,
     ) -> rusqlite::Result<Vec<String>> {
-        let mut statement = transaction.prepare("SELECT id FROM runs WHERE activation_id = ?1")?;
+        let mut statement = transaction.prepare("SELECT id FROM runs WHERE trigger_id = ?1")?;
         statement
-            .query_map(params![activation_id], |row| row.get(0))?
+            .query_map(params![trigger_id], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()
     }
 
@@ -512,7 +512,7 @@ pub(crate) mod tx {
     pub(crate) fn insert_claimed(
         transaction: &Transaction<'_>,
         run_id: &str,
-        activation_id: &str,
+        trigger_id: &str,
         ticket_id: &str,
         attempt: i64,
         flow_json: &str,
@@ -521,12 +521,12 @@ pub(crate) mod tx {
     ) -> rusqlite::Result<usize> {
         transaction.execute(
             "INSERT INTO runs
-                 (id, activation_id, ticket_id, state, attempt, flow_json, ticket_json,
+                 (id, trigger_id, ticket_id, state, attempt, flow_json, ticket_json,
                   created_at_ms, updated_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
             params![
                 run_id,
-                activation_id,
+                trigger_id,
                 ticket_id,
                 RunState::Claimed.as_str(),
                 attempt,
@@ -949,7 +949,7 @@ impl RunStore {
             tx::insert_claimed(
                 transaction,
                 claim.run_id,
-                claim.activation_id,
+                claim.trigger_id,
                 claim.ticket_id,
                 attempt,
                 claim.flow_json,
@@ -1092,7 +1092,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{RunState, RunStore};
-    use crate::db::{Db, LEGACY_STAGE_TABLE, SCHEMA_VERSION, StoreError};
+    use crate::db::{Db, LEGACY_STAGE_TABLE, REVERT_TRIGGER_RENAME, SCHEMA_VERSION, StoreError};
     use crate::domain::ticket::TicketSnapshot;
     use crate::flow::{Actor, Builtin, Check, FailAction, Flow, Stage};
     use crate::outcome::Outcome;
@@ -1109,7 +1109,7 @@ mod tests {
         RunAdmission {
             ticket_id: "T1",
             run_id,
-            activation_id: "A1",
+            trigger_id: "TR1",
             flow_json: "{}",
             ticket_json: "{}",
         }
@@ -1470,6 +1470,7 @@ mod tests {
                 "ALTER TABLE stage_runs RENAME TO {LEGACY_STAGE_TABLE};"
             ))
             .unwrap();
+        connection.execute_batch(REVERT_TRIGGER_RENAME).unwrap();
         connection.pragma_update(None, "user_version", 3).unwrap();
         drop(connection);
 
@@ -1534,6 +1535,7 @@ mod tests {
                 "ALTER TABLE stage_runs RENAME TO {LEGACY_STAGE_TABLE};"
             ))
             .unwrap();
+        connection.execute_batch(REVERT_TRIGGER_RENAME).unwrap();
         connection.pragma_update(None, "user_version", 8).unwrap();
         drop(connection);
 
@@ -1573,6 +1575,7 @@ mod tests {
                 "ALTER TABLE stage_runs RENAME TO {LEGACY_STAGE_TABLE};"
             ))
             .unwrap();
+        connection.execute_batch(REVERT_TRIGGER_RENAME).unwrap();
         connection.pragma_update(None, "user_version", 10).unwrap();
         drop(connection);
 
@@ -1649,6 +1652,7 @@ mod tests {
                  PRAGMA user_version = 11;"
             ))
             .unwrap();
+        connection.execute_batch(REVERT_TRIGGER_RENAME).unwrap();
         drop(connection);
 
         let store = open(&path, 2_000).unwrap();

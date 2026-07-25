@@ -9,8 +9,8 @@
 //! there a trigger that could select it?". Those are inverse questions, and no
 //! single function answers both.
 
-/// The gates behind a report. All but `has_queued_activation` are global; that
-/// one is answered per ticket, since a queued activation may be pinned to a
+/// The gates behind a report. All but `has_queued_trigger` are global; that
+/// one is answered per ticket, since a queued trigger may be pinned to a
 /// ticket other than the one being described.
 #[derive(Debug, Clone, Copy)]
 pub struct Gates {
@@ -20,7 +20,7 @@ pub struct Gates {
     pub agent_configured: bool,
     pub hours_open: bool,
     pub at_capacity: bool,
-    pub has_queued_activation: bool,
+    pub has_queued_trigger: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,7 +35,7 @@ pub enum Ineligible {
     StorageFull,
     OutsideRunningHours,
     AtCapacity,
-    NoActivation,
+    NoTrigger,
 }
 
 impl Ineligible {
@@ -59,7 +59,7 @@ impl Ineligible {
             }
             Self::OutsideRunningHours => "outside configured running hours".into(),
             Self::AtCapacity => "all agent slots are busy".into(),
-            Self::NoActivation => "ready but no queued activation; enqueue with `sloop run`".into(),
+            Self::NoTrigger => "ready but no queued trigger; enqueue with `sloop run`".into(),
         }
     }
 }
@@ -111,8 +111,8 @@ pub fn ticket_ineligibility(
         Some(Ineligible::OutsideRunningHours)
     } else if gates.at_capacity {
         Some(Ineligible::AtCapacity)
-    } else if !gates.has_queued_activation {
-        Some(Ineligible::NoActivation)
+    } else if !gates.has_queued_trigger {
+        Some(Ineligible::NoTrigger)
     } else {
         None
     }
@@ -130,7 +130,7 @@ mod tests {
             agent_configured: true,
             hours_open: true,
             at_capacity: false,
-            has_queued_activation: true,
+            has_queued_trigger: true,
         }
     }
 
@@ -232,10 +232,10 @@ mod tests {
         ));
 
         let mut gates = open_gates();
-        gates.has_queued_activation = false;
+        gates.has_queued_trigger = false;
         assert!(matches!(
             ineligibility("ready", 0, None, &gates),
-            Some(Ineligible::NoActivation)
+            Some(Ineligible::NoTrigger)
         ));
     }
 
@@ -251,8 +251,8 @@ mod tests {
             "failed after 2 attempt(s); requeue with `sloop retry`"
         );
         assert_eq!(
-            Ineligible::NoActivation.describe(),
-            "ready but no queued activation; enqueue with `sloop run`"
+            Ineligible::NoTrigger.describe(),
+            "ready but no queued trigger; enqueue with `sloop run`"
         );
     }
 }

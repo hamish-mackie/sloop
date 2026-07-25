@@ -93,7 +93,7 @@ with the number of active runs still draining. No new runs start during the
 drain; active runs continue through every remaining flow stage. When the
 last run settles, the daemon releases its sockets and lock, then replaces
 itself with the binary currently installed at the path from which it started.
-Queued activations remain queued and resume automatically in the replacement.
+Queued triggers remain queued and resume automatically in the replacement.
 
 Use `sloop show` to inspect the drain or `sloop show --follow` to stream its
 events. `sloop resume` cancels a pending restart and continues dispatching in
@@ -104,7 +104,7 @@ no force mode.
 
 Validate and register a ticket file (which must live below the configured
 ticket directory), stamping the allocated ID and worktree branch back into
-the file. The activation modes are mutually exclusive:
+the file. The trigger modes are mutually exclusive:
 
 - `--auto` (default) — queue one run for the next available opportunity.
 - `--manual` — register the ticket as ready without queuing a run.
@@ -125,7 +125,7 @@ says which state suppressed it:
 
 ```
 ticket TICK-43 updated from .agents/sloop/tickets/cooldown.md (project default, merged)
-no activation queued: TICK-43 is merged
+no trigger queued: TICK-43 is merged
 ```
 
 ### sloop run [TICKET] [--project P] [--only T1,T2] [--at TIME | --every INTERVAL | --overnight]
@@ -142,7 +142,7 @@ Enqueue a run. Naming a ticket or a project says *which* work, not
 Ticket and `--project` are mutually exclusive. Every run, named or not,
 passes the same gates: pause, running hours, and capacity.
 
-Time-based activations use the same scheduler gates as an immediate run:
+Time-based triggers use the same scheduler gates as an immediate run:
 
 - `--at HH:MM` queues one run for the next occurrence of that local time.
 - `--every INTERVAL` queues recurring work, first due after the interval.
@@ -163,7 +163,7 @@ return to `ready`.
 
 A daemon started against state left by an older version completes any queued
 run still pinned to an already-merged ticket, logging one
-`activation_completed_on_merged_ticket` record per run it retired.
+`trigger_completed_on_merged_ticket` record per run it retired.
 
 ### sloop retry <TICKET>
 
@@ -181,7 +181,7 @@ sloop show [REF_OR_PATTERN] [-N] [--follow] [--quiet]
 ```
 
 Without an argument, `sloop show` is a dashboard with daemon and gate
-state, active runs, queued activations, ticket counts, the next wake time, and
+state, active runs, queued triggers, ticket counts, the next wake time, and
 the 10 newest tickets. `sloop show -N` changes the number of recent tickets;
 `-n N` and `--limit N` are equivalent. A limit of zero or a non-numeric limit
 is a usage error.

@@ -25,6 +25,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use crate::db::{Db, StoreError};
 use crate::domain::ticket::TicketState;
 use crate::domain::work::{OwnerId, WorkOutcome};
+use crate::ids::NOTE_ID_PREFIX;
 use crate::outcome::Outcome;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,12 +128,12 @@ impl RunStore {
     }
 
     pub(crate) fn next_note_ordinal(&self) -> Result<i64, StoreError> {
-        self.reserve_ordinal("note", "notes")
+        self.reserve_ordinal("note", "notes", NOTE_ID_PREFIX)
     }
 
-    fn reserve_ordinal(&self, kind: &str, table: &str) -> Result<i64, StoreError> {
+    fn reserve_ordinal(&self, kind: &str, table: &str, prefix: &str) -> Result<i64, StoreError> {
         self.write(TransactionBehavior::Immediate, |transaction| {
-            tx::reserve_ordinal(transaction, kind, table)
+            tx::reserve_ordinal(transaction, kind, table, prefix)
         })
     }
 
@@ -546,18 +547,27 @@ fn restart_draining(connection: &rusqlite::Connection) -> rusqlite::Result<bool>
 pub(crate) mod tx {
     use rusqlite::{Transaction, params};
 
+    /// `prefix` is what the minted ids of `table` begin with, and it decides
+    /// where the ordinal starts inside them: `TR91` yields 91 only when the
+    /// substring skips both letters. Getting it wrong casts to zero rather than
+    /// erroring, which would silently disarm the high-water mark below.
     pub(crate) fn reserve_ordinal(
         transaction: &Transaction<'_>,
         kind: &str,
         table: &str,
+        prefix: &str,
     ) -> rusqlite::Result<i64> {
         let reserved: i64 = transaction.query_row(
             "SELECT next_ordinal FROM id_counters WHERE kind = ?1",
             params![kind],
             |row| row.get(0),
         )?;
+        let ordinal_start = prefix.len() + 1;
         let existing: i64 = transaction.query_row(
-            &format!("SELECT COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) + 1 FROM {table}"),
+            &format!(
+                "SELECT COALESCE(MAX(CAST(SUBSTR(id, {ordinal_start}) AS INTEGER)), 0) + 1
+                 FROM {table}"
+            ),
             [],
             |row| row.get(0),
         )?;
@@ -672,10 +682,10 @@ pub(crate) mod test_support {
                      ('T1', 'default', '.agents/sloop/tickets/t1.md', 'local', NULL,
                       'ready', 0, '', 'Ticket one', 'sloop/T1', 'claude', 'sonnet',
                       'medium', 'default', '', 1000, 1000);
-                 INSERT INTO activations
+                 INSERT INTO triggers
                      (id, kind, state, ticket_id, project_id, eligible_at_ms, interval_ms,
                       created_at_ms, updated_at_ms)
-                 VALUES ('A1', 'immediate', 'queued', 'T1', NULL, NULL, NULL, 1000, 1000);",
+                 VALUES ('TR1', 'immediate', 'queued', 'T1', NULL, NULL, NULL, 1000, 1000);",
             )
             .unwrap();
         RunStore::from_db(db)
@@ -692,7 +702,7 @@ pub(crate) mod test_support {
             .insert_claimed_run(
                 &RunAdmission {
                     run_id,
-                    activation_id: "A1",
+                    trigger_id: "TR1",
                     ticket_id: "T1",
                     flow_json,
                     ticket_json,

@@ -3,7 +3,7 @@
 //! Random sequences of lifecycle verbs run against the real storage boundaries on a
 //! tempfile SQLite database, mirrored by a deliberately simple in-memory
 //! reference model. After every operation the full database state — leases,
-//! ticket states, run states, queued activations — must equal the model's
+//! ticket states, run states, queued triggers — must equal the model's
 //! prediction, and every grant/denial must match what the model expected.
 //!
 //! Operations are valid-shaped but freely wrong-state: claiming a claimed
@@ -22,7 +22,7 @@ use sloop::db::StoreError;
 use sloop::domain::ticket::TicketState;
 use sloop::outcome::Outcome;
 use sloop::run_store::{Exit, RunAdmission, RunExit, RunStart, Start};
-use sloop::work_state::local::{ActivationKind, NewActivation};
+use sloop::work_state::local::{NewTrigger, TriggerKind};
 use tempfile::TempDir;
 
 use crate::TestStore;
@@ -32,12 +32,12 @@ const CLAIM_LEASE_MS: i64 = 60_000;
 
 #[derive(Debug, Clone)]
 enum Op {
-    /// Queue a fresh immediate activation for a ticket.
+    /// Queue a fresh immediate trigger for a ticket.
     Enqueue {
         ticket: usize,
     },
-    /// Attempt to claim a ticket with its oldest queued activation, or a
-    /// bogus activation id when none is queued.
+    /// Attempt to claim a ticket with its oldest queued trigger, or a
+    /// bogus trigger id when none is queued.
     Claim {
         ticket: usize,
     },
@@ -97,7 +97,7 @@ fn op() -> impl Strategy<Value = Op> {
 #[derive(Debug)]
 struct ModelRun {
     ticket: String,
-    activation: String,
+    trigger: String,
     state: &'static str,
     exited: bool,
 }
@@ -118,9 +118,9 @@ struct Model {
     run_order: Vec<String>,
     /// Ticket id → the lease it is under, if any.
     leases: BTreeMap<String, ModelLease>,
-    /// Ticket id → queued activation ids, oldest first.
+    /// Ticket id → queued trigger ids, oldest first.
     queued: BTreeMap<String, Vec<String>>,
-    activation_created_at: BTreeMap<String, i64>,
+    trigger_created_at: BTreeMap<String, i64>,
 }
 
 struct Harness {
@@ -130,7 +130,7 @@ struct Harness {
     model: Model,
     now_ms: i64,
     run_counter: usize,
-    activation_counter: usize,
+    trigger_counter: usize,
 }
 
 impl Harness {
@@ -174,7 +174,7 @@ impl Harness {
             model,
             now_ms,
             run_counter: 0,
-            activation_counter: 0,
+            trigger_counter: 0,
         }
     }
 
@@ -226,14 +226,14 @@ impl Harness {
     }
 
     fn enqueue(&mut self, ticket: &str) {
-        let id = format!("A{}", self.activation_counter);
-        self.activation_counter += 1;
+        let id = format!("TR{}", self.trigger_counter);
+        self.trigger_counter += 1;
         self.store
             .local
-            .insert_activation(
-                &NewActivation {
+            .insert_trigger(
+                &NewTrigger {
                     id: &id,
-                    kind: ActivationKind::Immediate,
+                    kind: TriggerKind::Immediate,
                     ticket_id: Some(ticket),
                     project_id: None,
                     eligible_at_ms: None,
@@ -241,44 +241,44 @@ impl Harness {
                 },
                 self.now_ms,
             )
-            .expect("insert activation");
+            .expect("insert trigger");
         self.model
-            .activation_created_at
+            .trigger_created_at
             .insert(id.clone(), self.now_ms);
-        self.queue_activation(ticket, id);
+        self.queue_trigger(ticket, id);
     }
 
-    fn queue_activation(&mut self, ticket: &str, activation: String) {
-        let created_at = &self.model.activation_created_at;
+    fn queue_trigger(&mut self, ticket: &str, trigger: String) {
+        let created_at = &self.model.trigger_created_at;
         let queued = self.model.queued.get_mut(ticket).expect("known ticket");
-        queued.push(activation);
+        queued.push(trigger);
         queued.sort_by(|left, right| {
             (created_at[left], left.as_str()).cmp(&(created_at[right], right.as_str()))
         });
     }
 
     fn claim(&mut self, ticket: &str) {
-        let activation = self
+        let trigger = self
             .model
             .queued
             .get(ticket)
             .expect("known ticket")
             .first()
             .cloned();
-        let activation_id = activation.clone().unwrap_or_else(|| "A-none".into());
+        let trigger_id = trigger.clone().unwrap_or_else(|| "A-none".into());
         let run_id = format!("R{}", self.run_counter);
 
         let admission = RunAdmission {
             ticket_id: ticket,
             run_id: &run_id,
-            activation_id: &activation_id,
+            trigger_id: &trigger_id,
             flow_json: "{}",
             ticket_json: "{}",
         };
         let claim = crate::claim(&self.store, &admission, CLAIM_LEASE_MS, self.now_ms);
 
         let ticket_ready = self.model.tickets[ticket] == "ready";
-        match (ticket_ready, activation) {
+        match (ticket_ready, trigger) {
             (false, _) => assert!(claim.is_none(), "{ticket}"),
             (true, None) => {
                 assert!(claim.is_none());
@@ -286,7 +286,7 @@ impl Harness {
                 // `claimed` must have rolled back. The post-op state
                 // comparison verifies exactly that.
             }
-            (true, Some(activation)) => {
+            (true, Some(trigger)) => {
                 let granted =
                     claim.unwrap_or_else(|| panic!("model expected a grant for {ticket}"));
                 assert_eq!(granted.run.run_id, run_id);
@@ -309,7 +309,7 @@ impl Harness {
                     run_id.clone(),
                     ModelRun {
                         ticket: ticket.into(),
-                        activation,
+                        trigger,
                         state: "claimed",
                         exited: false,
                     },
@@ -422,13 +422,13 @@ impl Harness {
 
         self.model.leases.remove(&ticket);
         let run = self.model.runs.get_mut(run_id).expect("known run");
-        let activation = run.activation.clone();
+        let trigger = run.trigger.clone();
         run.state = "aborted";
         run.exited = true;
         if self.model.tickets[ticket.as_str()] == "claimed" {
             *self.model.tickets.get_mut(&ticket).expect("known ticket") = "ready";
         }
-        self.queue_activation(&ticket, activation);
+        self.queue_trigger(&ticket, trigger);
     }
 
     fn settle(&mut self, run_id: &str, outcome: Outcome) {
@@ -455,7 +455,7 @@ impl Harness {
             Outcome::Orphaned => "orphaned",
         };
         run.exited = true;
-        let activation = run.activation.clone();
+        let trigger = run.trigger.clone();
         if self
             .model
             .leases
@@ -475,7 +475,7 @@ impl Harness {
             *self.model.tickets.get_mut(&ticket).expect("known ticket") = settled_state;
             if settled_state == "merged" {
                 // Settling to `merged` retires the ticket's remaining
-                // activations in the same transaction. Every activation here
+                // triggers in the same transaction. Every trigger here
                 // is pinned to its ticket, and dispatch only ever selects a
                 // `ready` one, so none of them could fire again.
                 self.model
@@ -486,8 +486,8 @@ impl Harness {
             }
         }
         if outcome == Outcome::RateLimited {
-            // A delayed retry re-queues the activation it consumed.
-            self.queue_activation(&ticket, activation);
+            // A delayed retry re-queues the trigger it consumed.
+            self.queue_trigger(&ticket, trigger);
         }
     }
 
@@ -557,18 +557,18 @@ impl Harness {
 
         let mut queued: Vec<String> = Vec::new();
         let mut statement = connection
-            .prepare("SELECT id FROM activations WHERE state = 'queued' ORDER BY id")
+            .prepare("SELECT id FROM triggers WHERE state = 'queued' ORDER BY id")
             .expect("prepare");
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))
-            .expect("query activations");
+            .expect("query triggers");
         for row in rows {
-            queued.push(row.expect("activation row"));
+            queued.push(row.expect("trigger row"));
         }
         let mut expected_queued: Vec<String> =
             self.model.queued.values().flatten().cloned().collect();
         expected_queued.sort();
-        assert_eq!(queued, expected_queued, "queued activations diverged");
+        assert_eq!(queued, expected_queued, "queued triggers diverged");
 
         extra_invariants(&connection);
     }

@@ -698,7 +698,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::db::{Db, LEGACY_STAGE_TABLE, StoreError};
+    use crate::db::{Db, LEGACY_STAGE_TABLE, REVERT_TRIGGER_RENAME, StoreError};
     use crate::outcome::Outcome;
     use crate::run_store::test_support::{claim_run, open_seeded, settle_run};
     use crate::run_store::{
@@ -1054,6 +1054,7 @@ mod tests {
                  PRAGMA user_version = 13;"
             ))
             .unwrap();
+        connection.execute_batch(REVERT_TRIGGER_RENAME).unwrap();
         drop(connection);
 
         let store = reopen(&path);

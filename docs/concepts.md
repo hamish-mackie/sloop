@@ -15,7 +15,12 @@ Sloop's socket API.
 ## The life of a run
 
 1. **Select.** The dispatcher pulls ready, unblocked work — a pure function
-   of the queue, optionally scoped to a ticket or project.
+   of the queue, optionally scoped to a ticket or project. What sits in that
+   queue is a **trigger**: the durable record that demand exists. A ticket is
+   *what* to do and a run is one attempt at it; a trigger is *when and
+   whether*. `sloop run` and `sloop post` queue them, `--at`/`--every`/
+   `--overnight` say when they come due, and a recurring one rearms itself
+   each time it fires.
 2. **Gate.** Every spawn, including explicitly named runs, must pass the
    same checks: not paused, inside running hours, below
    `max_parallel_tasks`.
@@ -129,7 +134,7 @@ the outcome from process, Git, check, merge, and policy-gated report evidence:
   with a safe diagnostic.
 - **The vendor rate-limits or returns an unknown rejection** → the ticket
   returns to ready and its agent target cools down for five minutes. The
-  queued activation retries after the cooldown, which survives daemon
+  queued trigger retries after the cooldown, which survives daemon
   restarts. Any commits from a rejected run stay on the preserved run branch.
 
 Sloop recognizes these failures from built-in, versioned vendor rule catalogs.
@@ -233,7 +238,9 @@ attempts, notes, evidence — lives in a local SQLite database that only the
 daemon writes. It is machine-specific and worthless to another clone. The
 committed files always win: the daemon reconciles them into its index at
 startup, and runtime history (such as notes) is the part that cannot be
-reconstructed from files and Git.
+reconstructed from files and Git. Queued triggers are in that same
+irreplaceable category: nothing in the repository records that you asked for a
+run at 02:00, so `sloop reindex` cannot put one back.
 
 Machine-local state never lives in the repository. On Linux it is under
 `~/.local/state/sloop/repositories/<repository>/`, with sockets in

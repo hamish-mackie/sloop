@@ -6,7 +6,7 @@ use sloop::clock::{Clock, SystemClock};
 use support::{FakeAgent, World, wait_until};
 
 #[test]
-fn post_manual_stamps_and_registers_without_an_activation() {
+fn post_manual_stamps_and_registers_without_an_trigger() {
     let world = World::configured();
     fs::write(
         world.root().join(".agents/sloop/config.yaml"),
@@ -43,7 +43,7 @@ fn post_manual_stamps_and_registers_without_an_activation() {
     assert_eq!(response["data"]["ticket"]["model"], "sonnet");
     assert_eq!(response["data"]["ticket"]["effort"], "medium");
     assert_eq!(response["data"]["ticket"]["id"], "TICK-1");
-    assert!(response["data"]["activation"].is_null());
+    assert!(response["data"]["trigger"].is_null());
 
     let contents = fs::read_to_string(world.root().join(ticket)).expect("read stamped ticket");
     assert!(
@@ -316,7 +316,7 @@ fn repost_refreshes_name_blockers_and_worktree_without_changing_identity() {
         serde_json::json!(["T0"])
     );
     assert_eq!(response["data"]["ticket"]["worktree"], "new/branch");
-    assert!(response["data"]["activation"].is_null());
+    assert!(response["data"]["trigger"].is_null());
     let connection = rusqlite::Connection::open(world.db_path()).unwrap();
     let body: String = connection
         .query_row("SELECT body FROM tickets WHERE id = 'T1'", [], |row| {
@@ -351,7 +351,7 @@ fn unknown_target_is_rejected_without_registering_or_activating_the_ticket() {
     let status = World::json_stdout(&world.sloop(&["status"]));
     assert_eq!(status["data"]["tickets"]["ready"], 0);
     assert!(
-        status["data"]["queued_activations"]
+        status["data"]["queued_triggers"]
             .as_array()
             .unwrap()
             .is_empty()
@@ -401,7 +401,7 @@ fn post_rejects_a_file_stem_that_is_not_a_worktree_slug() {
 }
 
 #[test]
-fn post_defaults_to_auto_and_creates_one_queued_activation() {
+fn post_defaults_to_auto_and_creates_one_queued_trigger() {
     let world = World::configured();
     world.start_daemon();
     let ticket = world.write_ticket("cooldown.md", "# Persist cooldowns\n");
@@ -409,12 +409,12 @@ fn post_defaults_to_auto_and_creates_one_queued_activation() {
 
     assert!(output.status.success());
     let response = World::json_stdout(&output);
-    assert_eq!(response["data"]["activation"]["state"], "queued");
-    assert_eq!(response["data"]["activation"]["kind"], "auto");
+    assert_eq!(response["data"]["trigger"]["state"], "queued");
+    assert_eq!(response["data"]["trigger"]["kind"], "auto");
 }
 
 #[test]
-fn post_at_queues_a_timed_activation_and_reposting_reschedules_it() {
+fn post_at_queues_a_timed_trigger_and_reposting_reschedules_it() {
     let world = World::configured();
     world.start_daemon();
     let ticket = world.write_ticket("cooldown.md", "# Persist cooldowns\n");
@@ -428,11 +428,11 @@ fn post_at_queues_a_timed_activation_and_reposting_reschedules_it() {
     );
     let first = World::json_stdout(&output);
     assert_eq!(first["data"]["ticket"]["state"], "ready");
-    assert_eq!(first["data"]["activation"]["kind"], "at");
-    assert_eq!(first["data"]["activation"]["state"], "queued");
-    let first_eligible = first["data"]["activation"]["eligible_at_ms"]
+    assert_eq!(first["data"]["trigger"]["kind"], "at");
+    assert_eq!(first["data"]["trigger"]["state"], "queued");
+    let first_eligible = first["data"]["trigger"]["eligible_at_ms"]
         .as_i64()
-        .expect("timed activation carries its eligibility instant");
+        .expect("timed trigger carries its eligibility instant");
     assert!(first_eligible > world.now_ms());
     assert_eq!(
         SystemClock.local_minute(first_eligible),
@@ -444,22 +444,22 @@ fn post_at_queues_a_timed_activation_and_reposting_reschedules_it() {
     assert!(repost.status.success());
     let second = World::json_stdout(&repost);
     assert_eq!(
-        second["data"]["activation"]["id"], first["data"]["activation"]["id"],
-        "reposting reuses the queued activation"
+        second["data"]["trigger"]["id"], first["data"]["trigger"]["id"],
+        "reposting reuses the queued trigger"
     );
     assert_eq!(
         SystemClock.local_minute(
-            second["data"]["activation"]["eligible_at_ms"]
+            second["data"]["trigger"]["eligible_at_ms"]
                 .as_i64()
-                .expect("rescheduled activation carries its eligibility instant")
+                .expect("rescheduled trigger carries its eligibility instant")
         ),
         4 * 60,
-        "reposting moves the activation to the new local time"
+        "reposting moves the trigger to the new local time"
     );
 }
 
 #[test]
-fn post_hold_registers_a_held_ticket_without_an_activation() {
+fn post_hold_registers_a_held_ticket_without_an_trigger() {
     let world = World::configured();
     world.start_daemon();
     let ticket = world.write_ticket("later.md", "# Do this later\n");
@@ -472,7 +472,7 @@ fn post_hold_registers_a_held_ticket_without_an_activation() {
     assert!(output.status.success());
     let response = World::json_stdout(&output);
     assert_eq!(response["data"]["ticket"]["state"], "held");
-    assert!(response["data"]["activation"].is_null());
+    assert!(response["data"]["trigger"].is_null());
 }
 
 #[test]
@@ -702,7 +702,7 @@ fn reposting_a_failed_ticket_queues_nothing_and_leaves_retry_predictable() {
     });
 
     // `--auto` is the default, and a failed ticket cannot be dispatched, so
-    // the edit must land without minting an activation that can never fire.
+    // the edit must land without minting a trigger that can never fire.
     let repost = world.sloop(&["post", &path]);
     assert!(
         repost.status.success(),
@@ -712,9 +712,9 @@ fn reposting_a_failed_ticket_queues_nothing_and_leaves_retry_predictable() {
     let response = World::json_stdout(&repost);
     assert_eq!(response["data"]["ticket"]["state"], "failed");
     assert_eq!(response["data"]["created"], false);
-    assert!(response["data"]["activation"].is_null());
+    assert!(response["data"]["trigger"].is_null());
     assert_eq!(
-        response["data"]["activation_suppressed"],
+        response["data"]["trigger_suppressed"],
         serde_json::json!({"reason": "terminal_ticket", "state": "failed"})
     );
 
@@ -726,9 +726,9 @@ fn reposting_a_failed_ticket_queues_nothing_and_leaves_retry_predictable() {
     assert_eq!(list["data"]["tickets"][0]["state"], "ready");
     assert_eq!(
         list["data"]["tickets"][0]["reason"],
-        "ready but no queued activation; enqueue with `sloop run`"
+        "ready but no queued trigger; enqueue with `sloop run`"
     );
     let status = World::json_stdout(&world.sloop(&["status"]));
-    assert_eq!(status["data"]["queued_activations"], serde_json::json!([]));
+    assert_eq!(status["data"]["queued_triggers"], serde_json::json!([]));
     assert_eq!(status["data"]["gate"]["active_agents"], 0);
 }

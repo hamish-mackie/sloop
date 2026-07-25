@@ -329,7 +329,7 @@ mod tests {
             attempts: 0,
             hints: ExecutionHints {
                 worktree: None,
-                activation_id: None,
+                trigger_id: None,
                 target: None,
                 model: None,
                 effort: None,

@@ -21,7 +21,7 @@ pub struct TicketRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionHints {
     pub worktree: Option<String>,
-    pub activation_id: Option<String>,
+    pub trigger_id: Option<String>,
     pub target: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,

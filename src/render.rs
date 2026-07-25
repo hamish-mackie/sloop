@@ -113,28 +113,28 @@ fn render_post(data: &Value) -> String {
     // Silence would read as "nothing was asked for". A settled ticket did ask
     // and was refused, so name the state that refused it — and the one verb
     // that undoes it, which exists only for `failed`.
-    if let Some(state) = data["activation_suppressed"]["state"].as_str() {
-        let _ = write!(text, "no activation queued: {id} is {state}");
+    if let Some(state) = data["trigger_suppressed"]["state"].as_str() {
+        let _ = write!(text, "no trigger queued: {id} is {state}");
         if state == "failed" {
             let _ = write!(text, "; `sloop retry {id}` returns it to ready");
         }
         text.push('\n');
     } else {
-        text.push_str(&render_activation(&data["activation"]));
+        text.push_str(&render_trigger(&data["trigger"]));
     }
     text
 }
 
 fn render_run(data: &Value) -> String {
-    render_activation(&data["activation"])
+    render_trigger(&data["trigger"])
 }
 
-fn render_activation(activation: &Value) -> String {
-    let Some(fields) = activation.as_object() else {
+fn render_trigger(trigger: &Value) -> String {
+    let Some(fields) = trigger.as_object() else {
         return String::new();
     };
     let mut text = format!(
-        "activation {} {} ({}",
+        "trigger {} {} ({}",
         fields.get("id").and_then(Value::as_str).unwrap_or("?"),
         fields
             .get("state")
@@ -204,7 +204,7 @@ fn render_status(data: &Value) -> String {
     let _ = writeln!(text, "tickets: {}", counts.join(", "));
 
     // Run lines lead with the alias and the ticket's name, so the line answers
-    // "what is this working on" without a second command. Queued activations
+    // "what is this working on" without a second command. Queued triggers
     // are not runs and keep their own shape.
     let runs = data["runs"]
         .as_array()
@@ -226,7 +226,7 @@ fn render_status(data: &Value) -> String {
         }
     }
 
-    let queued = data["queued_activations"]
+    let queued = data["queued_triggers"]
         .as_array()
         .map(Vec::as_slice)
         .unwrap_or_default();
@@ -925,7 +925,7 @@ mod tests {
                     "state": "running", "ticket": "T1", "ticket_name": "Generalized stages",
                     "project": "default"
                 }],
-                "queued_activations": [],
+                "queued_triggers": [],
                 "tickets": {
                     "ready": 1, "held": 2, "blocked": 0, "claimed": 1,
                     "merged": 3, "failed": 0, "needs_review": 0
@@ -966,7 +966,7 @@ mod tests {
                     "storage": {"writable": false, "reason": "database_full"}
                 },
                 "runs": [],
-                "queued_activations": [],
+                "queued_triggers": [],
                 "tickets": {}
             }),
         );
@@ -1042,7 +1042,7 @@ mod tests {
         );
     }
 
-    fn post_response(created: bool, activation: Value, suppressed: Value) -> ResponseEnvelope {
+    fn post_response(created: bool, trigger: Value, suppressed: Value) -> ResponseEnvelope {
         ResponseEnvelope::success(
             None,
             json!({
@@ -1053,17 +1053,17 @@ mod tests {
                     "state": suppressed["state"].as_str().unwrap_or("ready"),
                 },
                 "created": created,
-                "activation": activation,
-                "activation_suppressed": suppressed,
+                "trigger": trigger,
+                "trigger_suppressed": suppressed,
             }),
         )
     }
 
     #[test]
-    fn a_fresh_post_reports_the_registration_and_its_activation() {
+    fn a_fresh_post_reports_the_registration_and_its_trigger() {
         let response = post_response(
             true,
-            json!({"id": "A95", "kind": "auto", "state": "queued", "ticket": "TICK-43"}),
+            json!({"id": "TR95", "kind": "auto", "state": "queued", "ticket": "TICK-43"}),
             Value::Null,
         );
 
@@ -1071,12 +1071,12 @@ mod tests {
             render(Some("post"), &response),
             "ticket TICK-43 registered from .agents/sloop/tickets/cooldown.md \
              (project default, ready)\n\
-             activation A95 queued (auto, ticket TICK-43)\n"
+             trigger TR95 queued (auto, ticket TICK-43)\n"
         );
     }
 
     #[test]
-    fn a_repost_of_a_terminal_ticket_names_the_state_that_suppressed_the_activation() {
+    fn a_repost_of_a_terminal_ticket_names_the_state_that_suppressed_the_trigger() {
         let merged = post_response(
             false,
             Value::Null,
@@ -1087,7 +1087,7 @@ mod tests {
             render(Some("post"), &merged),
             "ticket TICK-43 updated from .agents/sloop/tickets/cooldown.md \
              (project default, merged)\n\
-             no activation queued: TICK-43 is merged\n"
+             no trigger queued: TICK-43 is merged\n"
         );
 
         // Only `failed` has a verb that undoes it, so only `failed` gets one.
@@ -1101,13 +1101,13 @@ mod tests {
             render(Some("post"), &failed),
             "ticket TICK-43 updated from .agents/sloop/tickets/cooldown.md \
              (project default, failed)\n\
-             no activation queued: TICK-43 is failed; \
+             no trigger queued: TICK-43 is failed; \
              `sloop retry TICK-43` returns it to ready\n"
         );
     }
 
     #[test]
-    fn a_post_that_requested_no_activation_stays_silent_about_one() {
+    fn a_post_that_requested_no_trigger_stays_silent_about_one() {
         let response = post_response(false, Value::Null, Value::Null);
 
         assert_eq!(

@@ -358,7 +358,7 @@ fn invalid_arguments_fail_before_dispatch() {
 }
 
 #[test]
-fn post_rejects_multiple_activation_modes() {
+fn post_rejects_multiple_trigger_modes() {
     let world = World::new();
     let output = world.sloop(&["post", "ticket.md", "--auto", "--manual"]);
 

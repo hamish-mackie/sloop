@@ -149,8 +149,8 @@ fn run_executes_the_fake_agent_in_an_isolated_worktree() {
         String::from_utf8_lossy(&output.stderr)
     );
     let response = World::json_stdout(&output);
-    assert_eq!(response["data"]["activation"]["state"], "queued");
-    assert_eq!(response["data"]["activation"]["ticket"], ticket.as_str());
+    assert_eq!(response["data"]["trigger"]["state"], "queued");
+    assert_eq!(response["data"]["trigger"]["ticket"], ticket.as_str());
 
     wait_until("the fake agent runs in its worktree", || {
         worktree_marker(&world, 1).is_file()
@@ -435,7 +435,7 @@ fn list_explains_paused_failed_held_and_claimed_tickets() {
 
 /// What an operator is told when a ticket is ready but nothing is queued
 /// behind it.
-const NO_ACTIVATION: &str = "ready but no queued activation; enqueue with `sloop run`";
+const NO_TRIGGER: &str = "ready but no queued trigger; enqueue with `sloop run`";
 
 /// The reason `sloop show` gives for a ticket, read from the dashboard rows.
 fn shown_reason(world: &World, ticket: &str) -> serde_json::Value {
@@ -456,10 +456,10 @@ fn shown_reason(world: &World, ticket: &str) -> serde_json::Value {
 }
 
 /// The gate that used to be answered globally: a ready ticket with nothing
-/// queued behind it must say so, even when the queue holds an activation that
+/// queued behind it must say so, even when the queue holds a trigger that
 /// can never select it.
 #[test]
-fn a_ready_ticket_reports_its_own_missing_activation() {
+fn a_ready_ticket_reports_its_own_missing_trigger() {
     let world = World::configured();
     configure_fake_agent(&world, 1, false);
     world.commit_all("initial");
@@ -467,16 +467,16 @@ fn a_ready_ticket_reports_its_own_missing_activation() {
 
     // A plain `--manual` post enqueues nothing, so the ticket sits ready.
     let unactivated = post_manual(&world, "unactivated.md", "# Unactivated\n");
-    assert_eq!(shown_reason(&world, &unactivated), NO_ACTIVATION);
+    assert_eq!(shown_reason(&world, &unactivated), NO_TRIGGER);
     let human = world.sloop_plain(&["show"]);
     assert!(human.status.success());
     assert!(
-        String::from_utf8_lossy(&human.stdout).contains(NO_ACTIVATION),
+        String::from_utf8_lossy(&human.stdout).contains(NO_TRIGGER),
         "{}",
         String::from_utf8_lossy(&human.stdout)
     );
 
-    // The masking case. A merged ticket, pinned by an activation that can
+    // The masking case. A merged ticket, pinned by a trigger that can
     // never fire, leaves the queue non-empty; the global question answered
     // `true` for every ticket in the repository and reported no reason at all.
     let merged = post_manual(&world, "merged-elsewhere.md", "# Merged elsewhere\n");
@@ -485,15 +485,11 @@ fn a_ready_ticket_reports_its_own_missing_activation() {
         status(&world)["tickets"]["merged"] == 1
     });
     assert!(world.sloop(&["run", &merged]).status.success());
-    wait_until("the dead activation settles in the queue", || {
-        status(&world)["queued_activations"]
-            .as_array()
-            .unwrap()
-            .len()
-            == 1
+    wait_until("the dead trigger settles in the queue", || {
+        status(&world)["queued_triggers"].as_array().unwrap().len() == 1
     });
 
-    assert_eq!(shown_reason(&world, &unactivated), NO_ACTIVATION);
+    assert_eq!(shown_reason(&world, &unactivated), NO_TRIGGER);
     // A merged ticket is not waiting on anything and needs no reason.
     assert_eq!(shown_reason(&world, &merged), serde_json::Value::Null);
 }
@@ -501,13 +497,13 @@ fn a_ready_ticket_reports_its_own_missing_activation() {
 /// `sloop retry` moves a failed ticket to `ready` without enqueueing anything,
 /// so the retried ticket has the same nothing behind it as a fresh post.
 #[test]
-fn a_retried_ticket_reports_its_missing_activation() {
+fn a_retried_ticket_reports_its_missing_trigger() {
     let world = World::configured();
     configure_failing_fake_agent(&world, 1, false);
     world.commit_all("initial");
     world.start_daemon();
 
-    // A blocked ticket keeps an activation queued that can never fire, so the
+    // A blocked ticket keeps a trigger queued that can never fire, so the
     // retried ticket's own emptiness is what has to be reported.
     let blocker = post_manual(&world, "retry-blocker.md", "# Retry blocker\n");
     let blocked = post_manual_blocked(&world, "retry-dependent.md", &[blocker.as_str()]);
@@ -519,10 +515,7 @@ fn a_retried_ticket_reports_its_missing_activation() {
         status(&world)["tickets"]["failed"] == 1
     });
     assert_eq!(
-        status(&world)["queued_activations"]
-            .as_array()
-            .unwrap()
-            .len(),
+        status(&world)["queued_triggers"].as_array().unwrap().len(),
         1
     );
     assert_eq!(
@@ -531,7 +524,7 @@ fn a_retried_ticket_reports_its_missing_activation() {
     );
 
     assert!(world.sloop(&["retry", &ticket]).status.success());
-    assert_eq!(shown_reason(&world, &ticket), NO_ACTIVATION);
+    assert_eq!(shown_reason(&world, &ticket), NO_TRIGGER);
 
     // Enqueueing one clears the reason, and the ticket runs again.
     assert!(world.sloop(&["run", &ticket]).status.success());
@@ -619,8 +612,8 @@ fn blocked_dependencies_are_reported_and_release_after_every_blocker_merges() {
     assert!(world.sloop(&["hold", &first]).status.success());
     assert!(world.sloop(&["hold", &second]).status.success());
 
-    // An unscoped activation has no dispatchable ticket while both blockers
-    // are held, and a named activation cannot bypass the dependency gate.
+    // An unscoped trigger has no dispatchable ticket while both blockers
+    // are held, and a named trigger cannot bypass the dependency gate.
     assert!(world.sloop(&["run"]).status.success());
     assert!(world.sloop(&["run", &dependent]).status.success());
     let snapshot = status(&world);
@@ -628,7 +621,7 @@ fn blocked_dependencies_are_reported_and_release_after_every_blocker_merges() {
     assert_eq!(snapshot["tickets"]["held"], 2);
     assert_eq!(snapshot["tickets"]["ready"], 0);
     assert_eq!(snapshot["tickets"]["blocked"], 1);
-    assert_eq!(snapshot["queued_activations"].as_array().unwrap().len(), 2);
+    assert_eq!(snapshot["queued_triggers"].as_array().unwrap().len(), 2);
 
     let listed = World::json_stdout(&world.sloop(&["list"]));
     let row = listed["data"]["tickets"]
@@ -643,7 +636,7 @@ fn blocked_dependencies_are_reported_and_release_after_every_blocker_merges() {
         format!("blocked by unmerged {first}, {second}")
     );
 
-    // The old unscoped activation takes the first released blocker.
+    // The old unscoped trigger takes the first released blocker.
     assert!(world.sloop(&["ready", &first]).status.success());
     wait_until("the first blocker merges", || {
         status(&world)["tickets"]["merged"] == 1
@@ -692,7 +685,7 @@ fn a_failed_blocker_keeps_its_dependent_blocked() {
     assert_eq!(snapshot["gate"]["active_agents"], 0);
     assert_eq!(snapshot["tickets"]["failed"], 1);
     assert_eq!(snapshot["tickets"]["blocked"], 1);
-    assert_eq!(snapshot["queued_activations"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot["queued_triggers"].as_array().unwrap().len(), 1);
     assert!(!worktree_marker(&world, 2).exists());
 }
 
@@ -714,7 +707,7 @@ fn parallelism_never_exceeds_the_configured_capacity() {
     let data = status(&world);
     assert_eq!(data["gate"]["active_agents"], 1);
     assert_eq!(data["runs"].as_array().unwrap().len(), 1);
-    assert_eq!(data["queued_activations"].as_array().unwrap().len(), 1);
+    assert_eq!(data["queued_triggers"].as_array().unwrap().len(), 1);
     assert!(
         !world.run_worktree(2).exists(),
         "the second run spawned past the capacity gate"
@@ -762,7 +755,7 @@ fn pause_gates_the_queue_survives_restart_and_resume_drains_it() {
         let data = status(&world);
         assert_eq!(data["daemon"]["paused"], true);
         assert_eq!(data["gate"]["active_agents"], 0);
-        assert_eq!(data["queued_activations"].as_array().unwrap().len(), 1);
+        assert_eq!(data["queued_triggers"].as_array().unwrap().len(), 1);
         assert!(
             !worktree_marker(&world, 2).exists(),
             "the second ticket started while paused"
@@ -816,7 +809,7 @@ fn a_project_scoped_run_selects_only_that_projects_tickets() {
     let output = world.sloop(&["run", "--project", "backend"]);
     assert!(output.status.success());
     assert_eq!(
-        World::json_stdout(&output)["data"]["activation"]["project"],
+        World::json_stdout(&output)["data"]["trigger"]["project"],
         "backend"
     );
 
@@ -915,7 +908,7 @@ fn overnight_dispatches_once_inside_the_window() {
     let output = world.sloop(&["run", "--overnight", "--only", &format!("{first},{second}")]);
     assert!(output.status.success());
     assert_eq!(
-        World::json_stdout(&output)["data"]["activation"]["kind"],
+        World::json_stdout(&output)["data"]["trigger"]["kind"],
         "overnight"
     );
     assert!(!worktree_marker(&world, 1).exists());
@@ -977,8 +970,8 @@ fn every_waits_for_the_window_rearms_and_dispatches_again() {
     ]);
     assert!(output.status.success());
     let response = World::json_stdout(&output);
-    assert_eq!(response["data"]["activation"]["kind"], "every");
-    assert_eq!(response["data"]["activation"]["interval_ms"], 120_000);
+    assert_eq!(response["data"]["trigger"]["kind"], "every");
+    assert_eq!(response["data"]["trigger"]["interval_ms"], 120_000);
 
     world.tick(Duration::from_secs(2 * 60));
     assert!(!worktree_marker(&world, 1).exists());
@@ -1003,7 +996,7 @@ fn every_waits_for_the_window_rearms_and_dispatches_again() {
     // The original two-minute cadence makes the next slot one minute after
     // this delayed dispatch, rather than immediately or two minutes from now.
     world.tick(Duration::from_secs(60));
-    wait_until("the rearmed recurring activation dispatches again", || {
+    wait_until("the rearmed recurring trigger dispatches again", || {
         worktree_marker(&world, 2).is_file()
     });
     assert_eq!(
@@ -1039,10 +1032,7 @@ fn at_dispatches_only_once_its_scheduled_time_passes() {
         "post --at failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        World::json_stdout(&output)["data"]["activation"]["kind"],
-        "at"
-    );
+    assert_eq!(World::json_stdout(&output)["data"]["trigger"]["kind"], "at");
     assert!(
         status(&world)["next_wake"].is_string(),
         "the dispatcher schedules a deadline instead of polling"
@@ -1052,7 +1042,7 @@ fn at_dispatches_only_once_its_scheduled_time_passes() {
     assert!(!worktree_marker(&world, 1).exists());
 
     world.tick(Duration::from_secs(2 * 60));
-    wait_until("the timed activation dispatches once due", || {
+    wait_until("the timed trigger dispatches once due", || {
         worktree_marker(&world, 1).is_file()
     });
 }
@@ -1115,12 +1105,12 @@ fn closing_time_does_not_cancel_active_work_or_start_the_next_run() {
     });
     let data = status(&world);
     assert_eq!(data["gate"]["running_hours"]["open"], false);
-    assert_eq!(data["queued_activations"].as_array().unwrap().len(), 1);
+    assert_eq!(data["queued_triggers"].as_array().unwrap().len(), 1);
     assert!(!worktree_marker(&world, 2).exists());
 }
 
 #[test]
-fn hold_then_ready_round_trips_an_auto_activation_without_dispatching_while_held() {
+fn hold_then_ready_round_trips_an_auto_trigger_without_dispatching_while_held() {
     let world = World::configured();
     let current = SystemClock.local_minute(world.now_ms());
     let start = (current + 2) % (24 * 60);
@@ -1147,10 +1137,7 @@ fn hold_then_ready_round_trips_an_auto_activation_without_dispatching_while_held
     });
     assert!(!worktree_marker(&world, 1).exists());
     assert_eq!(
-        status(&world)["queued_activations"]
-            .as_array()
-            .unwrap()
-            .len(),
+        status(&world)["queued_triggers"].as_array().unwrap().len(),
         1
     );
 
@@ -1158,7 +1145,7 @@ fn hold_then_ready_round_trips_an_auto_activation_without_dispatching_while_held
     assert!(ready.status.success());
     assert_eq!(World::json_stdout(&ready)["data"]["previous_state"], "held");
     assert_eq!(World::json_stdout(&ready)["data"]["state"], "ready");
-    wait_until("released activation runs", || {
+    wait_until("released trigger runs", || {
         worktree_marker(&world, 1).is_file()
     });
 }
@@ -1424,16 +1411,16 @@ fn durable_capacity_is_repaired_before_another_agent_can_spawn() {
         .expect("claim durable ticket");
     transaction
         .execute(
-            "INSERT INTO activations
+            "INSERT INTO triggers
                  (id, kind, state, ticket_id, created_at_ms, updated_at_ms)
              VALUES ('A-capacity', 'auto', 'completed', ?1, 1, 1)",
             [&leased_id],
         )
-        .expect("insert durable activation");
+        .expect("insert durable trigger");
     transaction
         .execute(
             "INSERT INTO runs
-                 (id, activation_id, ticket_id, state, attempt, pid, created_at_ms, updated_at_ms)
+                 (id, trigger_id, ticket_id, state, attempt, pid, created_at_ms, updated_at_ms)
              VALUES ('R-capacity', 'A-capacity', ?1, 'running', 1, ?2, 1, 1)",
             rusqlite::params![leased_id, i64::from(daemon_pid)],
         )

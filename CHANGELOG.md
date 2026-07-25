@@ -82,6 +82,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **What Sloop called an *activation* is now a *trigger*.** The scheduling model
+  has three nouns — a ticket is what to do, a run is one attempt at it, and the
+  third is the durable record that demand exists, the thing that makes the
+  dispatcher pick a ticket up. "Activation" named the act of activating rather
+  than the row waiting in a queue, so every mention of it had to be glossed
+  first; "the trigger fired" and "the trigger is pinned to TICK-63" read without
+  one. Scheduling, selection, claiming, and rearm behaviour are unchanged.
+
+  Operator-visible consequences: `sloop run` prints `trigger TR91 queued (now,
+  ticket TICK-63)`; trigger ids widen from `A<ordinal>` to `TR<ordinal>`,
+  because `T91` reads as a ticket id beside `TICK-91`; and the dashboard field
+  `queued_activations` becomes `queued_triggers`. On the wire, `post` and `run`
+  take a `trigger` argument where they took `activation`, and `post` answers
+  with `trigger` and `trigger_suppressed`. See "The activation → trigger
+  rename" in `docs/protocol.md` for the full field-by-field table.
+
+  Upgrading rewrites the database in place, ids and all. Queued triggers are
+  pending work recorded in no committed file and no commit, so `sloop reindex`
+  cannot rebuild one; the migration carries every row across instead.
 - `sloop verdict --confidence` on a `reported` stage is now recorded rather
   than discarded, so the flag means the same thing from a stage worker as from
   a panel reviewer. `sloop show <run>` prints it beside that stage's verdict
@@ -104,6 +123,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Deprecated
 
+- The `queued_activations` field on `status` and on the `show` dashboard, in
+  favour of `queued_triggers`. Both are emitted carrying the identical value,
+  following the precedent set by the `list` → `show` aliases;
+  `queued_activations` is **removed in 0.5.0**. The other envelope fields the
+  rename touched are swaps rather than aliases — see `docs/protocol.md`.
 - `on_fail` repair blocks. `fail_action: { return_to: <stage> }` covers the
   same ground with the flow's own stages — a failing check stage returning to
   the stage it guards — and the daemon now logs a `flow_on_fail_deprecated`

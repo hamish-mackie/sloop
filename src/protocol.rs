@@ -188,12 +188,12 @@ pub struct PostArgs {
     pub project: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow: Option<String>,
-    pub activation: PostActivation,
+    pub trigger: PostTrigger,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PostActivation {
+pub enum PostTrigger {
     Auto,
     At { time: String },
     Manual,
@@ -207,13 +207,13 @@ pub struct RunArgs {
     pub ticket: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
-    pub activation: RunActivation,
+    pub trigger: RunTrigger,
     pub only: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RunActivation {
+pub enum RunTrigger {
     Now,
     At { local_time: String },
     Every { interval_ms: u64 },
@@ -428,7 +428,7 @@ mod tests {
 
     use super::{
         EmptyArgs, ErrorBody, ErrorCode, Request, RequestEnvelope, RequestId, ResponseEnvelope,
-        RunActivation, RunArgs,
+        RunArgs, RunTrigger,
     };
 
     #[test]
@@ -438,7 +438,7 @@ mod tests {
             Request::Run(RunArgs {
                 ticket: Some("T1".into()),
                 project: None,
-                activation: RunActivation::Now,
+                trigger: RunTrigger::Now,
                 only: Vec::new(),
             }),
             None,
@@ -453,7 +453,7 @@ mod tests {
                 "verb": "run",
                 "args": {
                     "ticket": "T1",
-                    "activation": {"kind": "now"},
+                    "trigger": {"kind": "now"},
                     "only": []
                 },
                 "token": null

@@ -7,9 +7,9 @@ use rusqlite::Connection;
 mod migrations;
 
 #[cfg(test)]
-pub(crate) use migrations::LEGACY_STAGE_TABLE;
+pub(crate) use migrations::{LEGACY_STAGE_TABLE, REVERT_TRIGGER_RENAME};
 
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 
 // `synchronous = NORMAL` is the standard WAL pairing: commits skip the
 // per-transaction fsync (durability moves to checkpoints), which keeps the
@@ -96,8 +96,8 @@ pub enum StoreError {
         state: String,
         requested: String,
     },
-    ActivationNotQueued {
-        activation_id: String,
+    TriggerNotQueued {
+        trigger_id: String,
     },
     LeaseNotHeld {
         ticket_id: String,
@@ -171,9 +171,9 @@ impl fmt::Display for StoreError {
                 formatter,
                 "ticket `{ticket_id}` is `{state}` and cannot be changed to `{requested}`"
             ),
-            Self::ActivationNotQueued { activation_id } => write!(
+            Self::TriggerNotQueued { trigger_id } => write!(
                 formatter,
-                "activation `{activation_id}` is not queued for dispatch"
+                "trigger `{trigger_id}` is not queued for dispatch"
             ),
             Self::LeaseNotHeld { ticket_id, run_id } => write!(
                 formatter,

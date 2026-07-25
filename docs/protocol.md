@@ -86,24 +86,24 @@ Patterns that fall out of the verbs:
   sequence them, then `show` a ticket pattern to observe why work is not
   running.
 - **Register or refresh a ticket** — `post` returns `ticket`, `created`,
-  `activation`, and `activation_suppressed`. `created` is `false` when the
+  `trigger`, and `trigger_suppressed`. `created` is `false` when the
   file was already registered and the post only refreshed its indexed
   content.
 
-  An activation is queued only when the post leaves the ticket in `ready`.
-  `--manual` and `--hold` request none, so `activation` is null and
-  `activation_suppressed` is null too. Reposting a ticket that is `merged`,
+  A trigger is queued only when the post leaves the ticket in `ready`.
+  `--manual` and `--hold` request none, so `trigger` is null and
+  `trigger_suppressed` is null too. Reposting a ticket that is `merged`,
   `failed`, or `needs_review` still refreshes the index, but a post cannot
   return such a ticket to `ready`, so nothing is queued and nothing is
-  rescheduled — including with `--at`. There `activation` is null and
-  `activation_suppressed` is
+  rescheduled — including with `--at`. There `trigger` is null and
+  `trigger_suppressed` is
   `{"reason": "terminal_ticket", "state": "<ticket state>"}`. Read
-  `activation_suppressed`, not a null `activation`, to tell "none requested"
+  `trigger_suppressed`, not a null `trigger`, to tell "none requested"
   apart from "requested and refused".
 - **Build a dashboard or search tickets** — `show` takes optional `ref` and
   `limit` arguments. With neither, it returns the dashboard. The dashboard
   preserves the status fields (`daemon`, `gate`, `runs`,
-  `queued_activations`, `tickets`, and optional `next_wake`) and adds
+  `queued_triggers`, `tickets`, and optional `next_wake`) and adds
   `kind: "dashboard"`, `recent`, `recent_total`, and `recent_limit`.
   `recent` is newest first; `recent_total` is the untruncated count and
   `recent_limit` is the requested limit or the default `10`.
@@ -235,9 +235,36 @@ The existing status fields and top-level ticket rows keep their meanings.
 Existing v1 `status`, `list`, and `wait` requests remain accepted, although
 the CLI names are hidden deprecated aliases for the `show` surface.
 
-`post`'s `created` and `activation_suppressed` are additive in the same sense.
-`activation` keeps its meaning; it was already null whenever no activation was
+`post`'s `created` and `trigger_suppressed` are additive in the same sense.
+`trigger` keeps its meaning; it was already null whenever no trigger was
 queued, and the new field only explains which null it is.
+
+### The activation → trigger rename
+
+What Sloop used to call an *activation* is now a **trigger**. The concept, the
+values, and the scheduling behaviour are unchanged; only the vocabulary moved.
+Two things follow for clients.
+
+`queued_activations` on `status` and on the `show` dashboard is now
+`queued_triggers`. **Both fields are emitted, carrying the identical value.**
+`queued_activations` is deprecated as of **0.4.0** and is **removed in 0.5.0** —
+read `queued_triggers` and the transition costs you nothing.
+
+The remaining renames are swaps, not aliases, and they land in 0.4.0 with no
+transition period:
+
+| Was | Is |
+| --- | --- |
+| `post` argument `activation` | `trigger` |
+| `run` argument `activation` | `trigger` |
+| `post` response `activation` | `trigger` |
+| `post` response `activation_suppressed` | `trigger_suppressed` |
+
+Both request arguments are `deny_unknown_fields`, so a client that still sends
+`activation` is rejected outright rather than silently defaulted. Trigger ids
+also change shape: they were `A<ordinal>` (`A91`) and are now `TR<ordinal>`
+(`TR91`). Existing ids are rewritten in place when the daemon upgrades, so a
+client holding an old id must re-read it rather than assume it still resolves.
 
 The same rule applies to `show`'s run and stage history: `value.runs`,
 `value.stages`, `value.attempt`, `value.agent_exit_code`, and the timeline

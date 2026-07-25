@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::Duration;
 
-use support::{World, process_alive, wait_until};
+use support::{World, process_alive, revert_trigger_rename, wait_until};
 
 /// Writes a scripted fake agent and a repository config pointing at it, with
 /// an optional flow test command. The agent script is committed before
@@ -782,12 +782,13 @@ fn restart_between_exec_stages_skips_the_completed_stage() {
     );
 }
 
-/// Rewrites the run into the shape it had two schema versions ago: stage rows
+/// Rewrites the run into the shape it had three schema versions ago: stage rows
 /// with no `seq` and no `phase` in a table named after the regime that wrote
-/// them, a run state named after that regime, and its process checkpoint under
-/// the old evidence kind. Putting the schema version back makes the next open a
-/// genuine pre-migration database.
+/// them, a run state named after that regime, its process checkpoint under the
+/// old evidence kind, and triggers still spelled `activations`. Putting the
+/// schema version back makes the next open a genuine pre-migration database.
 fn plant_old_stage_shape(world: &World) {
+    revert_trigger_rename(world);
     let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
     connection
         .execute_batch(
@@ -2275,7 +2276,7 @@ fn cooldown_and_automatic_retry_survive_a_daemon_restart() {
     assert!(row["reason"].as_str().unwrap().contains("cooling down"));
 
     world.tick(Duration::from_secs(301));
-    wait_until("the released activation retries after cooldown", || {
+    wait_until("the released trigger retries after cooldown", || {
         tickets(&world)["merged"] == 1
     });
     assert!(world.root().join("work.txt").is_file());

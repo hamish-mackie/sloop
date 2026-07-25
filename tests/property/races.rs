@@ -20,7 +20,7 @@ use rusqlite::Connection;
 use sloop::domain::ticket::TicketState;
 use sloop::outcome::Outcome;
 use sloop::run_store::{Exit, RunAdmission, RunExit, RunStart, Start};
-use sloop::work_state::local::{ActivationKind, NewActivation};
+use sloop::work_state::local::{NewTrigger, TriggerKind};
 use tempfile::TempDir;
 
 use crate::TestStore;
@@ -78,13 +78,13 @@ impl Arena {
             .expect("insert ticket");
     }
 
-    fn add_activation(&self, store: &TestStore, id: &str, ticket: &str) {
+    fn add_trigger(&self, store: &TestStore, id: &str, ticket: &str) {
         store
             .local
-            .insert_activation(
-                &NewActivation {
+            .insert_trigger(
+                &NewTrigger {
                     id,
-                    kind: ActivationKind::Immediate,
+                    kind: TriggerKind::Immediate,
                     ticket_id: Some(ticket),
                     project_id: None,
                     eligible_at_ms: None,
@@ -92,7 +92,7 @@ impl Arena {
                 },
                 self.now(),
             )
-            .expect("insert activation");
+            .expect("insert trigger");
     }
 
     fn check_invariants(&self) {
@@ -101,11 +101,11 @@ impl Arena {
     }
 }
 
-fn run_admission<'a>(ticket: &'a str, run_id: &'a str, activation_id: &'a str) -> RunAdmission<'a> {
+fn run_admission<'a>(ticket: &'a str, run_id: &'a str, trigger_id: &'a str) -> RunAdmission<'a> {
     RunAdmission {
         ticket_id: ticket,
         run_id,
-        activation_id,
+        trigger_id,
         flow_json: "{}",
         ticket_json: "{}",
     }
@@ -146,23 +146,22 @@ fn simultaneous_claims_grant_exactly_one_winner() {
 
     for round in 0..20 {
         let ticket = format!("T{round}");
-        let activation = format!("A{round}");
+        let trigger = format!("TR{round}");
         arena.add_ticket(&setup, &ticket);
-        arena.add_activation(&setup, &activation, &ticket);
+        arena.add_trigger(&setup, &trigger, &ticket);
 
         let barrier = Barrier::new(THREADS);
         let grants: Vec<bool> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..THREADS)
                 .map(|thread| {
-                    let (arena, ticket, activation, barrier) =
-                        (&arena, &ticket, &activation, &barrier);
+                    let (arena, ticket, trigger, barrier) = (&arena, &ticket, &trigger, &barrier);
                     scope.spawn(move || {
                         let store = arena.open();
                         let run_id = format!("{ticket}-R{thread}");
                         barrier.wait();
                         crate::claim(
                             &store,
-                            &run_admission(ticket, &run_id, activation),
+                            &run_admission(ticket, &run_id, trigger),
                             60_000,
                             arena.now(),
                         )
@@ -191,14 +190,14 @@ fn simultaneous_exit_checkpoints_grant_exactly_one_owner() {
 
     for round in 0..20 {
         let ticket = format!("T{round}");
-        let activation = format!("A{round}");
+        let trigger = format!("TR{round}");
         let run_id = format!("{ticket}-R0");
         arena.add_ticket(&setup, &ticket);
-        arena.add_activation(&setup, &activation, &ticket);
+        arena.add_trigger(&setup, &trigger, &ticket);
         assert!(
             crate::claim(
                 &setup,
-                &run_admission(&ticket, &run_id, &activation),
+                &run_admission(&ticket, &run_id, &trigger),
                 60_000,
                 arena.now()
             )
@@ -255,13 +254,13 @@ fn simultaneous_settlements_land_exactly_once() {
 
     for round in 0..20 {
         let ticket = format!("T{round}");
-        let activation = format!("A{round}");
+        let trigger = format!("TR{round}");
         let run_id = format!("{ticket}-R0");
         arena.add_ticket(&setup, &ticket);
-        arena.add_activation(&setup, &activation, &ticket);
+        arena.add_trigger(&setup, &trigger, &ticket);
         crate::claim(
             &setup,
-            &run_admission(&ticket, &run_id, &activation),
+            &run_admission(&ticket, &run_id, &trigger),
             60_000,
             arena.now(),
         )
@@ -349,13 +348,13 @@ fn uncoordinated_lifecycle_hammer_preserves_invariants() {
                     barrier.wait();
                     for iteration in 0..ITERATIONS {
                         let ticket = POOL[(thread + iteration) % POOL.len()];
-                        let activation = format!("{ticket}-{thread}-{iteration}");
+                        let trigger = format!("{ticket}-{thread}-{iteration}");
                         let run_id = format!("{ticket}-{thread}-{iteration}-run");
-                        arena.add_activation(&store, &activation, ticket);
+                        arena.add_trigger(&store, &trigger, ticket);
 
                         if crate::claim(
                             &store,
-                            &run_admission(ticket, &run_id, &activation),
+                            &run_admission(ticket, &run_id, &trigger),
                             60_000,
                             arena.now(),
                         )

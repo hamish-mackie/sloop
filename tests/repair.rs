@@ -461,7 +461,7 @@ fn recovery_releases_a_claim_whose_run_commit_never_landed() {
         .unwrap();
     connection
         .execute(
-            "INSERT INTO activations
+            "INSERT INTO triggers
                  (id, kind, state, ticket_id, created_at_ms, updated_at_ms)
              VALUES ('A-window', 'immediate', 'completed', ?1, ?2, ?2)",
             rusqlite::params![ticket, now_ms],
@@ -469,7 +469,7 @@ fn recovery_releases_a_claim_whose_run_commit_never_landed() {
         .unwrap();
     connection
         .execute(
-            "INSERT INTO activations
+            "INSERT INTO triggers
                  (id, kind, state, ticket_id, created_at_ms, updated_at_ms)
              VALUES ('A-other', 'immediate', 'completed', ?1, ?2, ?3)",
             rusqlite::params![ticket, now_ms + 1, now_ms + 1],
@@ -490,7 +490,7 @@ fn recovery_releases_a_claim_whose_run_commit_never_landed() {
              VALUES (?1, 'R-window', ?2, ?3, ?3, ?4)",
             rusqlite::params![
                 ticket,
-                r#"{"activation":"A-window","owner":"R-window"}"#,
+                r#"{"trigger":"A-window","owner":"R-window"}"#,
                 now_ms,
                 now_ms + 60_000
             ],
@@ -516,7 +516,7 @@ fn recovery_releases_a_claim_whose_run_commit_never_landed() {
     assert_eq!(
         connection
             .query_row(
-                "SELECT state FROM activations WHERE id = 'A-window'",
+                "SELECT state FROM triggers WHERE id = 'A-window'",
                 [],
                 |row| row.get::<_, String>(0),
             )
@@ -526,7 +526,7 @@ fn recovery_releases_a_claim_whose_run_commit_never_landed() {
     assert_eq!(
         connection
             .query_row(
-                "SELECT state FROM activations WHERE id = 'A-other'",
+                "SELECT state FROM triggers WHERE id = 'A-other'",
                 [],
                 |row| row.get::<_, String>(0),
             )
@@ -572,7 +572,7 @@ fn recovery_releases_a_terminal_run_whose_source_release_never_landed() {
     let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
     connection
         .execute(
-            "INSERT INTO activations
+            "INSERT INTO triggers
                  (id, kind, state, ticket_id, created_at_ms, updated_at_ms)
              VALUES ('A-settlement-window', 'immediate', 'completed', ?1, ?2, ?2)",
             rusqlite::params![ticket, now_ms],
@@ -589,7 +589,7 @@ fn recovery_releases_a_terminal_run_whose_source_release_never_landed() {
     connection
         .execute(
             "INSERT INTO runs
-                 (id, activation_id, ticket_id, state, attempt, branch, exit_code,
+                 (id, trigger_id, ticket_id, state, attempt, branch, exit_code,
                   exited_at_ms, created_at_ms, updated_at_ms)
              VALUES ('R-settlement-window', 'A-settlement-window', ?1, 'failed', 1,
                      'sloop/settlement-window', 1, ?2, ?2, ?2)",
@@ -613,7 +613,7 @@ fn recovery_releases_a_terminal_run_whose_source_release_never_landed() {
              VALUES (?1, 'R-settlement-window', ?2, ?3, ?3, ?4)",
             rusqlite::params![
                 ticket,
-                r#"{"activation":"A-settlement-window","owner":"R-settlement-window"}"#,
+                r#"{"trigger":"A-settlement-window","owner":"R-settlement-window"}"#,
                 now_ms,
                 now_ms + 60_000
             ],
@@ -646,7 +646,7 @@ fn recovery_releases_a_terminal_run_whose_source_release_never_landed() {
     assert_eq!(
         connection
             .query_row(
-                "SELECT state FROM activations WHERE id = 'A-settlement-window'",
+                "SELECT state FROM triggers WHERE id = 'A-settlement-window'",
                 [],
                 |row| row.get::<_, String>(0),
             )
@@ -670,7 +670,7 @@ fn recovery_applies_recorded_external_merge_without_the_run_branch() {
     let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
     connection
         .execute(
-            "INSERT INTO activations
+            "INSERT INTO triggers
                  (id, kind, state, ticket_id, created_at_ms, updated_at_ms)
              VALUES ('A-external-window', 'immediate', 'completed', ?1, ?2, ?2)",
             rusqlite::params![ticket, now_ms],
@@ -686,7 +686,7 @@ fn recovery_applies_recorded_external_merge_without_the_run_branch() {
     connection
         .execute(
             "INSERT INTO runs
-                 (id, activation_id, ticket_id, state, attempt, branch, exit_code,
+                 (id, trigger_id, ticket_id, state, attempt, branch, exit_code,
                   exited_at_ms, created_at_ms, updated_at_ms)
              VALUES ('R-external-window', 'A-external-window', ?1, 'needs_review', 1,
                      'sloop/deleted-external-window', 0, ?2, ?2, ?2)",

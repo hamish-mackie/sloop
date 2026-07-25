@@ -3,6 +3,14 @@ use std::fmt;
 pub const DEFAULT_TICKET_PREFIX: &str = "TICK";
 pub const DEFAULT_PROJECT_PREFIX: &str = "PROJ";
 
+/// Trigger ids are `TR<ordinal>`, with no separator: `TR91`. Two letters, not
+/// one — a bare `T91` reads as a ticket id beside `TICK-91`, which is exactly
+/// the confusion an id prefix exists to prevent.
+pub const TRIGGER_ID_PREFIX: &str = "TR";
+
+/// Note ids are `N<ordinal>`.
+pub const NOTE_ID_PREFIX: &str = "N";
+
 /// Prefixes stay safe as unquoted frontmatter scalars while still allowing
 /// readable multi-part names such as `MY-WORK`.
 pub fn valid_prefix(prefix: &str) -> bool {

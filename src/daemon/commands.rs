@@ -12,14 +12,12 @@ use crate::config::parse_local_time;
 use crate::db::StoreError;
 use crate::domain::ticket::TicketState;
 use crate::frontmatter::{self, Frontmatter};
-use crate::ids::next_id;
+use crate::ids::{TRIGGER_ID_PREFIX, next_id};
 use crate::logging::LogLevel;
 use crate::protocol::{ErrorBody, ListArgs, ShowArgs};
 use crate::run_store::{EventRecord, RunRecord, RunState, RunStore};
 use crate::runner::local::run_output_path;
-use crate::work_state::local::{
-    ActivationKind, LocalSqlite, NewActivation, ProjectRecord, TicketRecord,
-};
+use crate::work_state::local::{LocalSqlite, NewTrigger, ProjectRecord, TicketRecord, TriggerKind};
 
 use super::dispatcher::{
     DispatcherState, LOGS_PAGE_LIMIT, LOGS_TAIL_LIMIT, conflict, internal, invalid_arguments,
@@ -363,13 +361,13 @@ pub(super) fn handle_status(state: &DispatcherState) -> Result<serde_json::Value
         })
         .collect::<Vec<_>>();
     let active_agents = runs.len();
-    let queued = local_lookup(state, LocalSqlite::queued_activations)?
+    let queued = local_lookup(state, LocalSqlite::queued_triggers)?
         .into_iter()
-        .map(|activation| {
+        .map(|trigger| {
             json!({
-                "id": activation.id,
-                "ticket": activation.ticket_id,
-                "project": activation.project_id,
+                "id": trigger.id,
+                "ticket": trigger.ticket_id,
+                "project": trigger.project_id,
                 "state": "queued",
             })
         })
@@ -411,6 +409,12 @@ pub(super) fn handle_status(state: &DispatcherState) -> Result<serde_json::Value
         },
         "gate": gate,
         "runs": runs,
+        "queued_triggers": queued,
+        // Deprecated in 0.4.0, removed in 0.5.0. `queued_activations` is what
+        // this field was called before the concept was named `trigger`, and it
+        // is emitted alongside its replacement carrying the identical value so
+        // a dashboard written against the old envelope keeps working for one
+        // release. Same treatment the `list` -> `show` aliases got.
         "queued_activations": queued,
         "tickets": {
             "ready": tickets.ready,
@@ -465,7 +469,7 @@ fn ticket_rows(
 ) -> Result<serde_json::Value, ErrorBody> {
     let now_ms = state.clock.now_ms();
     let at_capacity = run_lookup(state, RunStore::active_runs)?.len() >= state.max_agents;
-    // Every gate here is global; the activation gate is per ticket and is
+    // Every gate here is global; the trigger gate is per ticket and is
     // answered inside the loop below.
     let global_gates = crate::eligibility::Gates {
         paused: state.paused,
@@ -474,7 +478,7 @@ fn ticket_rows(
         agent_configured: state.agent.is_some(),
         hours_open: running_hours_open(state, now_ms),
         at_capacity,
-        has_queued_activation: false,
+        has_queued_trigger: false,
     };
     // `tickets` already arrives newest first, so truncating here keeps the
     // newest N and spares the per-ticket lookups below for the rest.
@@ -514,8 +518,8 @@ fn ticket_rows(
         // queue non-empty": a trigger pinned to another ticket must not explain
         // this one away.
         let gates = crate::eligibility::Gates {
-            has_queued_activation: local_lookup(state, |work_state| {
-                work_state.has_claimable_activation(&ticket.id, now_ms)
+            has_queued_trigger: local_lookup(state, |work_state| {
+                work_state.has_claimable_trigger(&ticket.id, now_ms)
             })?,
             ..global_gates
         };
@@ -565,13 +569,13 @@ fn ticket_rows(
     Ok(json!({"tickets": rows}))
 }
 
-/// Validates a `run` request and persists one queued activation. Acceptance
+/// Validates a `run` request and persists one queued trigger. Acceptance
 /// never implies a spawn; reconciliation decides that separately.
 pub(super) fn handle_run(
     state: &mut DispatcherState,
     args: &crate::protocol::RunArgs,
 ) -> Result<serde_json::Value, ErrorBody> {
-    use crate::protocol::RunActivation;
+    use crate::protocol::RunTrigger;
 
     if args.ticket.is_some() && args.project.is_some() {
         return Err(invalid_arguments(
@@ -612,17 +616,17 @@ pub(super) fn handle_run(
     }
 
     let now_ms = state.clock.now_ms();
-    let (kind, echo_kind, eligible_at_ms, interval_ms) = match &args.activation {
-        RunActivation::Now => (ActivationKind::Immediate, "now", None, None),
-        RunActivation::At { local_time } => {
+    let (kind, echo_kind, eligible_at_ms, interval_ms) = match &args.trigger {
+        RunTrigger::Now => (TriggerKind::Immediate, "now", None, None),
+        RunTrigger::At { local_time } => {
             let minute = parse_local_time(local_time).ok_or_else(|| {
                 invalid_arguments(&format!("time `{local_time}` must use a valid HH:MM value"))
             })?;
             let eligible_at_ms = next_local_minute_ms(state.clock.as_ref(), now_ms, minute)
                 .ok_or_else(|| invalid_arguments("the requested local time is out of range"))?;
-            (ActivationKind::At, "at", Some(eligible_at_ms), None)
+            (TriggerKind::At, "at", Some(eligible_at_ms), None)
         }
-        RunActivation::Every { interval_ms } => {
+        RunTrigger::Every { interval_ms } => {
             let interval_ms = i64::try_from(*interval_ms)
                 .ok()
                 .filter(|interval_ms| *interval_ms > 0)
@@ -631,13 +635,13 @@ pub(super) fn handle_run(
                 .checked_add(interval_ms)
                 .ok_or_else(|| invalid_arguments("--every interval is too large"))?;
             (
-                ActivationKind::Every,
+                TriggerKind::Every,
                 "every",
                 Some(eligible_at_ms),
                 Some(interval_ms),
             )
         }
-        RunActivation::Overnight => {
+        RunTrigger::Overnight => {
             let eligible_at_ms = state.running_hours.as_ref().map_or(now_ms, |hours| {
                 if hours.is_open(state.clock.local_minute(now_ms)) {
                     now_ms
@@ -646,21 +650,21 @@ pub(super) fn handle_run(
                 }
             });
             (
-                ActivationKind::Overnight,
+                TriggerKind::Overnight,
                 "overnight",
                 Some(eligible_at_ms),
                 None,
             )
         }
     };
-    let activation_id = format!(
-        "A{}",
-        local_lookup(state, LocalSqlite::next_activation_ordinal)?
+    let trigger_id = format!(
+        "{TRIGGER_ID_PREFIX}{}",
+        local_lookup(state, LocalSqlite::next_trigger_ordinal)?
     );
     local_lookup(state, |work_state| {
-        work_state.insert_activation(
-            &NewActivation {
-                id: &activation_id,
+        work_state.insert_trigger(
+            &NewTrigger {
+                id: &trigger_id,
                 kind,
                 ticket_id: args.ticket.as_deref(),
                 project_id: args.project.as_deref(),
@@ -672,30 +676,30 @@ pub(super) fn handle_run(
     })?;
     for only in &args.only {
         local_lookup(state, |work_state| {
-            work_state.insert_activation_filter(&activation_id, only)
+            work_state.insert_trigger_filter(&trigger_id, only)
         })?;
     }
 
-    let mut activation = json!({
-        "id": activation_id,
+    let mut trigger = json!({
+        "id": trigger_id,
         "kind": echo_kind,
         "state": "queued",
     });
     if let Some(ticket) = &args.ticket {
-        activation["ticket"] = json!(ticket);
+        trigger["ticket"] = json!(ticket);
     }
     if let Some(project) = &args.project {
-        activation["project"] = json!(project);
+        trigger["project"] = json!(project);
     }
     if let Some(eligible_at_ms) = eligible_at_ms {
-        activation["eligible_at_ms"] = json!(eligible_at_ms);
+        trigger["eligible_at_ms"] = json!(eligible_at_ms);
     }
-    match &args.activation {
-        RunActivation::At { local_time } => activation["local_time"] = json!(local_time),
-        RunActivation::Every { .. } => activation["interval_ms"] = json!(interval_ms),
-        RunActivation::Now | RunActivation::Overnight => {}
+    match &args.trigger {
+        RunTrigger::At { local_time } => trigger["local_time"] = json!(local_time),
+        RunTrigger::Every { .. } => trigger["interval_ms"] = json!(interval_ms),
+        RunTrigger::Now | RunTrigger::Overnight => {}
     }
-    Ok(json!({"activation": activation}))
+    Ok(json!({"trigger": trigger}))
 }
 
 pub(super) fn handle_hold(
@@ -1255,7 +1259,7 @@ fn index_projects(
 fn drop_reindex_runs(
     transaction: &rusqlite::Transaction<'_>,
     stale_tickets: &[String],
-    doomed_activations: &BTreeSet<String>,
+    doomed_triggers: &BTreeSet<String>,
 ) -> Result<usize, StoreError> {
     let mut doomed_runs = BTreeSet::new();
     for ticket_id in stale_tickets {
@@ -1264,10 +1268,10 @@ fn drop_reindex_runs(
             ticket_id,
         )?);
     }
-    for activation_id in doomed_activations {
-        doomed_runs.extend(crate::run_store::runs::tx::ids_for_activation(
+    for trigger_id in doomed_triggers {
+        doomed_runs.extend(crate::run_store::runs::tx::ids_for_trigger(
             transaction,
-            activation_id,
+            trigger_id,
         )?);
     }
 

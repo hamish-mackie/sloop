@@ -66,7 +66,7 @@ CREATE TABLE ticket_blockers (
     PRIMARY KEY (ticket_id, blocker_id)
 );
 
-CREATE TABLE activations (
+CREATE TABLE triggers (
     id              TEXT PRIMARY KEY,
     kind            TEXT NOT NULL,
     state           TEXT NOT NULL,
@@ -79,15 +79,15 @@ CREATE TABLE activations (
     CHECK (ticket_id IS NULL OR project_id IS NULL)
 );
 
-CREATE TABLE activation_filters (
-    activation_id   TEXT NOT NULL REFERENCES activations(id) ON DELETE CASCADE,
+CREATE TABLE trigger_filters (
+    trigger_id      TEXT NOT NULL REFERENCES triggers(id) ON DELETE CASCADE,
     ticket_id       TEXT NOT NULL REFERENCES tickets(id),
-    PRIMARY KEY (activation_id, ticket_id)
+    PRIMARY KEY (trigger_id, ticket_id)
 );
 
 CREATE TABLE runs (
     id                    TEXT PRIMARY KEY,
-    activation_id         TEXT NOT NULL REFERENCES activations(id),
+    trigger_id            TEXT NOT NULL REFERENCES triggers(id),
     ticket_id             TEXT NOT NULL REFERENCES tickets(id),
     state                 TEXT NOT NULL,
     attempt               INTEGER NOT NULL,
@@ -110,7 +110,7 @@ CREATE TABLE runs (
 );
 
 CREATE INDEX runs_by_ticket ON runs(ticket_id, created_at_ms);
-CREATE INDEX runs_by_activation ON runs(activation_id, created_at_ms);
+CREATE INDEX runs_by_trigger ON runs(trigger_id, created_at_ms);
 
 -- A lease is time-bounded ownership of a ticket by the daemon, taken
 -- atomically at claim time. `ticket_id` is the PRIMARY KEY and `run_id` is
@@ -119,7 +119,7 @@ CREATE INDEX runs_by_activation ON runs(activation_id, created_at_ms);
 -- `UPDATE ... WHERE state='ready'` in `claim_ticket`.
 --
 -- Leases are held only by the daemon; `owner_id` stores the source's ownership
--- token, including the activation needed to recover an interrupted claim.
+-- token, including the trigger needed to recover an interrupted claim.
 -- Workers never hold, renew, or observe leases — a worker's
 -- only credential is a per-run capability token granting the worker verbs on
 -- its own run.
@@ -226,6 +226,22 @@ CREATE TABLE IF NOT EXISTS id_counters (
     next_ordinal    INTEGER NOT NULL CHECK (next_ordinal > 0)
 );
 INSERT OR IGNORE INTO id_counters (kind, next_ordinal)
+SELECT 'trigger', COALESCE(MAX(CAST(SUBSTR(id, 3) AS INTEGER)), 0) + 1 FROM triggers;
+INSERT OR IGNORE INTO id_counters (kind, next_ordinal)
+SELECT 'note', COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) + 1 FROM notes;
+";
+
+/// The counter seed as it stood before [`TRIGGER_RENAME`]. Every arm that
+/// replays it is opening a database written by a binary that still called the
+/// table `activations` and minted one-letter `A<ordinal>` ids, so the seed has
+/// to name them; the rename step later in the same transaction carries the row
+/// and its ids forward.
+const LEGACY_ID_COUNTER_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS id_counters (
+    kind            TEXT PRIMARY KEY,
+    next_ordinal    INTEGER NOT NULL CHECK (next_ordinal > 0)
+);
+INSERT OR IGNORE INTO id_counters (kind, next_ordinal)
 SELECT 'activation', COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) + 1 FROM activations;
 INSERT OR IGNORE INTO id_counters (kind, next_ordinal)
 SELECT 'note', COALESCE(MAX(CAST(SUBSTR(id, 2) AS INTEGER)), 0) + 1 FROM notes;
@@ -322,6 +338,99 @@ UPDATE run_evidence
  WHERE kind = 'aftercare_process';
 ";
 
+// Renames the activation concept to `trigger`: the two tables, every column
+// that points at them, the minted id prefix, and the counter row that hands out
+// its ordinals. Nothing is dropped. A queued trigger is a durable record that
+// demand exists, reconstructible from neither the committed ticket files nor
+// Git, so `reindex` cannot put one back — the migration has to carry every row
+// across or the pending work is simply gone.
+//
+// `RENAME TO` and `RENAME COLUMN` rewrite the `REFERENCES` clauses in other
+// tables for us, but an `UPDATE` to a primary key does not propagate to the
+// plain `REFERENCES` columns pointing at it, so `runs` and `trigger_filters`
+// are rewritten by hand. `defer_foreign_keys` holds the constraint check until
+// commit, by which point all three tables agree again.
+//
+// The prefix goes to `TR`, not `T`: `T91` reads as a ticket id beside
+// `TICK-91`. Widening it by a character is why the id counter's seed moves from
+// `SUBSTR(id, 2)` to `SUBSTR(id, 3)`.
+//
+// `leases.owner_id` is a JSON ownership token that embeds the claiming
+// trigger's id, and recovery matches that id against `triggers` to re-find an
+// interrupted claim. It is rewritten to the same shape and key order
+// `lease_owner` now writes, so a lease planted before the upgrade still decodes
+// to a trigger that exists.
+const TRIGGER_RENAME: &str = "
+PRAGMA defer_foreign_keys = ON;
+
+ALTER TABLE activations RENAME TO triggers;
+ALTER TABLE activation_filters RENAME TO trigger_filters;
+ALTER TABLE trigger_filters RENAME COLUMN activation_id TO trigger_id;
+ALTER TABLE runs RENAME COLUMN activation_id TO trigger_id;
+
+DROP INDEX runs_by_activation;
+CREATE INDEX runs_by_trigger ON runs(trigger_id, created_at_ms);
+
+UPDATE triggers SET id = 'TR' || SUBSTR(id, 2) WHERE id GLOB 'A[0-9]*';
+UPDATE runs SET trigger_id = 'TR' || SUBSTR(trigger_id, 2)
+ WHERE trigger_id GLOB 'A[0-9]*';
+UPDATE trigger_filters SET trigger_id = 'TR' || SUBSTR(trigger_id, 2)
+ WHERE trigger_id GLOB 'A[0-9]*';
+
+UPDATE leases
+   SET owner_id = json_object(
+           'owner', json_extract(owner_id, '$.owner'),
+           'trigger', 'TR' || SUBSTR(json_extract(owner_id, '$.activation'), 2))
+ WHERE json_valid(owner_id)
+   AND json_extract(owner_id, '$.activation') GLOB 'A[0-9]*';
+
+UPDATE id_counters SET kind = 'trigger' WHERE kind = 'activation';
+";
+
+/// The exact inverse of [`TRIGGER_RENAME`], for the fixtures that plant a
+/// pre-migration database. They open a current-schema database and strip it
+/// back, so without this the thing they plant is only half old and the arm they
+/// exercise fails looking for `activations`.
+///
+/// The integration suite plants the same shape by hand, the way it already does
+/// for the stage-log migration; keep the two in step.
+///
+/// Unlike the migration steps this opens its own transaction, because it is run
+/// standalone rather than replayed by [`migrate`]. That is not cosmetic:
+/// `defer_foreign_keys` lasts only until the end of the enclosing transaction,
+/// so outside one it is undone by the very next statement's autocommit and the
+/// rewrite trips the `runs` foreign key partway through.
+#[cfg(test)]
+pub(crate) const REVERT_TRIGGER_RENAME: &str = "
+BEGIN IMMEDIATE;
+PRAGMA defer_foreign_keys = ON;
+
+UPDATE leases
+   SET owner_id = json_object(
+           'activation', 'A' || SUBSTR(json_extract(owner_id, '$.trigger'), 3),
+           'owner', json_extract(owner_id, '$.owner'))
+ WHERE json_valid(owner_id)
+   AND json_extract(owner_id, '$.trigger') GLOB 'TR[0-9]*';
+
+UPDATE trigger_filters SET trigger_id = 'A' || SUBSTR(trigger_id, 3)
+ WHERE trigger_id GLOB 'TR[0-9]*';
+UPDATE runs SET trigger_id = 'A' || SUBSTR(trigger_id, 3)
+ WHERE trigger_id GLOB 'TR[0-9]*';
+UPDATE triggers SET id = 'A' || SUBSTR(id, 3) WHERE id GLOB 'TR[0-9]*';
+
+DROP INDEX runs_by_trigger;
+
+ALTER TABLE runs RENAME COLUMN trigger_id TO activation_id;
+ALTER TABLE trigger_filters RENAME COLUMN trigger_id TO activation_id;
+ALTER TABLE trigger_filters RENAME TO activation_filters;
+ALTER TABLE triggers RENAME TO activations;
+
+CREATE INDEX runs_by_activation ON runs(activation_id, created_at_ms);
+
+UPDATE id_counters SET kind = 'activation' WHERE kind = 'trigger';
+COMMIT;
+";
+
 pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), DbError> {
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     match version {
@@ -360,13 +469,14 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), Db
                  );",
             )?;
             transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
-            transaction.execute_batch(ID_COUNTER_SCHEMA)?;
+            transaction.execute_batch(LEGACY_ID_COUNTER_SCHEMA)?;
             transaction.execute_batch(EVENTS_SCHEMA)?;
             transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
             transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
             transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.execute_batch(UNIFORM_STAGE_DRIVER)?;
+            transaction.execute_batch(TRIGGER_RENAME)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -389,13 +499,14 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), Db
                  );",
             )?;
             transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
-            transaction.execute_batch(ID_COUNTER_SCHEMA)?;
+            transaction.execute_batch(LEGACY_ID_COUNTER_SCHEMA)?;
             transaction.execute_batch(EVENTS_SCHEMA)?;
             transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
             transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
             transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.execute_batch(UNIFORM_STAGE_DRIVER)?;
+            transaction.execute_batch(TRIGGER_RENAME)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -417,13 +528,14 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), Db
                  );",
             )?;
             transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
-            transaction.execute_batch(ID_COUNTER_SCHEMA)?;
+            transaction.execute_batch(LEGACY_ID_COUNTER_SCHEMA)?;
             transaction.execute_batch(EVENTS_SCHEMA)?;
             transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
             transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
             transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.execute_batch(UNIFORM_STAGE_DRIVER)?;
+            transaction.execute_batch(TRIGGER_RENAME)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -437,13 +549,14 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), Db
                  ALTER TABLE runs ADD COLUMN worker_socket_path TEXT;",
             )?;
             transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
-            transaction.execute_batch(ID_COUNTER_SCHEMA)?;
+            transaction.execute_batch(LEGACY_ID_COUNTER_SCHEMA)?;
             transaction.execute_batch(EVENTS_SCHEMA)?;
             transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
             transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
             transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.execute_batch(UNIFORM_STAGE_DRIVER)?;
+            transaction.execute_batch(TRIGGER_RENAME)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -456,13 +569,14 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), Db
                      ALTER TABLE runs ADD COLUMN worker_socket_path TEXT;",
             )?;
             transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
-            transaction.execute_batch(ID_COUNTER_SCHEMA)?;
+            transaction.execute_batch(LEGACY_ID_COUNTER_SCHEMA)?;
             transaction.execute_batch(EVENTS_SCHEMA)?;
             transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
             transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
             transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.execute_batch(UNIFORM_STAGE_DRIVER)?;
+            transaction.execute_batch(TRIGGER_RENAME)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -472,13 +586,14 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), Db
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute_batch("ALTER TABLE runs ADD COLUMN worker_socket_path TEXT;")?;
             transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
-            transaction.execute_batch(ID_COUNTER_SCHEMA)?;
+            transaction.execute_batch(LEGACY_ID_COUNTER_SCHEMA)?;
             transaction.execute_batch(EVENTS_SCHEMA)?;
             transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
             transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
             transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.execute_batch(UNIFORM_STAGE_DRIVER)?;
+            transaction.execute_batch(TRIGGER_RENAME)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -487,13 +602,14 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), Db
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute_batch(RUN_SNAPSHOT_COLUMNS)?;
-            transaction.execute_batch(ID_COUNTER_SCHEMA)?;
+            transaction.execute_batch(LEGACY_ID_COUNTER_SCHEMA)?;
             transaction.execute_batch(EVENTS_SCHEMA)?;
             transaction.execute_batch(TICKET_SOURCE_COLUMNS)?;
             transaction.execute_batch(RESTART_DRAINING_COLUMN)?;
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
             transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.execute_batch(UNIFORM_STAGE_DRIVER)?;
+            transaction.execute_batch(TRIGGER_RENAME)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -508,6 +624,7 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), Db
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
             transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.execute_batch(UNIFORM_STAGE_DRIVER)?;
+            transaction.execute_batch(TRIGGER_RENAME)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -521,6 +638,7 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), Db
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
             transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.execute_batch(UNIFORM_STAGE_DRIVER)?;
+            transaction.execute_batch(TRIGGER_RENAME)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -533,6 +651,7 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), Db
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
             transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.execute_batch(UNIFORM_STAGE_DRIVER)?;
+            transaction.execute_batch(TRIGGER_RENAME)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -544,6 +663,7 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), Db
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
             transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.execute_batch(UNIFORM_STAGE_DRIVER)?;
+            transaction.execute_batch(TRIGGER_RENAME)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -554,6 +674,7 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), Db
             transaction.execute_batch(WORKTREE_CLEANUP_COLUMNS)?;
             transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.execute_batch(UNIFORM_STAGE_DRIVER)?;
+            transaction.execute_batch(TRIGGER_RENAME)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -563,6 +684,7 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), Db
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute_batch(STAGE_EVIDENCE_LOG)?;
             transaction.execute_batch(UNIFORM_STAGE_DRIVER)?;
+            transaction.execute_batch(TRIGGER_RENAME)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
@@ -571,6 +693,15 @@ pub(super) fn migrate(connection: &mut Connection, now_ms: i64) -> Result<(), Db
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute_batch(UNIFORM_STAGE_DRIVER)?;
+            transaction.execute_batch(TRIGGER_RENAME)?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit()?;
+            Ok(())
+        }
+        15 => {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(TRIGGER_RENAME)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())

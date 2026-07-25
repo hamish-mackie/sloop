@@ -92,16 +92,16 @@ fn claim(
         .unwrap();
     match result {
         ClaimResult::Claimed { ticket } => {
-            let activation_id = ticket
+            let trigger_id = ticket
                 .hints
-                .activation_id
+                .trigger_id
                 .as_deref()
-                .expect("local claims identify their activation");
+                .expect("local claims identify their trigger");
             let run = store
                 .runs
                 .insert_claimed_run(
                     &RunAdmission {
-                        activation_id,
+                        trigger_id,
                         run_id: admission.run_id,
                         ticket_id: admission.ticket_id,
                         flow_json: admission.flow_json,

@@ -745,6 +745,54 @@ pub fn wait_until_slow(what: &str, mut condition: impl FnMut() -> bool) {
     panic!("timed out waiting until {what}");
 }
 
+/// Puts a database back into the shape it had before triggers were called
+/// triggers: `activations`/`activation_filters`, `activation_id` on everything
+/// that points at them, `A<ordinal>` ids, and the lease ownership token that
+/// embeds one. Mirrors `REVERT_TRIGGER_RENAME` in `db::migrations`, which does
+/// the same for the unit fixtures — keep the two in step.
+///
+/// Callers still have to set `PRAGMA user_version` themselves: which older
+/// version they are impersonating is theirs to decide, and this only undoes the
+/// one step.
+///
+/// The transaction is load-bearing. `defer_foreign_keys` lasts only to the end
+/// of the enclosing transaction, and the rewrite points `runs.activation_id` at
+/// ids that do not exist yet partway through.
+pub fn revert_trigger_rename(world: &World) {
+    let connection = rusqlite::Connection::open(world.db_path()).expect("open state database");
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             PRAGMA defer_foreign_keys = ON;
+
+             UPDATE leases
+                SET owner_id = json_object(
+                        'activation', 'A' || SUBSTR(json_extract(owner_id, '$.trigger'), 3),
+                        'owner', json_extract(owner_id, '$.owner'))
+              WHERE json_valid(owner_id)
+                AND json_extract(owner_id, '$.trigger') GLOB 'TR[0-9]*';
+
+             UPDATE trigger_filters SET trigger_id = 'A' || SUBSTR(trigger_id, 3)
+              WHERE trigger_id GLOB 'TR[0-9]*';
+             UPDATE runs SET trigger_id = 'A' || SUBSTR(trigger_id, 3)
+              WHERE trigger_id GLOB 'TR[0-9]*';
+             UPDATE triggers SET id = 'A' || SUBSTR(id, 3) WHERE id GLOB 'TR[0-9]*';
+
+             DROP INDEX runs_by_trigger;
+
+             ALTER TABLE runs RENAME COLUMN trigger_id TO activation_id;
+             ALTER TABLE trigger_filters RENAME COLUMN trigger_id TO activation_id;
+             ALTER TABLE trigger_filters RENAME TO activation_filters;
+             ALTER TABLE triggers RENAME TO activations;
+
+             CREATE INDEX runs_by_activation ON runs(activation_id, created_at_ms);
+
+             UPDATE id_counters SET kind = 'activation' WHERE kind = 'trigger';
+             COMMIT;",
+        )
+        .expect("plant the pre-rename trigger shape");
+}
+
 impl Drop for World {
     fn drop(&mut self) {
         // Layer 1: a clean stop through the public verb; never autostarts.
