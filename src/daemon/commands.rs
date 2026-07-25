@@ -465,14 +465,16 @@ fn ticket_rows(
 ) -> Result<serde_json::Value, ErrorBody> {
     let now_ms = state.clock.now_ms();
     let at_capacity = run_lookup(state, RunStore::active_runs)?.len() >= state.max_agents;
-    let gates = crate::eligibility::Gates {
+    // Every gate here is global; the activation gate is per ticket and is
+    // answered inside the loop below.
+    let global_gates = crate::eligibility::Gates {
         paused: state.paused,
         draining: state.draining,
         storage_writable: !state.storage_full.get() && !state.reconciliation_blocked,
         agent_configured: state.agent.is_some(),
         hours_open: running_hours_open(state, now_ms),
         at_capacity,
-        has_queued_activation: !local_lookup(state, LocalSqlite::queued_activations)?.is_empty(),
+        has_queued_activation: false,
     };
     // `tickets` already arrives newest first, so truncating here keeps the
     // newest N and spares the per-ticket lookups below for the rest.
@@ -508,6 +510,15 @@ fn ticket_rows(
         {
             vendor_error = None;
         }
+        // "Is there a trigger that could select *this* ticket", not "is the
+        // queue non-empty": a trigger pinned to another ticket must not explain
+        // this one away.
+        let gates = crate::eligibility::Gates {
+            has_queued_activation: local_lookup(state, |work_state| {
+                work_state.has_claimable_activation(&ticket.id, now_ms)
+            })?,
+            ..global_gates
+        };
         let ineligibility = crate::eligibility::ticket_ineligibility(
             &ticket.state,
             ticket.attempts,
