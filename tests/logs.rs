@@ -193,6 +193,70 @@ fn stage_selects_the_output_of_one_flow_stage() {
     }
 }
 
+/// A backward edge runs one stage twice, and the two executions land in one
+/// log under one name. Without an attempt in the selector `--stage build` is
+/// two interleaved runs of the same command, which is exactly the page nobody
+/// wants when they are chasing one failure.
+#[test]
+fn stage_selects_one_execution_of_a_re_run_stage() {
+    let world = World::configured();
+    // The agent says which pass it is on, counting through a file outside the
+    // worktree so the count survives the span re-running.
+    let counter = world.root().join("passes.count");
+    fs::write(&counter, b"").unwrap();
+    configure_flow(
+        &world,
+        "  - name: build\n    action: agent\n    result_check: { builtin: commits }\n  - name: gate\n    action: { exec: [\"sh\", \"-c\", \"test -f second\"] }\n    result_check: none\n    fail_action: { return_to: build, attempts: 1 }\n  - { name: merge, kind: merge }\n",
+        &format!(
+            "printf x >> {counter}\npass=$(wc -c < {counter} | tr -d ' ')\necho \"agent speaking on pass $pass\"\nif [ \"$pass\" -gt 1 ]; then touch second; fi\ngit -c user.name=a -c user.email=a@example.invalid commit --quiet --allow-empty -m work\nexit 0\n",
+            counter = counter.display(),
+        ),
+    );
+    world.commit_all("initial");
+    world.start_daemon();
+    post_and_run(&world, "looped.md");
+    let run = world.run_id(1);
+    wait_until("the looped run settles", || {
+        matches!(world.run_state(&run).as_str(), "merged" | "failed")
+    });
+
+    // Both passes are under the one name...
+    let both =
+        entry_text(&World::json_stdout(&world.sloop(&["logs", &run, "--stage", "build"]))["data"]);
+    assert!(both.contains("pass 1") && both.contains("pass 2"), "{both}");
+
+    // ...and each is reachable alone, by the label `sloop show` prints.
+    let first = entry_text(
+        &World::json_stdout(&world.sloop(&["logs", &run, "--stage", "build#1"]))["data"],
+    );
+    assert!(
+        first.contains("pass 1") && !first.contains("pass 2"),
+        "{first}"
+    );
+    let second = entry_text(
+        &World::json_stdout(&world.sloop(&["logs", &run, "--stage", "build#2"]))["data"],
+    );
+    assert!(
+        second.contains("pass 2") && !second.contains("pass 1"),
+        "{second}"
+    );
+
+    // An attempt the stage never reached is an empty page, not an error: the
+    // stage exists, and how many times it ran is what the caller is asking.
+    let unreached =
+        World::json_stdout(&world.sloop(&["logs", &run, "--stage", "build#3"]))["data"].clone();
+    assert_eq!(unreached["entries"].as_array().expect("entries").len(), 0);
+
+    // A malformed attempt is refused rather than folded back into the name,
+    // which would answer a typo with an empty page.
+    let malformed = world.sloop(&["logs", &run, "--stage", "build#two"]);
+    assert!(!malformed.status.success());
+    let response = World::json_stdout_or_stderr(&malformed);
+    assert_eq!(response["error"]["code"], "invalid_arguments");
+    let message = response["error"]["message"].as_str().expect("message");
+    assert!(message.contains("<stage>#<attempt>"), "{message}");
+}
+
 #[test]
 fn an_unknown_stage_names_the_stages_the_flow_defines() {
     let world = World::configured();

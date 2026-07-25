@@ -31,7 +31,11 @@ blocked_by: []
 #
 # The flow this ticket binds to, naming a file under
 # .agents/sloop/flows/ without its extension. Defaults to `default`.
-# Run `sloop template flow` for the flow grammar.
+# Two flows ship with the binary and are written out by `sloop init`:
+#   default  build -> review -> merge
+#   train    build -> sync -> verify -> ff_only merge, so the tree that is
+#            verified is provably the tree that lands
+# Run `sloop template flow` for the grammar, and edit either file freely.
 # flow: default
 #
 # ---- stamped by sloop --------------------------------------------------

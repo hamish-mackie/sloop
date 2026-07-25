@@ -46,6 +46,11 @@ substring; regex metacharacters make it an unanchored regex, like grep. Quote
 regexes in your shell: 'log.*'. A pattern always renders the list view, even
 when it matches one ticket.
 
+A run's detail is its stage table: one row per stage execution, suffixed `#N`
+past the first attempt, with advisory failures marked `advisory` and any
+panel's seats listed under their stage. `sloop logs <run> --stage <name>#<N>`
+reads the output behind one of those rows.
+
 --follow streams events for the shown scope. Ticket and run scopes exit when
 they settle; dashboard, pattern, and project scopes run until interrupted.
 --follow --quiet suppresses the stream and only returns the outcome.
@@ -154,12 +159,16 @@ pub enum Command {
     )]
     Show(ShowCliArgs),
     /// Show output from a run.
-    #[command(after_help = "See `sloop show --help` for derived state and live activity.")]
+    #[command(
+        long_about = LOGS_LONG_ABOUT,
+        after_help = "See `sloop show --help` for derived state and live activity."
+    )]
     Logs {
         /// Run alias, ticket reference, or run-id prefix.
         run: String,
-        /// Show only output captured by this flow stage.
-        #[arg(long, value_name = "NAME")]
+        /// Show only output captured by this stage: `<stage>`, or
+        /// `<stage>#<attempt>` for one execution of a re-run stage.
+        #[arg(long, value_name = "STAGE[#ATTEMPT]")]
         stage: Option<String>,
         /// Show only the last N matching entries.
         #[arg(long, value_name = "N")]
@@ -202,14 +211,19 @@ pub enum Command {
     /// Append an advisory note to the current run.
     #[command(hide = true)]
     Note {
-        #[arg(required = true, trailing_var_arg = true)]
+        /// The note. It records an observation and moves nothing: no note
+        /// passes a stage, and a stage's verdict comes from its result check.
+        #[arg(required = true, trailing_var_arg = true, value_name = "TEXT")]
         text: Vec<String>,
     },
     /// Report the current stage's verdict.
-    #[command(hide = true)]
+    #[command(hide = true, long_about = VERDICT_LONG_ABOUT)]
     Verdict {
+        /// `pass` or `fail`. The first report is final.
         verdict: VerdictCliValue,
-        #[arg(long)]
+        /// Why. Optional on a `reported` stage, required from a panel
+        /// reviewer, and read by whoever opens `sloop show` next.
+        #[arg(long, value_name = "TEXT")]
         reason: Option<String>,
         /// How sure you are. Defaults to `medium`; only ever recorded as
         /// evidence, never weighted into a panel's aggregation.
@@ -217,6 +231,44 @@ pub enum Command {
         confidence: Option<ConfidenceCliValue>,
     },
 }
+
+/// `verdict` is the only worker verb that moves a run, so its help says who is
+/// allowed to call it before it says how. An agent that reports on a stage
+/// which never asked for a report gets a denial, not a recorded verdict.
+const VERDICT_LONG_ABOUT: &str = "\
+Report the current stage's verdict.
+
+Two callers may use it, each exactly once per stage execution:
+
+  - the worker on a stage whose flow declares `result_check: reported`. It
+    is the only thing that can pass such a stage; one that exits without
+    reporting fails with `no verdict reported`.
+  - a panel reviewer, when the stage's check is `result_check: { panel: ... }`.
+    Its credential names the seat the report lands on, so no argument chooses
+    one, and `--reason` is required.
+
+The first report for an execution is final; a second is refused. A `return_to`
+edge that re-enters the stage starts a fresh execution, which is owed its own
+report.
+
+`--confidence` takes `low`, `medium`, or `high` and defaults to `medium`. It is
+recorded as evidence and shown by `sloop show`, and is never weighted into a
+panel's quorum: a `fail` at low confidence counts exactly as much as one at
+high.";
+
+/// The selector grammar is the whole reason this verb needs long help: a stage
+/// a backward edge re-entered has more than one page of output under one name.
+const LOGS_LONG_ABOUT: &str = "\
+Show output from a run — stdout and stderr, in capture order.
+
+`--stage` narrows to one stage, named exactly as its flow names it. Add
+`#<attempt>` to narrow further to a single execution: `--stage build#2` is the
+second pass a `return_to` edge sent the walk through, and `--stage build` is
+every pass together. The suffix is the same label `sloop show` prints in its
+stage table, so a row read there is a selector that can be pasted back.
+
+A stage the run's flow does not define is an error listing the ones it does,
+rather than an empty page.";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum VerdictCliValue {

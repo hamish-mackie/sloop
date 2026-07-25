@@ -366,6 +366,12 @@ fn render_logs(data: &Value) -> String {
         let mut origin = entry["source"].as_str().unwrap_or("?").to_owned();
         if let Some(stage) = entry["stage"].as_str() {
             let _ = write!(origin, ":{stage}");
+            // The same `#N` suffix the stage table prints, so an unfiltered
+            // page of a looped run still says which execution wrote each line
+            // — and the label read here is the `--stage` selector to type next.
+            if let Some(attempt) = entry["attempt"].as_u64().filter(|attempt| *attempt > 1) {
+                let _ = write!(origin, "#{attempt}");
+            }
         }
         // Bytes that failed UTF-8 decoding are stored as base64; a human
         // view labels them rather than printing garbage.
@@ -573,11 +579,7 @@ fn stage_strip(stages: &Value) -> String {
                     duration(silent_for_ms),
                 );
             }
-            format!(
-                "{}:{}",
-                stage_label(stage),
-                stage_marker(stage["state"].as_str().unwrap_or("")),
-            )
+            format!("{}:{}", stage_label(stage), stage_marker(stage))
         })
         .collect::<Vec<_>>()
         .join("  ")
@@ -595,13 +597,24 @@ fn stage_label(stage: &Value) -> String {
     }
 }
 
-fn stage_marker(state: &str) -> &'static str {
-    match state {
+/// One stage's marker in the scan strip. An advisory stage's failure gets its
+/// own word rather than a decorated `FAIL`: the strip is read at a glance, and
+/// the only question it has to answer about a failure is whether the walk
+/// stopped there.
+fn stage_marker(stage: &Value) -> &'static str {
+    match stage["state"].as_str().unwrap_or("") {
         "passed" => "ok",
+        "failed" if advisory(stage) => "warn",
         "failed" => "FAIL",
         "running" => "..",
         _ => "-",
     }
+}
+
+/// True for a stage the flow declares `fail_action: continue`, whose failure
+/// was recorded and stepped over.
+fn advisory(stage: &Value) -> bool {
+    stage["advisory"] == Value::Bool(true)
 }
 
 /// A run or stage's wall-clock span. An unfinished one is open-ended rather
@@ -679,13 +692,27 @@ fn run_stages(stages: &Value) -> String {
         if let Some(exit_code) = stage["exit_code"].as_i64() {
             let _ = write!(line, "  exit {exit_code}");
         }
-        // Attempts are only worth a column when a repair actually retried the
-        // stage; every other stage ran exactly once and saying so is noise.
+        // Only worth saying on the row it changes the meaning of. On a passing
+        // or unreached advisory stage the word answers a question nobody asked;
+        // on a failing one it is the difference between "this ended the run"
+        // and "this was noted and stepped over".
+        if state == "failed" && advisory(stage) {
+            line.push_str("  advisory");
+        }
+        // Attempts are only worth a column when the stage was actually retried
+        // within one execution; every other stage ran once, and saying so on
+        // every row is noise. Re-entries are counted separately, by the `#N`
+        // label on the stage name.
         if let Some(attempts) = stage["attempts"].as_u64().filter(|attempts| *attempts > 1) {
             let _ = write!(line, "  {attempts} attempts");
         }
         if let Some(source) = stage["verdict_source"].as_str() {
             let _ = write!(line, "  verdict from {source}");
+        }
+        // A worker's own confidence sits beside the verdict it qualifies, the
+        // same way a panel seat's does one level down.
+        if let Some(confidence) = stage["confidence"].as_str() {
+            let _ = write!(line, "  confidence {confidence}");
         }
         if let Some(silent_for_ms) = stage["silent_for_ms"].as_i64() {
             let _ = write!(line, "  (no output {})", duration(silent_for_ms));
@@ -1451,6 +1478,111 @@ mod tests {
                 "    codex   fail  confidence medium  missing a test\n",
                 "    gemini  fail  no verdict reported\n",
             )
+        );
+    }
+
+    /// An advisory failure and the failure that ended the run must not read
+    /// alike. The table says `advisory` in words next to the state it
+    /// qualifies, and the run's own reason names the halting stage — never the
+    /// advisory one, which the walk provably stepped over.
+    #[test]
+    fn run_show_separates_an_advisory_failure_from_the_halting_one() {
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "ref": "TICK-1-r1",
+                "kind": "run",
+                "value": {
+                    "id": "R14", "alias": "TICK-1-r1", "ticket": "TICK-1",
+                    "state": "needs_review", "terminal": true,
+                    "halt": "fail_action",
+                    "reason": "stage `test` failed (exit 1) after agent completed with commits",
+                    "stages": [
+                        {"stage": "build", "state": "passed", "attempt": 1, "attempts": 1,
+                         "advisory": false},
+                        {"stage": "lint", "state": "failed", "attempt": 1, "attempts": 1,
+                         "exit_code": 2, "advisory": true},
+                        {"stage": "test", "state": "failed", "attempt": 1, "attempts": 1,
+                         "exit_code": 1, "advisory": false},
+                        {"stage": "merge", "state": "pending", "attempts": 0,
+                         "advisory": false},
+                    ],
+                }
+            }),
+        );
+
+        assert_eq!(
+            render(Some("show"), &response),
+            concat!(
+                "TICK-1-r1  (needs_review)\n",
+                "ticket: TICK-1\n",
+                "reason: stage `test` failed (exit 1) after agent completed with commits\n",
+                "stages:\n",
+                "  build  passed   -\n",
+                "  lint   failed   -  exit 2  advisory\n",
+                "  test   failed   -  exit 1\n",
+                "  merge  pending  -\n",
+            )
+        );
+    }
+
+    /// A worker's own confidence sits on the stage row, the way a panel seat's
+    /// sits on the seat row — one flag, one meaning, wherever it is reported.
+    #[test]
+    fn run_show_carries_a_reported_stages_confidence() {
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "ref": "TICK-1-r1",
+                "kind": "run",
+                "value": {
+                    "id": "R14", "alias": "TICK-1-r1", "ticket": "TICK-1",
+                    "state": "merged", "terminal": true,
+                    "stages": [{
+                        "stage": "review", "state": "passed", "attempt": 1, "attempts": 1,
+                        "verdict_source": "reported", "confidence": "low",
+                    }],
+                }
+            }),
+        );
+
+        assert!(
+            render(Some("show"), &response)
+                .contains("review  passed   -  verdict from reported  confidence low"),
+            "{}",
+            render(Some("show"), &response)
+        );
+    }
+
+    /// The scan strip has to carry the distinction too, in one token: an
+    /// operator reading a ticket's runs decides from it whether to open the
+    /// run at all.
+    #[test]
+    fn the_ticket_strip_marks_an_advisory_failure_as_a_warning() {
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "ref": "TICK-1",
+                "kind": "ticket",
+                "value": {
+                    "id": "TICK-1", "name": "advisory", "state": "merged", "blocked_by": [],
+                    "runs": [{
+                        "alias": "TICK-1-r1", "state": "merged",
+                        "stages": [
+                            {"stage": "build", "state": "passed", "attempt": 1},
+                            {"stage": "lint", "state": "failed", "attempt": 1,
+                             "advisory": true},
+                            {"stage": "merge", "state": "passed", "attempt": 1},
+                        ],
+                    }],
+                }
+            }),
+        );
+
+        assert!(
+            render(Some("show"), &response).contains("build:ok  lint:warn  merge:ok"),
+            "{}",
+            render(Some("show"), &response)
         );
     }
 

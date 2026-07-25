@@ -3,11 +3,15 @@
 # and a ticket binds to it with `flow: release` or `sloop post --flow
 # release`. Save this file as .agents/sloop/flows/<name>.yaml.
 #
+# Two flows ship inside the binary and need no file: `default`, which is
+# build -> review -> merge, and `train`, which syncs and verifies before an
+# `ff_only` merge. `sloop init` writes both out so they can be edited.
+#
 # The walk runs stages in order and halts on the first failure, unless a
 # stage's `fail_action` says otherwise. Evidence is persisted per stage
 # execution, so a daemon restart resumes exactly where the walk stood.
 #
-# Every stage is three things:
+# Every stage is three things, and every stage below writes all three:
 #   - `action`: the work, which is never trusted to grade itself.
 #       agent                     the ticket's agent target, prompted by the
 #                                 ticket body
@@ -45,11 +49,6 @@
 #   - `return_to` must name an earlier stage, `attempts` must be 1..=3, and
 #     the worst case a flow's budgets imply may not exceed 32 executions.
 #     Panel reviewers are spawns and count towards that budget.
-#   - `on_fail` is rejected on the `agent` stage, and is deprecated in
-#     favour of `return_to`.
-#
-# The top level may be this `stages:` mapping or a bare YAML list of
-# stages. Both parse identically.
 stages:
   # ---- an agent action -------------------------------------------------
   # Spawns the ticket's agent target in the run worktree with the ticket
@@ -62,59 +61,49 @@ stages:
     #   agent action; an agent that exits cleanly without committing
     #   leaves the branch for review rather than merging an empty change.
     result_check: { builtin: commits }
+    # fail_action: fail
+    #   Halt. Stages after this one are never requested, the ticket lands
+    #   in `needs_review` or `failed`, and the branch is preserved. This is
+    #   the default, written out here only because this template writes
+    #   all three parts on every stage.
+    fail_action: fail
 
-  # ---- an exec action --------------------------------------------------
+  # ---- an exec action, and the one backward edge ------------------------
   # Runs an argv (no shell) in the run worktree. Any number of these, in
   # order, before the merge stage.
   - name: test
     action: { exec: [cargo, test, --all-targets] }
     # result_check: none
     #   The action's own exit status is the verdict. This is the default
-    #   for `exec` and `merge` actions.
+    #   for `exec`, `merge`, and `sync` actions.
     result_check: none
-    # ---- fail_action: return_to ----------------------------------------
-    # A failing test sends the walk back to `build`, which re-runs with the
-    # failure in its prompt: the stage that failed, why, and the last 100
-    # lines of its output. The whole span from `build` through `test` runs
-    # again, so no verdict earned before the fix survives it. `attempts`
-    # bounds the loop; when it is spent the run ends exactly as it would
-    # have without the edge.
-    # fail_action: { return_to: build, attempts: 2 }
-    # ---- on_fail: repair and retry (deprecated) ------------------------
-    # Superseded by `return_to` above, which re-runs the ticket's own agent
-    # rather than a separate repair worker. Still supported; a run whose
-    # flow uses it is admitted with a deprecation note in the daemon log.
-    # When the stage fails, spawn a repair agent in the run worktree, then
-    # re-run this stage and re-apply its own result check. The repair
-    # agent never produces the verdict, and never changes the stage's
-    # action or the flow's ordering. Rejected on an `agent` action.
-    on_fail:
-      # The prompt handed to the repair agent. Required and non-empty.
-      agent: "Tests are failing in this worktree. Fix them without weakening assertions, then commit."
-      # How many repair-then-retry cycles this stage may use per run.
-      # Optional, defaults to 1, and must be between 1 and 3.
-      attempts: 2
-      # Optional overrides for the repair worker only. `target` must name
-      # an entry under `agent.targets` in config.yaml; all three default
-      # to the ticket's own snapshotted values.
-      target: claude
-      model: haiku
-      effort: low
+    # fail_action: { return_to: <stage>, attempts: N }
+    #   A failing test sends the walk back to `build`, which re-runs with
+    #   the failure in its prompt: the stage that failed, why, and the last
+    #   100 lines of its output. The whole span from `build` through `test`
+    #   runs again, so no verdict earned before the fix survives it.
+    #   `attempts` bounds the loop; when it is spent the run ends exactly
+    #   as it would have without the edge, and `sloop show` says the
+    #   return_to budget was spent rather than leaving it to be inferred.
+    fail_action: { return_to: build, attempts: 2 }
 
+  # ---- an advisory stage ------------------------------------------------
   - name: lint
     action: { exec: [cargo, clippy, --all-targets, "--", "-D", warnings] }
-    # fail_action: continue
-    #   Advisory: the failure is recorded and shown by `sloop show`, but the
-    #   walk carries on and the run's outcome is unchanged. Use it to report
-    #   on something without blocking the merge on it.
-    fail_action: continue
     # result_check: { exec: [...] }
     #   Requires the action to exit 0, then runs a second command in the
     #   worktree and takes its exit code as the verdict. Use it when the
     #   thing that proves the stage is not the thing that does the work.
     #   The check command must be non-empty.
     result_check: { exec: [cargo, fmt, "--check"] }
+    # fail_action: continue
+    #   Advisory: the failure is recorded and shown by `sloop show` — as
+    #   `warn` in the scan strip and `failed  advisory` in the stage table
+    #   — but the walk carries on and the run's outcome is unchanged. Use
+    #   it to report on something without blocking the merge on it.
+    fail_action: continue
 
+  # ---- a reported stage -------------------------------------------------
   - name: review
     # `--allowedTools Bash` lets the reviewer run tests and `sloop
     # verdict`; it deliberately omits Write/Edit so the reviewer can read
@@ -137,6 +126,7 @@ stages:
     #   Under `none` a reviewer that always exits 0 — as `claude --print`
     #   does — would approve every run.
     result_check: reported
+    fail_action: fail
     # ---- result_check: { panel: {...} } (the advanced form) --------------
     # One reviewer is one uncalibrated opinion. A panel seats 2..=5 of them,
     # spawns each in turn with the same prompt, and derives the verdict from
@@ -164,18 +154,18 @@ stages:
   # Merges the default branch into the run branch, inside the run worktree;
   # the shared default-branch checkout is only ever read. Passes when the
   # merge commits or there was nothing to integrate, and fails on a
-  # conflict — leaving no in-progress merge behind, so the `return_to`
-  # target starts from a clean tree. Any number, anywhere before the merge.
+  # conflict — leaving no in-progress merge behind, so a `return_to` target
+  # would start from a clean tree. Any number, anywhere before the merge.
   #
-  # Placed here it is only half the pattern: stages *after* a sync judge
-  # the tree that will actually land, so a sync belongs before them rather
-  # than after. See the `train` flow `sloop init` writes beside this one
-  # for the whole shape, including the `ff_only` merge that makes the
-  # verified tree provably the one that lands.
+  # Placed here it is only half the pattern: stages *after* a sync judge the
+  # tree that will actually land, so a sync belongs before them rather than
+  # after. See the `train` flow `sloop init` writes beside this one for the
+  # whole shape, including the `ff_only` merge that makes the verified tree
+  # provably the one that lands.
   - name: sync
     action: { builtin: sync }
     result_check: none
-    fail_action: { return_to: build, attempts: 1 }
+    fail_action: fail
 
   # ---- the merge builtin -----------------------------------------------
   # Applies the run branch to the default branch using Sloop's merge
@@ -192,26 +182,24 @@ stages:
     #   the merge policy is exactly as it was.
     #
     # Only `none` is allowed here. A conflicted merge parks the ticket in
-    # `needs_review` with the branch preserved, unless an `on_fail` repair
-    # resolves it first: for a merge stage the repair agent's job is to
-    # integrate the default branch *into* the run branch and resolve
-    # conflicts there.
+    # `needs_review` with the branch preserved.
     result_check: none
-    on_fail:
-      agent: "This run branch conflicts with the default branch. Merge the default branch into it, resolve the conflicts, and commit."
-      attempts: 1
+    fail_action: fail
 
-# ---- the older grammar -------------------------------------------------
-# The pre-`action` spelling still parses, as sugar for exactly the stages
-# above:
-#   kind: agent | build       ->  action: agent
-#   kind: exec + cmd: [argv]  ->  action: { exec: [argv] }
-#   kind: merge               ->  action: { builtin: merge }
-#   verdict: exit             ->  result_check: none
-#   verdict: commits          ->  result_check: { builtin: commits }
-#   verdict: { check: [argv] }->  result_check: { exec: [argv] }
-#   verdict: reported         ->  result_check: reported
-# The two spellings may not be mixed on one stage.
+# ---- legacy spellings, still accepted ----------------------------------
+# The pre-`action` grammar parses as sugar for exactly the stages above,
+# and the two spellings may not be mixed on one stage:
+#   kind: agent | build -> action: agent      verdict: exit     -> result_check: none
+#   kind: exec + cmd    -> action: { exec: }  verdict: commits  -> result_check: { builtin: commits }
+#   kind: merge         -> action: { builtin: merge }
+#                                             verdict: { check: [argv] } -> result_check: { exec: [argv] }
+#                                             verdict: reported -> result_check: reported
+#
+# `on_fail: { agent: <prompt>, attempts: N }` spawns a repair agent and
+# re-runs the stage, and is superseded by `fail_action: return_to`, which
+# re-runs the ticket's own agent instead. It is still accepted on any
+# non-`agent` stage; a run whose flow uses it is admitted with a
+# deprecation note in the daemon log.
 #
 # A configured `flow.test_cmd` in config.yaml is inserted as an implicit
 # `result_check: none` stage named `test` at index 1, so it cannot be

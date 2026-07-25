@@ -309,6 +309,10 @@ pub(crate) mod tx {
     /// backward edge re-enters gets one report per execution, and without the
     /// attempt the second worker's report would be discarded as a duplicate of
     /// the first.
+    ///
+    /// `confidence` is stored beside the verdict and never consulted by it, so
+    /// one worker's `--confidence` means exactly what a panel reviewer's does:
+    /// evidence an operator reads, not a weight any decision uses.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_stage_verdict(
         transaction: &Transaction<'_>,
@@ -316,6 +320,7 @@ pub(crate) mod tx {
         stage: &str,
         attempt: u32,
         verdict: &str,
+        confidence: &str,
         reason: Option<&str>,
         now_ms: i64,
     ) -> rusqlite::Result<bool> {
@@ -324,6 +329,7 @@ pub(crate) mod tx {
             "stage": stage,
             "attempt": attempt,
             "verdict": verdict,
+            "confidence": confidence,
             "reason": reason,
         })
         .to_string();
@@ -609,17 +615,28 @@ impl RunStore {
         output_stall(&self.db.lock(), run_id).map_err(StoreError::from)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_stage_verdict(
         &self,
         run_id: &str,
         stage: &str,
         attempt: u32,
         verdict: &str,
+        confidence: &str,
         reason: Option<&str>,
         now_ms: i64,
     ) -> Result<bool, StoreError> {
         self.write(TransactionBehavior::Deferred, |transaction| {
-            tx::record_stage_verdict(transaction, run_id, stage, attempt, verdict, reason, now_ms)
+            tx::record_stage_verdict(
+                transaction,
+                run_id,
+                stage,
+                attempt,
+                verdict,
+                confidence,
+                reason,
+                now_ms,
+            )
         })
     }
 

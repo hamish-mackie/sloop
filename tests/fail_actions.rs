@@ -264,6 +264,14 @@ fn an_exhausted_return_budget_fails_with_every_attempt_visible() {
         .to_owned();
     assert!(reason.contains("stage `test` failed"), "{reason}");
     assert!(reason.contains("on attempt 2"), "{reason}");
+    // A spent budget is a different ending from a plain halt, and the run says
+    // which it was rather than leaving it to be inferred from the attempt
+    // count. The wire token exists so a client need not parse the prose.
+    assert!(reason.contains("return_to budget spent"), "{reason}");
+    assert_eq!(
+        world.show_snapshot(&world.run_alias(1))["halt"],
+        "return_budget_exhausted"
+    );
 }
 
 /// An advisory failure is recorded and rendered, and changes nothing about
@@ -297,6 +305,72 @@ fn an_advisory_failure_is_visible_but_does_not_block_the_merge() {
     );
     // The agent ran once: an advisory failure loops nothing.
     assert_eq!(prompts(&prompt_log).len(), 1);
+
+    // The row that failed is marked as the advisory it is, and the rows that
+    // did not are not — a reader scanning the table has to be able to tell the
+    // failure that would have ended the run from the one that could not.
+    let stages = world.show_snapshot(&world.run_alias(1))["stages"].clone();
+    let advisory = |name: &str| {
+        stages
+            .as_array()
+            .expect("stages")
+            .iter()
+            .find(|stage| stage["stage"] == name)
+            .unwrap_or_else(|| panic!("no stage `{name}`"))["advisory"]
+            .clone()
+    };
+    assert_eq!(advisory("lint"), true);
+    assert_eq!(advisory("build"), false);
+    assert_eq!(advisory("merge"), false);
+
+    // And the scan strip carries it in one token, so the distinction survives
+    // into the view an operator reads before deciding to open the run.
+    let text = String::from_utf8_lossy(&world.sloop_plain(&["show", &ticket]).stdout).into_owned();
+    assert!(
+        text.contains("build:ok  lint:warn  merge:ok"),
+        "advisory strip missing: {text}"
+    );
+}
+
+/// An advisory failure is never the reason a run ended: the walk stepped over
+/// it by construction, so blaming the outcome on it would name the one stage
+/// that provably did not cause it.
+#[test]
+fn the_derived_reason_names_the_halting_failure_not_the_advisory_one() {
+    let world = World::configured();
+    let prompt_log = world.root().join("prompts.log");
+    let script = recording_agent(&world, &prompt_log);
+    configure(
+        &world,
+        "- { name: build, kind: agent, verdict: { check: ['true'] } }\n- name: lint\n  action: { exec: [\"false\"] }\n  result_check: none\n  fail_action: continue\n- name: test\n  action: { exec: [\"false\"] }\n  result_check: none\n  fail_action: fail\n- { name: merge, kind: merge }\n",
+        &script,
+    );
+    world.commit_all("initial");
+    world.start_daemon();
+    let ticket = post(&world, "advisory-then-halt.md");
+    assert!(world.sloop(&["run", &ticket]).status.success());
+
+    wait_until_slow("the run stops for review", || {
+        status(&world)["tickets"]["needs_review"] == 1
+    });
+
+    assert_eq!(
+        shown_stages(&world, &world.run_alias(1)),
+        [
+            ("build".to_owned(), "passed".to_owned()),
+            ("lint".to_owned(), "failed".to_owned()),
+            ("test".to_owned(), "failed".to_owned()),
+            ("merge".to_owned(), "pending".to_owned()),
+        ]
+    );
+    let run = world.show_snapshot(&world.run_alias(1));
+    let reason = run["reason"].as_str().expect("a derived reason").to_owned();
+    assert!(reason.contains("stage `test` failed"), "{reason}");
+    assert!(!reason.contains("lint"), "{reason}");
+    // A plain `fail_action: fail` halt: the sentence above already explains
+    // itself, so the reason gains no epithet, but the token still says which
+    // halt it was.
+    assert_eq!(run["halt"], "fail_action");
 }
 
 /// The exact block a re-entry is shown after the first `flaky_test_command`

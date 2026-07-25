@@ -70,7 +70,7 @@ fn is_false(value: &bool) -> bool {
 
 /// A stage's optional repair configuration. It configures the repair worker
 /// (prompt, attempt budget, and target/model/effort overrides) but can never
-/// alter the stage's verdict policy, command, or ordering.
+/// alter the stage's result check, action, or ordering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnFail {
     /// The prompt handed to the repair agent.
@@ -259,8 +259,7 @@ impl<'de> Deserialize<'de> for Stage {
             },
         }
 
-        /// The pre-split verdict policy, kept only so old snapshots still
-        /// read.
+        /// The pre-split result check, kept only so old snapshots still read.
         #[derive(Deserialize)]
         enum SnapshotVerdict {
             Exit,
@@ -510,9 +509,7 @@ fn parse_result_check(
             "exit" => Ok(Check::None),
             "commits" => Ok(Check::Actor(Actor::Builtin(Builtin::Commits))),
             "reported" => Ok(Check::Reported),
-            _ => Err(format!(
-                "stage `{stage}` has unknown verdict policy `{name}`"
-            )),
+            _ => Err(format!("stage `{stage}` has unknown verdict `{name}`")),
         },
         (None, Some(RawVerdict::Check { check })) => {
             if check.is_empty() {
@@ -618,7 +615,7 @@ fn parse_fail_action(stage: &str, raw: Option<RawFailAction>) -> Result<FailActi
 fn validate_stage(stage: &str, action: &Actor, result_check: &Check) -> Result<(), String> {
     if *action == Actor::Agent && *result_check == Check::None {
         return Err(format!(
-            "stage `{stage}`: agentic actions require a result_check or reported"
+            "stage `{stage}` is an agent action, so its result_check may not be `none`"
         ));
     }
     // Both git builtins are judged by what git did, so there is nothing for a
@@ -1441,7 +1438,7 @@ mod tests {
             let error = error(yaml);
             assert!(error.contains("stage `build`"), "{error}");
             assert!(
-                error.contains("agentic actions require a result_check or reported"),
+                error.contains("is an agent action, so its result_check may not be `none`"),
                 "{error}"
             );
         }

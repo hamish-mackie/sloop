@@ -309,7 +309,7 @@ fn reported_stage_records_the_first_verdict_and_rejects_the_second() {
         format!(
             "#!/bin/sh\n\
              SLOOP={}\n\
-             \"$SLOOP\" --json verdict fail --reason 'changes requested' > verdict.json 2> verdict.err\n\
+             \"$SLOOP\" --json verdict fail --reason 'changes requested' --confidence high > verdict.json 2> verdict.err\n\
              \"$SLOOP\" --json verdict pass > duplicate.out 2> duplicate.json\n\
              echo $? > duplicate.exit\n\
              exit 0\n",
@@ -352,6 +352,22 @@ fn reported_stage_records_the_first_verdict_and_rejects_the_second() {
         .expect("reported verdict evidence");
     assert_eq!(persisted["verdict"], "fail");
     assert_eq!(persisted["reason"], "changes requested");
+
+    // `--confidence` means the same thing on a solo reported stage as it does
+    // on a panel seat: recorded as evidence, never weighted. It has to reach
+    // the store and come back out of `show`, or the flag is a lie the help
+    // text tells.
+    assert_eq!(first["data"]["verdict"]["confidence"], "high");
+    assert_eq!(persisted["confidence"], "high");
+    let review = world.show_snapshot(&world.run_alias(1))["stages"]
+        .as_array()
+        .expect("stages")
+        .iter()
+        .find(|stage| stage["stage"] == "review")
+        .expect("a review row")
+        .clone();
+    assert_eq!(review["verdict_source"], "reported");
+    assert_eq!(review["confidence"], "high");
 }
 
 #[test]

@@ -154,26 +154,53 @@ mod tests {
             "no stage demonstrates an exec result check"
         );
 
-        // The advisory fail action is demonstrated, not merely described in a
-        // comment: a template that only mentions a feature cannot go stale
-        // loudly.
+        // Both non-default fail actions are demonstrated, not merely described
+        // in a comment: a template that only mentions a feature cannot go
+        // stale loudly. Exactly one of each, because the point of the example
+        // is the grammar, not a plausible pipeline.
         use crate::flow::FailAction;
-        assert_eq!(
-            flow.stages
-                .iter()
-                .find(|stage| stage.name == "lint")
-                .map(|stage| &stage.fail_action),
-            Some(&FailAction::Continue)
-        );
-
-        // `on_fail` is shown on both stage kinds that accept it.
-        let repaired: Vec<&str> = flow
+        let advisory: Vec<&str> = flow
             .stages
             .iter()
-            .filter(|stage| stage.on_fail.is_some())
+            .filter(|stage| stage.fail_action == FailAction::Continue)
             .map(|stage| stage.name.as_str())
             .collect();
-        assert_eq!(repaired, ["test", "merge"]);
+        assert_eq!(advisory, ["lint"]);
+        let returning: Vec<&str> = flow
+            .stages
+            .iter()
+            .filter(|stage| matches!(stage.fail_action, FailAction::ReturnTo { .. }))
+            .map(|stage| stage.name.as_str())
+            .collect();
+        assert_eq!(returning, ["test"]);
+
+        // Every stage writes all three parts. `fail_action` is the only one
+        // the parser defaults, so it is the only one whose presence has to be
+        // asserted against the source text rather than the parsed flow.
+        for stage in &flow.stages {
+            assert!(
+                FLOW.contains(&format!("name: {}", stage.name)),
+                "stage `{}` is not named in the template text",
+                stage.name
+            );
+        }
+        assert_eq!(
+            FLOW.lines()
+                .filter(|line| line.trim_start().starts_with("fail_action:"))
+                .count(),
+            flow.stages.len(),
+            "every stage must write its own `fail_action`"
+        );
+
+        // The canonical example is entirely in the current grammar: the
+        // deprecated `on_fail` survives only as a note under "legacy
+        // spellings", where a reader looking it up will find it and a reader
+        // learning the grammar will not copy it.
+        assert!(
+            flow.stages.iter().all(|stage| stage.on_fail.is_none()),
+            "the canonical example must not use the deprecated `on_fail`"
+        );
+        assert!(FLOW.contains("legacy spellings"));
     }
 
     #[test]

@@ -12,7 +12,7 @@ The commands split into two sets, and the split is enforced by the daemon:
   surface is `show` and `logs`; bare `sloop` prints help.
 - **Worker commands** (`brief`, `show`, `note`, `verdict`) are for the process
   inside a run. They authenticate with a per-run token. Only `verdict`, when
-  the current stage explicitly uses the `reported` policy, affects flow
+  the current stage's result check is `reported` or a `panel`, affects flow
   evidence.
 
 Two verbs answer without a socket at all: `init` writes files, and `template`
@@ -68,7 +68,15 @@ With `--json`, the template text is returned as `data.template` alongside
 `data.kind`; without it, the raw template is the entire output.
 
 `sloop template flow` is the only complete description of the flow schema
-available from an installed binary.
+available from an installed binary. It prints the current grammar — `action`,
+`result_check`, and `fail_action` written out on every stage, one `return_to`
+edge, one advisory stage, and a commented `panel` block — with the pre-`action`
+`kind:`/`verdict:` spelling and the deprecated `on_fail` reduced to a short
+"legacy spellings" note at the end, since both still parse.
+
+`sloop template ticket`'s `flow:` comment names the two flows that ship inside
+the binary and are written out by `sloop init`: `default` (build, review,
+merge) and `train` (build, sync, verify, `ff_only` merge).
 
 ### sloop daemon
 
@@ -210,12 +218,24 @@ adds `kind`, `recent`, `recent_total`, and `recent_limit` to the existing status
 fields; a pattern response has top-level `kind`, `ref`, and `tickets` fields.
 
 The `runs:` section lists every run of the ticket, newest attempt first: run
-alias, outcome, wall-clock span, and a strip of the run's flow stages marked
-`ok`, `FAIL`, `..` (running), or `-` (not reached).
+alias, outcome, wall-clock span, and a strip of the run's flow stages marked:
+
+| marker | meaning |
+| ------ | ------- |
+| `ok`   | passed |
+| `FAIL` | failed, and the walk stopped there |
+| `warn` | failed on a stage whose `fail_action` is `continue` — recorded, stepped over |
+| `..`   | running |
+| `-`    | not reached |
+
+A stage a `return_to` edge re-entered appears once per execution, and the
+re-runs carry a `#<attempt>` suffix. The suffix appears only past the first
+attempt, so a flow without loops reads exactly as it always did.
 
 ```
 runs:
-  TICK-5-r2  merged        20:15-20:21  build:ok  test:ok  merge:ok
+  TICK-5-r3  merged        21:40-21:52  build:ok  build#2:ok  test:FAIL  test#2:ok  merge:ok
+  TICK-5-r2  merged        20:15-20:21  build:ok  lint:warn  test:ok  merge:ok
   TICK-5-r1  needs_review  19:02-19:09  build:ok  test:FAIL  merge:-
 ```
 
@@ -229,7 +249,8 @@ timeline: claimed 19:02  started 19:02  finished 19:09
 agent exit: 0
 reason: stage `test` failed (exit 1) after agent completed with commits
 stages:
-  build  passed   19:02-19:05  3m0s   exit 0  verdict from exit_code
+  build  passed   19:02-19:05  3m0s  exit 0  verdict from exit_code
+  lint   failed   19:05-19:05  4s  exit 2  advisory  verdict from exit_code
   test   failed   19:05-19:09  4m12s  exit 1  verdict from exit_code
   merge  pending  -
 ```
@@ -242,9 +263,54 @@ every non-merged terminal run, naming the stage that actually failed. A
 merged run carries no reason, and a run still in flight shows its current
 stage as `..` with an open-ended span rather than a guessed ending.
 
+An advisory failure is never that stage: the walk stepped over it by
+construction, so the reason names the last *halting* failure instead. A
+terminal run whose only failures were advisory says so explicitly:
+
+```
+reason: run ended as needs_review with only advisory failures recorded (stage `lint`)
+```
+
+Where the failed stage alone does not explain the ending, the reason gains a
+trailing clause:
+
+- a spent backward edge — `…; return_to budget spent`
+- a stage log that no longer replays against the run's flow —
+  `…; the stage log does not replay against this flow`
+
+A plain `fail_action: fail` halt gets no clause, because the sentence naming
+the failed stage already is one. With `--json` the same distinction is a
+stable token in `value.halt`: `fail_action`, `return_budget_exhausted`, or
+`corrupt_log`.
+
 Stage names come from the run's admitted flow snapshot, so a run still shows
-the stages it actually had even if the flow file changed afterwards. A stage
-retried by an `on_fail` repair agent reports the total attempts it cost.
+the stages it actually had even if the flow file changed afterwards. Two
+different budgets can be spent on one stage and they are reported separately:
+`return_to` re-enters the stage and gets a row per execution with a `#N`
+label, while a deprecated `on_fail` retries *within* one execution and reports
+the total as `N attempts` on that one row.
+
+A stage judged by a `reported` check shows the worker's `--confidence` beside
+its verdict source. A stage judged by a `panel` lists every seat under it —
+target, verdict, confidence, and reason — including seats that never reported,
+because a silent seat is a `Fail` the quorum counted:
+
+```
+stages:
+  build   passed   19:02-19:05  3m0s  exit 0  verdict from exit_code
+  review  failed   19:05-19:11  6m0s  verdict from panel
+    claude  pass  confidence high  reads correct
+    codex   fail  confidence medium  missing a test
+    gemini  fail  no verdict reported
+```
+
+A seat that never reported has no confidence to state, so its line carries only
+the `fail` the quorum counted and the `no verdict reported` reason.
+
+The dashboard (`sloop show` with no argument) did not widen for any of this. It
+is still one line per active run and one per recent ticket; its run lines carry
+the same stage strip, so `#2` and `warn` show up there too, but nothing gained a
+column and the per-stage detail stays in the ticket and run views.
 
 Recognized vendor failures include their classification and safe
 diagnostic. `show` never writes generated activity into committed files.
@@ -281,17 +347,32 @@ desired state already holds, so it reports "not running" and exits 0.
 Kill the run's whole process group (including any children the agent
 spawned), release its ticket, and preserve the worktree for inspection.
 
-### sloop logs <RUN> [--stage NAME] [--tail N] [--follow]
+### sloop logs <RUN> [--stage STAGE[#ATTEMPT]] [--tail N] [--follow]
 
 Show a run's captured output — both stdout and stderr, in order. The
 underlying file is `runs/<run-id>/output.ndjson` in the state directory.
 Use [`sloop show`](#sloop-show) first for the run's derived outcome, timeline,
 and stage summary; use `logs` for the captured output behind that evidence.
 
-`--stage NAME` narrows the output to one flow stage, named exactly as the
-flow names it: `--stage build` is the agent's own output, `--stage test` is
-that exec stage's. A stage the run's flow does not define is an error listing
-the ones it does, not an empty page.
+`--stage` narrows the output to one flow stage, named exactly as the flow
+names it: `--stage build` is the agent's own output, `--stage test` is that
+exec stage's. A stage the run's flow does not define is an error listing the
+ones it does, not an empty page.
+
+Add `#<attempt>` to narrow further to a single execution. A `return_to` edge
+runs one stage more than once, and past that point the name alone selects two
+interleaved passes of the same command:
+
+```sh
+sloop logs TICK-5-r3 --stage build      # every pass
+sloop logs TICK-5-r3 --stage build#2    # only the pass the edge caused
+```
+
+The suffix is the same label `sloop show` prints in its stage table and in each
+log line's origin (`[stage:build#2]`), so a row read there is a selector that
+can be pasted back. An attempt the stage never reached is an empty page, since
+the stage exists and how often it ran is exactly what was asked; a malformed
+one (`--stage build#two`) is a usage error rather than a silent miss.
 
 `--tail N` keeps the last N matching entries instead of the first. An entry is
 one captured chunk, matching how the NDJSON file is stored, so `--tail 50` is
@@ -299,14 +380,15 @@ one captured chunk, matching how the NDJSON file is stored, so `--tail 50` is
 
 `--follow` streams entries as they are appended and exits when the run reaches
 a terminal state. On a run that has already settled it prints what exists and
-exits. All three combine: `sloop logs <RUN> --stage test --tail 50` answers
-"why did the test stage fail" in one command, and `--stage test --follow`
-streams only that stage.
+exits. All three combine: `sloop logs <RUN> --stage test#2 --tail 50` answers
+"why did the second pass of the test stage fail" in one command, and
+`--stage test --follow` streams only that stage.
 
-Filtering happens in the daemon, so any client of the socket gets it: this is
-the `logs` verb with `stage`, `tail`, and `after` arguments, returning a page
-plus `next_cursor`, `complete`, and `terminal`. `--follow` is a client-side
-loop over that cursor, like `show --follow` over `events`.
+Filtering happens in the daemon, so any client of the socket gets it — the
+attempt suffix included: this is the `logs` verb with `stage`, `tail`, and
+`after` arguments, returning a page plus `next_cursor`, `complete`, and
+`terminal`. `--follow` is a client-side loop over that cursor, like
+`show --follow` over `events`.
 
 ### Deprecated read aliases
 
@@ -369,14 +451,25 @@ a ticket's state, and claims like "done" carry no weight. Notes appear in
 
 ### sloop verdict pass|fail [--reason <TEXT>] [--confidence low|medium|high]
 
-Report the current stage's verdict when, and only when, that stage declares
-`result_check: reported`. The first report is persisted and final; a second report
-is rejected. A reported stage that exits without calling this command fails
-with `no verdict reported`.
+Report the current stage's verdict. Two callers may use it, each exactly once
+per stage execution:
+
+- **the stage's own worker**, when that stage declares `result_check: reported`.
+  This is the only thing that can pass such a stage; one that exits without
+  calling it fails with `no verdict reported`. `--reason` is optional here.
+  A worker on any other stage is refused with `stage \`<name>\` does not use
+  \`result_check: reported\``.
+- **a panel reviewer**, when the stage's check is `result_check: { panel: … }`.
+  Its credential names the seat the report lands on, so nothing about the call
+  chooses one, and `--reason` is mandatory: a panel's verdict is a tally, and an
+  unexplained vote tells the operator reading `sloop show` nothing.
+
+The first report for an execution is persisted and final; a second is rejected
+with `conflict`. A `return_to` edge that re-enters the stage begins a fresh
+execution, which is owed its own report — the first execution's verdict is
+never reused for the second.
 
 `--confidence` defaults to `medium` and takes only those three words — a float
-is rejected. It is recorded as evidence and never weighted into any decision.
-
-A **panel reviewer** uses the same command. Its credential names the seat the
-report lands on, so nothing about the call chooses one; `--reason` is mandatory
-there, and the credential authorises exactly one report.
+is rejected. It is recorded as evidence and shown by `sloop show`, from either
+caller, and never weighted into any decision: a `fail` at low confidence counts
+against a panel's quorum exactly as much as one at high.

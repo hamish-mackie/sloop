@@ -401,11 +401,24 @@ pub fn stage_output_tail(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageFilter {
     pub stage: String,
+    /// One execution of the stage, or every execution when absent. A backward
+    /// edge re-enters a stage, and past that point the name alone selects two
+    /// different runs of the same command interleaved in one page — which is
+    /// exactly the page nobody wants to read.
+    pub attempt: Option<u32>,
     pub agent_fallback: bool,
 }
 
 impl StageFilter {
     fn accepts(&self, record: &OutputRecord) -> bool {
+        // Output captured before attempts were tagged belongs to the only
+        // execution such a run ever had, so it answers to `#1`.
+        if self
+            .attempt
+            .is_some_and(|attempt| record.attempt.unwrap_or(1) != attempt)
+        {
+            return false;
+        }
         match record.stage.as_deref() {
             Some(stage) => stage == self.stage,
             None => self.agent_fallback && record.source == OutputSource::Agent,
@@ -546,6 +559,7 @@ mod tests {
                 limit: 10,
                 stage: Some(StageFilter {
                     stage: "test".into(),
+                    attempt: None,
                     agent_fallback: false,
                 }),
                 ..PageQuery::default()
@@ -576,6 +590,7 @@ mod tests {
             limit: 10,
             stage: Some(StageFilter {
                 stage: "build".into(),
+                attempt: None,
                 agent_fallback,
             }),
             ..PageQuery::default()
@@ -613,6 +628,7 @@ mod tests {
                 limit: 64,
                 stage: Some(StageFilter {
                     stage: "test".into(),
+                    attempt: None,
                     agent_fallback: false,
                 }),
                 tail: Some(2),

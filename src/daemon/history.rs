@@ -53,11 +53,21 @@ struct Stage {
     exit_code: Option<i32>,
     verdict_source: Option<String>,
     reason: Option<String>,
+    /// How sure the worker on a `reported` stage said it was. Absent on every
+    /// other check, and on a report made before the field existed. A panel's
+    /// confidences live on its seats instead.
+    confidence: Option<String>,
     silent_for_ms: Option<i64>,
     /// One entry per seat when this execution was judged by a panel, in
     /// reviewer order and including seats that never reported. Empty for every
     /// other check.
     reviewers: Vec<Value>,
+    /// True when the stage's `fail_action` is `continue`, so a `failed` row
+    /// here was recorded and stepped over rather than ending the walk. Without
+    /// it an advisory failure and the failure that killed the run render
+    /// identically, which is the one distinction an operator scanning the
+    /// table actually needs.
+    advisory: bool,
     /// Where the execution sits in the run's log. Rows are rendered in flow
     /// order, but "which failure ended the run" is a question about log order,
     /// and a loop makes the two differ. `0` on a stage with no row.
@@ -77,6 +87,8 @@ impl Stage {
             "exit_code": self.exit_code,
             "verdict_source": self.verdict_source,
             "reason": self.reason,
+            "confidence": self.confidence,
+            "advisory": self.advisory,
             "silent_for_ms": self.silent_for_ms,
             "reviewers": self.reviewers,
         })
@@ -97,6 +109,9 @@ pub(super) struct RunHistory {
     exit_code: Option<i64>,
     commits: usize,
     stall: Option<OutputStallEvidence>,
+    /// Why the walk stopped short of the flow's end, or `None` when it did
+    /// not stop short — including on a run still in flight.
+    halt: Option<crate::flow::HaltReason>,
 }
 
 /// Reads the history of several runs at once. The ticket view needs one row
@@ -138,7 +153,12 @@ fn history_with_timeline(
             .then(|| serde_json::from_str::<OutputStallEvidence>(data).ok())
             .flatten()
     });
-    let mut stages = stages(run, &recorded, &evidence, is_terminal(&run.state));
+    let terminal = is_terminal(&run.state);
+    let flow = run
+        .flow_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<crate::flow::Flow>(json).ok());
+    let mut stages = stages(flow.as_ref(), &recorded, &evidence, terminal);
     if run.state == "running"
         && state.supervised.contains(&run.id)
         && !state.cancelling.contains(&run.id)
@@ -153,6 +173,9 @@ fn history_with_timeline(
         stage.silent_for_ms = Some(staleness.silent_for_ms);
     }
     Ok(RunHistory {
+        halt: terminal
+            .then(|| halt_reason(flow.as_ref(), &recorded))
+            .flatten(),
         stages,
         state: run.state.clone(),
         exit_code: run.exit_code,
@@ -160,6 +183,25 @@ fn history_with_timeline(
         stall,
         timeline,
     })
+}
+
+/// Why the walk stopped short of the end of the flow, re-derived by replaying
+/// the same fold the driver ran.
+///
+/// The driver knows this at the moment it halts and keeps none of it: the
+/// stage log is the record, and the fold over it is total. Re-deriving here
+/// rather than storing a halt row is what stops `show` and the driver from
+/// ever disagreeing — there is only one answer, and both read it the same way.
+/// A run that walked the whole flow, or one whose flow snapshot is unreadable,
+/// halted nowhere and gets `None`.
+fn halt_reason(
+    flow: Option<&crate::flow::Flow>,
+    recorded: &[StageRecord],
+) -> Option<crate::flow::HaltReason> {
+    match crate::flow::next_step(flow?, &super::driver::replayable(recorded)) {
+        crate::flow::Step::Halted { reason, .. } => Some(reason),
+        _ => None,
+    }
 }
 
 impl RunHistory {
@@ -178,6 +220,7 @@ impl RunHistory {
                     "stage": stage.name,
                     "state": stage.state,
                     "attempt": stage.attempt,
+                    "advisory": stage.advisory,
                     "silent_for_ms": stage.silent_for_ms,
                 })
             })
@@ -189,13 +232,17 @@ impl RunHistory {
     ///
     /// `merged` runs need no explanation and live runs have not earned one yet,
     /// so both return `None`. Everything else names the failure the run ended
-    /// on — the *last* one recorded, because a walk stops on the failure it
-    /// cannot get past, and any earlier one was either advisory or superseded
-    /// by a re-run that followed it — and then, when the failure came after
-    /// the agent, says what the agent itself did. That trailing clause is the
+    /// on — the *last halting* one recorded, because a walk stops on the
+    /// failure it cannot get past, and any earlier one was superseded by a
+    /// re-run that followed it — and then, when the failure came after the
+    /// agent, says what the agent itself did. That trailing clause is the
     /// whole point: the smoke test that motivated this feature saw `exit: 0`
     /// and concluded the run had succeeded, when in fact the agent had
     /// succeeded and a later stage had not.
+    ///
+    /// An advisory failure is never the answer. The walk stepped over it by
+    /// construction, so naming it would blame the run's outcome on the one
+    /// stage that provably did not cause it.
     pub(super) fn derived_reason(&self) -> Option<String> {
         if self.state == "merged" || !is_terminal(&self.state) {
             return None;
@@ -209,13 +256,10 @@ impl RunHistory {
         let Some(failed) = self
             .stages
             .iter()
-            .filter(|stage| stage.state == "failed")
+            .filter(|stage| stage.state == "failed" && !stage.advisory)
             .max_by_key(|stage| stage.log_position)
         else {
-            return Some(format!(
-                "run ended as {} with no failing stage recorded",
-                self.state
-            ));
+            return Some(self.reason_without_a_halting_failure());
         };
         let mut reason = format!("stage `{}` failed", failed.name);
         if let Some(exit_code) = failed.exit_code {
@@ -246,7 +290,50 @@ impl RunHistory {
                 " after agent completed with no commits"
             });
         }
+        // A plain `fail_action: fail` halt needs no epithet — the sentence
+        // above already is one. The other two halts are the cases where the
+        // stage's own failure does not fully explain the ending.
+        if let Some(halt) = self.halt_clause() {
+            reason.push_str("; ");
+            reason.push_str(halt);
+        }
         Some(reason)
+    }
+
+    /// The trailing clause naming a halt the failed stage alone does not
+    /// explain, or `None` when the failure speaks for itself.
+    fn halt_clause(&self) -> Option<&'static str> {
+        match self.halt? {
+            crate::flow::HaltReason::FailActionHalt => None,
+            crate::flow::HaltReason::ReturnBudgetExhausted => Some("return_to budget spent"),
+            crate::flow::HaltReason::CorruptLog => {
+                Some("the stage log does not replay against this flow")
+            }
+        }
+    }
+
+    /// The explanation for a terminal run that recorded no halting failure:
+    /// either every stage passed and the flow simply had no merge to reach, or
+    /// the only failures were advisory ones the walk stepped over.
+    fn reason_without_a_halting_failure(&self) -> String {
+        let advisory: Vec<&str> = self
+            .stages
+            .iter()
+            .filter(|stage| stage.state == "failed" && stage.advisory)
+            .map(|stage| stage.name.as_str())
+            .collect();
+        if advisory.is_empty() {
+            return format!("run ended as {} with no failing stage recorded", self.state);
+        }
+        format!(
+            "run ended as {} with only advisory failures recorded ({})",
+            self.state,
+            advisory
+                .iter()
+                .map(|name| format!("stage `{name}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
     }
 
     /// The exit code of the agent stage specifically. `runs.exit_code` is that
@@ -262,6 +349,16 @@ impl RunHistory {
 
     fn stall_json(&self) -> Value {
         json!(self.stall)
+    }
+
+    /// The halt as a stable wire token, so a client can branch on it without
+    /// parsing the prose `reason`.
+    fn halt_json(&self) -> Option<&'static str> {
+        Some(match self.halt? {
+            crate::flow::HaltReason::FailActionHalt => "fail_action",
+            crate::flow::HaltReason::ReturnBudgetExhausted => "return_budget_exhausted",
+            crate::flow::HaltReason::CorruptLog => "corrupt_log",
+        })
     }
 }
 
@@ -292,17 +389,12 @@ fn format_duration(milliseconds: i64) -> String {
 /// stage that `flow.test_cmd` splices in at index 1) are inserted at their
 /// recorded index, which is where the flow driver actually put them.
 fn stages(
-    run: &RunRecord,
+    flow: Option<&crate::flow::Flow>,
     recorded: &[StageRecord],
     evidence: &[(String, String)],
     terminal: bool,
 ) -> Vec<Stage> {
-    let flow = run
-        .flow_json
-        .as_deref()
-        .and_then(|json| serde_json::from_str::<crate::flow::Flow>(json).ok());
     let mut names = flow
-        .as_ref()
         .map(|flow| {
             flow.stages
                 .iter()
@@ -320,17 +412,23 @@ fn stages(
     // already-recorded stage can be the one running right now, so "the first
     // stage with no row" no longer finds it. Only a run still in flight has a
     // running stage at all.
-    let running =
-        flow.as_ref().filter(|_| !terminal).and_then(|flow| {
-            match crate::flow::next_step(flow, &super::driver::replayable(recorded)) {
-                crate::flow::Step::Run { stage, attempt } => Some((stage.name.clone(), attempt)),
-                _ => None,
-            }
-        });
+    let running = flow.filter(|_| !terminal).and_then(|flow| {
+        match crate::flow::next_step(flow, &super::driver::replayable(recorded)) {
+            crate::flow::Step::Run { stage, attempt } => Some((stage.name.clone(), attempt)),
+            _ => None,
+        }
+    });
     let mut running_claimed = false;
 
     let mut stages = Vec::with_capacity(names.len());
     for name in names {
+        // A stage the snapshot does not name — the spliced `flow.test_cmd`
+        // stage — has no `fail_action` to read, and the driver halts on it.
+        let advisory = flow.is_some_and(|flow| {
+            flow.stages.iter().any(|stage| {
+                stage.name == name && stage.fail_action == crate::flow::FailAction::Continue
+            })
+        });
         // Rows carrying no verdict are an execution's action, already answered
         // for by the check row behind it.
         let executions = recorded
@@ -352,8 +450,10 @@ fn stages(
                 exit_code: row.exit_code,
                 verdict_source: row.verdict_source.clone(),
                 reason: row.reason.clone(),
+                confidence: reported_confidence(evidence, &name, row.attempt),
+                advisory,
                 silent_for_ms: None,
-                reviewers: panel_reviewers(flow.as_ref(), evidence, row),
+                reviewers: panel_reviewers(flow, evidence, row),
                 name: name.clone(),
             });
         }
@@ -367,9 +467,9 @@ fn stages(
         };
         if let Some(attempt) = running_here {
             running_claimed = true;
-            stages.push(pending(name, "running", attempt));
+            stages.push(pending(name, "running", attempt, advisory));
         } else if !executed {
-            stages.push(pending(name, "pending", 0));
+            stages.push(pending(name, "pending", 0, advisory));
         }
     }
     stages
@@ -377,7 +477,7 @@ fn stages(
 
 /// A stage the walk has not resolved: either the one executing now or one it
 /// has not reached.
-fn pending(name: String, state: &'static str, attempt: u32) -> Stage {
+fn pending(name: String, state: &'static str, attempt: u32, advisory: bool) -> Stage {
     Stage {
         name,
         state,
@@ -388,6 +488,8 @@ fn pending(name: String, state: &'static str, attempt: u32) -> Stage {
         exit_code: None,
         verdict_source: None,
         reason: None,
+        confidence: None,
+        advisory,
         silent_for_ms: None,
         reviewers: Vec::new(),
         log_position: 0,
@@ -444,6 +546,24 @@ fn panel_reviewers(
         .collect()
 }
 
+/// How sure the worker on a `reported` stage said it was, read back from the
+/// same evidence row the verdict itself came from.
+///
+/// Keyed by stage *and* attempt: a `return_to` edge re-enters a reported stage
+/// and each execution is owed its own report, so borrowing the first one's
+/// confidence for the second would attribute an opinion to a worker that never
+/// offered it. A report written before the field existed simply has none.
+fn reported_confidence(evidence: &[(String, String)], stage: &str, attempt: u32) -> Option<String> {
+    evidence
+        .iter()
+        .filter(|(kind, _)| kind == "stage_verdict")
+        .filter_map(|(_, data)| serde_json::from_str::<Value>(data).ok())
+        .find(|data| {
+            data["stage"] == stage && data["attempt"].as_u64().unwrap_or(1) == u64::from(attempt)
+        })
+        .and_then(|data| data["confidence"].as_str().map(str::to_owned))
+}
+
 /// Repair cycles a stage consumed, counted from the durable `repair_attempt`
 /// evidence rather than any in-memory counter, so a resumed run reports the
 /// same total a straight-through one does.
@@ -497,5 +617,6 @@ pub(super) fn extend_run_detail(value: &mut Value, history: &RunHistory) {
     value["finished_at_ms"] = json!(history.timeline.finished_at_ms);
     value["agent_exit_code"] = json!(history.agent_exit_code());
     value["stall"] = history.stall_json();
+    value["halt"] = json!(history.halt_json());
     value["stages"] = json!(history.stages_json());
 }

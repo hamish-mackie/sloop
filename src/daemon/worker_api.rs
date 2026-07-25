@@ -340,7 +340,7 @@ fn handle_verdict(
         .ok_or_else(|| internal("the executing stage is not in the run's flow snapshot"))?;
     if stage.result_check != Check::Reported {
         return Err(unauthorized(&format!(
-            "stage `{stage_name}` does not use the reported verdict policy"
+            "stage `{stage_name}` does not use `result_check: reported`"
         )));
     }
 
@@ -348,6 +348,11 @@ fn handle_verdict(
         VerdictValue::Pass => "pass",
         VerdictValue::Fail => "fail",
     };
+    // Stored, never consulted: the same rule a panel's seats live under, so
+    // `--confidence` means one thing wherever a worker reports from.
+    let confidence = args
+        .confidence
+        .map_or(Confidence::default(), Confidence::from);
     let inserted = state
         .run_store
         .record_stage_verdict(
@@ -355,6 +360,7 @@ fn handle_verdict(
             &stage_name,
             attempt,
             verdict,
+            confidence.as_str(),
             args.reason.as_deref(),
             state.clock.now_ms(),
         )
@@ -364,14 +370,16 @@ fn handle_verdict(
         })?;
     if !inserted {
         return Err(conflict(&format!(
-            "stage `{stage_name}` already has a reported verdict"
+            "stage `{stage_name}` has already reported a verdict"
         )));
     }
     Ok(json!({
         "verdict": {
             "run": run_id,
             "stage": stage_name,
+            "attempt": attempt,
             "verdict": verdict,
+            "confidence": confidence.as_str(),
             "reason": args.reason,
         }
     }))

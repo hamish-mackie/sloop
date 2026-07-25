@@ -62,8 +62,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their attempt (`build`, `build#2`), and a non-merged run's derived `reason`
   names the failure the walk actually stopped on rather than one a later
   attempt superseded.
+- `sloop show` tells an advisory failure apart from the one that ended the run:
+  the stage table marks it `advisory` and the scan strip marks it `warn` rather
+  than `FAIL`. A run's derived `reason` never names an advisory stage, since
+  the walk provably continued past it, and a terminal run whose only failures
+  were advisory says so. Stage rows carry a new `advisory` field.
+- A run whose walk stopped short says which halt it was. `sloop show <run>`
+  appends `; return_to budget spent` or `; the stage log does not replay
+  against this flow` to the derived reason where the failed stage alone does
+  not explain the ending, and `value.halt` carries the same distinction as a
+  stable token (`fail_action`, `return_budget_exhausted`, `corrupt_log`). It is
+  re-derived by replaying the walk's own fold, so it cannot disagree with the
+  driver.
+- `sloop logs --stage` accepts `<stage>#<attempt>`, selecting one execution of a
+  stage a `return_to` edge re-entered. Parsing happens in the daemon, so every
+  socket client gets it; a bare stage name still selects every execution. Log
+  lines label re-runs the same way (`[agent:build#2]`), so the label `sloop
+  show` prints is the selector to type next.
 
 ### Changed
+
+- `sloop verdict --confidence` on a `reported` stage is now recorded rather
+  than discarded, so the flag means the same thing from a stage worker as from
+  a panel reviewer. `sloop show <run>` prints it beside that stage's verdict
+  source, and the stage row carries a new `confidence` field.
+- `sloop template flow` prints the current grammar as its canonical example:
+  `action`, `result_check`, and `fail_action` written out on every stage, with
+  one `return_to` edge, one advisory stage, and a commented panel block. The
+  pre-`action` `kind:`/`verdict:` spelling and the deprecated `on_fail` are
+  demoted to a short "legacy spellings" note, and `sloop template ticket` names
+  the two flows that ship with the binary. `sloop verdict --help` and `sloop
+  logs --help` now document who may call them and what their selectors accept.
+- Denials and parse errors use one vocabulary for one concept: a stage that
+  cannot take a report says it does not use `result_check: reported` rather
+  than naming a "verdict policy".
 
 - Captured output records, stage-process checkpoints, agent-exit checkpoints,
   and reported verdicts are all scoped to `(stage, attempt)` rather than stage

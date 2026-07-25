@@ -225,6 +225,20 @@ fn a_two_of_three_quorum_passes_and_the_run_proceeds() {
     assert_eq!(seats[2]["verdict"], "fail");
     assert_eq!(seats[2]["confidence"], "low");
     assert_eq!(seats[2]["reason"], "naming could be better");
+
+    // And all of it reaches the text an operator actually reads. A tally in
+    // the envelope that the renderer drops is a tally nobody sees.
+    let text = String::from_utf8_lossy(&world.sloop_plain(&["show", &world.run_alias(1)]).stdout)
+        .into_owned();
+    for line in [
+        "review  passed",
+        "verdict from panel",
+        "alpha  pass  confidence high  reads correct",
+        "beta   pass  confidence medium  tests cover it",
+        "gamma  fail  confidence low  naming could be better",
+    ] {
+        assert!(text.contains(line), "show missed {line:?}:\n{text}");
+    }
 }
 
 /// One pass out of three is short of a two-vote quorum, so the stage fails —

@@ -53,8 +53,8 @@ The operator/worker split is enforced at the transport layer:
   `SLOOP_SOCKET` and `SLOOP_TOKEN` environment variables. Only `brief`,
   `show`, `note`, and `verdict` are accepted, the token must match the run,
   and the token stops working when the run settles. `verdict` is accepted
-  only for the currently executing stage when its snapshotted policy is
-  `reported`; the first report for that stage wins.
+  only for the currently executing stage when its snapshotted result check is
+  `reported`; the first report for that stage execution wins.
 
   A **panel reviewer's** credential is narrower still: it is minted for one
   seat — `(run, stage, attempt, reviewer index)` — and authorises exactly one
@@ -120,25 +120,69 @@ Patterns that fall out of the verbs:
   every run of the ticket newest attempt first. Each entry carries `id`,
   `alias`, `attempt`, `state`, `terminal`, `started_at_ms`,
   `finished_at_ms` (null while the run is in flight), the derived `reason`,
-  and `stages`: one `{stage, state}` pair per flow stage, where `state` is
-  `passed`, `failed`, `running`, or `pending`.
+  `stall`, and `stages`: one compact
+  `{stage, state, attempt, advisory, silent_for_ms}` object per stage
+  execution, where `state` is `passed`, `failed`, `running`, or `pending`. A
+  stage a `return_to` edge re-entered contributes one object per execution, so
+  this list is not one-to-one with the flow's stage names.
 - **Explain one run** — `show` on a run adds `attempt`, the timeline
   (`claimed_at_ms`, `started_at_ms`, `finished_at_ms`), `agent_exit_code`,
-  and `stages`: per stage, its `state`, `attempts` (including `on_fail`
-  repair retries), `started_at_ms`, `finished_at_ms`, `duration_ms`,
-  `exit_code`, `verdict_source`, and `reason`. Stage names come from the
-  run's admitted flow snapshot, so a run reports the stages it actually had
-  even after the flow file changes.
+  `halt`, and `stages`. Each stage row carries `stage`, `state`, `attempt`,
+  `attempts`, `advisory`, `started_at_ms`, `finished_at_ms`, `duration_ms`,
+  `exit_code`, `verdict_source`, `reason`, `confidence`, `silent_for_ms`, and
+  `reviewers`. Stage names come from the run's admitted flow snapshot, so a run
+  reports the stages it actually had even after the flow file changes.
+
+  The two attempt counters mean different things. `attempt` is which
+  *execution* of the stage the row is: a `return_to` edge re-enters a stage and
+  each re-entry is its own row, numbered from `1`. `attempts` is how many tries
+  one execution cost, counting the deprecated `on_fail` retries, which record
+  no row of their own. A row for a stage the walk has not reached has
+  `attempt: 0`.
+
+  `advisory` is `true` when the stage's `fail_action` is `continue`, so a
+  `failed` row with it set was recorded and stepped over rather than ending the
+  walk.
+
+  `confidence` is the `--confidence` a `reported` stage's worker sent, or null
+  on every other check and on reports made before the field existed. A panel's
+  confidences live on its seats instead: `reviewers` is one object per seat, in
+  reviewer order, with `reviewer` (the seat index), `target`, `verdict`,
+  `confidence`, and `reason`. Seats that never reported are present, as the
+  `fail` the quorum counted, with a null `confidence`. It is empty for every
+  non-panel check.
+
+  `value.halt` says why the walk stopped short of the end of the flow:
+  `fail_action` (the stage's `fail_action` is `fail`), `return_budget_exhausted`
+  (it had a `return_to` edge whose attempts were already spent), or
+  `corrupt_log` (the stage log does not replay against the run's flow). It is
+  null on a run that walked the whole flow and on one still in flight.
 
   `value.reason` on a run is now populated for every non-merged terminal
   run. It is a classified vendor diagnostic where one exists, and otherwise
   a sentence derived from the stored stage and evidence rows — never from
-  anything an agent reported about its own work. `exit_code` is unchanged
-  and has always been the *agent stage's* exit; `agent_exit_code` is the
-  same value under a name that cannot be misread as the run's outcome.
+  anything an agent reported about its own work. It names the last *halting*
+  failure; an advisory failure is never named as the cause, because the walk
+  provably continued past it. `exit_code` is unchanged and has always been the
+  *agent stage's* exit; `agent_exit_code` is the same value under a name that
+  cannot be misread as the run's outcome.
+- **Report a stage's verdict** — `verdict` takes
+  `{"verdict": "pass" | "fail"}` plus optional `reason` (a string) and
+  `confidence` (`"low"`, `"medium"`, or `"high"`, defaulting to `"medium"`; a
+  float or any other string is `invalid_arguments`). Nothing in the arguments
+  says which stage, attempt, or panel seat the report is for — all of that
+  comes from the token and the run's own state, so a worker cannot compose a
+  request that reports for anything but the execution it is in.
+
+  It returns `{"verdict": {"run", "stage", "attempt", "verdict", "confidence",
+  "reason"}}` for a stage worker, and the same object with `reviewer` in place
+  of `attempt` for a panel seat. A stage whose result check is not `reported`
+  is `unauthorized`; a second report on the same execution or seat is
+  `conflict`. `reason` is required from a panel reviewer and optional from a
+  stage worker. `confidence` is stored as evidence from either caller and is
+  never weighted into a panel's aggregation.
 - **Read or stream one run's output** — `logs` takes `{"run": <ref>}` plus
-  optional `stage` (one flow stage name; an undefined one is
-  `invalid_arguments`), `tail` (keep the last N matching entries), and
+  optional `stage`, `tail` (keep the last N matching entries), and
   `after` (a cursor). It returns the page along with `next_cursor`,
   `complete`, and `terminal`. Poll with `{"after": <cursor>}` to follow a
   live run and stop once a response is both `complete` and `terminal`;
@@ -146,6 +190,16 @@ Patterns that fall out of the verbs:
   dashboard tailing one stage of a large log transfers only that stage. Use
   `show` for the run's derived outcome and stage summary before reading its
   logs.
+
+  `stage` is a selector, not just a name: `"<stage>"` selects every execution,
+  and `"<stage>#<attempt>"` selects one — the disambiguation a `return_to` edge
+  makes necessary. A stage the run's flow does not define, and a malformed
+  attempt, are both `invalid_arguments`; an attempt the stage never reached is
+  an empty page. Each returned record carries its own `stage` and `attempt`, so
+  a client can group an unfiltered page itself. Both are absent on output
+  captured before those fields existed, and such a record is claimed by the
+  flow's first agent stage on its only attempt — which is the only execution a
+  run that produced one ever had.
 - **Stream activity** — `events` returns one page of the append-only
   activity feed (`run_claimed`, `run_started`, `run_finished`,
   `run_aborted`) plus a `next_cursor`. Poll with `{"after": <cursor>}` to
@@ -192,3 +246,24 @@ previously null unless a vendor error was classified, and is now also
 populated by a derived explanation — but it keeps its meaning ("why this run
 ended where it did"). A client that tested it for null as a proxy for "no
 vendor error" should read `value.classification` instead, which is unchanged.
+
+**The stage model did not bump the envelope.** Everything the `action` /
+`result_check` / `fail_action` split, `return_to` loops, advisory stages, the
+`sync` and `ff_only` builtins, and reviewer panels added to the wire is
+additive within version `1`, and the daemon still accepts and emits `v: 1`
+only:
+
+- `verdict.confidence` is a new optional request field. A client that predates
+  it simply omits it and is read as `medium`, so every older caller keeps
+  working unchanged.
+- `value.halt` on a run, and `attempt`, `advisory`, `confidence`, and
+  `reviewers` on a stage row, are new response fields. Nothing existing was
+  repurposed to make room for them.
+- `logs.stage` is the one field whose accepted *values* widened: it took a bare
+  stage name and now also takes `<stage>#<attempt>`. A bare name still means
+  what it always did — every execution of that stage — so no request that was
+  valid before means something different now. Only strings containing `#`,
+  which were previously always errors, changed from rejected to meaningful.
+- The one behavioural narrowing is in `stages`, and it predates this note: a
+  run whose walk looped contributes more than one row per stage name. A client
+  keying stage rows by name alone must key by `(stage, attempt)` instead.

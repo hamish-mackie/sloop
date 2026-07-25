@@ -670,7 +670,7 @@ impl RunDriver<'_> {
 
         // Each `on_fail` stage may run up to `attempts` repair-then-retry
         // cycles. The repair agent never produces the verdict: after it exits
-        // the stage is re-run and its own verdict policy re-applied, and that
+        // the stage is re-run and its own result check re-applied, and that
         // re-run is the only evidence.
         let mut repair_used = repair_attempts_used(&interrupted, &stage.name);
         let mut pending_repair: Option<(u32, ProcessIdentity, String)> = None;

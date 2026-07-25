@@ -871,16 +871,19 @@ pub(super) fn handle_logs(
     }))
 }
 
-/// Resolves a requested stage name against the run's own flow snapshot, so a
-/// typo is a named error rather than a silently empty page. A run recorded
+/// Resolves a requested stage selector against the run's own flow snapshot, so
+/// a typo is a named error rather than a silently empty page. A run recorded
 /// before flow snapshots existed has nothing to validate against; there the
 /// name is matched literally rather than refused.
-fn stage_filter(
-    run: &RunRecord,
-    requested: &str,
-) -> Result<crate::run_log::StageFilter, ErrorBody> {
+///
+/// The selector is `<stage>` or `<stage>#<attempt>` — the same spelling `show`
+/// prints in its stage table, so the label an operator just read is the
+/// argument they can paste back.
+fn stage_filter(run: &RunRecord, selector: &str) -> Result<crate::run_log::StageFilter, ErrorBody> {
+    let (requested, attempt) = split_attempt(selector)?;
     let literal = crate::run_log::StageFilter {
         stage: requested.to_owned(),
+        attempt,
         agent_fallback: false,
     };
     let Some(flow) = run
@@ -913,6 +916,26 @@ fn stage_filter(
         agent_fallback: first_agent.is_some_and(|stage| stage.name == requested),
         ..literal
     })
+}
+
+/// Splits `<stage>#<attempt>` into its parts, on the last `#` so a stage whose
+/// own name contains one still selects.
+///
+/// A malformed attempt is refused rather than folded back into the name: the
+/// caller who typed `--stage test#two` means to narrow to one execution, and
+/// silently handing them every execution of a stage called `test#two` — which
+/// no flow has — would answer with an empty page instead of the mistake.
+fn split_attempt(selector: &str) -> Result<(&str, Option<u32>), ErrorBody> {
+    let Some((stage, attempt)) = selector.rsplit_once('#') else {
+        return Ok((selector, None));
+    };
+    match attempt.parse::<u32>() {
+        Ok(attempt) if attempt >= 1 => Ok((stage, Some(attempt))),
+        _ => Err(invalid_arguments(&format!(
+            "`{selector}` is not a stage selector; write `<stage>` or `<stage>#<attempt>` \
+             with an attempt of at least 1"
+        ))),
+    }
 }
 
 /// One page of the activity feed. Reads are cursor-based and stateless, so a

@@ -98,6 +98,81 @@ fn invalid_flow_prevents_daemon_startup_with_a_named_error() {
     assert!(message.contains("unknown kind `unknown`"), "{message}");
 }
 
+/// The templates are the only grammar documentation an installed binary can
+/// reach, so the binary must accept exactly what it prints.
+///
+/// The unit tests in `src/templates.rs` already run each template through its
+/// own loader. This goes one rung further out: the *printed bytes* of `sloop
+/// template flow` and `sloop template ticket`, dropped into a fresh repository
+/// and posted. `post` snapshots the ticket's flow, so a template the parser
+/// accepts but the post path rejects — an `on_fail.target` naming no configured
+/// agent, a stage colliding with a spliced `flow.test_cmd` — fails here rather
+/// than in a user's terminal.
+#[test]
+fn the_printed_templates_post_cleanly_in_a_fresh_repository() {
+    let world = World::new();
+    assert!(world.sloop(&["init"]).status.success());
+
+    let printed = |kind: &str| {
+        let output = world.sloop_plain(&["template", kind]);
+        assert!(
+            output.status.success(),
+            "template {kind} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("template is UTF-8")
+    };
+
+    // The flow is installed under the name the ticket will bind to, so the
+    // post has to read and snapshot this exact text.
+    fs::write(
+        world.root().join(".agents/sloop/flows/from-template.yaml"),
+        printed("flow"),
+    )
+    .unwrap();
+    let ticket = world.root().join(".agents/sloop/tickets/from-template.md");
+    fs::write(&ticket, printed("ticket")).unwrap();
+
+    let output = world.sloop(&[
+        "post",
+        ticket.to_str().unwrap(),
+        "--flow",
+        "from-template",
+        "--manual",
+    ]);
+    assert!(
+        output.status.success(),
+        "posting the printed templates failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let posted = World::json_stdout(&output)["data"]["ticket"].clone();
+    assert_eq!(posted["name"], "Add request logging");
+    assert_eq!(posted["state"], "ready");
+    assert_eq!(posted["flow"], "from-template");
+
+    // The success above only means something if this path can fail: `post`
+    // reads and snapshots the named flow, so a flow it cannot parse stops the
+    // post rather than being discovered when the run is dispatched.
+    fs::write(
+        world.root().join(".agents/sloop/flows/broken.yaml"),
+        "- { name: build, kind: agent }\n- { name: oops, kind: nonsense }\n",
+    )
+    .unwrap();
+    let rejected = world.sloop(&[
+        "post",
+        ticket.to_str().unwrap(),
+        "--flow",
+        "broken",
+        "--manual",
+    ]);
+    assert!(!rejected.status.success());
+    let message = World::json_stdout_or_stderr(&rejected)["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .to_owned();
+    assert!(message.contains("broken.yaml"), "{message}");
+}
+
 #[test]
 fn documented_verbs_are_exposed_by_the_real_binary() {
     let world = World::new();
