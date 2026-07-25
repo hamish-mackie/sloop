@@ -433,6 +433,113 @@ fn list_explains_paused_failed_held_and_claimed_tickets() {
     assert!(human.contains(&format!("{claimed} claimed (default) claimed")));
 }
 
+/// What an operator is told when a ticket is ready but nothing is queued
+/// behind it.
+const NO_ACTIVATION: &str = "ready but no queued activation; enqueue with `sloop run`";
+
+/// The reason `sloop show` gives for a ticket, read from the dashboard rows.
+fn shown_reason(world: &World, ticket: &str) -> serde_json::Value {
+    let output = world.sloop(&["show"]);
+    assert!(
+        output.status.success(),
+        "show failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let data = World::json_stdout(&output);
+    data["data"]["recent"]
+        .as_array()
+        .expect("recent rows")
+        .iter()
+        .find(|row| row["id"] == ticket)
+        .unwrap_or_else(|| panic!("no row for {ticket} in {}", data["data"]["recent"]))["reason"]
+        .clone()
+}
+
+/// The gate that used to be answered globally: a ready ticket with nothing
+/// queued behind it must say so, even when the queue holds an activation that
+/// can never select it.
+#[test]
+fn a_ready_ticket_reports_its_own_missing_activation() {
+    let world = World::configured();
+    configure_fake_agent(&world, 1, false);
+    world.commit_all("initial");
+    world.start_daemon();
+
+    // A plain `--manual` post enqueues nothing, so the ticket sits ready.
+    let unactivated = post_manual(&world, "unactivated.md", "# Unactivated\n");
+    assert_eq!(shown_reason(&world, &unactivated), NO_ACTIVATION);
+    let human = world.sloop_plain(&["show"]);
+    assert!(human.status.success());
+    assert!(
+        String::from_utf8_lossy(&human.stdout).contains(NO_ACTIVATION),
+        "{}",
+        String::from_utf8_lossy(&human.stdout)
+    );
+
+    // The masking case. A merged ticket, pinned by an activation that can
+    // never fire, leaves the queue non-empty; the global question answered
+    // `true` for every ticket in the repository and reported no reason at all.
+    let merged = post_manual(&world, "merged-elsewhere.md", "# Merged elsewhere\n");
+    assert!(world.sloop(&["run", &merged]).status.success());
+    wait_until_slow("the other ticket merges", || {
+        status(&world)["tickets"]["merged"] == 1
+    });
+    assert!(world.sloop(&["run", &merged]).status.success());
+    wait_until("the dead activation settles in the queue", || {
+        status(&world)["queued_activations"]
+            .as_array()
+            .unwrap()
+            .len()
+            == 1
+    });
+
+    assert_eq!(shown_reason(&world, &unactivated), NO_ACTIVATION);
+    // A merged ticket is not waiting on anything and needs no reason.
+    assert_eq!(shown_reason(&world, &merged), serde_json::Value::Null);
+}
+
+/// `sloop retry` moves a failed ticket to `ready` without enqueueing anything,
+/// so the retried ticket has the same nothing behind it as a fresh post.
+#[test]
+fn a_retried_ticket_reports_its_missing_activation() {
+    let world = World::configured();
+    configure_failing_fake_agent(&world, 1, false);
+    world.commit_all("initial");
+    world.start_daemon();
+
+    // A blocked ticket keeps an activation queued that can never fire, so the
+    // retried ticket's own emptiness is what has to be reported.
+    let blocker = post_manual(&world, "retry-blocker.md", "# Retry blocker\n");
+    let blocked = post_manual_blocked(&world, "retry-dependent.md", &[blocker.as_str()]);
+    assert!(world.sloop(&["run", &blocked]).status.success());
+
+    let ticket = post_manual(&world, "retried.md", "# Retried\n");
+    assert!(world.sloop(&["run", &ticket]).status.success());
+    wait_until_slow("the first attempt fails", || {
+        status(&world)["tickets"]["failed"] == 1
+    });
+    assert_eq!(
+        status(&world)["queued_activations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        shown_reason(&world, &ticket),
+        "failed after 1 attempt(s); requeue with `sloop retry`"
+    );
+
+    assert!(world.sloop(&["retry", &ticket]).status.success());
+    assert_eq!(shown_reason(&world, &ticket), NO_ACTIVATION);
+
+    // Enqueueing one clears the reason, and the ticket runs again.
+    assert!(world.sloop(&["run", &ticket]).status.success());
+    wait_until_slow("the retried attempt runs", || {
+        status(&world)["tickets"]["failed"] == 1
+    });
+}
+
 #[test]
 fn list_orders_tickets_newest_first_and_honours_a_row_limit() {
     let world = World::configured();

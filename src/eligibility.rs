@@ -1,8 +1,17 @@
-//! Why a ticket is not being dispatched right now. One pure decision used by
-//! the dispatcher's gates and reported verbatim by the `list` verb, so the
-//! operator sees exactly what the scheduler saw.
+//! Why a ticket is not being dispatched right now: the *reporting* decision,
+//! built only by the daemon's `show`/`list` handlers. The dispatcher does not
+//! call this module — `scheduler::reconcile` checks its own gates inline — so
+//! the global gates here mirror the dispatcher's by construction and must be
+//! kept in step with them by hand.
+//!
+//! The two paths are not unifiable: the dispatcher asks "given this trigger,
+//! which ticket does it select?" while the report asks "given this ticket, is
+//! there a trigger that could select it?". Those are inverse questions, and no
+//! single function answers both.
 
-/// Global dispatcher gates, snapshotted at the moment of the question.
+/// The gates behind a report. All but `has_queued_activation` are global; that
+/// one is answered per ticket, since a queued activation may be pinned to a
+/// ticket other than the one being described.
 #[derive(Debug, Clone, Copy)]
 pub struct Gates {
     pub paused: bool,

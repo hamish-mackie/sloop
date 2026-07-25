@@ -632,6 +632,18 @@ impl LocalSqlite {
         Ok(activations)
     }
 
+    /// Whether any queued activation could select this ticket: the reporting
+    /// mirror of the claim path's selection, asked per ticket rather than as
+    /// "does the queue hold anything at all".
+    pub fn has_claimable_activation(
+        &self,
+        ticket_id: &str,
+        now_ms: i64,
+    ) -> Result<bool, StoreError> {
+        let connection = self.db.lock();
+        Ok(Self::claimable_activation_on(&connection, ticket_id, now_ms)?.is_some())
+    }
+
     pub fn dispatchable_activations(
         &self,
         now_ms: i64,
@@ -1871,12 +1883,15 @@ impl LocalSqlite {
         Ok(ticket)
     }
 
+    /// Shared by the claim path, which asks inside its transaction, and by
+    /// `has_claimable_activation`, which asks read-only. `Transaction` derefs
+    /// to `Connection`, so one statement serves both.
     fn claimable_activation_on(
-        transaction: &Transaction<'_>,
+        connection: &Connection,
         ticket_id: &str,
         now_ms: i64,
     ) -> Result<Option<QueuedActivation>, StoreError> {
-        transaction
+        connection
             .query_row(
                 "SELECT a.id, a.kind, a.ticket_id, a.project_id, a.eligible_at_ms, a.interval_ms
                  FROM activations a
@@ -3222,6 +3237,100 @@ mod tests {
 
         let error = store.readopt_lease("T1", "R1", 60_000, 4_000).unwrap_err();
         assert!(matches!(error, StoreError::LeaseNotHeld { .. }));
+    }
+
+    fn insert_ready_t0(store: &LocalSqlite, now_ms: i64) {
+        store
+            .insert_local_ticket(
+                "T0",
+                "default",
+                ".agents/sloop/tickets/t0.md",
+                "Ticket zero",
+                &[],
+                "sloop/T0",
+                None,
+                None,
+                None,
+                "default",
+                TicketState::Ready,
+                now_ms,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn an_activation_pinned_to_another_ticket_does_not_answer_for_this_one() {
+        let directory = tempdir().unwrap();
+        let store = open_seeded(&directory.path().join("sloop.db"));
+        insert_ready_t0(&store, 2_000);
+
+        // A1 is pinned to T1, so only T1 has demand behind it.
+        assert!(store.has_claimable_activation("T1", 2_000).unwrap());
+        assert!(!store.has_claimable_activation("T0", 2_000).unwrap());
+
+        // The masking case: T1 merges and is then pinned by an activation that
+        // can never fire. The queue is non-empty, so the global question
+        // answers `true` for T0 — the misreport this method exists to avoid.
+        granted_claim(&store, &claim_t1("R1"), 2_000);
+        settle_for_test(&store, "R1", Outcome::Merged, 3_000);
+        store
+            .insert_activation(
+                &NewActivation {
+                    id: "A2",
+                    kind: ActivationKind::Immediate,
+                    ticket_id: Some("T1"),
+                    project_id: None,
+                    eligible_at_ms: None,
+                    interval_ms: None,
+                },
+                3_000,
+            )
+            .unwrap();
+
+        assert!(!store.queued_activations().unwrap().is_empty());
+        assert!(!store.has_claimable_activation("T0", 3_000).unwrap());
+    }
+
+    #[test]
+    fn an_unpinned_activation_answers_for_every_ticket_it_could_select() {
+        let directory = tempdir().unwrap();
+        let store = open_seeded(&directory.path().join("sloop.db"));
+        insert_ready_t0(&store, 2_000);
+        store
+            .insert_activation(
+                &NewActivation {
+                    id: "A2",
+                    kind: ActivationKind::Immediate,
+                    ticket_id: None,
+                    project_id: None,
+                    eligible_at_ms: None,
+                    interval_ms: None,
+                },
+                2_000,
+            )
+            .unwrap();
+        let unpinned = QueuedActivation {
+            id: "A2".into(),
+            kind: "immediate".into(),
+            ticket_id: None,
+            project_id: None,
+            eligible_at_ms: None,
+            interval_ms: None,
+        };
+
+        // Selection takes one ticket, but the gate holds for both: the loser is
+        // next in line rather than unactivated.
+        assert_eq!(
+            select_ready_ticket(&store, &unpinned, 2_000).as_deref(),
+            Some("T1")
+        );
+        assert!(store.has_claimable_activation("T1", 2_000).unwrap());
+        assert!(store.has_claimable_activation("T0", 2_000).unwrap());
+
+        // An activation restricted with `--only` stops answering for the
+        // tickets it excludes, exactly as selection ignores them.
+        store.insert_activation_filter("A2", "T1").unwrap();
+        assert!(!store.has_claimable_activation("T0", 2_000).unwrap());
     }
 
     #[test]
