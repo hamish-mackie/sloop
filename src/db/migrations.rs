@@ -252,9 +252,6 @@ ALTER TABLE runs ADD COLUMN flow_json TEXT;
 ALTER TABLE runs ADD COLUMN ticket_json TEXT;
 ";
 
-// The activity feed read by `sloop watch`. Rows are written inside the same
-// transaction as the state transition they describe, so the feed can never
-// disagree with the tables it narrates.
 const EVENTS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS events (
     sequence        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -281,15 +278,6 @@ ALTER TABLE runs ADD COLUMN cleanup_eligible_at_ms INTEGER;
 ALTER TABLE runs ADD COLUMN cleaned_at_ms INTEGER;
 ";
 
-// Turns the stage table into the ordered evidence log described above. The
-// primary key moves from the natural key to `(run_id, seq)`, and `state`
-// becomes nullable, so the table is rebuilt rather than altered in place.
-//
-// Every pre-existing row is one whole stage execution, judged and resolved, so
-// each backfills as an `action` row carrying its verdict. Numbering them by
-// `(stage_index, attempt)` reproduces the order the linear walk wrote them in,
-// which is what makes a run queued before the migration replay to the same
-// `Step` afterwards.
 const STAGE_EVIDENCE_LOG: &str = "
 CREATE TABLE stage_evidence_log (
     run_id          TEXT NOT NULL REFERENCES runs(id),
@@ -320,13 +308,6 @@ DROP TABLE aftercare_stages;
 ALTER TABLE stage_evidence_log RENAME TO aftercare_stages;
 ";
 
-// Dissolves the aftercare regime: one driver now walks every stage, so nothing
-// stored is named after the thread that used to walk the tail of a flow. The
-// stage log becomes `stage_runs`, the run state that meant "no agent process
-// left to identify" becomes `driving`, and the interrupted-stage process
-// checkpoint becomes `stage_process`. These are the only strings left carrying
-// the old spelling, and only because a database written by an older binary
-// still holds them.
 const UNIFORM_STAGE_DRIVER: &str = "
 ALTER TABLE aftercare_stages RENAME TO stage_runs;
 
@@ -338,28 +319,6 @@ UPDATE run_evidence
  WHERE kind = 'aftercare_process';
 ";
 
-// Renames the activation concept to `trigger`: the two tables, every column
-// that points at them, the minted id prefix, and the counter row that hands out
-// its ordinals. Nothing is dropped. A queued trigger is a durable record that
-// demand exists, reconstructible from neither the committed ticket files nor
-// Git, so `reindex` cannot put one back — the migration has to carry every row
-// across or the pending work is simply gone.
-//
-// `RENAME TO` and `RENAME COLUMN` rewrite the `REFERENCES` clauses in other
-// tables for us, but an `UPDATE` to a primary key does not propagate to the
-// plain `REFERENCES` columns pointing at it, so `runs` and `trigger_filters`
-// are rewritten by hand. `defer_foreign_keys` holds the constraint check until
-// commit, by which point all three tables agree again.
-//
-// The prefix goes to `TR`, not `T`: `T91` reads as a ticket id beside
-// `TICK-91`. Widening it by a character is why the id counter's seed moves from
-// `SUBSTR(id, 2)` to `SUBSTR(id, 3)`.
-//
-// `leases.owner_id` is a JSON ownership token that embeds the claiming
-// trigger's id, and recovery matches that id against `triggers` to re-find an
-// interrupted claim. It is rewritten to the same shape and key order
-// `lease_owner` now writes, so a lease planted before the upgrade still decodes
-// to a trigger that exists.
 const TRIGGER_RENAME: &str = "
 PRAGMA defer_foreign_keys = ON;
 

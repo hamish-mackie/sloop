@@ -125,8 +125,6 @@ pub(crate) fn enqueue(
     };
     let (id, reused) = match existing {
         Some(id) => {
-            // Only the caller knows whether the repost carried a new time; an
-            // absent one must not re-time the trigger already in the queue.
             if let Some(eligible_at_ms) = request.eligible_at_ms {
                 reschedule(transaction, &id, eligible_at_ms, now_ms)?;
             }
@@ -252,8 +250,6 @@ pub(crate) fn consume(
                  WHERE id = ?1 AND state = 'queued' AND kind != 'every'",
                 params![trigger_id, now_ms],
             )?,
-            // A fault is the domain refusing to write; the claim path rejects
-            // before it gets here, so reaching this arm is a caller bug.
             Effect::Fault(_) | Effect::Requeue { .. } => {
                 return Err(StoreError::TriggerNotQueued {
                     trigger_id: trigger_id.into(),
@@ -466,9 +462,6 @@ pub(crate) fn deletion_plan(
     stale_projects: &[String],
 ) -> Result<DeletionPlan, StoreError> {
     let mut plan = DeletionPlan::default();
-    // A trigger pinned to a vanished ticket is demand for work that no longer
-    // exists, whatever state it is in: the row has to go because `ticket_id`
-    // references the ticket.
     for ticket_id in stale_tickets {
         let mut statement = connection.prepare("SELECT id FROM triggers WHERE ticket_id = ?1")?;
         plan.doomed.extend(
@@ -477,9 +470,6 @@ pub(crate) fn deletion_plan(
                 .collect::<Result<Vec<_>, _>>()?,
         );
     }
-    // A project is a scope, not an owner. Live demand scoped to a vanished
-    // project can never be satisfied, so it dies; a settled trigger is history
-    // and only loses the scope.
     for project_id in stale_projects {
         let mut statement =
             connection.prepare("SELECT id, state FROM triggers WHERE project_id = ?1")?;
@@ -546,8 +536,6 @@ fn reserve_ordinal(connection: &Connection) -> Result<i64, StoreError> {
         [],
         |row| row.get(0),
     )?;
-    // `SUBSTR` skips the two-character `TR` prefix; see
-    // `run_store::tx::reserve_ordinal`, which does the same for `notes`.
     let existing: i64 = connection.query_row(
         "SELECT COALESCE(MAX(CAST(SUBSTR(id, 3) AS INTEGER)), 0) + 1 FROM triggers",
         [],
@@ -716,8 +704,6 @@ impl LocalSqlite {
         if stranded.is_empty() {
             return Ok(Vec::new());
         }
-        // By ticket, not by trigger: two triggers stranded on one ticket are
-        // retired by a single named transition rather than a second no-op.
         let tickets: BTreeSet<&str> = stranded
             .iter()
             .map(|(_, ticket_id)| ticket_id.as_str())
@@ -860,8 +846,6 @@ mod tests {
                 .collect();
             assert_eq!(from_sql, from_domain, "disagreement at now_ms = {now_ms}");
         }
-        // A fixture that agreed only because both sides were empty would prove
-        // nothing.
         assert!(!store.dispatchable_triggers(2_000).unwrap().is_empty());
     }
 
@@ -913,8 +897,6 @@ mod tests {
     fn a_failure_after_the_row_insert_leaves_no_trigger_at_all() {
         let directory = tempdir().unwrap();
         let store = seeded(&directory.path().join("sloop.db"));
-        // `trigger_filters.ticket_id` references `tickets`, so the second
-        // filter fails after the row and the first filter are already written.
         let filters = ["T2".to_owned(), "GONE".to_owned()];
         let error = store
             .enqueue_trigger(&request(TriggerKind::Immediate, &filters), 2_000)
@@ -950,7 +932,6 @@ mod tests {
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].id, enqueued.id);
         assert_eq!(queued[0].kind, TriggerKind::Immediate);
-        // The restriction is in force: T1 is ready but not named.
         assert_eq!(
             store
                 .select_ready_ticket(None, &enqueued.id, 2_000)
@@ -975,7 +956,6 @@ mod tests {
         assert!(second.reused);
         assert_eq!(store.queued_triggers().unwrap().len(), 1);
 
-        // A different kind is different demand, so it is not absorbed.
         let scheduled = EnqueueRequest {
             eligible_at_ms: Some(9_000),
             ..EnqueueRequest {
@@ -988,7 +968,6 @@ mod tests {
         assert_ne!(third.id, first.id);
         assert_eq!(store.queued_triggers().unwrap().len(), 2);
 
-        // Reposting with a new time re-times the trigger already queued.
         let retimed = EnqueueRequest {
             eligible_at_ms: Some(11_000),
             ..scheduled.clone()
@@ -1006,7 +985,6 @@ mod tests {
             Some(11_000)
         );
 
-        // `Allow` is the run path: two invocations, two triggers.
         let run = EnqueueRequest {
             ticket_id: Some("T1"),
             ..request(TriggerKind::Immediate, &[])
@@ -1087,12 +1065,6 @@ mod tests {
             1,
             "the recurring trigger stays queued and the one-shot one does not"
         );
-        // The `state = 'queued'` guard is what makes a retired trigger
-        // unmovable: a second claimer holding the same effect is rejected
-        // rather than quietly re-retiring it. A rearm carries no such
-        // protection and needs none — a recurring trigger is *meant* to stay
-        // queued, and double-spawning is prevented by the conditional ticket
-        // claim that runs before this.
         assert!(matches!(
             consume(&connection, &once.id, &[Effect::Complete], 2_000),
             Err(StoreError::TriggerNotQueued { .. })

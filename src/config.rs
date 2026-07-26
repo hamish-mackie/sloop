@@ -131,10 +131,6 @@ impl RunningHours {
 
     pub fn next_opening_ms(&self, clock: &dyn crate::clock::Clock, now_ms: i64) -> i64 {
         let mut candidate = (now_ms.div_euclid(60_000) + 1) * 60_000;
-        // Evaluate real instants rather than constructing a local wall time:
-        // skipped and repeated DST minutes then follow the same `is_open`
-        // policy as every spawn decision. Forty-nine hours covers even a
-        // skipped local calendar day.
         for _ in 0..=(49 * 60) {
             if self.is_open(clock.local_minute(candidate)) {
                 return candidate;

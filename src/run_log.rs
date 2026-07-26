@@ -105,8 +105,6 @@ impl RunLogWriter {
         }
         let next_sequence = last_sequence(path)?.map_or(1, |last| last + 1);
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        // A crash can leave a partial record with no trailing newline; the
-        // next record must start on its own line or it would be corrupted too.
         if !ends_with_newline(path)? {
             file.write_all(b"\n")?;
         }
@@ -175,8 +173,6 @@ impl RunLogWriter {
             .write_all(&line)
             .and_then(|()| inner.file.sync_data())
         {
-            // Keep the previous complete-record boundary after a short write,
-            // especially ENOSPC, so future appends cannot join corrupt JSON.
             let _ = inner.file.set_len(original_len);
             return Err(error);
         }
@@ -391,8 +387,6 @@ pub fn stage_output_tail(
         }
         captured.extend_from_slice(&record.chunk.into_bytes());
     }
-    // Chunks are pipe reads, not lines, so the text is only split into lines
-    // after reassembly.
     let text = String::from_utf8_lossy(&captured);
     let text = text.strip_suffix('\n').unwrap_or(&text);
     if text.is_empty() {
@@ -422,8 +416,6 @@ pub struct StageFilter {
 
 impl StageFilter {
     fn accepts(&self, record: &OutputRecord) -> bool {
-        // Output captured before attempts were tagged belongs to the only
-        // execution such a run ever had, so it answers to `#1`.
         if self
             .attempt
             .is_some_and(|attempt| record.attempt.unwrap_or(1) != attempt)
@@ -483,16 +475,12 @@ pub fn read_filtered_page(path: &Path, query: &PageQuery) -> io::Result<OutputPa
         Err(error) => return Err(error),
     };
 
-    // A tail keeps the newest accepted records, so it must read to the end;
-    // the trailing window is bounded by the caller's limit either way.
     let window = query.tail.map_or(query.limit, |tail| tail.min(query.limit));
     let mut entries = VecDeque::new();
     let mut next_cursor = query.after;
     let mut complete = true;
     let mut elided = 0;
     for line in BufReader::new(file).lines() {
-        // An unparsable line is an incomplete tail, not corruption of the
-        // records before it.
         let Ok(record) = serde_json::from_str::<OutputRecord>(&line?) else {
             continue;
         };
@@ -583,8 +571,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(texts(&page), ["tested"]);
-        // Records 3 was examined and rejected, so a follower resuming here
-        // neither replays it nor re-reads it on every poll.
         assert_eq!(page.next_cursor, 3);
         assert!(page.complete);
     }
@@ -614,8 +600,6 @@ mod tests {
         let claimed = read_filtered_page(&path, &filter(true)).unwrap();
         assert_eq!(texts(&claimed), ["legacy agent", "tagged agent"]);
 
-        // Without the fallback only the tagged record matches: an untagged
-        // record names no stage and must not be invented into one.
         let literal = read_filtered_page(&path, &filter(false)).unwrap();
         assert_eq!(texts(&literal), ["tagged agent"]);
     }
@@ -653,8 +637,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(texts(&page), ["t4", "t5"]);
-        // A tail reads to the end of the file, so the page is complete and
-        // the cursor is past every record — including the ones it dropped.
         assert!(page.complete);
         assert_eq!(page.next_cursor, 12);
     }
@@ -682,7 +664,6 @@ mod tests {
         .unwrap();
         assert_eq!(texts(&all), ["one", "two"]);
 
-        // The limit outranks the tail; a caller cannot page past it.
         let capped = read_filtered_page(
             &path,
             &PageQuery {
@@ -734,8 +715,6 @@ mod tests {
             super::stage_output_tail(&path, "test", 2, 100).unwrap(),
             "a2 line 0\na2 line 1\na2 line 2\na2 line 3"
         );
-        // A stage that never ran, and a run with no output at all, are both
-        // simply nothing to quote rather than an error.
         assert_eq!(super::stage_output_tail(&path, "test", 3, 10).unwrap(), "");
         assert_eq!(
             super::stage_output_tail(&directory.path().join("absent.ndjson"), "test", 1, 10)
@@ -969,8 +948,6 @@ mod tests {
         assert_eq!(page.entries.len(), 1);
         assert!(page.complete);
 
-        // The partial record was never complete, so its sequence is free to
-        // reuse, and the new record must land on its own line.
         let writer = RunLogWriter::open(&path).unwrap();
         let sequence = writer
             .append(

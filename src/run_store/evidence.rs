@@ -207,9 +207,6 @@ pub(crate) mod tx {
                 "reason": row.reason,
             })
             .to_string();
-            // A re-executed stage overwrites its own row rather than
-            // duplicating it, and `seq` is deliberately absent from the update
-            // so the rewrite keeps the log position it first took.
             transaction.execute(
                 "INSERT INTO stage_runs
                      (run_id, seq, stage_index, stage, state, attempt, phase,
@@ -426,8 +423,6 @@ fn stage_log(connection: &Connection, run_id: &str) -> rusqlite::Result<Vec<Stag
                 finished_at_ms: row.get(6)?,
                 exit_code: row.get(7)?,
                 output_ref: field("output").unwrap_or_default(),
-                // A resolved row written before the source was recorded was
-                // judged by its own exit, which is what the old default said.
                 verdict_source: field("verdict_source")
                     .or_else(|| state.is_some().then(|| "exit_code".to_owned())),
                 reason: field("reason"),
@@ -887,8 +882,6 @@ mod tests {
                 &[stage_row(0, "build", 1, StagePhase::Action, Some("passed"))],
             )
             .unwrap();
-        // One execution of `verify`, judged by an independent actor: two rows
-        // sharing a stage and an attempt, and only the last carries a verdict.
         store
             .append_stage_rows(
                 "R1",
@@ -1045,12 +1038,8 @@ mod tests {
         );
         let migrated = store.stage_log("R1").unwrap();
         assert_eq!(migrated[0].verdict_source.as_deref(), Some("reported"));
-        // A row that never recorded a source was judged by its own exit, which
-        // is what the pre-log reader assumed.
         assert_eq!(migrated[1].verdict_source.as_deref(), Some("exit_code"));
 
-        // The migrated log still appends: the next row takes the position
-        // after the two that were backfilled.
         store
             .append_stage_rows(
                 "R1",

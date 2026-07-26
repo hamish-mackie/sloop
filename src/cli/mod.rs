@@ -436,8 +436,6 @@ impl TryFrom<Command> for Request {
         let empty = EmptyArgs::default;
         Ok(match command {
             Command::Init => Self::Init(empty()),
-            // `template` is answered entirely from compiled-in content, so it
-            // has no protocol verb and must never reach the daemon path.
             Command::Template { .. } => {
                 return Err(RequestConstructionError(
                     "template is printed locally and has no daemon request".into(),
@@ -662,8 +660,6 @@ where
             };
             match cli.command {
                 Some(subcommand) => run_command(subcommand, mode, stdout, stderr),
-                // Bare `sloop` orients rather than acts: print the same help
-                // as `sloop --help` instead of defaulting to a verb.
                 None => {
                     let help = command.render_help().to_string();
                     let help = help.trim_end();
@@ -676,8 +672,6 @@ where
                 }
             }
         }
-        // Parsing failed, so the flag is read from the raw arguments: an
-        // agent asking for `--json --help` still gets an envelope.
         Err(error) => {
             let mode = if args.iter().any(|arg| arg == "--json") {
                 OutputMode::Json
@@ -1048,9 +1042,6 @@ fn run_wait(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> ExitCode {
-    // Validate with the legacy run resolver so unknown and unrun references
-    // still fail immediately, then follow the original scope exactly as the
-    // advertised replacement does.
     match crate::daemon::request(Request::Wait(RunReferenceArgs { run: run.clone() })) {
         Ok(result) if result.response.ok => {}
         Ok(result) => {
@@ -1196,21 +1187,10 @@ fn follow_show(
                 if let Some(next) = next {
                     cursor = Some(next);
                 }
-                // A cursor short of the newest sequence means more rows are
-                // already waiting; skip the sleep and drain them. The test is
-                // on the cursor rather than on this page being non-empty
-                // because a scoped page can filter out every row it scanned
-                // and still leave matching rows further along. Requiring the
-                // cursor to have moved keeps a daemon that returns no cursor
-                // from spinning.
                 let caught_up = next == data["latest"].as_i64();
                 if advanced && !caught_up {
                     continue;
                 }
-                // Settlement and its final event are committed together, but
-                // they can land after the events snapshot and before the show
-                // snapshot below. Once terminal state is observed, perform one
-                // more event poll before exiting so that event is never lost.
                 if caught_up && let Some(merged) = settled_outcome {
                     return if merged {
                         ExitCode::SUCCESS
@@ -1327,8 +1307,6 @@ fn follow_logs(
                         ExitCode::FAILURE,
                     );
                 }
-                // The attempt-disambiguation note describes the run, not the
-                // page; repeating it on every page would be noise.
                 if written && let Some(data) = result.response.data.as_mut() {
                     data["note"] = serde_json::Value::Null;
                 }
@@ -1347,14 +1325,10 @@ fn follow_logs(
                 if let Some(next) = data["next_cursor"].as_u64() {
                     args.after = Some(next);
                 }
-                // `tail` selects a window of what already exists; every later
-                // page is whatever arrived after it.
                 args.tail = None;
                 if settled {
                     return ExitCode::SUCCESS;
                 }
-                // A truncated page means more output is already on disk;
-                // drain it before pausing.
                 if !complete {
                     continue;
                 }
@@ -1667,7 +1641,6 @@ mod tests {
             expanded(&["sloop", "--json", "list", "-2"]),
             ["sloop", "--json", "list", "--limit=2"]
         );
-        // `-0` is expanded so clap's range, not this function, refuses it.
         assert_eq!(expanded(&["sloop", "list", "-0"])[2], "--limit=0");
         assert_eq!(
             expanded(&["sloop", "show", "log", "-2"]),
@@ -1676,7 +1649,6 @@ mod tests {
         for untouched in [
             ["sloop", "list", "-abc"].as_slice(),
             ["sloop", "list", "-n"].as_slice(),
-            // Another verb's arguments, and the verb token itself, are safe.
             ["sloop", "post", "list", "-2"].as_slice(),
             ["sloop", "watch", "-2"].as_slice(),
         ] {
@@ -1700,8 +1672,6 @@ mod tests {
 
     #[test]
     fn unknown_subcommand_suggests_a_near_miss_spelling() {
-        // clap's own similarity matcher supplies this tip; the envelope must
-        // carry it through unchanged.
         let envelope = error_envelope(&["statuss"]);
 
         let message = envelope["error"]["message"]

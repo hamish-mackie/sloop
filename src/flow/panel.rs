@@ -100,8 +100,6 @@ pub(super) fn parse_panel(stage: &str, raw: RawPanel) -> Result<Panel, String> {
         .map(|prompt| prompt.trim().to_owned())
         .filter(|prompt| !prompt.is_empty())
         .ok_or_else(|| format!("stage `{stage}` panel must define a non-empty `prompt`"))?;
-    // The path is joined onto the repository's Sloop directory, so anything
-    // that could escape it is refused rather than resolved.
     if Path::new(&prompt).is_absolute() || prompt.split('/').any(|segment| segment == "..") {
         return Err(format!(
             "stage `{stage}` panel prompt must be a relative path under `{PANEL_PROMPT_ROOT}` \
@@ -132,8 +130,6 @@ pub(super) fn parse_panel(stage: &str, raw: RawPanel) -> Result<Panel, String> {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    // An unstated quorum is unanimity: a panel whose rule was never written
-    // down must not silently be the most permissive one it could have been.
     let quorum = raw
         .require
         .and_then(|require| require.quorum)
@@ -410,15 +406,9 @@ mod tests {
             )
         };
 
-        // Four stages whose panel seats three: the base walk costs seven
-        // executions and each of the three re-runs costs the same seven, for
-        // twenty-eight. Under the cap.
         let bounded = parse("example", &flow("[{target: a}, {target: b}, {target: c}]"));
         assert!(bounded.is_ok(), "{bounded:?}");
 
-        // Widen the same panel to five seats and every one of those four
-        // passes costs nine instead of seven — thirty-six in total, which the
-        // cap refuses at parse time rather than at the thirty-third spawn.
         let error = error(&flow(
             "[{target: a}, {target: b}, {target: c}, {target: d}, {target: e}]",
         ));
@@ -440,7 +430,6 @@ mod tests {
         for seats in [2usize, 3] {
             for quorum in 1..=seats as u32 {
                 let panel = panel_of(seats, quorum);
-                // Every assignment of the three states to the seats.
                 for combination in 0..states.len().pow(seats as u32) {
                     let reported: Vec<Option<ReviewerReport>> = (0..seats)
                         .map(|seat| states[combination / states.len().pow(seat as u32) % 3].clone())
@@ -463,7 +452,6 @@ mod tests {
                         outcome.verdict, expected,
                         "seats {seats}, quorum {quorum}, reports {reported:?}"
                     );
-                    // Every seat is accounted for, whether it spoke or not.
                     assert_eq!(outcome.reports.len(), seats);
                     assert_eq!(
                         outcome.reason,
@@ -490,8 +478,6 @@ mod tests {
         assert_eq!(outcome.reports[1].confidence, None);
         assert_eq!(outcome.reports[1].reason, NO_VERDICT_REPORTED);
 
-        // A stage abandoned before its last seats ran leaves a short slice,
-        // which fills out the same way rather than shrinking the panel.
         let truncated = aggregate(&panel, &[report(Verdict::Pass)]);
         assert_eq!(truncated.verdict, Verdict::Fail);
         assert_eq!(truncated.reports.len(), 3);

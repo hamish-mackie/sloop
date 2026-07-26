@@ -395,14 +395,6 @@ pub async fn handle(
             error,
         })?
         .unwrap_or_else(|| content.clone());
-    // A repost cannot move a settled ticket: `update_authored_ticket` omits
-    // `state` from its `SET`, so `merged`, `failed`, and `needs_review` all
-    // survive the write. Dispatch requires `ready`, so a trigger queued
-    // here could never fire; it would only sit in `queued_triggers` as
-    // phantom demand and skew every gate that reads that count. `failed` is
-    // included even though `sloop retry` revives it: a lingering trigger
-    // would make one failed ticket spawn on `retry` while every other one
-    // waits for `sloop run`.
     let terminal_state = existing
         .as_ref()
         .map(|ticket| ticket.state.clone())
@@ -495,9 +487,6 @@ pub async fn handle(
         },
         "created": created,
         "trigger": trigger,
-        // `trigger` alone cannot tell a machine consumer why it is null:
-        // `--manual` and `--hold` never asked for one, while a terminal
-        // ticket asked and was refused. Only the second sets this.
         "trigger_suppressed": terminal_state.map(|state| json!({
             "reason": "terminal_ticket",
             "state": state,
@@ -528,8 +517,6 @@ pub(crate) fn parse_ticket_frontmatter(
             error,
         })?;
 
-    // A field that failed to parse is already reported by its own problem;
-    // adding "missing" on top of "wrong type" would only muddy the list.
     let name_is_reported = field_errors
         .iter()
         .any(|error| matches!(error, FrontmatterError::InvalidFieldType { key } if key == "name"));
@@ -652,9 +639,6 @@ fn repository_relative(root: &Path, ticket_dir: &Path, file: &str) -> Result<Pat
             component => normalized.push(component),
         }
     }
-    // Both sides go through the same resolution: `Repository::discover` hands
-    // this a canonical root, but a caller that does not must not silently get
-    // a containment answer decided by symlink spelling.
     let relative = resolve_symlinks(&normalized)
         .strip_prefix(resolve_symlinks(root))
         .map(Path::to_path_buf)
@@ -824,8 +808,6 @@ impl fmt::Display for PostError {
                 directory.display()
             ),
             Self::InvalidTicket { path, error } => write!(formatter, "{path}: {error}"),
-            // A lone problem keeps the original one-line `path: problem`
-            // shape; only a genuine list needs the heading and bullets.
             Self::InvalidTicketFields { path, problems } => match problems.as_slice() {
                 [problem] => write!(formatter, "{path}: {problem}"),
                 problems => {
@@ -1096,7 +1078,6 @@ mod tests {
             )
             .unwrap();
 
-            // The edit lands; only the trigger is withheld.
             assert_eq!(response["ticket"]["id"], "TICK-1");
             assert_eq!(response["created"], false);
             assert_eq!(
@@ -1140,8 +1121,6 @@ mod tests {
 
         assert!(second["trigger"].is_null());
         assert_eq!(second["trigger_suppressed"]["state"], "merged");
-        // The trigger left over from before the merge keeps its original
-        // time: the reschedule branch must not run for a settled ticket.
         let queued = store.queued_triggers().unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].eligible_at_ms, Some(10_000));
@@ -1611,8 +1590,6 @@ mod tests {
         .unwrap();
         drop(store);
 
-        // A fresh store with no rows of its own must recover the flow binding
-        // purely from the committed frontmatter that the first post stamped.
         let fresh_store =
             LocalSqlite::from_db(Db::open(&root.path().join("fresh.db"), 3_000).unwrap());
         fresh_store

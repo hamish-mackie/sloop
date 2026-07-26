@@ -178,10 +178,6 @@ fn insert_lines(content: &str, lines: String) -> Result<Option<String>, Frontmat
         }
         None => format!("---\n{lines}---\n{content}"),
     };
-    // Line insertion assumes a block-style mapping; exotic-but-parseable
-    // blocks (a flow mapping like `{id: x}`) would end up invalid. Verify
-    // the write before handing it back: refusing with an error is always
-    // preferable to corrupting a user's committed file.
     parse(&stamped)?;
     Ok(Some(stamped))
 }
@@ -308,7 +304,6 @@ mod tests {
                 FrontmatterError::InvalidFieldType { key: "name".into() },
             ]
         );
-        // Failed fields fall back to defaults; readable ones still parse.
         assert_eq!(frontmatter.name, "");
         assert!(!frontmatter.has_blocked_by());
         assert_eq!(frontmatter.target.as_deref(), Some("claude"));
@@ -488,7 +483,6 @@ mod tests {
                 Err(FrontmatterError::ForeignLineBreak)
             );
         }
-        // Body bytes are user Markdown and stay unrestricted.
         assert!(parse("---\nid: T1\n---\nbody\rwith\u{0085}breaks\n").is_ok());
     }
 

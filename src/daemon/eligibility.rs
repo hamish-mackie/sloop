@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn ticket_states_explain_themselves_before_global_gates() {
         let mut gates = open_gates();
-        gates.paused = true; // ticket-level reasons must win over global ones
+        gates.paused = true;
         assert!(matches!(
             ineligibility("failed", 2, None, &gates),
             Some(Ineligible::Failed { attempts: 2 })

@@ -484,8 +484,6 @@ impl ConditionState {
         {
             *found |= contains(&window, signature.as_bytes());
         }
-        // Keep one full pattern length because status/error codes also need
-        // the following byte to prove their token boundary.
         let keep = self.overlap_len.min(window.len());
         self.tail.extend_from_slice(&window[window.len() - keep..]);
     }
@@ -628,7 +626,6 @@ rules:
         assert_eq!(matched.rule_id, "claude.rate-limit.usage-limit");
         assert!(matched.class.requires_cooldown());
 
-        // The earlier plain-limit wording keeps matching, on either stream.
         let plain = b"API Error: You've hit your limit; resets 12am (UTC)".as_slice();
         assert!(classifier.classify(Some(1), plain, b"").is_some());
         assert!(classifier.classify(Some(1), b"", plain).is_some());
@@ -647,15 +644,9 @@ rules:
     /// Each quotes the limit wording; none of them is the vendor speaking.
     /// Shapes and nesting are taken from runs that were wrongly discarded.
     const AGENT_QUOTING_THE_LIMIT: &[&str] = &[
-        // Reading a file whose fixtures contain a verbatim rejection. The
-        // escaped payload carries `is_api_error_message` and an `error` field,
-        // but as string content, not as fields of this record.
         r##"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"const CLAUDE_SESSION_LIMIT_STDOUT: &str = r#\"{\"type\":\"assistant\",\"message\":{\"content\":[{\"text\":\"You've hit your session limit\"}]},\"error\":\"rate_limit\",\"is_api_error_message\":true}\"#;"}]}}"##,
-        // Searching for the wording.
         r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5","content":[{"type":"tool_use","id":"toolu_02","name":"Bash","input":{"command":"rg -n \"You've hit your\" src/","description":"Find the limit signature"}}]}}"#,
-        // Explaining the wording in prose.
         r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"The catalog matches on \"You've hit your\", which the repository also contains."}]}}"#,
-        // Reporting on the work, in a run that succeeded.
         r#"{"type":"result","subtype":"success","is_error":false,"num_turns":113,"result":"Done. The rule keys on \"You've hit your\" and now also checks record structure."}"#,
     ];
 
@@ -677,8 +668,6 @@ rules:
             );
         }
 
-        // A whole run's worth of them, interleaved and split across chunk
-        // boundaries that fall inside records, still classifies as clean.
         let transcript = format!("{}\n", AGENT_QUOTING_THE_LIMIT.join("\n"));
         let mut scanner = classifier.scanner(Some(0));
         for chunk in transcript.as_bytes().chunks(17) {
@@ -719,7 +708,6 @@ rules:
         assert!(classifier.classify(Some(1), plain, b"").is_some());
         assert!(classifier.classify(Some(1), b"", plain).is_some());
 
-        // An unframed catalog's conditions may still be spread across lines.
         let opencode = b"UnknownError:\nUnexpected server error. Check server logs for details.";
         assert!(classifier.classify(Some(1), b"", opencode).is_some());
     }

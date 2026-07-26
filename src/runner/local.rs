@@ -147,9 +147,6 @@ pub fn launch_agent<H: StageHooks>(
     let mut child = command
         .spawn()
         .map_err(|error| RunnerError::Execution(error.to_string()))?;
-    // The agent's own flow stage is recorded alongside its output so the
-    // stage an operator reads about in the flow is the stage they can filter
-    // `sloop logs` by.
     let readers = vec![
         spawn_output_reader(
             child.stdout.take().expect("stdout was piped"),
@@ -190,9 +187,6 @@ pub fn launch_agent<H: StageHooks>(
         worker,
         started_at_ms,
     };
-    // The child is already running; its stage_process row is not written yet.
-    // The exec path exposes the same window, and a test that means to hold it
-    // open has to be able to hold it here too.
     wait_for_test_hook(&format!(
         "before-stage-process-checkpoint-{}",
         checkpoint.stage
@@ -711,9 +705,6 @@ mod tests {
 
     #[test]
     fn worker_socket_paths_fit_the_macos_socket_length_cap() {
-        // A representative macOS runtime directory: `$TMPDIR` on macOS is
-        // `/var/folders/<2>/<30>/T/`, followed by the sloop runtime key. The
-        // tightest real layout adds a `tempdir` test prefix on top.
         let runtime_dir = std::path::Path::new(
             "/var/folders/24/8k48jl6d249_n_qfxwsl6xvm0000gn/T/.tmpAbC123/sloop/0123456789abcdef",
         );

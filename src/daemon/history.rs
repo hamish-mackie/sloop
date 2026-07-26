@@ -263,13 +263,9 @@ impl RunHistory {
         if let Some(detail) = failed.reason.as_deref().filter(|text| !text.is_empty()) {
             reason.push_str(&format!(": {detail}"));
         }
-        // Only worth saying when a `return_to` edge actually re-entered the
-        // stage; a stage that ran once is the ordinary case and needs no count.
         if failed.attempt > 1 {
             reason.push_str(&format!(" on attempt {}", failed.attempt));
         }
-        // Only worth saying when the agent is not itself the failure: if the
-        // agent failed, the stage line above already carries its exit.
         if self
             .stages
             .first()
@@ -281,9 +277,6 @@ impl RunHistory {
                 " after agent completed with no commits"
             });
         }
-        // A plain `fail_action: fail` halt needs no epithet — the sentence
-        // above already is one. The other two halts are the cases where the
-        // stage's own failure does not fully explain the ending.
         if let Some(halt) = self.halt_clause() {
             reason.push_str("; ");
             reason.push_str(halt);
@@ -399,10 +392,6 @@ fn stages(
         }
     }
 
-    // Where the walk stands is the fold's answer, not a guess: with loops, an
-    // already-recorded stage can be the one running right now, so "the first
-    // stage with no row" no longer finds it. Only a run still in flight has a
-    // running stage at all.
     let running = flow.filter(|_| !terminal).and_then(|flow| {
         match crate::flow::next_step(flow, &super::driver::replayable(recorded)) {
             crate::flow::Step::Run { stage, attempt } => Some((stage.name.clone(), attempt)),
@@ -413,15 +402,11 @@ fn stages(
 
     let mut stages = Vec::with_capacity(names.len());
     for name in names {
-        // A stage the snapshot does not name — the spliced `flow.test_cmd`
-        // stage — has no `fail_action` to read, and the driver halts on it.
         let advisory = flow.is_some_and(|flow| {
             flow.stages.iter().any(|stage| {
                 stage.name == name && stage.fail_action == crate::flow::FailAction::Continue
             })
         });
-        // Rows carrying no verdict are an execution's action, already answered
-        // for by the check row behind it.
         let executions = recorded
             .iter()
             .enumerate()
@@ -450,8 +435,6 @@ fn stages(
         let executed = stages.iter().any(|stage| stage.name == name);
         let running_here = match &running {
             Some((stage, attempt)) if *stage == name => Some(*attempt),
-            // Without a readable flow snapshot the fold cannot say, so the
-            // first unrecorded stage of a live run stands in as it always did.
             None if !terminal && !executed && !running_claimed => Some(1),
             _ => None,
         };
@@ -499,10 +482,6 @@ fn panel_reviewers(
     evidence: &[(String, String)],
     row: &StageRecord,
 ) -> Vec<Value> {
-    // The panel is found by *name*: a configured `flow.test_cmd` splices a
-    // stage into the flow the driver walks but not into the snapshot, so the
-    // recorded index need not be an index into the snapshot. The evidence rows
-    // are still keyed by the driver's index, which is what the row carries.
     let Some(crate::flow::Check::Panel(panel)) = flow
         .and_then(|flow| flow.stages.iter().find(|stage| stage.name == row.stage))
         .map(|stage| &stage.result_check)

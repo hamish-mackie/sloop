@@ -136,8 +136,6 @@ pub fn next_step<'a>(flow: &'a Flow, evidence: &[StageEvidence]) -> Step<'a> {
     let mut cursor = 0usize;
     for (position, row) in evidence.iter().enumerate() {
         let Some(stage) = flow.stages.get(cursor) else {
-            // The walk already ran off the end of the flow, so no execution
-            // could have produced this row.
             return corrupt(row.stage.clone());
         };
         let consumed = &evidence[..position];
@@ -171,9 +169,6 @@ pub fn next_step<'a>(flow: &'a Flow, evidence: &[StageEvidence]) -> Step<'a> {
                             reason: HaltReason::ReturnBudgetExhausted,
                         };
                     }
-                    // Replay resumes from the target; the rows appended
-                    // before the jump are behind the fold and superseded by
-                    // whatever the re-run records.
                     cursor = target_index;
                 }
             },
@@ -389,9 +384,6 @@ mod tests {
     fn a_failed_row_halts_the_walk_and_later_stages_are_never_requested() {
         let flow = build_review_merge();
 
-        // The fold stops at `review`, so a `merge` row could only be a
-        // corrupt appendix — stages after a halting failure are never
-        // requested, and evidence claiming otherwise is never believed.
         let evidence = [passed(&flow, 0), failed(&flow, 1), passed(&flow, 2)];
 
         assert_eq!(
@@ -419,8 +411,6 @@ mod tests {
     fn a_return_to_loop_converges_on_the_second_attempt() {
         let flow = flow_with(&[("build", FailAction::Halt), ("test", return_to("build", 2))]);
 
-        // The failure sends the cursor back to `build`, which is now on its
-        // second execution.
         let mut log = vec![pass(&flow, 0, 1), fail(&flow, 1, 1)];
         assert_eq!(next_step(&flow, &log), run(&flow, 0, 2));
 
@@ -450,15 +440,12 @@ mod tests {
 
     #[test]
     fn distinct_backward_edges_keep_independent_budgets() {
-        // `test` and `review` each own one backward edge with one attempt.
         let flow = flow_with(&[
             ("build", FailAction::Halt),
             ("test", return_to("build", 1)),
             ("review", return_to("test", 1)),
         ]);
 
-        // `test`'s edge is spent, but that says nothing about `review`'s:
-        // its own failure still jumps, re-entering `test` for a third time.
         let mut log = vec![
             pass(&flow, 0, 1),
             fail(&flow, 1, 1),
@@ -468,8 +455,6 @@ mod tests {
         ];
         assert_eq!(next_step(&flow, &log), run(&flow, 1, 3));
 
-        // And the reverse: `review`'s untouched budget never refills
-        // `test`'s, which is still exhausted.
         log.push(fail(&flow, 1, 3));
         assert_eq!(
             next_step(&flow, &log),
@@ -485,8 +470,6 @@ mod tests {
             ("test", return_to("build", 1)),
         ]);
 
-        // `lint` passed before the jump, but the jump puts that row behind
-        // the fold: the span re-runs whole, so `lint` is requested again.
         let mut log = vec![pass(&flow, 0, 1), pass(&flow, 1, 1), fail(&flow, 2, 1)];
         assert_eq!(next_step(&flow, &log), run(&flow, 0, 2));
 
@@ -500,26 +483,21 @@ mod tests {
     fn a_row_the_cursor_did_not_expect_is_a_corrupt_log() {
         let flow = build_review_merge();
 
-        // A row for a stage the cursor is not standing on.
         assert_eq!(
             next_step(&flow, &[passed(&flow, 1)]),
             halted("build", HaltReason::CorruptLog)
         );
 
-        // The same row twice: the second arrives with the cursor already
-        // past it.
         assert_eq!(
             next_step(&flow, &[passed(&flow, 0), passed(&flow, 0)]),
             halted("review", HaltReason::CorruptLog)
         );
 
-        // The right stage on the wrong attempt.
         assert_eq!(
             next_step(&flow, &[pass(&flow, 0, 2)]),
             halted("build", HaltReason::CorruptLog)
         );
 
-        // A row appended after the walk already ran off the end.
         assert_eq!(
             next_step(
                 &flow,
@@ -561,11 +539,9 @@ mod tests {
             ("test", return_to("build", 2)),
         ]);
 
-        // Nothing has jumped yet, so nothing triggered a re-entry.
         assert_eq!(return_trigger(&flow, &[]), None);
         assert_eq!(return_trigger(&flow, &[pass(&flow, 0, 1)]), None);
 
-        // `lint` fails with a halting edge: a failure, but not a jump.
         assert_eq!(
             return_trigger(&flow, &[pass(&flow, 0, 1), fail(&flow, 1, 1)]),
             None
@@ -574,12 +550,9 @@ mod tests {
         let mut log = vec![pass(&flow, 0, 1), pass(&flow, 1, 1), fail(&flow, 2, 1)];
         assert_eq!(return_trigger(&flow, &log), Some((2, 1)));
 
-        // The whole span re-runs, and every stage inside it is re-entered
-        // because of the same failure.
         log.push(pass(&flow, 0, 2));
         assert_eq!(return_trigger(&flow, &log), Some((2, 1)));
 
-        // A second jump supersedes the first.
         log.extend([pass(&flow, 1, 2), fail(&flow, 2, 2)]);
         assert_eq!(return_trigger(&flow, &log), Some((2, 2)));
     }

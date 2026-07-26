@@ -182,9 +182,6 @@ pub fn step(trigger: &mut Trigger, event: Event, now_ms: i64) -> Vec<Effect> {
                 None => vec![Effect::Fault(Fault::InvalidCadence)],
             }
         }
-        // Kind is deliberately not consulted. A recurring trigger pinned to a
-        // merged ticket is as unfireable as a one-shot one, and leaving it
-        // queued is demand that can never be met but is still counted.
         Event::Completed => {
             if trigger.state != TriggerState::Queued {
                 return Vec::new();
@@ -258,14 +255,12 @@ mod tests {
     fn scheduleless_kinds_are_due_on_sight_and_scheduled_kinds_wait() {
         assert!(queued(TriggerKind::Immediate, None).is_due(1_000));
         assert!(queued(TriggerKind::Auto, None).is_due(1_000));
-        // A schedule on a scheduleless kind is ignored rather than obeyed.
         assert!(queued(TriggerKind::Immediate, Some(9_000)).is_due(1_000));
 
         for kind in [TriggerKind::At, TriggerKind::Every, TriggerKind::Overnight] {
             assert!(!queued(kind, Some(1_001)).is_due(1_000), "{kind:?} early");
             assert!(queued(kind, Some(1_000)).is_due(1_000), "{kind:?} on time");
             assert!(queued(kind, Some(999)).is_due(1_000), "{kind:?} late");
-            // No schedule at all is corrupt, and firing is the wrong guess.
             assert!(!queued(kind, None).is_due(1_000), "{kind:?} unscheduled");
         }
     }
@@ -318,8 +313,6 @@ mod tests {
         );
         assert_eq!(trigger.state, TriggerState::Queued);
         assert_eq!(trigger.eligible_at_ms, Some(61_000));
-        // The rearm is strictly in the future, so the same tick cannot fire it
-        // a second time.
         assert!(!trigger.is_due(1_000));
     }
 
@@ -355,8 +348,6 @@ mod tests {
             [Effect::Complete]
         );
         assert_eq!(recurring.state, TriggerState::Completed);
-        // Replaying the sweep writes nothing, which is what lets it run on
-        // every startup for free.
         assert_eq!(step(&mut recurring, Event::Completed, 3_000), []);
         assert_eq!(step(&mut recurring, Event::Fired, 3_000), []);
     }
@@ -382,8 +373,6 @@ mod tests {
             }]
         );
         assert_eq!(trigger.state, TriggerState::Queued);
-        // `immediate` ignores its schedule, so the revived trigger is due at
-        // once; the cooldown that set `not_before_ms` is a separate gate.
         assert!(trigger.is_due(2_000));
 
         let mut cancelled = Trigger {
@@ -408,13 +397,11 @@ mod tests {
         assert_eq!(rearm_every_at(1_000, 60_000, 1_000), Some(61_000));
         assert_eq!(rearm_every_at(1_000, 60_000, 60_999), Some(61_000));
         assert_eq!(rearm_every_at(1_000, 60_000, 61_000), Some(121_000));
-        // Asleep for an hour on a one-minute cadence owes one run, not sixty.
         assert_eq!(rearm_every_at(1_000, 60_000, 3_601_000), Some(3_661_000));
     }
 
     #[test]
     fn rearm_refuses_impossible_arithmetic() {
-        // Not yet due: rearming would skip the instant it was waiting for.
         assert_eq!(rearm_every_at(2_000, 60_000, 1_000), None);
         assert_eq!(rearm_every_at(1_000, 0, 2_000), None);
         assert_eq!(rearm_every_at(1_000, -60_000, 2_000), None);

@@ -108,9 +108,6 @@ fn branch_state(root: &Path, branch: &str) -> Result<Option<TicketState>, Reinde
             "cannot compare Git branch `{branch}` with HEAD"
         )));
     }
-    // The branch's creation tip is stable even if the default branch is later
-    // rebased or squashed. Comparing against HEAD would turn untouched run
-    // branches into apparent work after any such rewrite.
     let has_work = created_at.is_some_and(|created_at| created_at != tip);
     if !has_work {
         return Ok(None);
@@ -118,12 +115,6 @@ fn branch_state(root: &Path, branch: &str) -> Result<Option<TicketState>, Reinde
     if merged.success() {
         return Ok(Some(TicketState::Merged));
     }
-    // The ancestor test only sees merges that keep the branch tip reachable from
-    // HEAD. Sloop's merge stage, an operator squash and a rebase all land the
-    // same changes as new commits, so a branch whose work is demonstrably on the
-    // default branch still fails that test. Fall back to patch equivalence
-    // before calling the branch unreviewed; only a genuinely unlanded commit
-    // earns `NeedsReview`.
     Ok(Some(if patch_equivalent(root, branch)? {
         TicketState::Merged
     } else {

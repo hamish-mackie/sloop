@@ -33,9 +33,6 @@ pub enum WorkerRole {
 /// them here is how the two channels came to contradict each other.
 pub fn definition_of_done(role: WorkerRole, check: &Check) -> Vec<String> {
     let obligation = match (role, check) {
-        // A seat judges; it never satisfies the stage's check itself, whatever
-        // that check happens to be. Its report is the only thing counted from
-        // it, so it is the only thing the brief asks for.
         (WorkerRole::PanelReviewer, _) => {
             "This stage passes only on your reported verdict; the work under review is not yours to change"
         }
@@ -48,9 +45,6 @@ pub fn definition_of_done(role: WorkerRole, check: &Check) -> Vec<String> {
         (WorkerRole::Stage, Check::None) => {
             "This stage passes on your own exit status: exit 0 only if the work succeeded"
         }
-        // Every other check is an independent judge that runs after this
-        // worker. It is named as a judge and not by name: what it is belongs to
-        // the flow, and a worker is told about its own stage.
         (WorkerRole::Stage, Check::Actor(_) | Check::Panel(_)) => {
             "An independent check judges this stage's work after you exit"
         }

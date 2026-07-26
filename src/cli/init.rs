@@ -57,9 +57,6 @@ pub fn init(root: &Path) -> Result<InitOutcome, InitError> {
         DEFAULT_FLOW,
         &mut outcome,
     )?;
-    // Read back rather than assumed: `init` is idempotent and is routinely run
-    // in a repository that already has a config, so the train's verify stage
-    // can name the test command that repository actually uses.
     ensure_file(
         root,
         ".agents/sloop/flows/train.yaml",
@@ -211,8 +208,6 @@ mod tests {
             flow.stages[1].action,
             crate::flow::Actor::Builtin(crate::flow::Builtin::Sync)
         );
-        // Verification is after the sync, not before it: the point of the
-        // flow is that the tested tree is the tree that lands.
         assert_eq!(
             flow.stages[2].action,
             crate::flow::Actor::Exec {
@@ -227,7 +222,6 @@ mod tests {
                 attempts: 3,
             }
         );
-        // The irreversible stage carries no second opinion, on principle.
         assert_eq!(flow.stages[3].result_check, crate::flow::Check::None);
     }
 
@@ -300,8 +294,6 @@ mod tests {
         let crate::flow::Actor::Exec { cmd } = &review.action else {
             panic!("review stage must be an exec stage: {:?}", review.action);
         };
-        // Bare `claude --print` cannot run any command, so it could never call
-        // `sloop verdict`; the tool allowance is load-bearing, not decorative.
         assert!(
             cmd.windows(2)
                 .any(|pair| pair == ["--allowedTools", "Bash"]),

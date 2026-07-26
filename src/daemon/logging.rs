@@ -69,8 +69,6 @@ impl OperationalLog {
             return;
         };
         if file.write_all(&line).and_then(|()| file.flush()).is_err() {
-            // A full filesystem can leave a short write. Remove it so a later
-            // successful record still begins on a valid NDJSON boundary.
             let _ = file.set_len(original_len);
         }
     }

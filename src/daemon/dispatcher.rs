@@ -202,8 +202,6 @@ pub(super) async fn run_dispatcher(
 ) {
     let mut liveness_tick = tokio::time::interval(Duration::from_secs(2));
     liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Tokio intervals fire immediately once; consume that tick because startup
-    // recovery already classified every durable lease.
     liveness_tick.tick().await;
     reconcile(&mut state, &events_tx, &log).await;
     loop {

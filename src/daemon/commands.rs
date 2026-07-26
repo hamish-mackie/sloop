@@ -142,9 +142,6 @@ fn ticket_detail(
 ) -> Result<serde_json::Value, ErrorBody> {
     let vendor_error = current_ticket_vendor_error(state, ticket)?;
     let mut detail = ticket_show(reference, ticket, vendor_error.as_ref());
-    // Where the ticket got to, and how. The runs section sits between the
-    // summary and the body so `show` answers "what has happened to this?"
-    // without an operator having to guess run aliases to find out.
     let runs = run_lookup(state, |run_store| run_store.runs_for_ticket(&ticket.id))?;
     let histories = super::history::histories(state, &runs)?;
     detail["value"]["runs"] = json!(
@@ -182,9 +179,6 @@ fn run_detail(
     let vendor_error = run_lookup(state, |run_store| run_store.vendor_error_for_run(&run.id))?;
     let terminal = super::history::is_terminal(&run.state);
     let history = super::history::history(state, run)?;
-    // A classified vendor rejection is the more specific account of the same
-    // ending, so it still wins the `reason` line; otherwise the reason is
-    // derived from the stage evidence rather than left empty.
     let reason = if history.stalled() {
         history.derived_reason()
     } else {
@@ -234,9 +228,6 @@ fn project_activity(
         }
     }
 
-    // Notes and commits are attributed to a run in output a human reads, so
-    // they are attributed by alias. One lookup per ticket covers every run the
-    // project's activity can mention.
     let mut aliases: HashMap<String, String> = HashMap::new();
     for ticket in &tickets {
         for run in run_lookup(state, |run_store| run_store.runs_for_ticket(&ticket.id))? {
@@ -410,11 +401,6 @@ pub(super) fn handle_status(state: &DispatcherState) -> Result<serde_json::Value
         "gate": gate,
         "runs": runs,
         "queued_triggers": queued,
-        // Deprecated in 0.4.0, removed in 0.5.0. `queued_activations` is what
-        // this field was called before the concept was named `trigger`, and it
-        // is emitted alongside its replacement carrying the identical value so
-        // a dashboard written against the old envelope keeps working for one
-        // release. Same treatment the `list` -> `show` aliases got.
         "queued_activations": queued,
         "tickets": {
             "ready": tickets.ready,
@@ -442,11 +428,6 @@ fn dashboard(
     let tickets = local_lookup(state, LocalSqlite::tickets)?;
     let total = tickets.len();
     let limit = requested_limit.unwrap_or(DEFAULT_RECENT_LIMIT);
-    // Everything waiting on a human, whether or not it is new enough to make
-    // the recent window. A `needs_review` ticket that has aged out of that
-    // window is otherwise reported only as a digit in the count line, which
-    // is how one sat unnoticed for a week. Unbounded on purpose: this list is
-    // the work, and truncating it would recreate the same blind spot.
     let waiting: Vec<_> = tickets
         .iter()
         .filter(|ticket| {
@@ -484,8 +465,6 @@ fn ticket_rows(
 ) -> Result<serde_json::Value, ErrorBody> {
     let now_ms = state.clock.now_ms();
     let at_capacity = run_lookup(state, RunStore::active_runs)?.len() >= state.max_agents;
-    // Every gate here is global; the trigger gate is per ticket and is
-    // answered inside the loop below.
     let global_gates = Gates {
         paused: state.paused,
         draining: state.draining,
@@ -495,8 +474,6 @@ fn ticket_rows(
         at_capacity,
         has_queued_trigger: false,
     };
-    // `tickets` already arrives newest first, so truncating here keeps the
-    // newest N and spares the per-ticket lookups below for the rest.
     match limit {
         Some(0) => return Err(invalid_arguments("limit must be greater than zero")),
         Some(limit) => tickets.truncate(limit as usize),
@@ -507,8 +484,6 @@ fn ticket_rows(
         let active_run = run_lookup(state, |run_store| {
             run_store.active_run_for_ticket(&ticket.id)
         })?;
-        // Every ineligibility reason and list row names the run by alias; the
-        // internal id rides alongside for machine consumers.
         let active_alias = active_run
             .as_ref()
             .map(|(_, attempt)| crate::run_ref::alias(&ticket.id, *attempt));
@@ -529,9 +504,6 @@ fn ticket_rows(
         {
             vendor_error = None;
         }
-        // "Is there a trigger that could select *this* ticket", not "is the
-        // queue non-empty": a trigger pinned to another ticket must not explain
-        // this one away.
         let gates = Gates {
             has_queued_trigger: local_lookup(state, |work_state| {
                 work_state.has_claimable_trigger(&ticket.id, now_ms)
@@ -671,11 +643,6 @@ pub(super) fn handle_run(
             )
         }
     };
-    // `Duplicates::Allow`: two `sloop run` invocations are two requests for
-    // work, unlike a repost, which absorbs into the trigger already queued.
-    // The verb mints the id and writes every `--only` filter with the row, so a
-    // crash mid-write cannot leave a restricted run behind as an unrestricted
-    // one.
     let trigger_id = local_lookup(state, |work_state| {
         work_state.enqueue_trigger(
             &EnqueueRequest {
@@ -852,9 +819,6 @@ pub(super) fn handle_logs(
         Some(tail) => Some(tail as usize),
         None => None,
     };
-    // The run's state is sampled before its output is read. The other order
-    // could report a run terminal while a chunk written just after the read
-    // is still on disk, and a follower that exits on `terminal` would lose it.
     let terminal = is_terminal(&resolved.run.state);
     let query = crate::run_log::PageQuery {
         after: args.after.unwrap_or(0),
@@ -864,8 +828,6 @@ pub(super) fn handle_logs(
         stage,
         tail,
     };
-    // The log lives under the resolved run's own id, never under whatever
-    // shorthand the caller happened to type.
     let page = crate::run_log::read_filtered_page(
         &run_output_path(&state.state_dir, &resolved.run.id),
         &query,
@@ -924,9 +886,6 @@ fn stage_filter(run: &RunRecord, selector: &str) -> Result<crate::run_log::Stage
             run.id, flow.name
         )));
     }
-    // Agent output captured before stages were tagged carries no stage name.
-    // The flow's first agent stage owns it: that is the only stage such a
-    // record could have come from in every flow that produced one.
     let first_agent = flow
         .stages
         .iter()
@@ -983,9 +942,6 @@ pub(super) fn handle_events(
         (None, None) => 0,
     };
     let scanned = run_lookup(state, |run_store| run_store.events_after(after, limit))?;
-    // The cursor tracks rows *scanned*, not rows emitted. A scoped watcher
-    // whose page matches nothing must still advance, or every poll would
-    // rescan the feed from the same cursor forever.
     let next_cursor = scanned.last().map_or(after.max(0), |event| event.sequence);
     let events = scanned
         .iter()
@@ -1073,16 +1029,11 @@ pub(super) fn handle_cancel(
         )));
     }
 
-    // Intent must be durable before any signal: if the daemon dies between
-    // the kill and the exit event, recovery still reads the cancellation.
     run_lookup(state, |run_store| {
         run_store.record_cancel_requested(&run.id, state.clock.now_ms())
     })?;
     state.cancelling.insert(run.id.clone());
 
-    // Whatever stage is executing checkpointed its process group, wherever it
-    // sits in the flow, so one reading kills it. A run between stages has no
-    // process at all; its driver reads the intent above and stops there.
     let rows = run_lookup(state, |run_store| run_store.run_evidence(&run.id))?;
     let identity = stage_process_identity(&rows, None).map_err(|error| internal(&error))?;
     match identity {
@@ -1108,8 +1059,6 @@ pub(super) fn handle_cancel(
                 }
             }
         }
-        // A run whose stage process predates the uniform checkpoint, or whose
-        // agent was recorded on the run row alone, still has its group there.
         None if run.state == "running" => {
             if let Err(error) =
                 stop_agent_process_group(run.pid, run.pid_start_time, run.process_group_id)
@@ -1155,8 +1104,6 @@ pub(super) fn handle_stop(
             cancelled.push(alias);
         }
     }
-    // The accept loop exits after replying. Close every reconcile side effect
-    // immediately so the dispatcher cannot spawn or clean Git state meanwhile.
     state.draining = true;
     Ok(json!({
         "stopping": true,

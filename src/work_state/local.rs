@@ -851,9 +851,6 @@ impl LocalSqlite {
                 .collect::<Vec<_>>()
         };
 
-        // Which triggers a deletion kills, and which merely lose their scope,
-        // is a trigger lifecycle rule; this path names it rather than
-        // reimplementing it.
         let plan = trigger::deletion_plan(&transaction, &stale_tickets, &stale_projects)?;
 
         let mut rows_dropped = drop_runs(&transaction, &stale_tickets, &plan.doomed)?;
@@ -1629,9 +1626,6 @@ impl WorkState for LocalSqlite {
         let now_ms = self.clock.now_ms();
         let lease_ms = lease_ms(ttl)?;
         let mut connection = self.db.lock();
-        // The unchanged schema still points leases at runs. Admission now
-        // commits the source claim first, so this one connection suspends FK
-        // enforcement only while creating that recoverable dangling lease.
         connection
             .pragma_update(None, "foreign_keys", false)
             .map_err(StoreError::from)
@@ -1646,8 +1640,6 @@ impl WorkState for LocalSqlite {
             else {
                 return Ok(ClaimResult::Lost { held_by: None });
             };
-            // The domain decides what firing this trigger does; storage only
-            // persists it, under guards that let exactly one claimer win.
             let effects = domain_trigger::step(
                 &mut domain_trigger::Trigger::from(&trigger),
                 domain_trigger::Event::Fired,
@@ -1773,8 +1765,6 @@ impl WorkState for LocalSqlite {
                 decode_lease_owner(&stored_owner).1
             }
             Some(_) => {
-                // A newer owner proves this owner's release already completed.
-                // The stale retry must not disturb the newer claim.
                 transaction
                     .commit()
                     .map_err(StoreError::from)
@@ -1867,10 +1857,6 @@ impl WorkState for LocalSqlite {
                                 message: format!("ticket `{}` has no trigger to retry", ticket.id),
                             })?,
                     };
-                    // The retry's cooldown is the trigger's new eligibility, so
-                    // the requeue and the re-timing are one transition rather
-                    // than a requeue followed by a raw update that happened to
-                    // duplicate `reschedule`.
                     let mut facts = trigger::facts(&transaction, &trigger_id)
                         .map_err(source_error)?
                         .ok_or_else(|| SourceError::Corrupt {
@@ -2377,10 +2363,6 @@ mod tests {
     async fn local_work_state_complete_retires_triggers_pinned_to_the_merged_ticket() {
         let (_directory, local) = open_seeded_local();
         insert_ready_ticket(&local, "T2", 1_000);
-        // TR2 is a recurring trigger pinned to the merging ticket: not yet
-        // eligible, so the claim leaves it alone, and unfireable forever once
-        // T1 merges. TR3 is pinned elsewhere and TR4 is unpinned demand, so both
-        // must survive.
         local
             .insert_trigger(
                 &NewTrigger {
@@ -2405,7 +2387,6 @@ mod tests {
 
         assert_eq!(local.ticket("T1").unwrap().unwrap().state, "merged");
         assert_eq!(queued_trigger_ids(&local), vec!["TR3", "TR4"]);
-        // The surviving unpinned trigger still resolves to whatever is ready.
         assert_eq!(
             local
                 .select_ready_ticket(Some("default"), "TR4", 2_000)
@@ -2441,8 +2422,6 @@ mod tests {
             .unwrap();
         assert_eq!(queued_trigger_ids(&local), vec!["TR2"]);
 
-        // A settled review branch merged outside the run reaches release with
-        // no lease left to consume; the pinned trigger dies there too.
         local
             .release(&ticket_ref(), &OwnerId("R1".into()), Disposition::Complete)
             .await
@@ -2454,8 +2433,6 @@ mod tests {
 
     #[tokio::test]
     async fn local_work_state_non_merge_dispositions_leave_pinned_triggers_queued() {
-        // `failed`, `held` and `needs_review` are not final the way `merged`
-        // is: the ticket can return to `ready`, so its triggers must survive.
         for disposition in [
             Disposition::Abandon,
             Disposition::Park {
@@ -2485,8 +2462,6 @@ mod tests {
         insert_ready_ticket(&local, "T2", 1_000);
         insert_queued_trigger(&local, "TR2", TriggerKind::Immediate, Some("T2"), None);
         insert_queued_trigger(&local, "TR3", TriggerKind::Auto, None, Some("default"));
-        // TR1 is pinned to T1, which reached `merged` without the settle-time
-        // rule ever running — exactly the row the sweep exists for.
         local
             .db
             .lock()
@@ -2499,7 +2474,6 @@ mod tests {
         );
         assert_eq!(queued_trigger_ids(&local), vec!["TR2", "TR3"]);
 
-        // Idempotent: a database with nothing stranded reports nothing.
         assert!(
             local
                 .complete_merged_ticket_triggers(3_000)
@@ -2698,7 +2672,6 @@ mod tests {
         let store = open_seeded(&directory.path().join("sloop.db"));
         granted_claim(&store, &claim_t1("R1"), 2_000);
 
-        // The lease expires at 62_000; renewal at or after that must fail.
         let error = store.renew_lease("T1", "R1", 60_000, 62_000).unwrap_err();
         assert!(matches!(error, StoreError::LeaseNotHeld { .. }));
     }
@@ -2709,9 +2682,7 @@ mod tests {
         let store = open_seeded(&directory.path().join("sloop.db"));
         granted_claim(&store, &claim_t1("R1"), 2_000);
 
-        // The lease expired at 62_000, so ordinary renewal is refused...
         assert!(store.renew_lease("T1", "R1", 60_000, 90_000).is_err());
-        // ...while adoption re-arms it, and renewal works again afterwards.
         assert_eq!(
             store.readopt_lease("T1", "R1", 60_000, 90_000).unwrap(),
             150_000
@@ -2758,13 +2729,9 @@ mod tests {
         let store = open_seeded(&directory.path().join("sloop.db"));
         insert_ready_t0(&store, 2_000);
 
-        // TR1 is pinned to T1, so only T1 has demand behind it.
         assert!(store.has_claimable_trigger("T1", 2_000).unwrap());
         assert!(!store.has_claimable_trigger("T0", 2_000).unwrap());
 
-        // The masking case: T1 merges and is then pinned by a trigger that
-        // can never fire. The queue is non-empty, so the global question
-        // answers `true` for T0 — the misreport this method exists to avoid.
         granted_claim(&store, &claim_t1("R1"), 2_000);
         settle_for_test(&store, "R1", Outcome::Merged, 3_000);
         store
@@ -2812,8 +2779,6 @@ mod tests {
             interval_ms: None,
         };
 
-        // Selection takes one ticket, but the gate holds for both: the loser is
-        // next in line rather than unactivated.
         assert_eq!(
             select_ready_ticket(&store, &unpinned, 2_000).as_deref(),
             Some("T1")
@@ -2821,8 +2786,6 @@ mod tests {
         assert!(store.has_claimable_trigger("T1", 2_000).unwrap());
         assert!(store.has_claimable_trigger("T0", 2_000).unwrap());
 
-        // A trigger restricted with `--only` stops answering for the
-        // tickets it excludes, exactly as selection ignores them.
         store.insert_trigger_filter("TR2", "T1").unwrap();
         assert!(!store.has_claimable_trigger("T0", 2_000).unwrap());
     }
@@ -2869,7 +2832,6 @@ mod tests {
             interval_ms: None,
         };
 
-        // T1 was registered first, so it wins despite T0 sorting lower.
         assert_eq!(
             select_ready_ticket(&store, &trigger, 2_000).as_deref(),
             Some("T1")
@@ -2918,7 +2880,6 @@ mod tests {
             eligible_at_ms: None,
             interval_ms: None,
         };
-        // T1 is claimed and T2's blocker has not merged: nothing is ready.
         assert_eq!(select_ready_ticket(&store, &trigger, 2_000), None);
 
         settle_for_test(&store, "R1", Outcome::Merged, 3_000);
@@ -3263,9 +3224,6 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("sloop.db");
 
-        // Everything a trigger can be: queued and pinned, queued recurring and
-        // scoped by `--only`, and already completed. Plus the two rows that
-        // name a trigger from outside its own table.
         {
             let local = open_seeded(&path);
             insert_ready_ticket(&local, "T2", 1_000);
@@ -3284,8 +3242,6 @@ mod tests {
                 .unwrap();
             local.insert_trigger_filter("TR2", "T2").unwrap();
             insert_queued_trigger(&local, "TR3", TriggerKind::Auto, Some("T2"), None);
-            // TR3 is the only trigger pinned to T2, so retiring T2's demand
-            // settles exactly it.
             trigger::complete_for_ticket(&local.db.lock(), "T2", 1_150).unwrap();
             local
                 .db
@@ -3304,7 +3260,6 @@ mod tests {
                 .unwrap();
         }
 
-        // Now make it genuinely pre-rename and reopen, which migrates it.
         {
             let connection = rusqlite::Connection::open(&path).unwrap();
             connection.execute_batch(REVERT_TRIGGER_RENAME).unwrap();
@@ -3312,9 +3267,6 @@ mod tests {
         }
         let local = LocalSqlite::from_db(Db::open(&path, 2_000).unwrap());
 
-        // Both queued triggers survive, keep their order, and answer to the
-        // widened prefix. The completed one is still completed rather than
-        // resurrected or dropped.
         let queued = local.queued_triggers().unwrap();
         assert_eq!(
             queued.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
@@ -3343,8 +3295,6 @@ mod tests {
             ]
         );
 
-        // The three referencing columns were rewritten with the ids they point
-        // at, so nothing dangles.
         let filter: (String, String) = connection
             .query_row(
                 "SELECT trigger_id, ticket_id FROM trigger_filters",
@@ -3371,7 +3321,6 @@ mod tests {
         assert_eq!(claimed_trigger.as_deref(), Some("TR1"));
         assert_eq!(stored_owner, super::lease_owner(&owner, "TR1"));
 
-        // The engine's own verdict on whether the graph still hangs together.
         assert_eq!(
             connection
                 .prepare("PRAGMA foreign_key_check")
@@ -3383,9 +3332,6 @@ mod tests {
         );
         drop(connection);
 
-        // The counter row came across under its new key, and the high-water
-        // mark still reads an ordinal out of the two-letter prefix: reading
-        // `TR3` as anything but 3 would hand out a colliding id.
         assert_eq!(
             local
                 .enqueue_trigger(

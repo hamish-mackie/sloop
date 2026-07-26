@@ -59,8 +59,6 @@ pub(super) async fn recover_inflight_runs(
         .recoverable_runs()
         .map_err(DaemonError::Store)?;
     for run in runs {
-        // Every durable lease consumes capacity until adoption or settlement
-        // succeeds; a transient database error must never permit double-spawn.
         state.active.insert(run.id.clone());
         let process_identity = recoverable_process_identity(&run);
         let cancellation_requested = state
@@ -190,9 +188,6 @@ pub(super) async fn recover_inflight_runs(
             ProcessIdentity::GoneOrReused => {
                 state.recovering.insert(run.id.clone());
                 if run.state == RunState::Driving {
-                    // A run whose flow has not reached an agent stage yet has
-                    // no credentials to restore; its driver mints them when a
-                    // stage needs them.
                     if run.worker_token.is_some()
                         && let Err(error) = restore_worker_socket(state, &run)
                     {
@@ -384,14 +379,6 @@ pub(super) fn restore_worker_socket(
     let listener = UnixListener::bind(&socket_path).map_err(|error| error.to_string())?;
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
         .map_err(|error| error.to_string())?;
-    // The persisted token is the *agent stage's*: only an agent launch writes
-    // one to the run row. A panel reviewer's credential is minted per seat and
-    // never persisted, so nothing here can restore one — which is right, since
-    // recovery re-runs the stage and its panel from the top.
-    //
-    // Naming the stage from the checkpoint is sound here in a way it is not at
-    // launch: recovery runs with nothing spawning, so the row cannot be one
-    // stage behind the worker holding the token.
     let stage = executing_stage(&state.run_store, &run.id, run.flow_json.as_deref());
     let attempt = executing_attempt(&state.run_store, &run.id);
     state.worker_tokens.insert(
@@ -651,10 +638,6 @@ async fn park_unresumable_run(
                 "unresumable_run_park_failed",
                 json!({"run_id": run.id, "error": store_error.to_string()}),
             );
-            // The run stays `active` — the lease holds its capacity until a
-            // park actually lands — but it must leave `recovering`, or the
-            // liveness pass skips it forever and a transient storage error
-            // strands the run instead of retrying the park.
             state.recovering.remove(&run.id);
             return;
         }
@@ -808,9 +791,6 @@ fn claim_recovered_exit(
             let run_store = RunStore::from_db(db);
             let exit = RunExit {
                 run_id,
-                // The interrupted execution is the one the driver last
-                // checkpointed a process for; a run with none behind it only
-                // ever had a first.
                 attempt: executing_attempt(&run_store, run_id),
                 exit_code: *exit_code,
                 capture_complete: *capture_complete,
@@ -878,8 +858,6 @@ pub(super) async fn reconcile_run_liveness(
         }
     };
     for run in runs {
-        // A run this daemon has not seen before is being adopted now, so its
-        // lease is re-armed once its identity checks out below.
         let adopted = state.active.insert(run.id.clone());
         if state.recovering.contains(&run.id) {
             continue;
@@ -1075,8 +1053,6 @@ pub(super) fn stop_persisted_process_group(
         PersistedProcessState::UnverifiableLeader => {
             return Err("cannot verify the persisted process leader".into());
         }
-        // The group may still exist, but without the recorded leader its
-        // identity is unverifiable and signaling it is unsafe.
         PersistedProcessState::LeaderMissing => return Ok(PersistedProcessStop::LeaderMissing),
         PersistedProcessState::OriginalLeader => {}
     }

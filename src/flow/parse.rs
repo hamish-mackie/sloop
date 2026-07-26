@@ -159,8 +159,6 @@ fn parse_action(stage: &str, action: Option<RawActor>) -> Result<(Actor, bool), 
             Ok((Actor::Exec { cmd: exec }, false))
         }
         RawActor::Builtin { builtin, ff_only } => match builtin.as_str() {
-            // The one action `ff_only` means anything to, so the one that does
-            // not refuse it.
             "merge" => Ok((Actor::Builtin(Builtin::Merge), ff_only.unwrap_or_default())),
             "sync" => {
                 reject_ff_only(stage, ff_only)?;
@@ -234,8 +232,6 @@ fn parse_result_check(
             reject_ff_only(stage, ff_only)?;
             match builtin.as_str() {
                 "commits" => Ok(Check::Actor(Actor::Builtin(Builtin::Commits))),
-                // Both builtins that act on git refuse the check position:
-                // a judge that moves a branch is not judging anything.
                 "merge" | "sync" => Err(format!(
                     "stage `{stage}` result_check may not be the `{builtin}` builtin"
                 )),
@@ -307,9 +303,6 @@ fn validate_stage(stage: &str, action: &Actor, result_check: &Check) -> Result<(
             "stage `{stage}` is an agent action, so its result_check may not be `none`"
         ));
     }
-    // Both git builtins are judged by what git did, so there is nothing for a
-    // second opinion to add — and `reported` in particular could only ever
-    // fail, since a builtin runs no worker to report with.
     for (builtin, name) in [(Builtin::Merge, "merge"), (Builtin::Sync, "sync")] {
         if *action == Actor::Builtin(builtin) && *result_check != Check::None {
             return Err(format!(
@@ -324,10 +317,6 @@ fn validate_stage(stage: &str, action: &Actor, result_check: &Check) -> Result<(
 /// one driver walks every stage the same way, so an agent action is legal in
 /// any position and any number of times, each with its own supervised process.
 fn validate_order(stages: &[Stage]) -> Result<(), String> {
-    // A stageless flow walks straight to complete, so a ticket posted to one
-    // would finish having done nothing. The rule that used to rule this out
-    // was "the first stage must be an agent stage", which went with the
-    // single-agent-stage restriction; the emptiness half of it still holds.
     if stages.is_empty() {
         return Err("flow must define at least one stage".into());
     }
@@ -340,9 +329,6 @@ fn validate_order(stages: &[Stage]) -> Result<(), String> {
             "flow may contain at most one merge stage; found {merge_count}"
         ));
     }
-    // Any number of syncs, anywhere before the merge. Integrating the default
-    // branch after it has already been moved would be answering a question the
-    // walk has stopped asking.
     if let Some(merge_index) = stages.iter().position(|stage| stage.action == merge)
         && let Some(stray) = stages[merge_index..]
             .iter()
@@ -599,8 +585,6 @@ mod tests {
             assert!(error.contains(needle), "{error}");
         }
 
-        // The whole of a 0.3.0 stage, refused on the first removed key rather
-        // than on the `action` it never had a chance to define.
         let legacy = error("- { name: test, kind: exec, cmd: ['true'], verdict: exit }\n");
         assert!(legacy.contains("stage `test`"), "{legacy}");
         assert!(legacy.contains("removed `kind` key"), "{legacy}");
@@ -707,7 +691,6 @@ mod tests {
         .unwrap();
         assert!(train.stages[1].ff_only);
 
-        // Written `false`, it is still the untouched merge policy.
         let explicit = parse(
             "example",
             "- { name: build, action: agent }\n- { name: merge, action: { builtin: merge, ff_only: false } }\n",
@@ -735,8 +718,6 @@ mod tests {
         )
         .unwrap();
         let snapshot = serde_json::to_string(&plain).unwrap();
-        // Off is the absence of the key, so a flow that never asked for the
-        // mode does not start carrying it.
         assert!(!snapshot.contains("ff_only"), "{snapshot}");
         assert_eq!(serde_json::from_str::<Flow>(&snapshot).unwrap(), plain);
     }
@@ -844,7 +825,6 @@ mod tests {
             }
         );
 
-        // An omitted budget is one attempt, not an unbounded loop.
         let defaulted = parse(
             "example",
             "- { name: build, action: agent }\n- { name: test, action: { exec: ['true'] }, fail_action: { return_to: build } }\n",
@@ -888,8 +868,6 @@ mod tests {
 
     #[test]
     fn the_worst_case_execution_count_is_capped() {
-        // Ten stages, each execution of the whole span costing ten: the base
-        // walk plus three re-runs is forty, well over the cap.
         let mut yaml = String::from("- { name: build, action: agent }\n");
         for index in 1..9 {
             yaml.push_str(&format!(

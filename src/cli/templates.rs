@@ -95,7 +95,6 @@ mod tests {
         assert_eq!(frontmatter.name, "Add request logging");
         assert!(frontmatter.has_blocked_by());
         assert!(frontmatter.blocked_by.is_empty());
-        // Stamped fields stay commented out, so `sloop post` allocates them.
         assert_eq!(frontmatter.id, None);
         assert_eq!(frontmatter.project, None);
         assert_eq!(frontmatter.worktree, None);
@@ -118,8 +117,6 @@ mod tests {
             .collect();
         assert_eq!(names, ["build", "test", "lint", "review", "sync", "merge"]);
 
-        // One example of every action and every result check, which is the
-        // whole point of this template.
         use crate::flow::{Actor, Builtin, Check};
         assert!(flow.stages.iter().any(|stage| stage.action == Actor::Agent));
         assert!(
@@ -154,10 +151,6 @@ mod tests {
             "no stage demonstrates an exec result check"
         );
 
-        // Both non-default fail actions are demonstrated, not merely described
-        // in a comment: a template that only mentions a feature cannot go
-        // stale loudly. Exactly one of each, because the point of the example
-        // is the grammar, not a plausible pipeline.
         use crate::flow::FailAction;
         let advisory: Vec<&str> = flow
             .stages
@@ -174,9 +167,6 @@ mod tests {
             .collect();
         assert_eq!(returning, ["test"]);
 
-        // Every stage writes all three parts. `fail_action` is the only one
-        // the parser defaults, so it is the only one whose presence has to be
-        // asserted against the source text rather than the parsed flow.
         for stage in &flow.stages {
             assert!(
                 FLOW.contains(&format!("name: {}", stage.name)),
@@ -242,9 +232,6 @@ mod tests {
         let repository = crate::config::Repository::discover(root.path()).unwrap();
         let config = crate::config::Config::load(&repository).unwrap();
 
-        // Loading also validates every panel seat's target against the
-        // config's agent targets, which a flow template seating one must
-        // satisfy.
         assert_eq!(config.flows["default"].stages.len(), 6);
     }
 }

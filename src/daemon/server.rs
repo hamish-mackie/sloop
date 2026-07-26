@@ -69,8 +69,6 @@ pub fn request(request: Request) -> Result<ClientResponse, DaemonError> {
     let repository = Repository::discover(&cwd)?;
     Config::validate_client_essentials(&repository)?;
 
-    // Posting binds and snapshots a live flow definition. All other requests
-    // can use the configuration snapshot held by an existing daemon.
     if matches!(&request, Request::Post(_)) {
         Config::load(&repository)?;
     }
@@ -82,7 +80,6 @@ pub fn request(request: Request) -> Result<ClientResponse, DaemonError> {
         });
     }
 
-    // Implicit startup has the same validation boundary as `sloop daemon`.
     Config::load(&repository)?;
     spawn_daemon(&repository)?;
     let deadline = Instant::now() + STARTUP_TIMEOUT;
@@ -193,13 +190,8 @@ fn serve_current_repository_once() -> Result<ServeExit, DaemonError> {
     )?;
 
     let lock = acquire_daemon_lock(&repository.lock_path)?;
-    // Hold the pre-v7 runtime lock as well during the lock-location
-    // transition, preventing an already-running older daemon in this runtime
-    // root from sharing the database with the new process.
     let legacy_lock_path = repository.runtime_dir.join("daemon.lock");
     let legacy_lock = acquire_daemon_lock(&legacy_lock_path)?;
-    // Identity is advisory; the flock is the guard, so write errors are
-    // ignored rather than fatal.
     let identity = json!({
         "pid": std::process::id(),
         "started_at_ms": process_start_time(std::process::id()),
@@ -220,13 +212,9 @@ fn serve_current_repository_once() -> Result<ServeExit, DaemonError> {
         .map_err(DaemonError::Store)?;
     let local_work_state = LocalSqlite::from_db(db.clone());
     let run_store = RunStore::from_db(db.clone());
-    // A fresh process satisfies any persisted restart intent, including after
-    // a crash during a drain or a successful self-exec.
     run_store
         .clear_restart_draining(clock.now_ms())
         .map_err(DaemonError::Store)?;
-    // Bound the activity feed once per daemon lifetime; watchers page by
-    // sequence, so trimming old rows never invalidates a held cursor.
     run_store
         .trim_events(EVENT_RETENTION)
         .map_err(DaemonError::Store)?;
@@ -479,8 +467,6 @@ async fn handle_connection(
         Err(error) => ResponseEnvelope::failure(None, error),
     };
 
-    // The reply must be flushed before the daemon exits, so the connection
-    // handler owns the shutdown signal for an accepted stop.
     let stopping = is_stop && response.ok;
     let encoded = serde_json::to_vec(&response).map_err(io::Error::other)?;
     stream.write_all(&encoded).await?;

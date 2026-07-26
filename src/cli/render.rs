@@ -90,9 +90,6 @@ fn render_init(data: &Value) -> String {
             let _ = writeln!(text, "  {label}: {path}");
         }
     }
-    // The scaffold shows the shape but not the grammar; point at the verb
-    // that documents every field, since nothing else in an installed binary
-    // does.
     text.push_str(
         "\nwrite a ticket with `sloop template ticket > .agents/sloop/tickets/<name>.md`\n\
          see also `sloop template flow|project|config`\n",
@@ -114,9 +111,6 @@ fn render_post(data: &Value) -> String {
         ticket["project"].as_str().unwrap_or("?"),
         ticket["state"].as_str().unwrap_or("?"),
     );
-    // Silence would read as "nothing was asked for". A settled ticket did ask
-    // and was refused, so name the state that refused it — and the one verb
-    // that undoes it, which exists only for `failed`.
     if let Some(state) = data["trigger_suppressed"]["state"].as_str() {
         let _ = write!(text, "no trigger queued: {id} is {state}");
         if state == "failed" {
@@ -194,9 +188,6 @@ fn render_status(data: &Value, style: Style) -> String {
 
     let _ = writeln!(text, "{}", ticket_counts(&data["tickets"], style));
 
-    // Run lines lead with the alias and the ticket's name, so the line answers
-    // "what is this working on" without a second command. Queued triggers
-    // are not runs and keep their own shape.
     let runs = data["runs"]
         .as_array()
         .map(Vec::as_slice)
@@ -251,8 +242,6 @@ fn next_wake_relative(next_wake: &str) -> String {
     };
     match deadline_ms - now_ms() {
         remaining if remaining > 0 => format!("in {}", duration(remaining)),
-        // The daemon is due to wake and has not yet; naming a negative
-        // interval would read as a missed deadline rather than a live one.
         _ => "imminent".to_owned(),
     }
 }
@@ -302,9 +291,6 @@ fn render_list(data: &Value, style: Style) -> String {
         .map(str::len)
         .max()
         .unwrap_or(1);
-    // In a single-project repository the project column is the same
-    // parenthesis on every row — a column of pure noise. It earns its width
-    // only when it tells two rows apart.
     let first_project = tickets[0]["project"].as_str();
     let mixed_projects = tickets
         .iter()
@@ -323,8 +309,6 @@ fn render_list(data: &Value, style: Style) -> String {
             let _ = write!(text, "({})  ", ticket["project"].as_str().unwrap_or("?"));
         }
         text.push_str(name);
-        // A `merged` row's reason is history nobody asked for. A
-        // `needs_review` or `failed` one is the whole point of the row.
         if ticket["run"].is_null()
             && state != "merged"
             && let Some(reason) = ticket["reason"].as_str()
@@ -411,15 +395,10 @@ fn render_logs(data: &Value) -> String {
         let mut origin = entry["source"].as_str().unwrap_or("?").to_owned();
         if let Some(stage) = entry["stage"].as_str() {
             let _ = write!(origin, ":{stage}");
-            // The same `#N` suffix the stage table prints, so an unfiltered
-            // page of a looped run still says which execution wrote each line
-            // — and the label read here is the `--stage` selector to type next.
             if let Some(attempt) = entry["attempt"].as_u64().filter(|attempt| *attempt > 1) {
                 let _ = write!(origin, "#{attempt}");
             }
         }
-        // Bytes that failed UTF-8 decoding are stored as base64; a human
-        // view labels them rather than printing garbage.
         let line = entry["text"].as_str().unwrap_or("<binary output>");
         let _ = writeln!(text, "[{timestamp}] [{origin}] {line}");
     }
@@ -512,9 +491,6 @@ fn render_dashboard(data: &Value, style: Style) -> String {
         }
     }
 
-    // Everything a human has to act on, whether or not it is recent enough to
-    // appear below. A `needs_review` ticket that has aged out of the window is
-    // otherwise visible only as a digit in the count line.
     let attention = data["attention"]
         .as_array()
         .map(Vec::as_slice)
@@ -612,8 +588,6 @@ fn ticket_runs(runs: &Value, style: Style) -> String {
     if runs.is_empty() {
         return "runs: none\n".to_owned();
     }
-    // The alias and state columns are padded to the widest entry so the spans
-    // and stage strips line up down the section and can be read as columns.
     let alias_width = column_width(runs, "alias");
     let state_width = column_width(runs, "state");
     let mut text = String::from("runs:\n");
@@ -715,8 +689,6 @@ fn span(start_ms: Option<i64>, end_ms: Option<i64>) -> String {
         return "-".to_owned();
     };
     let end = end_ms.and_then(crate::clock::local_time);
-    // `HH:MM` alone is ambiguous for anything that did not happen today or
-    // that ran across midnight, so those two cases widen to include the date.
     let today = crate::clock::local_time(now_ms());
     let dated = today.is_some_and(|today| !start.same_day(&today))
         || end.is_some_and(|end| !start.same_day(&end));
@@ -757,9 +729,6 @@ fn run_state(value: &Value, style: Style) -> String {
     if state == "failed"
         && let Some(threshold_ms) = value["stall"]["threshold_ms"].as_i64()
     {
-        // The annotation is the diagnosis, not the verdict, so it carries its
-        // own tone: a stall is something to look at rather than a hard failure
-        // the flow reported.
         let stall = format!("(stalled: no output for {})", duration(threshold_ms));
         return format!("{painted} {}", style.paint(Some(Tone::Yellow), &stall));
     }
@@ -791,18 +760,12 @@ fn run_stages(stages: &Value, style: Style) -> String {
         if let Some(exit_code) = stage["exit_code"].as_i64() {
             let _ = write!(line, "  exit {exit_code}");
         }
-        // Only worth saying on the row it changes the meaning of. On a passing
-        // or unreached advisory stage the word answers a question nobody asked;
-        // on a failing one it is the difference between "this ended the run"
-        // and "this was noted and stepped over".
         if state == "failed" && advisory(stage) {
             line.push_str("  advisory");
         }
         if let Some(source) = stage["verdict_source"].as_str() {
             let _ = write!(line, "  verdict from {source}");
         }
-        // A worker's own confidence sits beside the verdict it qualifies, the
-        // same way a panel seat's does one level down.
         if let Some(confidence) = stage["confidence"].as_str() {
             let _ = write!(line, "  confidence {confidence}");
         }
@@ -837,8 +800,6 @@ fn panel_reviewers(reviewers: &Value) -> String {
             "    {target:width$}  {:4}",
             seat["verdict"].as_str().unwrap_or("?"),
         );
-        // A reviewer that never reported has no confidence to state, and
-        // inventing one would dress an absence up as an opinion.
         if let Some(confidence) = seat["confidence"].as_str() {
             let _ = write!(line, "  confidence {confidence}");
         }
@@ -878,8 +839,6 @@ fn render_run_show(data: &Value, style: Style) -> String {
     if let Some(worktree) = value["worktree"].as_str() {
         let _ = writeln!(text, "worktree: {worktree}");
     }
-    // Claim, start, and finish bound the run; a run still in flight simply
-    // lacks the later fields rather than showing a guessed end.
     let timeline = [
         ("claimed", value["claimed_at_ms"].as_i64()),
         ("started", value["started_at_ms"].as_i64()),
@@ -894,9 +853,6 @@ fn render_run_show(data: &Value, style: Style) -> String {
     if !timeline.is_empty() {
         let _ = writeln!(text, "timeline: {}", timeline.join("  "));
     }
-    // `exit: 0` read as "the run passed" even when a later stage had failed,
-    // which is exactly how one smoke-test failure got misdiagnosed. The label
-    // now says whose exit it is.
     if let Some(exit_code) = value["exit_code"].as_i64() {
         let _ = writeln!(text, "agent exit: {exit_code}");
     }
@@ -1041,7 +997,6 @@ mod tests {
             text.contains("running hours: 22:00-06:00 (closed)"),
             "{text}"
         );
-        // A deadline in the past is the daemon being due, not a missed one.
         assert!(text.contains("next wake: imminent"), "{text}");
         assert!(
             text.contains("tickets: 1 ready, 2 held, 1 claimed, 3 merged"),
@@ -1226,7 +1181,6 @@ mod tests {
              no trigger queued: TICK-43 is merged\n"
         );
 
-        // Only `failed` has a verb that undoes it, so only `failed` gets one.
         let failed = post_response(
             false,
             Value::Null,
@@ -1384,8 +1338,6 @@ mod tests {
     /// does not depend on which day the suite runs.
     fn today_at(offset_ms: i64) -> i64 {
         let today = crate::clock::local_time(super::now_ms()).expect("local time");
-        // Noon plus the offset: far enough from either midnight that a few
-        // minutes either way cannot spill into another day.
         super::now_ms() - i64::from(today.hour) * 3_600_000 - i64::from(today.minute) * 60_000
             + 12 * 3_600_000
             + offset_ms
@@ -1767,8 +1719,6 @@ mod tests {
         );
         assert!(today.ends_with(')'), "{today}");
 
-        // Half a second past nine minutes, so the coarsest-unit floor lands
-        // on `9m0s` however long the assertion itself takes to reach.
         let open = super::span(Some(super::now_ms() - 540_500), None);
         assert!(open.ends_with("-... (9m0s)"), "{open}");
 
@@ -1795,8 +1745,6 @@ mod tests {
         let behind = crate::clock::format_timestamp(super::now_ms() - 5_000).expect("rfc3339");
         assert_eq!(super::next_wake_relative(&behind), "imminent");
 
-        // A timestamp we cannot read is still information; passing it through
-        // beats reporting a deadline that does not exist.
         assert_eq!(
             super::next_wake_relative("not a timestamp"),
             "not a timestamp"
@@ -1815,7 +1763,6 @@ mod tests {
             })),
             "tickets: 0 ready, 1 claimed, 1 needs_review, 77 merged"
         );
-        // `merged` last, and every non-zero state in the fixed order.
         assert_eq!(
             counts(json!({
                 "ready": 3, "held": 1, "blocked": 2, "claimed": 4,
@@ -2018,8 +1965,6 @@ mod tests {
         assert!(colored.contains("\u{1b}[32mok\u{1b}[0m"), "{colored:?}");
         assert!(colored.contains("\u{1b}[33mwarn\u{1b}[0m"), "{colored:?}");
         assert!(colored.contains("\u{1b}[31mFAIL\u{1b}[0m"), "{colored:?}");
-        // Unremarkable tokens stay unstyled: `-` for a stage never reached,
-        // and the ticket ids and names around them.
         assert!(!colored.contains("\u{1b}[31m-\u{1b}[0m"), "{colored:?}");
         assert_eq!(strip_ansi(&colored), plain);
     }

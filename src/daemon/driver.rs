@@ -125,9 +125,6 @@ impl StageHooks for StoreStageHooks<'_> {
         };
         match self.run_store.start(&start, checkpoint.started_at_ms)? {
             Start::Granted => {}
-            // The launch raced a rollback or a recovery that already closed
-            // the run. Surfacing it as the same conflict error keeps the
-            // caller's abort path unchanged.
             Start::Denied(StartDenial::NotClaimed { state }) => {
                 return Err(StoreError::RunStateConflict {
                     run_id: checkpoint.run_id.clone(),
@@ -136,8 +133,6 @@ impl StageHooks for StoreStageHooks<'_> {
                 });
             }
         }
-        // An agent stage checkpoints its process the same way every other
-        // stage does, so "which stage is executing" has one answer.
         self.record_stage_process(
             &checkpoint.run_id,
             &checkpoint.stage,
@@ -249,8 +244,6 @@ impl AgentFacts {
                 .and_then(|data| serde_json::from_value::<VendorErrorMatch>(data).ok()),
             cooldown_until_ms: value("vendor_error_classified")
                 .and_then(|data| data["cooldown_until_ms"].as_i64()),
-            // Checkpoints written before re-entries existed name no attempt,
-            // and such a run only ever had a first.
             checkpointed_attempt: Some(
                 value("exit_classified")
                     .and_then(|data| data["attempt"].as_u64())
@@ -319,9 +312,6 @@ pub(super) fn start_driver(
     events: mpsc::Sender<RunEvent>,
 ) {
     tokio::task::spawn_blocking(move || {
-        // A driver needs its own connection. Nothing about the run has been
-        // touched yet, so failing to open one is worth retrying rather than
-        // settling: the daemon is still up, and storage may well come back.
         let db = loop {
             if environment.shutdown.load(Ordering::Acquire) {
                 return;
@@ -425,8 +415,6 @@ impl RunDriver<'_> {
                         .position(|candidate| candidate.name == stage.name)
                         .expect("next_step returned a stage from this flow");
                     StageRun {
-                        // Only a re-entry has a failure behind it; a stage's
-                        // first execution answers for nothing.
                         context: (attempt > 1)
                             .then(|| self.failure_context(&rows, &log))
                             .flatten(),
@@ -435,10 +423,6 @@ impl RunDriver<'_> {
                         attempt,
                     }
                 }
-                // Every halt lands the ticket where the same failure would
-                // have without an edge: a spent `return_to` budget is the
-                // failure it could not repair, and says so through the stage
-                // it stopped on.
                 Step::Halted { failed_stage, .. } => {
                     let halt = self
                         .flow
@@ -454,8 +438,6 @@ impl RunDriver<'_> {
             let index = run.index;
             match self.execute(&run) {
                 Ok(true) => {}
-                // The stage resolved into another owner's hands: the agent
-                // exit was claimed elsewhere, so that owner settles the run.
                 Ok(false) => return None,
                 Err(error) => return Some(self.abandoned(error, index)),
             }
@@ -535,15 +517,11 @@ impl RunDriver<'_> {
                     self.clock().now_ms(),
                 )
                 .map_err(|error| WalkError::Admission(error.to_string()))?;
-            // Losing the handoff means something else already moved the run on;
-            // it owns the walk and this driver has nothing to settle.
             if begun != Start::Granted {
                 return Ok(Preparation::NotOurs);
             }
             return Ok(Preparation::Ready);
         }
-        // A resumed run settles on the exit facts the daemon that observed
-        // them recorded, never on a fresh reading.
         let evidence = self
             .run_store
             .run_evidence(self.run_id())
@@ -626,9 +604,6 @@ impl RunDriver<'_> {
         let Some(action) = self.run_action(run, merge_recovery)? else {
             return Ok(false);
         };
-        // The action's own reading, before the result check has a say. Only an
-        // independent actor that actually runs produces evidence of its own,
-        // and so a second log row; the rest judge in place.
         let mut reading = action.verdict;
         let mut check = None;
         let mut panel = None;
@@ -655,14 +630,7 @@ impl RunDriver<'_> {
                 panel = Some(outcome);
                 check = Some(judged);
             }
-            // The action failed on its own terms, so there is nothing left
-            // for a panel to judge — and a panel is the most expensive
-            // check there is. Seating five reviewers to confirm a verdict
-            // already reached is tokens spent on nothing.
             Check::Panel(_) => {}
-            // Parsing refuses an agent judge and both git builtins as a
-            // check, so none of them can reach a run. Fail closed rather
-            // than pass a stage nothing actually judged.
             Check::Actor(Actor::Agent)
             | Check::Actor(Actor::Builtin(Builtin::Merge | Builtin::Sync)) => {
                 reading = Verdict::Fail;
@@ -674,9 +642,6 @@ impl RunDriver<'_> {
         } else {
             None
         };
-        // A panel's aggregate is derived, never stored: what persists is the
-        // reviewers' reports, and this reading is recomputed from them every
-        // time — including by a daemon that resumed mid-walk.
         let (verdict, source, reason) = match &panel {
             Some(outcome) => (
                 outcome.verdict,
@@ -760,8 +725,6 @@ impl RunDriver<'_> {
                 };
                 self.run_exec(&stage.name, run.attempt, cmd, worker)
             }
-            // `Commits` never reaches here: parsing refuses it as an action,
-            // so the builtins that act are `Merge` and `Sync`.
             Actor::Builtin(Builtin::Commits) => StageResult {
                 verdict: Verdict::Fail,
                 exit_code: Some(1),
@@ -784,8 +747,6 @@ impl RunDriver<'_> {
     fn run_agent(&mut self, run: &StageRun) -> Result<Option<StageResult>, WalkError> {
         let stage = &run.stage;
         let primary = self.is_primary_agent_stage(run.index);
-        // The checkpoint speaks for one execution. A re-entry is a different
-        // execution, so an earlier attempt's exit never stands in for it.
         if primary && self.agent.checkpointed_attempt == Some(run.attempt) {
             self.agent.checkpointed_attempt = None;
             let now = self.clock().now_ms();
@@ -814,8 +775,6 @@ impl RunDriver<'_> {
         let launched = match launched {
             Ok(launched) => launched,
             Err(error) => {
-                // A first stage that cannot launch has recorded nothing, so
-                // the claim can still roll back and the ticket be retried whole.
                 if run.index == 0 {
                     return Err(WalkError::Admission(error.to_string()));
                 }
@@ -1028,9 +987,6 @@ impl RunDriver<'_> {
                 ticket.id
             )
         })?;
-        // The failure block lands after the bootstrap and the repository's
-        // own instructions: it is the most recent thing that happened, not a
-        // standing rule, and the ticket still frames the work.
         let prompt = match run.context.as_ref() {
             Some(context) => format!(
                 "{}\n\n{}",
@@ -1207,10 +1163,6 @@ impl RunDriver<'_> {
         };
         let worktree = self.plan.worktree.as_path();
 
-        // Whatever the default branch is at this instant is what this sync
-        // integrates. The lock is held only for the read: a sync writes
-        // nothing the merge stage contends for, and holding it across the
-        // integration would let one run's conflicts stall another's merge.
         let default_head = {
             let Ok(_guard) = MERGE_LOCK.lock() else {
                 return failed(1);
@@ -1229,10 +1181,6 @@ impl RunDriver<'_> {
             }
         };
 
-        // A sync owns merge state in the run worktree: it promises to leave
-        // none behind, and starts by making that true. A daemon that died
-        // mid-integration is the usual author of what is found here, and the
-        // branch tip it restores is a state the walk can always re-enter.
         match shared_checkout_has_git_operation(worktree) {
             Ok(true) => {
                 self.log().emit_with_fields(
@@ -1263,8 +1211,6 @@ impl RunDriver<'_> {
             );
             return failed(1);
         }
-        // Already up to date is a pass with nothing to run: the run branch
-        // holds the default branch, which is all the stage promises.
         match git_is_ancestor(worktree, &default_head, &self.plan.branch) {
             Ok(true) => return integrated(),
             Ok(false) => {}
@@ -1279,8 +1225,6 @@ impl RunDriver<'_> {
             }
         }
 
-        // The merge commit is Sloop's own action, so it carries Sloop's
-        // identity — the same one `attempt_merge` signs with.
         let argv = vec![
             "git".to_owned(),
             "-c".to_owned(),
@@ -1300,9 +1244,6 @@ impl RunDriver<'_> {
         if result.verdict == Verdict::Pass {
             return result;
         }
-        // The conflict has been captured in the run log by now, so the tree
-        // holding it has nothing left to say. Restoring the branch tip is what
-        // lets a `return_to` target start from a clean worktree.
         abort_in_progress_merge(worktree);
         result
     }
@@ -1329,10 +1270,6 @@ impl RunDriver<'_> {
     ) -> Result<(PanelOutcome, StageResult), String> {
         let started_at_ms = self.clock().now_ms();
         let prompt = panel_prompt(&self.environment.root, panel)?;
-        // A crash part-way through a panel re-runs the stage, but the seats
-        // that already reported are append-only and one-shot: their reports
-        // stand, and re-spawning those reviewers could only burn tokens to be
-        // refused. Silent seats are the ones still owed a hearing.
         let filed = self.panel_reports(run, panel.reviewers.len())?;
         for (index, reviewer) in panel.reviewers.iter().enumerate() {
             if cancelled(&self.run_store, self.run_id(), self.log()) {
@@ -1382,8 +1319,6 @@ impl RunDriver<'_> {
         let outcome = aggregate(panel, &reported);
         let judged = StageResult {
             verdict: outcome.verdict,
-            // No single process spoke for the panel, and inventing a code for
-            // the aggregate would read as one that did.
             exit_code: None,
             started_at_ms,
             finished_at_ms: self.clock().now_ms(),
@@ -1732,8 +1667,6 @@ fn reported_verdict(
         .filter(|(kind, _)| kind == "stage_verdict")
         .find_map(|(_, data)| {
             let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
-            // A report written before re-entries existed names no attempt and
-            // belongs to the only execution its stage had.
             let reported = value["attempt"].as_u64().unwrap_or(1);
             (value["stage"] == stage && reported == u64::from(attempt)).then_some(value)
         })
@@ -1810,9 +1743,6 @@ pub(super) fn attempt_merge(
         return MergeOutcome::Diverged;
     };
     let message = format!("Merge run branch '{branch}'");
-    // The merge commit is sloop's own action, not the operator's or the
-    // agent's, so it carries sloop's identity; a fast-forward creates no
-    // commit and ignores these.
     let mut command = Command::new("sh");
     command
         .args([
@@ -1829,7 +1759,6 @@ pub(super) fn attempt_merge(
             "--quiet",
         ]);
     if ff_only {
-        // No commit is ever created here, so there is no message to write.
         command.arg("--ff-only");
     } else {
         command.args(["-m", &message]);

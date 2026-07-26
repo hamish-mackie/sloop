@@ -684,8 +684,6 @@ pub(crate) mod test_support {
                       'medium', 'default', '', 1000, 1000);",
             )
             .unwrap();
-        // The trigger goes in through its own module even here: the fixture
-        // borrows the concept, it does not own a second copy of its SQL.
         crate::work_state::trigger::insert(
             &db.lock(),
             &crate::work_state::trigger::NewTrigger {

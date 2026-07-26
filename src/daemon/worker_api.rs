@@ -26,8 +26,6 @@ pub(super) fn dispatch_worker(
     run_id: &str,
     token: Option<&str>,
 ) -> ResponseEnvelope {
-    // The scope is read from the issued credential, not from the request: what
-    // a token may do was decided when it was minted.
     let scope = token.and_then(|presented| {
         state
             .worker_tokens
@@ -68,7 +66,6 @@ pub(super) fn dispatch_worker(
                 &args,
             ),
         },
-        // The connection handler already rejected operator verbs.
         _ => Err(unauthorized(
             "operator verbs are not available on a worker socket",
         )),
@@ -162,9 +159,6 @@ fn handle_brief(
         }
     };
 
-    // The assignment is this stage execution, not the run: what a worker owes
-    // is a property of the stage it is running, and the role its credential
-    // gives it there.
     let executing = executing_stage(&run, scope)?;
     let role = match scope {
         WorkerScope::Stage { .. } => WorkerRole::Stage,
@@ -186,8 +180,6 @@ fn handle_brief(
         },
         "worktree": run.worktree_path,
         "branch": run.branch,
-        // The stage's identity only. A panel seat reads its stage from its own
-        // credential and learns nothing here about the seats beside it.
         "stage": {
             "name": executing.name,
             "attempt": executing.attempt,
@@ -309,8 +301,6 @@ fn handle_panel_report(
     let run = run_lookup(state, |run_store| run_store.run(run_id))?
         .ok_or_else(|| internal("the run for this token no longer exists"))?;
     let executing = executing_stage(&run, scope)?;
-    // A panel report is what the whole stage turns on, and an unexplained one
-    // is worth nothing to the operator reading `sloop show` afterwards.
     let reason = args
         .reason
         .as_deref()
@@ -366,8 +356,6 @@ fn handle_verdict(
 ) -> Result<serde_json::Value, ErrorBody> {
     let run = run_lookup(state, |run_store| run_store.run(run_id))?
         .ok_or_else(|| internal("the run for this token no longer exists"))?;
-    // A worker can only ever report for the stage it is running, and the
-    // resolver is the only thing that decides which stage that is.
     let executing = executing_stage(&run, scope)?;
     let stage_name = executing.name;
     let attempt = executing.attempt;
@@ -381,8 +369,6 @@ fn handle_verdict(
         VerdictValue::Pass => "pass",
         VerdictValue::Fail => "fail",
     };
-    // Stored, never consulted: the same rule a panel's seats live under, so
-    // `--confidence` means one thing wherever a worker reports from.
     let confidence = args
         .confidence
         .map_or(Confidence::default(), Confidence::from);

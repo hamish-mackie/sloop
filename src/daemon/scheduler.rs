@@ -170,8 +170,6 @@ pub(super) fn index_projects(
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_default();
-        // A malformed project file must not keep the daemon from starting;
-        // it is simply not indexed until fixed.
         let Ok(frontmatter) = crate::frontmatter::parse(&content) else {
             continue;
         };
@@ -183,8 +181,6 @@ pub(super) fn index_projects(
         });
     }
 
-    // Explicit IDs in every file establish the high-water mark before sorted
-    // idless files are assigned, regardless of where those explicit files sort.
     let mut ids: Vec<String> = projects
         .iter()
         .filter_map(|project| project.frontmatter.id.clone())
@@ -246,9 +242,6 @@ pub(super) fn renews_lease(
         return false;
     }
     if run_state == RunState::Driving {
-        // A driving run has no agent process left to identify. The driver
-        // walking its stages is the liveness evidence, the same reading
-        // run-liveness reconciliation takes.
         return supervised;
     }
     identity != ProcessIdentity::GoneOrReused
@@ -330,9 +323,6 @@ async fn renew_supervised_leases(state: &mut DispatcherState, log: &OperationalL
             .await;
         match renewed {
             Ok(ClaimResult::Claimed { .. }) => {}
-            // The daemon believes it supervises this run yet does not hold a
-            // renewable lease on it. That is an anomaly worth surfacing, but
-            // recovery keys off process identity, so nothing changes here.
             Ok(ClaimResult::Lost { .. }) => log.emit_with_fields(
                 LogLevel::Warn,
                 "sloop::dispatcher",
@@ -364,13 +354,8 @@ pub(super) async fn reconcile(
     settle_pending_exits(state, log).await;
     reconcile_output_stalls(state, log);
     reconcile_stall_watchdog(state, log);
-    // Settling externally merged review branches is independent of the dispatch
-    // gates below: it releases blocked dependents even while paused, at
-    // capacity, or outside running hours.
     reconcile_external_merges(state, log).await;
     reconcile_worktree_cleanup(state, log);
-    // Supervised runs keep their leases truthful regardless of the dispatch
-    // gates: a run outliving the TTL while the daemon is paused is still alive.
     renew_supervised_leases(state, log).await;
     if state.storage_full.get()
         || state.reconciliation_blocked
@@ -394,10 +379,6 @@ pub(super) async fn reconcile(
         }
     };
 
-    // A durable lease missing from memory must consume capacity before the
-    // dispatcher can use an apparently free slot. The periodic pass remains
-    // responsible for idle reconciliation; this extra scan only runs when a
-    // queued trigger could otherwise spawn now.
     if !triggers.is_empty() && state.active.len() < state.max_agents {
         wait_for_test_hook("before-spawn-capacity-reconciliation");
         reconcile_run_liveness(state, events, log).await;
@@ -451,8 +432,6 @@ pub(super) async fn reconcile(
         };
 
         let now_ms = state.clock.now_ms();
-        // Minting reads the OS CSPRNG, so it happens here at the effect
-        // boundary; everything downstream just carries the id it was handed.
         let run_id = match state.run_ids.mint() {
             Ok(run_id) => run_id,
             Err(error) => {
@@ -476,7 +455,6 @@ pub(super) async fn reconcile(
             .await
         {
             Ok(ClaimResult::Claimed { ticket }) => ticket,
-            // Losing a conditional source claim is expected under contention.
             Ok(ClaimResult::Lost { .. }) => continue,
             Err(error) => {
                 log.emit_with_fields(
@@ -562,9 +540,6 @@ pub(super) async fn reconcile(
                 continue;
             }
         };
-        // Admission ends here. Everything after it — the workspace, every
-        // stage, the merge, and the settlement event — belongs to the run's
-        // driver, which owns the run from this moment until it settles.
         let target = ticket
             .hints
             .target
@@ -576,8 +551,6 @@ pub(super) async fn reconcile(
                     .map(|agent| agent.default_target.clone())
             })
             .unwrap_or_default();
-        // Paths and branches carry the short id: filesystem names are internal
-        // plumbing, and a 32-character suffix would drown the readable part.
         let short_id = crate::run_ref::short(&run_id);
         let plan = DriverPlan {
             run_id: run_id.clone(),
@@ -668,7 +641,6 @@ pub(super) async fn roll_back_admission(
             );
         }
     }
-    // A driver can fail after the worker socket was bound.
     close_worker_socket(state, run_id);
     log.emit_with_fields(
         LogLevel::Error,
@@ -715,15 +687,11 @@ async fn reconcile_external_merges(state: &mut DispatcherState, log: &Operationa
             }
         }
         let Some(default_tip) = default_tip.as_deref() else {
-            // Without the default branch tip nothing new can be proven.
             continue;
         };
         let Ok(branch_tip) = git_stdout(&state.root, &["rev-parse", &branch.branch]) else {
-            // A deleted branch ref or any git failure leaves the ticket alone.
             continue;
         };
-        // A tip equal to the default tip is not a strict ancestor: an untouched
-        // branch coinciding with the default branch proves no external merge.
         if branch_tip == default_tip {
             continue;
         }
@@ -1305,28 +1273,21 @@ mod tests {
 
     #[test]
     fn only_runs_verified_alive_this_pass_renew_their_lease() {
-        // A supervised run whose process is still identifiable renews.
         assert!(renews_lease(
             RunState::Running,
             true,
             ProcessIdentity::Matches
         ));
-        // So does one whose identity cannot be disproved: recovery already
-        // treats unverifiable as alive.
         assert!(renews_lease(
             RunState::Running,
             true,
             ProcessIdentity::Unverifiable
         ));
-        // A failed identity check must leave the lease expiring, supervised or
-        // not — that is the whole point of strict renewal.
         assert!(!renews_lease(
             RunState::Running,
             true,
             ProcessIdentity::GoneOrReused
         ));
-        // A driving run has no agent process left; the driver walking it is
-        // the liveness evidence, so supervision alone decides.
         assert!(renews_lease(
             RunState::Driving,
             true,
@@ -1337,7 +1298,6 @@ mod tests {
             false,
             ProcessIdentity::GoneOrReused
         ));
-        // Terminal runs hold no lease worth keeping truthful.
         for state in [RunState::Merged, RunState::Failed, RunState::Aborted] {
             assert!(!renews_lease(state, true, ProcessIdentity::Matches));
         }
@@ -1410,7 +1370,6 @@ mod tests {
                 .collect()
         };
 
-        // First pass stamps the two tickets whose files are gone.
         reconcile_tickets(root.path(), &local_work_state, &run_store, 2_000, window).unwrap();
         assert_eq!(
             stamps(&local_work_state),
@@ -1422,12 +1381,9 @@ mod tests {
             ]
         );
 
-        // Within the window nothing is deleted and stamps keep their origin.
         reconcile_tickets(root.path(), &local_work_state, &run_store, 2_050, window).unwrap();
         assert_eq!(stamps(&local_work_state)[1], ("T2".into(), Some(2_000)));
 
-        // Past the window the unreferenced orphan is deleted; T3 survives
-        // because T4 still names it as a blocker.
         reconcile_tickets(root.path(), &local_work_state, &run_store, 2_100, window).unwrap();
         assert_eq!(
             stamps(&local_work_state),
@@ -1438,7 +1394,6 @@ mod tests {
             ]
         );
 
-        // The file coming back clears the stamp even after the window.
         fs::write(tickets.join("blocked-gone.md"), "# Returned\n").unwrap();
         reconcile_tickets(root.path(), &local_work_state, &run_store, 3_000, window).unwrap();
         assert_eq!(stamps(&local_work_state)[1], ("T3".into(), None));

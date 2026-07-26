@@ -47,9 +47,6 @@ impl ExecTicketSource {
             .take()
             .expect("piped source stdin is available")
             .write_all(&input);
-        // A source that answers without reading its request closes the pipe
-        // under us. That is not a failure of its own: the exit status and
-        // stderr hold the answer, so reap the child and let those speak.
         if let Err(error) = write_result
             && error.kind() != io::ErrorKind::BrokenPipe
         {
