@@ -329,7 +329,7 @@ fn an_advisory_failure_is_visible_but_does_not_block_the_merge() {
     // into the view an operator reads before deciding to open the run.
     let text = String::from_utf8_lossy(&world.sloop_plain(&["show", &ticket]).stdout).into_owned();
     assert!(
-        text.contains("build:ok  lint:warn  merge:ok"),
+        text.contains("build:ok -> lint:warn -> merge:ok"),
         "advisory strip missing: {text}"
     );
 }

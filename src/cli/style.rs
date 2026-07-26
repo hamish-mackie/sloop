@@ -35,7 +35,9 @@ impl Tone {
 
 const RESET: &str = "\u{1b}[0m";
 
-/// Whether a rendering may emit escape sequences.
+/// Whether a rendering may emit escape sequences and non-ASCII glyphs. Both
+/// ask the same question — is a human watching, or a pipe — so both hang off
+/// the one gate rather than growing a second flag that could disagree with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Style {
     color: bool,
@@ -67,6 +69,14 @@ impl Style {
             Some(tone) => format!("{}{text}{RESET}", tone.code()),
             None => text.to_owned(),
         }
+    }
+
+    /// `styled` where the tty gate is open, `plain` otherwise. The caller
+    /// supplies both forms so the fallback is chosen next to the glyph it
+    /// stands in for, and so a glyph can never reach a pipe that would mangle
+    /// it.
+    pub fn glyph(self, styled: &'static str, plain: &'static str) -> &'static str {
+        if self.color { styled } else { plain }
     }
 
     /// `text` in `tone`, padded on the right to `width` *visible* columns.
@@ -122,6 +132,14 @@ mod tests {
                 .paint(Some(Tone::Dim), "merged")
                 .contains('\u{1b}')
         );
+    }
+
+    /// The same gate decides escapes and glyphs, so a rendering that reaches a
+    /// pipe is ASCII throughout rather than ASCII except for one arrow.
+    #[test]
+    fn the_plain_style_falls_back_to_the_ascii_form_of_a_glyph() {
+        assert_eq!(Style::PLAIN.glyph(" \u{2192} ", " -> "), " -> ");
+        assert_eq!(Style::COLOR.glyph(" \u{2192} ", " -> "), " \u{2192} ");
     }
 
     #[test]

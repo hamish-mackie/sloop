@@ -616,9 +616,12 @@ fn column_width(runs: &[Value], key: &str) -> usize {
         .unwrap_or(1)
 }
 
-/// The per-stage markers on a run's summary line. Deliberately ASCII: the rest
-/// of this renderer is, and a stage strip is exactly the output most likely to
-/// be piped through something that mangles glyphs.
+/// The per-stage markers on a run's summary line, joined by an arrow: the
+/// stages are a walk through the flow, and the arrow makes that reading
+/// immediate. The glyph arrow lives behind the tty gate — a stage strip is
+/// exactly the output most likely to be piped through something that mangles
+/// glyphs, so the plain path stays ASCII like the rest of this renderer, and
+/// spells the joiner `->` as `render_ticket_transition` already does.
 fn stage_strip(stages: &Value, style: Style) -> String {
     stages
         .as_array()
@@ -641,7 +644,7 @@ fn stage_strip(stages: &Value, style: Style) -> String {
             )
         })
         .collect::<Vec<_>>()
-        .join("  ")
+        .join(style.glyph(" \u{2192} ", " -> "))
 }
 
 /// How a stage execution is named in output. A backward edge re-enters a
@@ -1390,8 +1393,8 @@ mod tests {
                 concat!(
                     "TICK-1  cooldown  (merged)\n",
                     "runs:\n",
-                    "  TICK-1-r2  merged        {}-{}  build:ok  test:ok  merge:ok\n",
-                    "  TICK-1-r1  needs_review  {}-{}  build:ok  test:FAIL  merge:-\n",
+                    "  TICK-1-r2  merged        {}-{}  build:ok -> test:ok -> merge:ok\n",
+                    "  TICK-1-r1  needs_review  {}-{}  build:ok -> test:FAIL -> merge:-\n",
                 ),
                 clock_at(0),
                 clock_at(360_000),
@@ -1668,7 +1671,7 @@ mod tests {
         );
 
         assert!(
-            render(Some("show"), &response).contains("build:ok  lint:warn  merge:ok"),
+            render(Some("show"), &response).contains("build:ok -> lint:warn -> merge:ok"),
             "{}",
             render(Some("show"), &response)
         );
@@ -1699,9 +1702,48 @@ mod tests {
         );
 
         assert!(
-            render(Some("show"), &response).contains("build:ok  build#2:ok  test:FAIL  test#2:ok"),
+            render(Some("show"), &response)
+                .contains("build:ok -> build#2:ok -> test:FAIL -> test#2:ok"),
             "{}",
             render(Some("show"), &response)
+        );
+    }
+
+    /// The stages are a walk through the flow and the joiner says so. Which
+    /// arrow is the tty gate's call: a strip is the line most likely to end up
+    /// in a pipe, and `->` survives one where `→` may not.
+    #[test]
+    fn the_stage_strip_joins_its_markers_with_an_arrow() {
+        let stages = json!([
+            {"stage": "build", "state": "passed"},
+            {"stage": "sync", "state": "passed"},
+            {"stage": "test", "state": "running"},
+            {"stage": "merge", "state": "pending"},
+        ]);
+
+        let plain = super::stage_strip(&stages, Style::PLAIN);
+        assert_eq!(plain, "build:ok -> sync:ok -> test:.. -> merge:-");
+        assert!(!plain.contains('\u{2192}'), "{plain}");
+
+        let styled = super::stage_strip(&stages, Style::COLOR);
+        assert_eq!(
+            strip_ansi(&styled),
+            "build:ok \u{2192} sync:ok \u{2192} test:.. \u{2192} merge:-"
+        );
+    }
+
+    /// The arrow joins whole entries. A marker carrying its own prose is one
+    /// entry however many words it runs to, so nothing is inserted inside it.
+    #[test]
+    fn the_arrow_never_reaches_inside_a_marker() {
+        let stages = json!([
+            {"stage": "build", "state": "passed"},
+            {"stage": "test", "state": "running", "silent_for_ms": 252_000},
+        ]);
+
+        assert_eq!(
+            super::stage_strip(&stages, Style::PLAIN),
+            "build:ok -> test:running (no output 4m12s)"
         );
     }
 
@@ -1944,9 +1986,10 @@ mod tests {
 
     /// Color is a decoration over the plain rendering and nothing more: the
     /// same words in the same columns, escapes only around the tokens worth
-    /// looking at. Padding sits outside the escapes, so stripping them has to
-    /// give the plain rendering back byte for byte — that equality is what
-    /// proves a colored column still lines up.
+    /// looking at. Padding sits outside the escapes, so stripping them — and
+    /// the one glyph the gate also swaps, the strip's arrow — has to give the
+    /// plain rendering back byte for byte. That equality is what proves a
+    /// colored column still lines up.
     #[test]
     fn color_wraps_only_the_tokens_worth_flagging() {
         let response = ResponseEnvelope::success(
@@ -1993,6 +2036,7 @@ mod tests {
         assert!(colored.contains("\u{1b}[33mwarn\u{1b}[0m"), "{colored:?}");
         assert!(colored.contains("\u{1b}[31mFAIL\u{1b}[0m"), "{colored:?}");
         assert!(!colored.contains("\u{1b}[31m-\u{1b}[0m"), "{colored:?}");
-        assert_eq!(strip_ansi(&colored), plain);
+        assert!(!plain.contains('\u{2192}'), "{plain}");
+        assert_eq!(strip_ansi(&colored).replace(" \u{2192} ", " -> "), plain);
     }
 }

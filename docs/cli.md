@@ -216,7 +216,7 @@ daemon: pid 3760 running - 1/2 agents active - next wake in 4m12s
 tickets: 0 ready, 1 claimed, 1 needs_review, 77 merged
 
 runs:
-  TICK-86-r2  driving  19:51-... (9m0s)  build:ok  sync:ok  test:..  merge:-  Move db.rs to db/mod.rs
+  TICK-86-r2  driving  19:51-... (9m0s)  build:ok -> sync:ok -> test:.. -> merge:-  Move db.rs to db/mod.rs
 
 attention:
   TICK-64  needs_review  Split the run store
@@ -244,9 +244,11 @@ one project, so a single-project repository never repeats the same name down
 every line.
 
 When stdout is a terminal, a restrained palette marks `FAIL` and `failed` in
-red, `warn` and `needs_review` in yellow, `ok` in green, and `merged` dim.
-Everything else is unstyled. Set `NO_COLOR`, redirect to a file, or pipe the
-output and no escape sequences are emitted at all; `--json` never carries them.
+red, `warn` and `needs_review` in yellow, `ok` in green, and `merged` dim, and
+the stage strip joins its markers with `→`. Everything else is unstyled. Set
+`NO_COLOR`, redirect to a file, or pipe the output and no escape sequences are
+emitted at all, and the strip falls back to the ASCII `->` shown below;
+`--json` never carries either.
 
 With an argument, `show` first tries the exact reference forms: ticket IDs,
 run IDs and aliases, unique run-ID prefixes, ticket names, and project IDs. An
@@ -282,7 +284,8 @@ existing status fields; a pattern response has top-level `kind`, `ref`, and
 `tickets` fields.
 
 The `runs:` section lists every run of the ticket, newest attempt first: run
-alias, outcome, wall-clock span, and a strip of the run's flow stages marked:
+alias, outcome, wall-clock span, and a strip of the run's flow stages, joined
+by an arrow to read as the walk they are, and marked:
 
 | marker | meaning |
 | ------ | ------- |
@@ -298,9 +301,9 @@ attempt, so a flow without loops reads exactly as it always did.
 
 ```
 runs:
-  TICK-5-r3  merged        21:40-21:52  build:ok  build#2:ok  test:FAIL  test#2:ok  merge:ok
-  TICK-5-r2  merged        20:15-20:21  build:ok  lint:warn  test:ok  merge:ok
-  TICK-5-r1  needs_review  19:02-19:09  build:ok  test:FAIL  merge:-
+  TICK-5-r3  merged        21:40-21:52  build:ok -> build#2:ok -> test:FAIL -> test#2:ok -> merge:ok
+  TICK-5-r2  merged        20:15-20:21  build:ok -> lint:warn -> test:ok -> merge:ok
+  TICK-5-r1  needs_review  19:02-19:09  build:ok -> test:FAIL -> merge:-
 ```
 
 `sloop show <run>` expands one of those lines:
