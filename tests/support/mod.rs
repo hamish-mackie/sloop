@@ -719,10 +719,22 @@ pub fn process_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// Multiplies the polling deadlines below. Deadlines exist to catch hangs,
+/// not to enforce performance, so CI sets this for platforms whose runners
+/// are slow enough to blow deadlines sized for a development machine.
+fn deadline_scale() -> u32 {
+    std::env::var("SLOOP_TEST_DEADLINE_SCALE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
 /// Polls an observable condition until it holds or a deadline passes. Tests
 /// must wait on state, never sleep and hope.
 pub fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(10) * deadline_scale();
     while std::time::Instant::now() < deadline {
         if condition() {
             return;
@@ -735,7 +747,8 @@ pub fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
 /// Like `wait_until`, with a 20-second deadline for probes on multi-second
 /// timers such as the daemon liveness tick.
 pub fn wait_until_slow(what: &str, mut condition: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(20) * deadline_scale();
     while std::time::Instant::now() < deadline {
         if condition() {
             return;
