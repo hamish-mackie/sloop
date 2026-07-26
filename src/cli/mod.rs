@@ -12,13 +12,17 @@ use clap::{
 };
 use serde_json::json;
 
+mod init;
+mod render;
+mod templates;
+
+use self::templates::TemplateKind;
 use crate::protocol::{
     ConfidenceValue, EmptyArgs, ErrorBody, ErrorCode, EventsArgs, ListArgs, LogsArgs, NoteArgs,
     PostArgs, PostTrigger, Request, RequestEnvelope, RequestId, ResponseEnvelope, RunArgs,
     RunReferenceArgs, RunTrigger, ShowArgs, StopArgs, TicketReferenceArgs, VerdictArgs,
     VerdictValue,
 };
-use crate::templates::TemplateKind;
 
 /// `ready` is the line people misread: it is a precondition, not a promise.
 /// Nothing dispatches until a trigger is queued for the ticket, so the state
@@ -930,7 +934,7 @@ fn run_init(mode: OutputMode, stdout: &mut impl Write, stderr: &mut impl Write) 
             );
         }
     };
-    match crate::init::init(&cwd) {
+    match self::init::init(&cwd) {
         Ok(outcome) => write_response(
             mode,
             Some("init"),
@@ -947,8 +951,8 @@ fn run_init(mode: OutputMode, stdout: &mut impl Write, stderr: &mut impl Write) 
         ),
         Err(error) => {
             let code = match error {
-                crate::init::InitError::Conflict { .. } => ErrorCode::Conflict,
-                crate::init::InitError::Io { .. } => ErrorCode::Internal,
+                self::init::InitError::Conflict { .. } => ErrorCode::Conflict,
+                self::init::InitError::Io { .. } => ErrorCode::Internal,
             };
             write_response(
                 mode,
@@ -1613,7 +1617,7 @@ fn write_envelope(
             .map_err(|_| ())
             .and_then(|()| output.write_all(b"\n").map_err(|_| ())),
         OutputMode::Human => output
-            .write_all(crate::render::render(verb, response).as_bytes())
+            .write_all(self::render::render(verb, response).as_bytes())
             .map_err(|_| ()),
     }
 }

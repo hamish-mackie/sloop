@@ -3,15 +3,15 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_CONFIG: &str = include_str!("defaults/config.yaml");
-pub const DEFAULT_PROJECT: &str = include_str!("defaults/projects/default.md");
-pub const DEFAULT_FLOW: &str = include_str!("defaults/flows/default.yaml");
+pub const DEFAULT_CONFIG: &str = include_str!("../defaults/config.yaml");
+pub const DEFAULT_PROJECT: &str = include_str!("../defaults/projects/default.md");
+pub const DEFAULT_FLOW: &str = include_str!("../defaults/flows/default.yaml");
 /// The merge-train flow, materialized beside `default` rather than in place of
 /// it. Its `verify` stage is a `{test_cmd}` placeholder that
 /// [`render_train_flow`] fills in, so the shipped copy is not a flow file until
 /// it has been rendered.
-pub const TRAIN_FLOW_TEMPLATE: &str = include_str!("defaults/flows/train.yaml");
-pub const DEFAULT_REVIEW_PROMPT: &str = include_str!("defaults/prompts/review.md");
+pub const TRAIN_FLOW_TEMPLATE: &str = include_str!("../defaults/flows/train.yaml");
+pub const DEFAULT_REVIEW_PROMPT: &str = include_str!("../defaults/prompts/review.md");
 
 /// The verify command the train flow falls back to when the repository has
 /// configured none. Named here rather than buried in the template so the

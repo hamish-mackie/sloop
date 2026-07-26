@@ -101,7 +101,7 @@ fn invalid_flow_prevents_daemon_startup_with_a_named_error() {
 /// The templates are the only grammar documentation an installed binary can
 /// reach, so the binary must accept exactly what it prints.
 ///
-/// The unit tests in `src/templates.rs` already run each template through its
+/// The unit tests in `src/cli/templates.rs` already run each template through its
 /// own loader. This goes one rung further out: the *printed bytes* of `sloop
 /// template flow` and `sloop template ticket`, dropped into a fresh repository
 /// and posted. `post` snapshots the ticket's flow, so a template the parser
