@@ -16,7 +16,7 @@
 mod brief;
 mod prompt;
 
-pub use brief::definition_of_done;
+pub use brief::{WorkerRole, check_label, definition_of_done};
 pub use prompt::{
     BACKWARD_CONTEXT_LINES, FailureContext, PANEL_REVIEWER_INSTRUCTION, REVIEW_PROMPT_PATH,
     compose_worker_prompt, panel_prompt, previous_attempt_block,

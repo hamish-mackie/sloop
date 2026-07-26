@@ -471,9 +471,40 @@ ends.
 ### sloop brief
 
 Everything needed to work: the ticket body, the selected agent target, the
-worktree path, the branch, and the definition of done. Designed to be
-re-read at any time — an agent that loses context can recover its
-assignment.
+worktree path, the branch, the stage being executed, and the definition of
+done. Designed to be re-read at any time — an agent that loses context can
+recover its assignment.
+
+The brief is keyed on the **stage execution**, not the run:
+
+```json
+"stage": { "name": "review", "attempt": 1, "result_check": "reported" }
+```
+
+- `name` is the stage the caller is executing. For a panel reviewer it comes
+  from the seat's own credential, so a reviewer reads the stage its token names
+  and nothing about the seats beside it.
+- `attempt` counts executions of that stage. A `fail_action: { return_to: … }`
+  edge re-enters it, and each execution is a separate assignment owed its own
+  report — an agent on `attempt: 2` is being run again, not for the first time.
+- `result_check` names what the stage turns on: `none`, `reported`, `commits`,
+  `exec`, `agent`, or `panel`. It is the *kind* of judge, never its command or
+  target: a worker is told about its own stage, not about the flow's shape.
+
+`definition_of_done` follows from that check and from whether the caller is the
+stage's worker or a reviewer on its panel, so it says what this stage turns on
+and nothing about how to operate the CLI:
+
+| Caller | Definition of done |
+| --- | --- |
+| a panel reviewer | the stage passes only on its reported verdict; the work under review is not its to change |
+| `result_check: reported` | the stage passes only on the worker's reported verdict |
+| `result_check: { builtin: commits }` | commit the work to the run branch |
+| `result_check: none` | the worker's own exit status is the verdict |
+| any other check | an independent check judges the work after the worker exits |
+
+Only a `commits` check asks for a commit. A reviewer's brief never does — its
+prompt tells it to change nothing, and the two must agree.
 
 ### sloop show <REF>
 

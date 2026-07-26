@@ -5,10 +5,10 @@ use serde_json::json;
 use crate::domain::ticket::TicketSnapshot;
 use crate::flow::{Check, Confidence, Flow};
 use crate::protocol::{ErrorBody, Request, RequestId, ResponseEnvelope, VerdictArgs, VerdictValue};
-use crate::run_store::PanelReportRecord;
+use crate::run_store::{PanelReportRecord, RunRecord};
 use crate::runner::WorkerScope;
 use crate::vendor_error::VendorErrorMatch;
-use crate::worker::definition_of_done;
+use crate::worker::{WorkerRole, check_label, definition_of_done};
 
 use crate::work_state::local::TicketRecord;
 
@@ -43,7 +43,7 @@ pub(super) fn dispatch_worker(
     };
 
     let data = match request {
-        Request::Brief(_) => handle_brief(state, run_id),
+        Request::Brief(_) => handle_brief(state, run_id, &scope),
         Request::Show(args) => match args.reference.as_deref() {
             Some(reference) if args.limit.is_none() => handle_show(state, run_id, reference),
             _ => Err(unauthorized(
@@ -52,19 +52,17 @@ pub(super) fn dispatch_worker(
         },
         Request::Note(args) => handle_note(state, run_id, &args.text),
         Request::Verdict(args) => match &scope {
-            WorkerScope::Stage => handle_verdict(state, run_id, &args),
+            WorkerScope::Stage => handle_verdict(state, run_id, &scope, &args),
             WorkerScope::PanelReviewer {
-                stage,
                 stage_index,
-                attempt,
                 reviewer_index,
+                ..
             } => handle_panel_report(
                 state,
                 run_id,
+                &scope,
                 PanelSeat {
-                    stage,
                     stage_index: *stage_index,
-                    attempt: *attempt,
                     reviewer_index: *reviewer_index,
                 },
                 &args,
@@ -81,10 +79,87 @@ pub(super) fn dispatch_worker(
     }
 }
 
+/// The stage execution a worker's credential serves: which stage, which
+/// execution of it, and what its result turns on.
+struct ExecutingStage {
+    name: String,
+    /// A `return_to` edge re-enters a stage, and each execution is a separate
+    /// assignment: the attempt is part of what a brief or a report is *for*.
+    attempt: u32,
+    check: Check,
+}
+
+/// Resolves the stage the caller is executing, from the source its own scope
+/// makes authoritative.
+///
+/// A stage worker's answer comes from the live `stage_process` row — the
+/// driver checkpoints exactly one per run, so "the stage currently executing"
+/// picks out one answer whatever kind of stage it is. A panel seat's comes
+/// from its credential, because a panel runs several workers against a single
+/// stage execution and the row no longer distinguishes them.
+///
+/// Neither scope reads the other's source. That is load-bearing: a reviewer's
+/// authority is exactly the seat its token was minted for, and letting it fall
+/// back to the executing row would hand it whatever the driver happens to be
+/// running.
+fn executing_stage(
+    state: &DispatcherState,
+    run: &RunRecord,
+    scope: &WorkerScope,
+) -> Result<ExecutingStage, ErrorBody> {
+    if !matches!(run.state.as_str(), "running" | "driving") {
+        return Err(conflict("the run has no stage currently executing"));
+    }
+    let snapshot = run
+        .flow_json
+        .as_deref()
+        .ok_or_else(|| internal("the run has no flow snapshot"))?;
+    let flow: Flow = serde_json::from_str(snapshot)
+        .map_err(|error| internal(&format!("the run's flow snapshot is invalid: {error}")))?;
+    let (name, attempt) = match scope {
+        WorkerScope::Stage => stage_process(state, &run.id)?,
+        WorkerScope::PanelReviewer { stage, attempt, .. } => (stage.clone(), *attempt),
+    };
+    let stage = flow
+        .stages
+        .iter()
+        .find(|stage| stage.name == name)
+        .ok_or_else(|| internal("the executing stage is not in the run's flow snapshot"))?;
+    Ok(ExecutingStage {
+        name,
+        attempt,
+        check: stage.result_check.clone(),
+    })
+}
+
+/// The stage and attempt the driver last checkpointed a process for. Only a
+/// [`WorkerScope::Stage`] credential may be answered from it.
+fn stage_process(state: &DispatcherState, run_id: &str) -> Result<(String, u32), ErrorBody> {
+    let rows = run_lookup(state, |run_store| run_store.run_evidence(run_id))?;
+    let executing = rows
+        .iter()
+        .find(|(kind, _)| kind == super::driver::STAGE_PROCESS)
+        .and_then(|(_, data)| serde_json::from_str::<serde_json::Value>(data).ok())
+        .ok_or_else(|| conflict("the run has no stage process currently executing"))?;
+    let stage = executing["stage"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| conflict("the run has no stage process currently executing"))?;
+    let attempt = executing["attempt"]
+        .as_u64()
+        .and_then(|attempt| u32::try_from(attempt).ok())
+        .unwrap_or(1);
+    Ok((stage, attempt))
+}
+
 /// Everything the agent needs to work, re-readable after a compaction: the
-/// ticket body from its committed file, the isolated workspace, and the
-/// evidence-based definition of done.
-fn handle_brief(state: &DispatcherState, run_id: &str) -> Result<serde_json::Value, ErrorBody> {
+/// ticket body from its committed file, the isolated workspace, the stage it
+/// is executing, and what that stage turns on.
+fn handle_brief(
+    state: &DispatcherState,
+    run_id: &str,
+    scope: &WorkerScope,
+) -> Result<serde_json::Value, ErrorBody> {
     let run = run_lookup(state, |run_store| run_store.run(run_id))?
         .ok_or_else(|| internal("the run for this token no longer exists"))?;
     let ticket = match run.ticket_json.as_deref() {
@@ -113,7 +188,15 @@ fn handle_brief(state: &DispatcherState, run_id: &str) -> Result<serde_json::Val
         }
     };
 
-    let definition_of_done = definition_of_done(state.flow_test_cmd.is_some());
+    // The assignment is this stage execution, not the run: what a worker owes
+    // is a property of the stage it is running, and the role its credential
+    // gives it there.
+    let executing = executing_stage(state, &run, scope)?;
+    let role = match scope {
+        WorkerScope::Stage => WorkerRole::Stage,
+        WorkerScope::PanelReviewer { .. } => WorkerRole::PanelReviewer,
+    };
+    let definition_of_done = definition_of_done(role, &executing.check);
 
     Ok(json!({
         "run": run_id,
@@ -123,13 +206,19 @@ fn handle_brief(state: &DispatcherState, run_id: &str) -> Result<serde_json::Val
             "blocked_by": ticket.blocked_by,
             "worktree": ticket.worktree,
             "body": ticket.body,
-            "acceptance": [],
             "target": ticket.target,
             "model": ticket.model,
             "effort": ticket.effort,
         },
         "worktree": run.worktree_path,
         "branch": run.branch,
+        // The stage's identity only. A panel seat reads its stage from its own
+        // credential and learns nothing here about the seats beside it.
+        "stage": {
+            "name": executing.name,
+            "attempt": executing.attempt,
+            "result_check": check_label(&executing.check),
+        },
         "definition_of_done": definition_of_done,
     }))
 }
@@ -217,12 +306,12 @@ fn handle_note(
     Ok(json!({"note": {"id": note_id, "run": run_id, "text": text}}))
 }
 
-/// The seat a panel reviewer's credential names. Copied out of the scope so
-/// the handler cannot accidentally read anything else off the request.
-struct PanelSeat<'a> {
-    stage: &'a str,
+/// Where in the panel a reviewer's credential seats it. Copied out of the
+/// scope so the handler cannot accidentally read anything else off the
+/// request; the stage and attempt it belongs to come from the same credential,
+/// through [`executing_stage`].
+struct PanelSeat {
     stage_index: usize,
-    attempt: u32,
     reviewer_index: usize,
 }
 
@@ -239,14 +328,13 @@ struct PanelSeat<'a> {
 fn handle_panel_report(
     state: &DispatcherState,
     run_id: &str,
-    seat: PanelSeat<'_>,
+    scope: &WorkerScope,
+    seat: PanelSeat,
     args: &VerdictArgs,
 ) -> Result<serde_json::Value, ErrorBody> {
     let run = run_lookup(state, |run_store| run_store.run(run_id))?
         .ok_or_else(|| internal("the run for this token no longer exists"))?;
-    if !matches!(run.state.as_str(), "running" | "driving") {
-        return Err(conflict("the run has no stage currently executing"));
-    }
+    let executing = executing_stage(state, &run, scope)?;
     // A panel report is what the whole stage turns on, and an unexplained one
     // is worth nothing to the operator reading `sloop show` afterwards.
     let reason = args
@@ -263,9 +351,9 @@ fn handle_panel_report(
         .confidence
         .map_or(Confidence::default(), Confidence::from);
     let record = PanelReportRecord {
-        stage: seat.stage,
+        stage: &executing.name,
         stage_index: seat.stage_index,
-        attempt: seat.attempt,
+        attempt: executing.attempt,
         reviewer_index: seat.reviewer_index,
         verdict,
         confidence: confidence.as_str(),
@@ -281,13 +369,13 @@ fn handle_panel_report(
     if !inserted {
         return Err(conflict(&format!(
             "reviewer {} of stage `{}` has already reported",
-            seat.reviewer_index, seat.stage
+            seat.reviewer_index, executing.name
         )));
     }
     Ok(json!({
         "verdict": {
             "run": run_id,
-            "stage": seat.stage,
+            "stage": executing.name,
             "reviewer": seat.reviewer_index,
             "verdict": verdict,
             "confidence": confidence.as_str(),
@@ -299,44 +387,17 @@ fn handle_panel_report(
 fn handle_verdict(
     state: &DispatcherState,
     run_id: &str,
+    scope: &WorkerScope,
     args: &VerdictArgs,
 ) -> Result<serde_json::Value, ErrorBody> {
     let run = run_lookup(state, |run_store| run_store.run(run_id))?
         .ok_or_else(|| internal("the run for this token no longer exists"))?;
-    let snapshot = run
-        .flow_json
-        .as_deref()
-        .ok_or_else(|| internal("the run has no flow snapshot"))?;
-    let flow: Flow = serde_json::from_str(snapshot)
-        .map_err(|error| internal(&format!("the run's flow snapshot is invalid: {error}")))?;
-    // The executing stage is whatever the driver last checkpointed a process
-    // for — one answer, whatever kind of stage it is and wherever it sits in
-    // the flow. A worker can only ever report for the stage it is running.
-    if !matches!(run.state.as_str(), "running" | "driving") {
-        return Err(conflict("the run has no stage currently executing"));
-    }
-    let rows = run_lookup(state, |run_store| run_store.run_evidence(run_id))?;
-    let executing = rows
-        .iter()
-        .find(|(kind, _)| kind == super::driver::STAGE_PROCESS)
-        .and_then(|(_, data)| serde_json::from_str::<serde_json::Value>(data).ok())
-        .ok_or_else(|| conflict("the run has no stage process currently executing"))?;
-    let stage_name = executing["stage"]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| conflict("the run has no stage process currently executing"))?;
-    // A backward edge can re-enter a reported stage, and each execution is
-    // owed its own report: the attempt is part of what the report is *for*.
-    let attempt = executing["attempt"]
-        .as_u64()
-        .and_then(|attempt| u32::try_from(attempt).ok())
-        .unwrap_or(1);
-    let stage = flow
-        .stages
-        .iter()
-        .find(|stage| stage.name == stage_name)
-        .ok_or_else(|| internal("the executing stage is not in the run's flow snapshot"))?;
-    if stage.result_check != Check::Reported {
+    // A worker can only ever report for the stage it is running, and the
+    // resolver is the only thing that decides which stage that is.
+    let executing = executing_stage(state, &run, scope)?;
+    let stage_name = executing.name;
+    let attempt = executing.attempt;
+    if executing.check != Check::Reported {
         return Err(unauthorized(&format!(
             "stage `{stage_name}` does not use `result_check: reported`"
         )));

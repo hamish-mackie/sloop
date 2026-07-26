@@ -7,7 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`sloop brief` is keyed on the stage the caller is executing, not on the
+  run.** The reply gains a `stage` block — `{"name", "attempt",
+  "result_check"}` — and `definition_of_done` now states what *that* stage
+  turns on instead of one run-level sentence handed to everybody.
+
+  The old text was authored in the socket handler and began "Commit your work to
+  the run branch" for every caller. Three kinds of worker hold a brief-capable
+  token, and only one of them builds anything: Sloop's own panel bootstrap tells
+  a reviewer to change nothing and to run `sloop brief`, which replied that its
+  job was to commit. The obligation now follows from the stage's `result_check`
+  and the caller's role, derived in one place:
+
+  | Caller | Definition of done |
+  | --- | --- |
+  | a panel reviewer | the stage passes only on its reported verdict; the work under review is not its to change |
+  | `result_check: reported` | the stage passes only on the worker's reported verdict |
+  | `result_check: { builtin: commits }` | commit the work to the run branch |
+  | `result_check: none` | the worker's own exit status is the verdict |
+  | any other check | an independent check judges the work after the worker exits |
+
+  A builder's brief is unchanged in substance: an `action: agent` stage defaults
+  to the commits check, so it is still told to commit to the run branch.
+
+  `attempt` is the other half of the assignment's identity. A
+  `fail_action: { return_to: … }` edge re-enters a stage, each execution is owed
+  its own report, and an agent that could not see the attempt could not tell a
+  retry from a first run.
+
+  Two judgement calls in the new text, both deliberate:
+
+  - **`flow.test_cmd` no longer earns a line.** It used to append "The
+    configured test command passes" whenever the key was set. But `test_cmd` is
+    spliced into every flow as its own `test` stage, judged by its own exit —
+    so the line told a worker to satisfy a check belonging to a *different*
+    stage, which is the same category of error as telling a reviewer to commit.
+    A flow's stages name their own tests, and a stage's brief describes that
+    stage.
+  - **A worker whose check is an independent actor is told that one exists, not
+    which.** Naming it would be useful, and it would also hand a worker the
+    flow's shape and the judge's argv — an invitation to run or game the check
+    rather than do the work. The stage block's `result_check` names the *kind*
+    of judge (`exec`, `agent`, `panel`, …), which is a fact about the caller's
+    own stage; the command behind it is not.
+
+  For clients: `definition_of_done` keeps its type and was always prose for an
+  agent to read. `stage` is additive. `ticket.acceptance` is removed — see
+  below.
+
 ### Removed
+
+- **`ticket.acceptance` from the `sloop brief` reply.** It was hardcoded to
+  `[]` on every reply, so no client could ever have read a value out of it, and
+  nothing in Sloop wrote one. It is part of the documented brief shape, so its
+  removal is recorded here rather than left to be discovered.
 
 - **The legacy `kind` / `cmd` / `verdict` stage grammar.** `0.3.x` named a
   stage's work with `kind` and graded it with `verdict`; `0.4.0` names the same

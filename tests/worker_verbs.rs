@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
-use support::{World, wait_until};
+use support::{World, wait_until, wait_until_slow};
 
 #[test]
 fn brief_sends_an_authenticated_worker_request() {
@@ -15,10 +15,11 @@ fn brief_sends_an_authenticated_worker_request() {
         "ok": true,
         "data": {
             "run": "R1",
-            "ticket": {"id": "T1", "body": "Persist cooldowns", "acceptance": []},
+            "ticket": {"id": "T1", "body": "Persist cooldowns"},
             "worktree": "/repo/.worktrees/R1",
             "branch": "sloop/R1-T1",
-            "definition_of_done": ["Changes committed", "Tests pass"]
+            "stage": {"name": "build", "attempt": 1, "result_check": "commits"},
+            "definition_of_done": ["Commit your work to the run branch"]
         }
     });
     let (output, request) = world.worker_exchange(&["brief"], reply.clone());
@@ -260,11 +261,20 @@ fn a_running_agent_reads_its_brief_and_records_a_note() {
             .expect("branch")
             .starts_with("sloop/")
     );
+    // The brief is keyed on the stage the worker is executing, not on the run.
+    assert_eq!(brief["data"]["stage"]["name"], "build");
+    assert_eq!(brief["data"]["stage"]["attempt"], 1);
+    assert_eq!(brief["data"]["stage"]["result_check"], "commits");
+    // A builder's obligation is unchanged in substance: an `action: agent`
+    // stage is checked for commits, so commits are what it is asked for.
+    assert_eq!(
+        brief["data"]["definition_of_done"],
+        json!(["Commit your work to the run branch"])
+    );
+    // `acceptance` was hardcoded empty and read by nothing; it is gone.
     assert!(
-        !brief["data"]["definition_of_done"]
-            .as_array()
-            .expect("definition_of_done")
-            .is_empty()
+        brief["data"]["ticket"]["acceptance"].is_null(),
+        "brief kept the dead acceptance field: {brief}"
     );
 
     let show = worktree_json(&world, 1, "show.json");
@@ -368,6 +378,134 @@ fn reported_stage_records_the_first_verdict_and_rejects_the_second() {
         .clone();
     assert_eq!(review["verdict_source"], "reported");
     assert_eq!(review["confidence"], "high");
+}
+
+/// Two stages of one run, two obligations. The builder is checked for commits
+/// and is told to commit; the reviewer's stage turns on its report, and its
+/// brief must not send it off to write code — which is exactly what a brief
+/// keyed on the run did, in contradiction of the prompt the same daemon
+/// handed it.
+#[test]
+fn a_reported_stages_brief_names_its_own_stage_and_asks_for_no_commit() {
+    let world = World::configured();
+    configure_worker_agent(&world, false);
+    let reviewer = world.root().join("reviewer.sh");
+    fs::write(
+        &reviewer,
+        format!(
+            "#!/bin/sh\n\
+             SLOOP={}\n\
+             \"$SLOOP\" --json brief > review-brief.json 2> review-brief.err\n\
+             \"$SLOOP\" --json verdict pass --reason 'looks right' >/dev/null 2>&1\n\
+             exit 0\n",
+            serde_json::to_string(env!("CARGO_BIN_EXE_sloop")).expect("quote sloop path"),
+        ),
+    )
+    .expect("write reviewer");
+    fs::write(
+        world.root().join(".agents/sloop/flows/default.yaml"),
+        format!(
+            "stages:\n  - {{ name: build, action: agent }}\n  - name: review\n    action: {{ exec: [\"sh\", {}] }}\n    result_check: reported\n  - {{ name: merge, action: {{ builtin: merge }} }}\n",
+            serde_json::to_string(&reviewer.to_string_lossy()).expect("quote reviewer path"),
+        ),
+    )
+    .expect("write reported flow");
+    world.commit_all("initial");
+    world.start_daemon();
+    let ticket = post_manual(&world, "reported-brief.md", "# Reported review\n");
+
+    assert!(world.sloop(&["run", &ticket]).status.success());
+    wait_until("the reviewed run settles", || run_settled(&world));
+
+    let brief = worktree_json(&world, 1, "review-brief.json");
+    assert_eq!(brief["ok"], true, "reviewer brief failed: {brief}");
+    assert_eq!(brief["data"]["stage"]["name"], "review");
+    assert_eq!(brief["data"]["stage"]["attempt"], 1);
+    assert_eq!(brief["data"]["stage"]["result_check"], "reported");
+    let obligations = brief["data"]["definition_of_done"]
+        .as_array()
+        .expect("definition_of_done");
+    assert_eq!(obligations.len(), 1, "{obligations:?}");
+    let obligation = obligations[0]
+        .as_str()
+        .expect("obligation text")
+        .to_lowercase();
+    assert!(
+        obligation.contains("reported verdict"),
+        "reviewer obligation: {obligation}"
+    );
+    assert!(
+        !obligation.contains("commit"),
+        "a reported stage's worker was told to commit: {obligation}"
+    );
+
+    // The same run's builder still reads the obligation it always did. The two
+    // briefs differ because the stages differ, which is the whole point.
+    let build = worktree_json(&world, 1, "brief.json");
+    assert_eq!(build["data"]["stage"]["name"], "build");
+    assert_eq!(build["data"]["stage"]["result_check"], "commits");
+    assert_eq!(
+        build["data"]["definition_of_done"],
+        json!(["Commit your work to the run branch"])
+    );
+}
+
+/// A `return_to` edge re-enters the stage, and the second execution is a
+/// separate assignment owed its own report. A worker that could not see the
+/// attempt could not tell a retry from a first run.
+#[test]
+fn a_re_entered_stages_brief_reports_the_second_attempt() {
+    let world = World::configured();
+    configure_worker_agent(&world, false);
+    let counter = world.root().join("rounds");
+    fs::write(&counter, b"").expect("create round counter");
+    let reviewer = world.root().join("reviewer.sh");
+    fs::write(
+        &reviewer,
+        format!(
+            "#!/bin/sh\n\
+             SLOOP={sloop}\n\
+             COUNTER={counter}\n\
+             printf x >> \"$COUNTER\"\n\
+             round=$(wc -c < \"$COUNTER\" | tr -d ' ')\n\
+             \"$SLOOP\" --json brief > \"review-brief-$round.json\" 2>&1\n\
+             if [ \"$round\" -le 1 ]; then\n  \
+               \"$SLOOP\" --json verdict fail --reason 'round one' >/dev/null 2>&1\n\
+             else\n  \
+               \"$SLOOP\" --json verdict pass --reason 'round two' >/dev/null 2>&1\n\
+             fi\n\
+             exit 0\n",
+            sloop = serde_json::to_string(env!("CARGO_BIN_EXE_sloop")).expect("quote sloop path"),
+            counter =
+                serde_json::to_string(&counter.to_string_lossy()).expect("quote counter path"),
+        ),
+    )
+    .expect("write reviewer");
+    fs::write(
+        world.root().join(".agents/sloop/flows/default.yaml"),
+        format!(
+            "stages:\n  - {{ name: build, action: agent }}\n  - name: review\n    action: {{ exec: [\"sh\", {}] }}\n    result_check: reported\n    fail_action: {{ return_to: build, attempts: 1 }}\n  - {{ name: merge, action: {{ builtin: merge }} }}\n",
+            serde_json::to_string(&reviewer.to_string_lossy()).expect("quote reviewer path"),
+        ),
+    )
+    .expect("write re-entering flow");
+    world.commit_all("initial");
+    world.start_daemon();
+    let ticket = post_manual(&world, "re-entered.md", "# Re-entered review\n");
+
+    assert!(world.sloop(&["run", &ticket]).status.success());
+    wait_until_slow("the re-reviewed run settles", || run_settled(&world));
+
+    for (round, attempt) in [(1, 1), (2, 2)] {
+        let brief = worktree_json(&world, 1, &format!("review-brief-{round}.json"));
+        assert_eq!(brief["ok"], true, "round {round} brief failed: {brief}");
+        assert_eq!(brief["data"]["stage"]["name"], "review");
+        assert_eq!(
+            brief["data"]["stage"]["attempt"], attempt,
+            "round {round}: {brief}"
+        );
+        assert_eq!(brief["data"]["stage"]["result_check"], "reported");
+    }
 }
 
 #[test]

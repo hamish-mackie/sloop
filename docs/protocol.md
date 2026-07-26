@@ -56,6 +56,14 @@ The operator/worker split is enforced at the transport layer:
   only for the currently executing stage when its snapshotted result check is
   `reported`; the first report for that stage execution wins.
 
+  `brief` answers *what* the caller was assigned, and is keyed on the stage
+  execution rather than the run: alongside the ticket, worktree, and branch it
+  carries `stage` — `{"name": …, "attempt": …, "result_check": …}` — and the
+  `definition_of_done` that stage's check implies. Both come from the caller's
+  own credential: a stage worker's stage is read from the run's live
+  stage-process checkpoint, a reviewer's from its seat. Nothing seat-specific
+  appears in a brief, so two reviewers on one panel read identical replies.
+
   A **panel reviewer's** credential is narrower still: it is minted for one
   seat — `(run, stage, attempt, reviewer index)` — and authorises exactly one
   `verdict`. Which report the call lands on is derived from the credential,
@@ -238,6 +246,16 @@ the CLI names are hidden deprecated aliases for the `show` surface.
 `post`'s `created` and `trigger_suppressed` are additive in the same sense.
 `trigger` keeps its meaning; it was already null whenever no trigger was
 queued, and the new field only explains which null it is.
+
+`brief` is the one exception, in **0.4.0**. Its `stage` block is additive, but
+two things changed under clients:
+
+- `ticket.acceptance` is **removed**. It was hardcoded to `[]` on every reply
+  and never carried a value, so nothing could have read anything from it.
+- `definition_of_done` keeps its type — an array of strings — and changes what
+  it says. It used to state the same run-level obligation to every caller; it
+  now states what the caller's own stage turns on. Its contents were always
+  prose for an agent to read, never a value to branch on.
 
 ### The activation → trigger rename
 

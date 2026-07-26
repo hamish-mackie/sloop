@@ -581,6 +581,84 @@ fn a_reviewers_token_cannot_report_for_a_later_stage_or_another_run() {
     }
 }
 
+/// A seat's brief is its own credential read back: the stage it was minted
+/// for, and the obligation that stage puts on a reviewer. Sloop's own panel
+/// prompt tells a reviewer to change nothing, so a brief that told it to commit
+/// would have the daemon contradicting itself in two strings it authored.
+///
+/// It is also the whole of what a seat learns: two seats of the same panel read
+/// the identical brief, so nothing in it identifies a colleague.
+#[test]
+fn a_panel_seats_brief_names_its_stage_and_hides_the_other_seats() {
+    let world = World::configured();
+    let build = builder(&world);
+    let briefing = |name: &str| {
+        write_script(
+            &world,
+            &format!("{name}.sh"),
+            &format!(
+                "{sloop} --json brief > {name}-brief.json 2>&1 || true\n\
+                 {sloop} --json verdict pass --reason 'acceptable' >/dev/null 2>&1 || true\n\
+                 exit 0\n",
+                sloop = sloop_binary(),
+            ),
+        )
+    };
+    let alpha = briefing("alpha");
+    let beta = briefing("beta");
+    configure(
+        &world,
+        "- { name: build, action: agent, result_check: { exec: ['true'] } }\n\
+         - name: review\n  \
+           action: { exec: ['true'] }\n  \
+           result_check:\n    \
+             panel:\n      \
+               prompt: prompts/panel.md\n      \
+               reviewers: [{ target: alpha }, { target: beta }]\n      \
+               require: { quorum: 2 }\n\
+         - { name: merge, action: { builtin: merge }, result_check: none }\n",
+        &[("builder", &build), ("alpha", &alpha), ("beta", &beta)],
+    );
+    world.commit_all("initial");
+    world.start_daemon();
+    let ticket = post(&world, "panel-brief.md");
+    assert!(world.sloop(&["run", &ticket]).status.success());
+
+    wait_until_slow("the briefed panel merges", || {
+        status(&world)["tickets"]["merged"] == 1
+    });
+
+    let alpha_brief = worktree_json(&world, "alpha-brief.json");
+    assert_eq!(alpha_brief["ok"], true, "{alpha_brief}");
+    // The stage comes from the credential, not from whatever the driver is
+    // running: a seat's brief names the stage its token was minted for.
+    assert_eq!(alpha_brief["data"]["stage"]["name"], "review");
+    assert_eq!(alpha_brief["data"]["stage"]["attempt"], 1);
+    assert_eq!(alpha_brief["data"]["stage"]["result_check"], "panel");
+    let obligation = alpha_brief["data"]["definition_of_done"][0]
+        .as_str()
+        .expect("obligation text")
+        .to_lowercase();
+    assert!(
+        obligation.contains("reported verdict"),
+        "reviewer obligation: {obligation}"
+    );
+    assert!(
+        !obligation.contains("commit"),
+        "a panel reviewer was told to commit: {obligation}"
+    );
+
+    // Seat 0 and seat 1 read the same words. There is no seat index, no
+    // colleague's target, and no other seat's report in a brief — so holding
+    // one seat's credential reveals nothing about the panel around it. Only
+    // the envelope's echoed request id differs, which is per-call and says
+    // nothing about who asked.
+    assert_eq!(
+        alpha_brief["data"],
+        worktree_json(&world, "beta-brief.json")["data"]
+    );
+}
+
 /// A backward edge re-runs the panel, and the second round's reports belong to
 /// the second round. Keying them by attempt is what keeps a converged loop
 /// from being decided by the votes that sent it back.
