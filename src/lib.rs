@@ -12,8 +12,6 @@ pub mod outcome;
 pub mod paths;
 pub mod post;
 pub mod protocol;
-pub mod reindex;
-mod reindex_evidence;
 pub mod render;
 pub mod run_log;
 pub mod run_ref;

@@ -4,7 +4,8 @@
 //! transitions and run evidence are separate storage boundaries.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -18,6 +19,7 @@ use crate::frontmatter::Frontmatter;
 pub(crate) mod exec;
 pub mod local;
 pub(crate) mod markdown;
+mod reindex_evidence;
 pub mod trigger;
 
 use exec::ExecTicketSource;
@@ -50,6 +52,23 @@ impl fmt::Display for TicketFeedError {
 }
 
 impl std::error::Error for TicketFeedError {}
+
+#[derive(Debug)]
+pub(crate) struct ReindexError(pub(crate) String);
+
+impl ReindexError {
+    pub(crate) fn io(path: &Path, source: io::Error) -> Self {
+        Self(format!("{}: {source}", path.display()))
+    }
+}
+
+impl fmt::Display for ReindexError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ReindexError {}
 
 /// The configured authored-ticket feeder. The public extension seam is the
 /// exec wire protocol, so server wiring uses this concrete enum rather than a

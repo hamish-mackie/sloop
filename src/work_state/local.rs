@@ -21,11 +21,10 @@ use crate::domain::work::{
 use crate::flow::Flow;
 use crate::frontmatter;
 use crate::ids::next_id;
-use crate::reindex::ReindexError;
 use crate::work_state::exec::ExecTicketSource;
 use crate::work_state::trigger;
 use crate::work_state::{
-    ActiveClaim, ClaimResult, ClaimStrength, SourceError, TicketFeeder, WorkState,
+    ActiveClaim, ClaimResult, ClaimStrength, ReindexError, SourceError, TicketFeeder, WorkState,
 };
 
 const TICKET_RECORD_SELECT: &str =
@@ -775,7 +774,7 @@ impl LocalSqlite {
             )));
         }
 
-        crate::reindex_evidence::derive_states(root, worktree_dir, &mut tickets)?;
+        crate::work_state::reindex_evidence::derive_states(root, worktree_dir, &mut tickets)?;
         let result = self
             .apply_reindex(
                 project_ids,
