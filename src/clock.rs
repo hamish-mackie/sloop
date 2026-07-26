@@ -176,3 +176,41 @@ fn local_minute(timestamp_ms: i64) -> u16 {
     }
     (local.tm_hour as u16) * 60 + local.tm_min as u16
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_timestamp;
+
+    #[test]
+    fn a_whole_second_instant_parses_to_its_epoch_millisecond() {
+        assert_eq!(
+            parse_timestamp("2026-07-15T22:00:00Z"),
+            Some(1_784_152_800_000)
+        );
+    }
+
+    /// The daemon stamps envelopes with millisecond precision, so the
+    /// fraction is the common case rather than the exotic one.
+    #[test]
+    fn a_fractional_second_instant_keeps_its_milliseconds() {
+        assert_eq!(
+            parse_timestamp("2026-07-26T11:03:39.687Z"),
+            Some(1_785_063_819_687)
+        );
+    }
+
+    #[test]
+    fn a_numeric_offset_resolves_to_the_same_instant_as_its_z_form() {
+        assert_eq!(
+            parse_timestamp("2026-07-15T22:00:00+10:00"),
+            parse_timestamp("2026-07-15T12:00:00Z")
+        );
+    }
+
+    #[test]
+    fn anything_that_is_not_rfc3339_is_none() {
+        assert_eq!(parse_timestamp("not-a-time"), None);
+        assert_eq!(parse_timestamp(""), None);
+        assert_eq!(parse_timestamp("2026-07-15"), None);
+    }
+}

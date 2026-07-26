@@ -1896,6 +1896,33 @@ mod tests {
         assert!(!calm.contains("attention:"), "{calm}");
     }
 
+    /// A deadline the renderer cannot read is still the daemon's answer, so it
+    /// reaches the reader intact rather than vanishing from the header.
+    #[test]
+    fn an_unreadable_next_wake_reaches_the_dashboard_verbatim() {
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "kind": "dashboard",
+                "daemon": {"pid": 3760, "paused": false, "draining": false},
+                "gate": {"active_agents": 0, "max_agents": 2},
+                "next_wake": "whenever the gate opens",
+                "tickets": {"ready": 0, "held": 0, "blocked": 0, "claimed": 0,
+                            "merged": 0, "failed": 0, "needs_review": 0},
+                "runs": [],
+                "attention": [],
+                "recent": [],
+                "recent_total": 0,
+            }),
+        );
+
+        let text = render(Some("show"), &response);
+        assert!(
+            text.contains("next wake whenever the gate opens\n"),
+            "{text}"
+        );
+    }
+
     /// Drops every `ESC [ ... m` sequence, so a styled rendering can be
     /// compared against the plain one it decorates.
     fn strip_ansi(text: &str) -> String {
