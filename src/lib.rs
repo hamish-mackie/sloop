@@ -9,7 +9,6 @@ pub mod flow;
 pub mod frontmatter;
 pub mod ids;
 pub mod init;
-pub mod logging;
 pub mod outcome;
 pub mod paths;
 pub mod post;

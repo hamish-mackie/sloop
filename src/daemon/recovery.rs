@@ -13,7 +13,6 @@ use crate::clock::Clock;
 use crate::db::{Db, StoreError};
 use crate::domain::work::{Disposition, TicketRef};
 use crate::flow::Flow;
-use crate::logging::{LogLevel, OperationalLog};
 use crate::outcome::Outcome;
 use crate::run_log::{OutputStream, output_staleness};
 use crate::run_store::{
@@ -34,6 +33,7 @@ use super::driver::{
     git_is_ancestor, git_stdout, shared_checkout_has_git_operation, start_driver,
     try_commits_on_branch,
 };
+use super::logging::{LogLevel, OperationalLog};
 use super::scheduler::{DEFAULT_LEASE_MS, VENDOR_COOLDOWN_MS};
 use super::server::{DaemonError, serve_worker_socket};
 

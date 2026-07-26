@@ -33,7 +33,6 @@ use crate::flow::{
     ReviewerReport, Stage, StageEvidence, Step, Verdict, VerdictSource, aggregate, next_step,
     resolve_verdict, return_trigger,
 };
-use crate::logging::{LogLevel, OperationalLog};
 use crate::outcome::{ExitClass, FlowHalt, MergeOutcome, classify_exit};
 use crate::run_log::stage_output_tail;
 use crate::run_store::{
@@ -56,6 +55,7 @@ use crate::worker::{
 };
 
 use super::dispatcher::{DispatcherState, RunEvent};
+use super::logging::{LogLevel, OperationalLog};
 use super::recovery::{
     MergeProcessCheckpoint, PersistedProcessStop, RecoveryClassification, classify_run_output,
     inspect_interrupted_merge, stop_interrupted_process,

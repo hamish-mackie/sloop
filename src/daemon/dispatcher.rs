@@ -14,7 +14,6 @@ use crate::config::{AgentConfig, RunningHours, parse_local_time};
 use crate::db::StoreError;
 use crate::domain::work::{Disposition, TicketRef, WorkOutcome};
 use crate::flow::Flow;
-use crate::logging::{LogLevel, OperationalLog};
 use crate::outcome::{FlowHalt, MergeOutcome, RunEvidence, classify_exit, derive_outcome};
 use crate::protocol::{ErrorBody, ErrorCode, Request, RequestId, ResponseEnvelope};
 use crate::run_ref::RunIdSource;
@@ -30,6 +29,7 @@ use super::commands::{
     handle_ready, handle_reindex, handle_retry, handle_run, handle_status, handle_stop,
     handle_wait,
 };
+use super::logging::{LogLevel, OperationalLog};
 use super::recovery::{RecoveryClassification, reconcile_run_liveness};
 use super::scheduler::{next_dispatch_deadline, reconcile};
 use super::server::serve_worker_socket;

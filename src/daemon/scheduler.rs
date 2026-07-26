@@ -14,7 +14,6 @@ use crate::domain::work::{Disposition, OwnerId, TicketRef, WorkOutcome, WorkTick
 use crate::flow::Flow;
 use crate::frontmatter::Frontmatter;
 use crate::ids::next_id;
-use crate::logging::{LogLevel, OperationalLog};
 use crate::run_log::output_staleness;
 use crate::run_store::{
     NeedsReviewBranch, OutputStallEvidence, RunAdmission, RunState, RunStore,
@@ -30,6 +29,7 @@ use super::dispatcher::{
     push_work_outcome, recover_storage, settle_pending_exits,
 };
 use super::driver::{DriverEnvironment, DriverPlan, git_is_ancestor, git_stdout, start_driver};
+use super::logging::{LogLevel, OperationalLog};
 use super::recovery::{
     ProcessIdentity, executing_stage, reconcile_run_liveness, recoverable_process_identity,
     stop_agent_process_group,

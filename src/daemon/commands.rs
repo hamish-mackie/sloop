@@ -14,7 +14,6 @@ use crate::domain::ticket::TicketState;
 use crate::domain::trigger::TriggerKind;
 use crate::frontmatter::{self, Frontmatter};
 use crate::ids::next_id;
-use crate::logging::LogLevel;
 use crate::protocol::{ErrorBody, ListArgs, ShowArgs};
 use crate::run_store::{EventRecord, RunRecord, RunState, RunStore};
 use crate::runner::local::run_output_path;
@@ -22,6 +21,7 @@ use crate::work_state::local::{LocalSqlite, ProjectRecord, TicketRecord};
 use crate::work_state::trigger::{Duplicates, EnqueueRequest};
 
 use super::dispatcher::{DispatcherState, conflict, internal, invalid_arguments, not_found};
+use super::logging::LogLevel;
 use super::recovery::{
     PersistedProcessStop, stage_process_identity, stop_agent_process_group,
     stop_persisted_process_group,

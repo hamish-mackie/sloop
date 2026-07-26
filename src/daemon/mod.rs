@@ -2,6 +2,7 @@ mod commands;
 mod dispatcher;
 mod driver;
 mod history;
+mod logging;
 mod recovery;
 mod scheduler;
 mod server;

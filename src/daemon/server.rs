@@ -22,7 +22,6 @@ use crate::config::{Config, ConfigError, Repository, TicketSourceConfig};
 use crate::db::{Db, StoreError};
 use crate::frontmatter::FrontmatterError;
 use crate::ids::IdError;
-use crate::logging::{LogLevel, OperationalLog};
 use crate::protocol::{
     Capability, ErrorBody, ErrorCode, Request, RequestEnvelope, RequestId, ResponseEnvelope,
 };
@@ -37,6 +36,7 @@ use super::dispatcher::{
     DaemonControl, DispatcherMessage, DispatcherState, RequestOrigin, internal, protocol_error,
     run_dispatcher, unauthorized,
 };
+use super::logging::{LogLevel, OperationalLog};
 use super::recovery::recover_inflight_runs;
 use super::scheduler::{
     index_projects, reconcile_merged_ticket_triggers, reconcile_tickets,
