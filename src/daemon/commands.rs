@@ -21,6 +21,7 @@ use crate::work_state::local::{LocalSqlite, ProjectRecord, TicketRecord};
 use crate::work_state::trigger::{Duplicates, EnqueueRequest};
 
 use super::dispatcher::{DispatcherState, conflict, internal, invalid_arguments, not_found};
+use super::eligibility::{Gates, display_state, ticket_ineligibility};
 use super::logging::LogLevel;
 use super::recovery::{
     PersistedProcessStop, stage_process_identity, stop_agent_process_group,
@@ -470,7 +471,7 @@ fn ticket_rows(
     let at_capacity = run_lookup(state, RunStore::active_runs)?.len() >= state.max_agents;
     // Every gate here is global; the trigger gate is per ticket and is
     // answered inside the loop below.
-    let global_gates = crate::eligibility::Gates {
+    let global_gates = Gates {
         paused: state.paused,
         draining: state.draining,
         storage_writable: !state.storage_full.get() && !state.reconciliation_blocked,
@@ -516,21 +517,20 @@ fn ticket_rows(
         // "Is there a trigger that could select *this* ticket", not "is the
         // queue non-empty": a trigger pinned to another ticket must not explain
         // this one away.
-        let gates = crate::eligibility::Gates {
+        let gates = Gates {
             has_queued_trigger: local_lookup(state, |work_state| {
                 work_state.has_claimable_trigger(&ticket.id, now_ms)
             })?,
             ..global_gates
         };
-        let ineligibility = crate::eligibility::ticket_ineligibility(
+        let ineligibility = ticket_ineligibility(
             &ticket.state,
             ticket.attempts,
             active_alias.as_deref(),
             &blockers,
             &gates,
         );
-        let display_state =
-            crate::eligibility::display_state(&ticket.state, ineligibility.as_ref());
+        let display_state = display_state(&ticket.state, ineligibility.as_ref());
         let mut reason = ineligibility.map(|reason| reason.describe());
         if ticket.state == "held"
             && let Some(held_reason) = ticket.held_reason

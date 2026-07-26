@@ -1,6 +1,7 @@
 mod commands;
 mod dispatcher;
 mod driver;
+mod eligibility;
 mod history;
 mod logging;
 mod recovery;

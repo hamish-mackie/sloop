@@ -4,7 +4,6 @@ pub mod config;
 pub mod daemon;
 pub mod db;
 pub mod domain;
-pub mod eligibility;
 pub mod flow;
 pub mod frontmatter;
 pub mod ids;
