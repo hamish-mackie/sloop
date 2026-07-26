@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A `sloop show` dashboard section for everything waiting on a human.** The
+  dashboard envelope gains an `attention` array — every ticket currently in
+  `needs_review` or `failed`, newest first, in the same row shape as `recent`
+  and never truncated by `-N`. The human rendering prints it between `runs:`
+  and `recent:`, with each row's reason, and omits the section entirely when
+  the array is empty. A `needs_review` ticket that had aged out of the recent
+  window was previously visible only as a digit in the count line.
+
+  This is an additive protocol-v1 field. No existing dashboard field changes
+  shape or value.
+
+- **Tty-gated color in the human output.** `FAIL` and `failed` render red;
+  `warn`, `needs_review`, and a `(stalled: …)` annotation yellow; `ok` green
+  and `merged` dim. Everything else is unstyled. Color is emitted only when
+  stdout is a terminal and `NO_COLOR` is unset, and never in `--json`.
+
+### Changed
+
+- **The human `show` and `status` output reads without arithmetic.** `next
+  wake` is a countdown (`next wake in 4m12s`, or `next wake imminent` when the
+  deadline has passed) rather than the one raw UTC RFC3339 instant in
+  otherwise-local output; `--json` still carries `next_wake` as RFC3339. An
+  unfinished span says how long it has been running — `19:51-... (9m0s)` —
+  while still refusing to invent an end time. Finished spans are unchanged.
+
+- **The ticket count line shows only what is happening.** A state prints only
+  when its count is non-zero, except `ready`, where an empty queue is itself
+  the signal, and `merged` moves to the end. Seven states with four zeros
+  became `tickets: 0 ready, 1 claimed, 1 needs_review, 77 merged`.
+
+- **Ticket rows drop noise.** The `(project)` column appears only when the
+  displayed rows span more than one project, and the reason is suppressed only
+  for `merged` — a `needs_review` or `failed` row's reason is the reason to
+  read the row.
+
 ## [0.4.0] - 2026-07-26
 
 ### Changed

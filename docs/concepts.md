@@ -47,7 +47,7 @@ When a ticket is sitting in `ready` with nothing happening, `sloop show` says so
 on the ticket's own row:
 
 ```
-TICK-1  ready  (default)  Add request logging  — ready but no queued trigger; enqueue with `sloop run`
+TICK-1  ready  Add request logging  — ready but no queued trigger; enqueue with `sloop run`
 ```
 
 ### Ticket states

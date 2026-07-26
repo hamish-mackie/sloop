@@ -423,14 +423,42 @@ fn list_explains_paused_failed_held_and_claimed_tickets() {
         .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
         .collect::<Vec<_>>()
         .join("\n");
+    // Every ticket here is in the `default` project, so the project column is
+    // one identical parenthesis per row and is dropped entirely.
+    assert!(!human.contains("(default)"), "{human}");
+    assert!(human.contains(&format!("{paused} ready paused — scheduler is paused")));
     assert!(human.contains(&format!(
-        "{paused} ready (default) paused — scheduler is paused"
+        "{failed} failed failed — failed after 1 attempt(s)"
     )));
-    assert!(human.contains(&format!(
-        "{failed} failed (default) failed — failed after 1 attempt(s)"
-    )));
-    assert!(human.contains(&format!("{held} held (default) held — held by operator")));
-    assert!(human.contains(&format!("{claimed} claimed (default) claimed")));
+    assert!(human.contains(&format!("{held} held held — held by operator")));
+    assert!(human.contains(&format!("{claimed} claimed claimed")));
+
+    // The failed ticket is also what the dashboard's `attention:` section is
+    // for, and its row carries the reason a reader needs to act on it.
+    let dashboard = World::json_stdout(&world.sloop(&["show"]))["data"].clone();
+    let waiting: Vec<&str> = dashboard["attention"]
+        .as_array()
+        .expect("an attention array")
+        .iter()
+        .filter_map(|ticket| ticket["id"].as_str())
+        .collect();
+    assert_eq!(waiting, vec![failed.as_str()], "{dashboard}");
+
+    let text = world.sloop_plain(&["show"]);
+    assert!(text.status.success());
+    let text = String::from_utf8(text.stdout).unwrap();
+    let attention_row = text
+        .split("attention:\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no attention section in {text}"))
+        .lines()
+        .next()
+        .expect("an attention row");
+    assert!(attention_row.contains(&failed), "{attention_row}");
+    assert!(
+        attention_row.contains("— failed after 1 attempt(s)"),
+        "{attention_row}"
+    );
 }
 
 /// What an operator is told when a ticket is ready but nothing is queued

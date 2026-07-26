@@ -341,6 +341,73 @@ fn an_agent_that_succeeds_before_a_failing_stage_reports_that_stage_as_the_reaso
     assert!(ticket_text.contains("test:FAIL"), "{ticket_text}");
 }
 
+/// A ticket waiting on a human has to be visible on the dashboard whether or
+/// not it is recent. The envelope grows one additive `attention` array — every
+/// `needs_review` or `failed` ticket, in the same row shape as `recent` — and
+/// the human rendering gives it a section of its own carrying each row's
+/// reason. Nothing waiting means no array entries and no section at all.
+#[test]
+fn the_dashboard_lists_every_ticket_waiting_on_a_human() {
+    let world = World::configured();
+    configure(&world, FLOW_FAILING_TEST, &committing_agent());
+    world.commit_all("initial");
+    world.start_daemon();
+
+    let dashboard = |world: &World| World::json_stdout(&world.sloop(&["show"]))["data"].clone();
+    let dashboard_text = |world: &World| {
+        let output = world.sloop_plain(&["show"]);
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    // Before anything has run, there is nothing to attend to — and the
+    // section must be absent rather than an empty heading.
+    assert_eq!(dashboard(&world)["attention"], serde_json::json!([]));
+    let calm_text = dashboard_text(&world);
+    assert!(!calm_text.contains("attention:"), "{calm_text}");
+
+    let ticket = post(&world, "needs-review.md");
+    assert!(world.sloop(&["run", &ticket]).status.success());
+    wait_until_slow("the run lands in needs_review", || {
+        status(&world)["tickets"]["needs_review"] == 1
+    });
+
+    let waiting = dashboard(&world);
+    let attention = waiting["attention"].as_array().expect("an attention array");
+    assert_eq!(attention.len(), 1, "{waiting}");
+    assert_eq!(attention[0]["id"], ticket.as_str());
+    assert_eq!(attention[0]["state"], "needs_review");
+    // The same row shape `recent` uses, key for key — including `reason`,
+    // which a `needs_review` ticket carries as null because nothing about it
+    // is ineligible; it is finished and waiting on a person.
+    let recent_keys = waiting["recent"][0].as_object().expect("a recent row");
+    let attention_keys = attention[0].as_object().expect("an attention row");
+    assert_eq!(
+        attention_keys.keys().collect::<Vec<_>>(),
+        recent_keys.keys().collect::<Vec<_>>(),
+        "{waiting}"
+    );
+    // Additive only: the fields a dashboard consumer already reads are
+    // untouched.
+    assert_eq!(waiting["kind"], "dashboard");
+    assert!(waiting["recent"].is_array(), "{waiting}");
+    assert!(waiting["recent_total"].is_u64(), "{waiting}");
+
+    let text = dashboard_text(&world);
+    let section = text
+        .split("attention:\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no attention section in {text}"));
+    let row = section.lines().next().expect("an attention row");
+    assert!(row.starts_with("  "), "{row}");
+    assert!(row.contains(&ticket), "{row}");
+    assert!(row.contains("needs_review"), "{row}");
+    // Piped output carries no escape sequences, whatever the palette says.
+    assert!(!text.contains('\u{1b}'), "{text}");
+    // And no raw UTC instant survives in the human dashboard.
+    assert!(!text.contains("next wake 2"), "{text}");
+}
+
 #[test]
 fn a_ticket_with_several_runs_lists_them_newest_first() {
     let world = World::configured();

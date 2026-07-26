@@ -442,9 +442,24 @@ fn dashboard(
     let tickets = local_lookup(state, LocalSqlite::tickets)?;
     let total = tickets.len();
     let limit = requested_limit.unwrap_or(DEFAULT_RECENT_LIMIT);
+    // Everything waiting on a human, whether or not it is new enough to make
+    // the recent window. A `needs_review` ticket that has aged out of that
+    // window is otherwise reported only as a digit in the count line, which
+    // is how one sat unnoticed for a week. Unbounded on purpose: this list is
+    // the work, and truncating it would recreate the same blind spot.
+    let waiting: Vec<_> = tickets
+        .iter()
+        .filter(|ticket| {
+            ticket.state == TicketState::NeedsReview.as_str()
+                || ticket.state == TicketState::Failed.as_str()
+        })
+        .cloned()
+        .collect();
+    let attention = ticket_rows(state, waiting, None)?;
     let recent = ticket_rows(state, tickets, Some(limit))?;
     let mut dashboard = handle_status(state)?;
     dashboard["kind"] = json!("dashboard");
+    dashboard["attention"] = attention["tickets"].clone();
     dashboard["recent"] = recent["tickets"].clone();
     dashboard["recent_total"] = json!(total);
     dashboard["recent_limit"] = json!(limit);

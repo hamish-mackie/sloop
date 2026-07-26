@@ -87,6 +87,14 @@ pub fn format_timestamp(timestamp_ms: i64) -> Option<String> {
         .ok()
 }
 
+/// Reads an RFC3339 timestamp back to milliseconds since the epoch — the
+/// inverse of `format_timestamp`, for renderings that hold only the
+/// envelope's string form and need to do arithmetic on it.
+pub fn parse_timestamp(text: &str) -> Option<i64> {
+    let at = OffsetDateTime::parse(text, &Rfc3339).ok()?;
+    i64::try_from(at.unix_timestamp_nanos() / 1_000_000).ok()
+}
+
 /// Finds the next real instant whose local wall clock matches `minute`.
 /// Starting at the next whole minute makes the current minute mean its next
 /// occurrence, while scanning real instants handles DST transitions.

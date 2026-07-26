@@ -112,9 +112,14 @@ Patterns that fall out of the verbs:
   `limit` arguments. With neither, it returns the dashboard. The dashboard
   preserves the status fields (`daemon`, `gate`, `runs`,
   `queued_triggers`, `tickets`, and optional `next_wake`) and adds
-  `kind: "dashboard"`, `recent`, `recent_total`, and `recent_limit`.
-  `recent` is newest first; `recent_total` is the untruncated count and
-  `recent_limit` is the requested limit or the default `10`.
+  `kind: "dashboard"`, `attention`, `recent`, `recent_total`, and
+  `recent_limit`. `recent` is newest first; `recent_total` is the untruncated
+  count and `recent_limit` is the requested limit or the default `10`.
+  `attention` is every ticket currently in `needs_review` or `failed`, newest
+  first, in the same row shape as `recent`. It is never truncated — `limit`
+  applies to `recent` alone — and is `[]` when nothing is waiting. `next_wake`
+  is an RFC3339 timestamp here; only the human rendering shows it as a
+  countdown.
 
   With `ref`, the daemon first resolves exact ticket, run, ticket-name, and
   project reference forms. Exact references retain their existing detail

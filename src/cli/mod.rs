@@ -14,8 +14,10 @@ use serde_json::json;
 
 mod init;
 mod render;
+mod style;
 mod templates;
 
+use self::style::Style;
 use self::templates::TemplateKind;
 use crate::protocol::{
     ConfidenceValue, EmptyArgs, ErrorBody, ErrorCode, EventsArgs, ListArgs, LogsArgs, NoteArgs,
@@ -95,11 +97,13 @@ pub struct Cli {
 }
 
 /// How responses are written. Envelopes are always produced internally;
-/// `Human` translates them at the final write.
+/// `Human` translates them at the final write, carrying the styling decided
+/// once here at the top level. `Json` has no style: an envelope is parsed,
+/// never read, so it never carries an escape sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputMode {
     Json,
-    Human,
+    Human(Style),
 }
 
 #[derive(Debug, Subcommand)]
@@ -654,7 +658,7 @@ where
             let mode = if cli.json {
                 OutputMode::Json
             } else {
-                OutputMode::Human
+                OutputMode::Human(Style::detect())
             };
             match cli.command {
                 Some(subcommand) => run_command(subcommand, mode, stdout, stderr),
@@ -678,7 +682,7 @@ where
             let mode = if args.iter().any(|arg| arg == "--json") {
                 OutputMode::Json
             } else {
-                OutputMode::Human
+                OutputMode::Human(Style::detect())
             };
             match error.kind() {
                 ErrorKind::DisplayHelp => write_plain_or(
@@ -882,7 +886,7 @@ fn write_plain_or(
 ) -> ExitCode {
     match mode {
         OutputMode::Json => write_response(mode, None, output, envelope, ExitCode::SUCCESS),
-        OutputMode::Human => {
+        OutputMode::Human(_) => {
             if writeln!(output, "{text}").is_err() {
                 return ExitCode::FAILURE;
             }
@@ -905,7 +909,7 @@ fn run_template(kind: TemplateKind, mode: OutputMode, stdout: &mut impl Write) -
             &ResponseEnvelope::success(None, json!({"kind": kind.as_str(), "template": text})),
             ExitCode::SUCCESS,
         ),
-        OutputMode::Human => {
+        OutputMode::Human(_) => {
             if stdout.write_all(text.as_bytes()).is_err() {
                 return ExitCode::FAILURE;
             }
@@ -1176,7 +1180,7 @@ fn follow_show(
                         OutputMode::Json => serde_json::to_writer(&mut *stdout, event)
                             .map_err(|_| ())
                             .and_then(|()| stdout.write_all(b"\n").map_err(|_| ())),
-                        OutputMode::Human => {
+                        OutputMode::Human(_) => {
                             writeln!(stdout, "{}", format_event(event)).map_err(|_| ())
                         }
                     };
@@ -1616,8 +1620,8 @@ fn write_envelope(
         OutputMode::Json => serde_json::to_writer(&mut *output, response)
             .map_err(|_| ())
             .and_then(|()| output.write_all(b"\n").map_err(|_| ())),
-        OutputMode::Human => output
-            .write_all(self::render::render(verb, response).as_bytes())
+        OutputMode::Human(style) => output
+            .write_all(self::render::render(verb, response, style).as_bytes())
             .map_err(|_| ()),
     }
 }

@@ -188,7 +188,7 @@ follow it with `sloop run <TICKET>`. `sloop show` says as much on the ticket's
 row:
 
 ```
-TICK-4  ready  (default)  Broken ticket  — ready but no queued trigger; enqueue with `sloop run`
+TICK-4  ready  Broken ticket  — ready but no queued trigger; enqueue with `sloop run`
 ```
 
 ### sloop hold <TICKET> / sloop ready <TICKET>
@@ -203,13 +203,50 @@ sloop show [REF_OR_PATTERN] [-N] [--follow] [--quiet]
 ```
 
 Without an argument, `sloop show` is a dashboard with daemon and gate
-state, ticket counts, the next wake time, active runs, and the 10 newest
-tickets. Queue depth is not a line of its own: each recent ticket carries the
-scheduler's reason instead, so a ticket with no queued trigger says so where you
-are already looking. The `--json` payload does carry the full
-`queued_triggers` list. `sloop show -N` changes the number of recent tickets;
-`-n N` and `--limit N` are equivalent. A limit of zero or a non-numeric limit
-is a usage error.
+state, ticket counts, the next wake time, active runs, everything waiting on a
+human, and the 10 newest tickets. Queue depth is not a line of its own: each
+recent ticket carries the scheduler's reason instead, so a ticket with no
+queued trigger says so where you are already looking. The `--json` payload does
+carry the full `queued_triggers` list. `sloop show -N` changes the number of
+recent tickets; `-n N` and `--limit N` are equivalent. A limit of zero or a
+non-numeric limit is a usage error.
+
+```
+daemon: pid 3760 running - 1/2 agents active - next wake in 4m12s
+tickets: 0 ready, 1 claimed, 1 needs_review, 77 merged
+
+runs:
+  TICK-86-r2  driving  19:51-... (9m0s)  build:ok  sync:ok  test:..  merge:-  Move db.rs to db/mod.rs
+
+attention:
+  TICK-64  needs_review  Split the run store
+
+recent:
+  TICK-91  merged  Group the CLI presentation layer into a src/cli directory
+
+77 more - `sloop show -78` for all - `sloop show <ref>` for detail
+```
+
+The count line prints a state only when its count is non-zero, except `ready`,
+which always appears because an empty queue is itself a signal; `merged` sits
+last. `next wake` is a countdown rather than an instant — the `--json` envelope
+keeps it as an RFC3339 timestamp. A run or stage that has not finished shows an
+open span with the time elapsed so far, `19:51-... (9m0s)`; no end time is
+invented for it.
+
+The `attention:` section lists every ticket in `needs_review` or `failed`,
+newest first, with its reason when it has one. It is absent when there are
+none, and it is not limited by `-N`: a ticket waiting on a person stays visible
+however far it has aged past the recent window.
+
+The `(project)` column is printed only when the rows on screen span more than
+one project, so a single-project repository never repeats the same name down
+every line.
+
+When stdout is a terminal, a restrained palette marks `FAIL` and `failed` in
+red, `warn` and `needs_review` in yellow, `ok` in green, and `merged` dim.
+Everything else is unstyled. Set `NO_COLOR`, redirect to a file, or pipe the
+output and no escape sequences are emitted at all; `--json` never carries them.
 
 With an argument, `show` first tries the exact reference forms: ticket IDs,
 run IDs and aliases, unique run-ID prefixes, ticket names, and project IDs. An
@@ -240,8 +277,9 @@ sloop show 'flow|merge' -5
 Each ticket row includes its state and, when it is not running, the scheduler's
 current reason. Failed and cooled-down tickets include a safe vendor diagnostic
 when a built-in rule recognized the rejection. With `--json`, the dashboard
-adds `kind`, `recent`, `recent_total`, and `recent_limit` to the existing status
-fields; a pattern response has top-level `kind`, `ref`, and `tickets` fields.
+adds `kind`, `attention`, `recent`, `recent_total`, and `recent_limit` to the
+existing status fields; a pattern response has top-level `kind`, `ref`, and
+`tickets` fields.
 
 The `runs:` section lists every run of the ticket, newest attempt first: run
 alias, outcome, wall-clock span, and a strip of the run's flow stages marked:

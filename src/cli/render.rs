@@ -7,12 +7,16 @@ use std::fmt::Write;
 
 use serde_json::Value;
 
+use super::style::{Style, Tone, marker_tone, state_tone};
 use crate::protocol::{ErrorBody, ResponseEnvelope};
 
 /// Renders a response envelope as human-readable text. `verb` selects a
 /// verb-specific layout; unknown or absent verbs fall back to pretty JSON so
 /// no response is ever silently dropped.
-pub fn render(verb: Option<&str>, response: &ResponseEnvelope) -> String {
+///
+/// `style` arrives already decided by the caller rather than being sniffed
+/// here, which keeps every function below a pure function of its arguments.
+pub fn render(verb: Option<&str>, response: &ResponseEnvelope, style: Style) -> String {
     if let Some(error) = &response.error {
         return render_error(error);
     }
@@ -28,15 +32,15 @@ pub fn render(verb: Option<&str>, response: &ResponseEnvelope) -> String {
         Some("post") => render_post(data),
         Some("run") => render_run(data),
         Some("retry" | "hold" | "ready") => render_ticket_transition(data),
-        Some("list") => render_list(data),
-        Some("status") => render_status(data),
+        Some("list") => render_list(data, style),
+        Some("status") => render_status(data, style),
         Some("pause" | "resume") => render_scheduler_transition(data),
         Some("stop") => render_stop(data),
         Some("wait") => render_wait(data),
         Some("cancel") => render_cancel(data),
         Some("logs") => render_logs(data),
         Some("reindex") => render_reindex(data),
-        Some("show") => render_show(data),
+        Some("show") => render_show(data, style),
         _ => fallback(data),
     }
 }
@@ -151,7 +155,7 @@ fn render_trigger(trigger: &Value) -> String {
     text
 }
 
-fn render_status(data: &Value) -> String {
+fn render_status(data: &Value, style: Style) -> String {
     let daemon = &data["daemon"];
     let state = if daemon["draining"] == Value::Bool(true) {
         let active = data["gate"]["active_agents"].as_u64().unwrap_or(0);
@@ -185,23 +189,10 @@ fn render_status(data: &Value) -> String {
         );
     }
     if let Some(next_wake) = data["next_wake"].as_str() {
-        let _ = writeln!(text, "next wake: {next_wake}");
+        let _ = writeln!(text, "next wake: {}", next_wake_relative(next_wake));
     }
 
-    let tickets = &data["tickets"];
-    let counts: Vec<String> = [
-        "ready",
-        "held",
-        "blocked",
-        "claimed",
-        "merged",
-        "failed",
-        "needs_review",
-    ]
-    .iter()
-    .map(|state| format!("{} {state}", tickets[*state]))
-    .collect();
-    let _ = writeln!(text, "tickets: {}", counts.join(", "));
+    let _ = writeln!(text, "{}", ticket_counts(&data["tickets"], style));
 
     // Run lines lead with the alias and the ticket's name, so the line answers
     // "what is this working on" without a second command. Queued triggers
@@ -215,11 +206,12 @@ fn render_status(data: &Value) -> String {
     } else {
         text.push_str("runs:\n");
         for run in runs {
+            let state = run["state"].as_str().unwrap_or("?");
             let _ = writeln!(
                 text,
                 "  {} {} — {} (project {})",
                 run["alias"].as_str().unwrap_or("?"),
-                run["state"].as_str().unwrap_or("?"),
+                style.paint(state_tone(state), state),
                 run["ticket_name"].as_str().unwrap_or("?"),
                 run["project"].as_str().unwrap_or("-"),
             );
@@ -248,7 +240,48 @@ fn render_status(data: &Value) -> String {
     text
 }
 
-fn render_list(data: &Value) -> String {
+/// The `next wake` deadline as a countdown. Machines get the instant; a human
+/// reading a dashboard wants the interval, and converting between the two in
+/// their head is exactly the arithmetic this saves. An unparseable string is
+/// passed through rather than swallowed — a timestamp we cannot read is still
+/// information.
+fn next_wake_relative(next_wake: &str) -> String {
+    let Some(deadline_ms) = crate::clock::parse_timestamp(next_wake) else {
+        return next_wake.to_owned();
+    };
+    match deadline_ms - now_ms() {
+        remaining if remaining > 0 => format!("in {}", duration(remaining)),
+        // The daemon is due to wake and has not yet; naming a negative
+        // interval would read as a missed deadline rather than a live one.
+        _ => "imminent".to_owned(),
+    }
+}
+
+/// The ticket counts worth reading. A zero is not news, with one exception:
+/// `ready` always prints, because an empty queue is itself the signal an
+/// operator is looking for. `merged` sits last — it is the number that only
+/// grows, so the states that might need attention lead the line.
+fn ticket_counts(tickets: &Value, style: Style) -> String {
+    let counts = [
+        "ready",
+        "held",
+        "blocked",
+        "claimed",
+        "failed",
+        "needs_review",
+        "merged",
+    ]
+    .into_iter()
+    .filter_map(|state| {
+        let count = tickets[state].as_u64().unwrap_or(0);
+        (count > 0 || state == "ready")
+            .then(|| format!("{count} {}", style.paint(state_tone(state), state)))
+    })
+    .collect::<Vec<_>>();
+    format!("tickets: {}", counts.join(", "))
+}
+
+fn render_list(data: &Value, style: Style) -> String {
     let tickets = data["tickets"]
         .as_array()
         .map(Vec::as_slice)
@@ -269,19 +302,31 @@ fn render_list(data: &Value) -> String {
         .map(str::len)
         .max()
         .unwrap_or(1);
+    // In a single-project repository the project column is the same
+    // parenthesis on every row — a column of pure noise. It earns its width
+    // only when it tells two rows apart.
+    let first_project = tickets[0]["project"].as_str();
+    let mixed_projects = tickets
+        .iter()
+        .any(|ticket| ticket["project"].as_str() != first_project);
     let mut text = String::new();
     for ticket in tickets {
         let id = ticket["id"].as_str().unwrap_or("?");
         let state = ticket["state"].as_str().unwrap_or("?");
-        let project = ticket["project"].as_str().unwrap_or("?");
         let name = ticket["name"].as_str().unwrap_or("?");
         let _ = write!(
             text,
-            "{id:id_width$}  {state:state_width$}  ({project})  {name}"
+            "{id:id_width$}  {}  ",
+            style.column(state_tone(state), state, state_width)
         );
-        let terminal = matches!(state, "merged" | "needs_review");
+        if mixed_projects {
+            let _ = write!(text, "({})  ", ticket["project"].as_str().unwrap_or("?"));
+        }
+        text.push_str(name);
+        // A `merged` row's reason is history nobody asked for. A
+        // `needs_review` or `failed` one is the whole point of the row.
         if ticket["run"].is_null()
-            && !terminal
+            && state != "merged"
             && let Some(reason) = ticket["reason"].as_str()
         {
             let _ = write!(text, "  — {reason}");
@@ -410,18 +455,18 @@ fn render_reindex(data: &Value) -> String {
     )
 }
 
-fn render_show(data: &Value) -> String {
+fn render_show(data: &Value, style: Style) -> String {
     match data["kind"].as_str() {
-        Some("dashboard") => render_dashboard(data),
-        Some("matches") => render_list(data),
-        Some("ticket") => render_ticket_show(data),
-        Some("run") => render_run_show(data),
-        Some("project") => render_project_show(data),
+        Some("dashboard") => render_dashboard(data, style),
+        Some("matches") => render_list(data, style),
+        Some("ticket") => render_ticket_show(data, style),
+        Some("run") => render_run_show(data, style),
+        Some("project") => render_project_show(data, style),
         _ => fallback(data),
     }
 }
 
-fn render_dashboard(data: &Value) -> String {
+fn render_dashboard(data: &Value, style: Style) -> String {
     let daemon = &data["daemon"];
     let gate = &data["gate"];
     let state = if daemon["draining"] == Value::Bool(true) {
@@ -436,24 +481,11 @@ fn render_dashboard(data: &Value) -> String {
         daemon["pid"], gate["active_agents"], gate["max_agents"]
     );
     if let Some(next_wake) = data["next_wake"].as_str() {
-        let _ = write!(text, " - next wake {next_wake}");
+        let _ = write!(text, " - next wake {}", next_wake_relative(next_wake));
     }
     text.push('\n');
 
-    let tickets = &data["tickets"];
-    let counts = [
-        "ready",
-        "held",
-        "blocked",
-        "claimed",
-        "merged",
-        "failed",
-        "needs_review",
-    ]
-    .iter()
-    .map(|state| format!("{} {state}", tickets[*state]))
-    .collect::<Vec<_>>();
-    let _ = writeln!(text, "tickets: {}", counts.join(", "));
+    let _ = writeln!(text, "{}", ticket_counts(&data["tickets"], style));
 
     let runs = data["runs"]
         .as_array()
@@ -464,25 +496,42 @@ fn render_dashboard(data: &Value) -> String {
         let alias_width = column_width(runs, "alias");
         let state_width = column_width(runs, "state");
         for run in runs {
+            let state = run["state"].as_str().unwrap_or("?");
             let _ = writeln!(
                 text,
-                "  {:alias_width$}  {:state_width$}  {}  {}  {}",
+                "  {:alias_width$}  {}  {}  {}  {}",
                 run["alias"].as_str().unwrap_or("?"),
-                run["state"].as_str().unwrap_or("?"),
+                style.column(state_tone(state), state, state_width),
                 span(
                     run["started_at_ms"].as_i64(),
                     run["finished_at_ms"].as_i64()
                 ),
-                stage_strip(&run["stages"]),
+                stage_strip(&run["stages"], style),
                 run["ticket_name"].as_str().unwrap_or("?"),
             );
         }
     }
 
+    // Everything a human has to act on, whether or not it is recent enough to
+    // appear below. A `needs_review` ticket that has aged out of the window is
+    // otherwise visible only as a digit in the count line.
+    let attention = data["attention"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if !attention.is_empty() {
+        text.push_str("\nattention:\n");
+        text.push_str(&indented(&render_list(
+            &serde_json::json!({"tickets": attention}),
+            style,
+        )));
+    }
+
     text.push_str("\nrecent:\n");
-    text.push_str(&render_list(
+    text.push_str(&indented(&render_list(
         &serde_json::json!({"tickets": data["recent"]}),
-    ));
+        style,
+    )));
     let shown = data["recent"].as_array().map_or(0, Vec::len);
     let total = data["recent_total"].as_u64().unwrap_or(shown as u64);
     let more = total.saturating_sub(shown as u64);
@@ -497,16 +546,27 @@ fn render_dashboard(data: &Value) -> String {
     text
 }
 
+/// Indents a rendered block under its section heading. The dashboard's
+/// sections are read as a nested outline; a flush-left block reads as a new
+/// top-level thing rather than as the contents of the heading above it.
+fn indented(block: &str) -> String {
+    block
+        .lines()
+        .map(|line| format!("  {line}\n"))
+        .collect::<String>()
+}
+
 /// A scannable frontmatter summary followed by the ticket body. The worker's
 /// own `show` carries no `body`, so the same layout renders just the summary
 /// for it — no worker-specific branch and no behavior change.
-fn render_ticket_show(data: &Value) -> String {
+fn render_ticket_show(data: &Value, style: Style) -> String {
     let value = &data["value"];
+    let state = value["state"].as_str().unwrap_or("?");
     let mut text = format!(
         "{}  {}  ({})\n",
         value["id"].as_str().unwrap_or("?"),
         value["name"].as_str().unwrap_or("?"),
-        value["state"].as_str().unwrap_or("?"),
+        style.paint(state_tone(state), state),
     );
     if let Some(project) = value["project"].as_str() {
         let _ = writeln!(text, "project: {project}");
@@ -530,7 +590,7 @@ fn render_ticket_show(data: &Value) -> String {
     if let Some(reason) = value["reason"].as_str() {
         let _ = writeln!(text, "reason: {reason}");
     }
-    text.push_str(&ticket_runs(&value["runs"]));
+    text.push_str(&ticket_runs(&value["runs"], style));
     if let Some(body) = value["body"]
         .as_str()
         .map(str::trim)
@@ -545,7 +605,7 @@ fn render_ticket_show(data: &Value) -> String {
 /// span, and a strip of stage markers. A ticket that has never run prints
 /// `runs: none` rather than nothing, so "no runs yet" is distinguishable from
 /// an older `sloop` that did not report runs at all.
-fn ticket_runs(runs: &Value) -> String {
+fn ticket_runs(runs: &Value, style: Style) -> String {
     let Some(runs) = runs.as_array() else {
         return String::new();
     };
@@ -558,16 +618,17 @@ fn ticket_runs(runs: &Value) -> String {
     let state_width = column_width(runs, "state");
     let mut text = String::from("runs:\n");
     for run in runs {
+        let state = run["state"].as_str().unwrap_or("?");
         let _ = writeln!(
             text,
-            "  {:alias_width$}  {:state_width$}  {}  {}",
+            "  {:alias_width$}  {}  {}  {}",
             run["alias"].as_str().unwrap_or("?"),
-            run["state"].as_str().unwrap_or("?"),
+            style.column(state_tone(state), state, state_width),
             span(
                 run["started_at_ms"].as_i64(),
                 run["finished_at_ms"].as_i64()
             ),
-            stage_strip(&run["stages"]),
+            stage_strip(&run["stages"], style),
         );
     }
     text
@@ -584,7 +645,7 @@ fn column_width(runs: &[Value], key: &str) -> usize {
 /// The per-stage markers on a run's summary line. Deliberately ASCII: the rest
 /// of this renderer is, and a stage strip is exactly the output most likely to
 /// be piped through something that mangles glyphs.
-fn stage_strip(stages: &Value) -> String {
+fn stage_strip(stages: &Value, style: Style) -> String {
     stages
         .as_array()
         .map(Vec::as_slice)
@@ -598,7 +659,12 @@ fn stage_strip(stages: &Value) -> String {
                     duration(silent_for_ms),
                 );
             }
-            format!("{}:{}", stage_label(stage), stage_marker(stage))
+            let marker = stage_marker(stage);
+            format!(
+                "{}:{}",
+                stage_label(stage),
+                style.paint(marker_tone(marker), marker)
+            )
         })
         .collect::<Vec<_>>()
         .join("  ")
@@ -638,9 +704,14 @@ fn advisory(stage: &Value) -> bool {
 
 /// A run or stage's wall-clock span. An unfinished one is open-ended rather
 /// than closed at the current instant — a running stage has no end yet, and
-/// printing one would be an invention.
+/// printing one would be an invention. The elapsed time trailing an open span
+/// is not the same claim: how long it has been going is a fact about now,
+/// and it spares the reader the clock arithmetic `19:51-...` demands.
 fn span(start_ms: Option<i64>, end_ms: Option<i64>) -> String {
-    let Some(start) = start_ms.and_then(crate::clock::local_time) else {
+    let Some(started_at) = start_ms else {
+        return "-".to_owned();
+    };
+    let Some(start) = crate::clock::local_time(started_at) else {
         return "-".to_owned();
     };
     let end = end_ms.and_then(crate::clock::local_time);
@@ -651,7 +722,10 @@ fn span(start_ms: Option<i64>, end_ms: Option<i64>) -> String {
         || end.is_some_and(|end| !start.same_day(&end));
     let opening = if dated { start.dated() } else { start.clock() };
     match end {
-        None => format!("{opening}-..."),
+        None => format!(
+            "{opening}-... ({})",
+            duration(now_ms().saturating_sub(started_at))
+        ),
         Some(end) if start.same_day(&end) => format!("{opening}-{}", end.clock()),
         Some(end) => format!("{opening}-{}", end.dated()),
     }
@@ -677,19 +751,24 @@ fn duration(milliseconds: i64) -> String {
     }
 }
 
-fn run_state(value: &Value) -> String {
+fn run_state(value: &Value, style: Style) -> String {
     let state = value["state"].as_str().unwrap_or("?");
+    let painted = style.paint(state_tone(state), state);
     if state == "failed"
         && let Some(threshold_ms) = value["stall"]["threshold_ms"].as_i64()
     {
-        return format!("failed (stalled: no output for {})", duration(threshold_ms));
+        // The annotation is the diagnosis, not the verdict, so it carries its
+        // own tone: a stall is something to look at rather than a hard failure
+        // the flow reported.
+        let stall = format!("(stalled: no output for {})", duration(threshold_ms));
+        return format!("{painted} {}", style.paint(Some(Tone::Yellow), &stall));
     }
-    state.to_owned()
+    painted
 }
 
 /// The run's stage table: how far the flow got, and on what evidence. This is
 /// the view that answers "how did this run fail" without opening the database.
-fn run_stages(stages: &Value) -> String {
+fn run_stages(stages: &Value, style: Style) -> String {
     let Some(stages) = stages.as_array().filter(|stages| !stages.is_empty()) else {
         return String::new();
     };
@@ -699,7 +778,8 @@ fn run_stages(stages: &Value) -> String {
     for (stage, name) in stages.iter().zip(&names) {
         let state = stage["state"].as_str().unwrap_or("?");
         let mut line = format!(
-            "  {name:name_width$}  {state:7}  {}",
+            "  {name:name_width$}  {}  {}",
+            style.column(state_tone(state), state, 7),
             span(
                 stage["started_at_ms"].as_i64(),
                 stage["finished_at_ms"].as_i64()
@@ -771,7 +851,7 @@ fn panel_reviewers(reviewers: &Value) -> String {
 }
 
 /// A run's identity and settled evidence, one fact per line.
-fn render_run_show(data: &Value) -> String {
+fn render_run_show(data: &Value, style: Style) -> String {
     let value = &data["value"];
     let mut text = String::new();
     if let Some(note) = value["note"].as_str() {
@@ -781,7 +861,7 @@ fn render_run_show(data: &Value) -> String {
         text,
         "{}  ({})",
         value["alias"].as_str().unwrap_or("?"),
-        run_state(value),
+        run_state(value, style),
     );
     let ticket = value["ticket"].as_str().unwrap_or("?");
     match value["ticket_name"].as_str() {
@@ -823,11 +903,11 @@ fn render_run_show(data: &Value) -> String {
     if let Some(reason) = value["reason"].as_str() {
         let _ = writeln!(text, "reason: {reason}");
     }
-    text.push_str(&run_stages(&value["stages"]));
+    text.push_str(&run_stages(&value["stages"], style));
     text
 }
 
-fn render_project_show(data: &Value) -> String {
+fn render_project_show(data: &Value, style: Style) -> String {
     let project = &data["value"];
     let mut text = format!(
         "project {} ({})\n",
@@ -843,12 +923,13 @@ fn render_project_show(data: &Value) -> String {
         return text;
     }
     for ticket in tickets {
+        let state = ticket["state"].as_str().unwrap_or("?");
         let _ = writeln!(
             text,
             "\n{}  {}  ({})",
             ticket["id"].as_str().unwrap_or("?"),
             ticket["name"].as_str().unwrap_or("?"),
-            ticket["state"].as_str().unwrap_or("?"),
+            style.paint(state_tone(state), state),
         );
         for note in ticket["notes"]
             .as_array()
@@ -899,8 +980,16 @@ fn string_items(value: &Value) -> impl Iterator<Item = &str> {
 mod tests {
     use serde_json::{Value, json};
 
-    use super::render;
+    use super::super::style::Style;
     use crate::protocol::{ErrorBody, ErrorCode, ResponseEnvelope};
+
+    /// The uncolored rendering, which is what almost every assertion below
+    /// wants: color is a decoration over this text, and asserting on the
+    /// plain form keeps the expectations readable as the output an operator
+    /// piping to a file sees. The styled path has its own tests.
+    fn render(verb: Option<&str>, response: &ResponseEnvelope) -> String {
+        super::render(verb, response, Style::PLAIN)
+    }
 
     #[test]
     fn errors_render_the_code_and_message() {
@@ -952,11 +1041,10 @@ mod tests {
             text.contains("running hours: 22:00-06:00 (closed)"),
             "{text}"
         );
-        assert!(text.contains("next wake: 2026-07-15T22:00:00Z"), "{text}");
+        // A deadline in the past is the daemon being due, not a missed one.
+        assert!(text.contains("next wake: imminent"), "{text}");
         assert!(
-            text.contains(
-                "tickets: 1 ready, 2 held, 0 blocked, 1 claimed, 3 merged, 0 failed, 0 needs_review"
-            ),
+            text.contains("tickets: 1 ready, 2 held, 1 claimed, 3 merged"),
             "{text}"
         );
         assert!(
@@ -990,8 +1078,11 @@ mod tests {
         );
     }
 
+    /// A running ticket's reason is the run itself, which the row already
+    /// names; `merged` is history nobody asked for. `needs_review` is the one
+    /// terminal state whose reason is the entire reason to read the row.
     #[test]
-    fn list_renders_reasons_but_not_running_or_terminal_reasons() {
+    fn list_renders_reasons_but_not_running_or_merged_ones() {
         let response = ResponseEnvelope::success(
             None,
             json!({
@@ -1001,16 +1092,49 @@ mod tests {
                     {"id": "T2", "name": "Add retries", "project": "default", "state": "claimed", "run": "R1",
                      "reason": "claimed by run R1"},
                     {"id": "T3", "name": "Polish the UI", "project": "web", "state": "merged", "run": null,
-                     "reason": null}
+                     "reason": "merged into main"},
+                    {"id": "T4", "name": "Split the store", "project": "web", "state": "needs_review", "run": null,
+                     "reason": "merge conflict in src/db/mod.rs"}
                 ]
             }),
         );
 
         assert_eq!(
             render(Some("list"), &response),
-            "TICKET-1  ready    (default)  Fix dispatch  — scheduler is paused; resume with `sloop resume`\n\
-             T2        claimed  (default)  Add retries\n\
-             T3        merged   (web)  Polish the UI\n"
+            "TICKET-1  ready         (default)  Fix dispatch  — scheduler is paused; resume with `sloop resume`\n\
+             T2        claimed       (default)  Add retries\n\
+             T3        merged        (web)  Polish the UI\n\
+             T4        needs_review  (web)  Split the store  — merge conflict in src/db/mod.rs\n"
+        );
+    }
+
+    /// One project repeated down every row is a column of pure noise. It
+    /// earns its width only when it tells two rows apart.
+    #[test]
+    fn the_project_column_appears_only_when_projects_differ() {
+        let rows = |project: &str| {
+            ResponseEnvelope::success(
+                None,
+                json!({
+                    "tickets": [
+                        {"id": "T1", "name": "Fix dispatch", "project": "default",
+                         "state": "ready", "run": null, "reason": null},
+                        {"id": "T2", "name": "Polish the UI", "project": project,
+                         "state": "merged", "run": null, "reason": null}
+                    ]
+                }),
+            )
+        };
+
+        assert_eq!(
+            render(Some("list"), &rows("default")),
+            "T1  ready   Fix dispatch\n\
+             T2  merged  Polish the UI\n"
+        );
+        assert_eq!(
+            render(Some("list"), &rows("web")),
+            "T1  ready   (default)  Fix dispatch\n\
+             T2  merged  (web)  Polish the UI\n"
         );
     }
 
@@ -1629,13 +1753,77 @@ mod tests {
         );
     }
 
+    /// An open span still refuses to invent an end time, but says how long it
+    /// has been open — a fact about now, not a guess about later. The two
+    /// halves are asserted from their own anchors: the opening from a fixed
+    /// instant today, the elapsed from a fixed interval before now, so
+    /// neither assertion depends on when the suite runs.
     #[test]
-    fn a_running_stage_renders_an_open_ended_span() {
-        assert_eq!(
-            super::span(Some(today_at(0)), None),
-            format!("{}-...", clock_at(0))
+    fn a_running_stage_renders_an_open_ended_span_with_its_elapsed_time() {
+        let today = super::span(Some(today_at(0)), None);
+        assert!(
+            today.starts_with(&format!("{}-... (", clock_at(0))),
+            "{today}"
         );
+        assert!(today.ends_with(')'), "{today}");
+
+        // Half a second past nine minutes, so the coarsest-unit floor lands
+        // on `9m0s` however long the assertion itself takes to reach.
+        let open = super::span(Some(super::now_ms() - 540_500), None);
+        assert!(open.ends_with("-... (9m0s)"), "{open}");
+
         assert_eq!(super::span(None, None), "-");
+    }
+
+    /// A finished span is byte-for-byte what it always was. Elapsed-so-far is
+    /// only meaningful while there is no end to subtract from.
+    #[test]
+    fn a_finished_span_is_unchanged_by_the_elapsed_suffix() {
+        assert_eq!(
+            super::span(Some(today_at(0)), Some(today_at(360_000))),
+            format!("{}-{}", clock_at(0), clock_at(360_000))
+        );
+    }
+
+    /// The dashboard is otherwise entirely local time; a raw UTC instant in
+    /// the middle of it is a reader's context switch for no gain.
+    #[test]
+    fn the_next_wake_deadline_renders_as_a_countdown() {
+        let ahead = crate::clock::format_timestamp(super::now_ms() + 252_500).expect("rfc3339");
+        assert_eq!(super::next_wake_relative(&ahead), "in 4m12s");
+
+        let behind = crate::clock::format_timestamp(super::now_ms() - 5_000).expect("rfc3339");
+        assert_eq!(super::next_wake_relative(&behind), "imminent");
+
+        // A timestamp we cannot read is still information; passing it through
+        // beats reporting a deadline that does not exist.
+        assert_eq!(
+            super::next_wake_relative("not a timestamp"),
+            "not a timestamp"
+        );
+    }
+
+    /// Four zeros bury the one number that matters, so a zero only prints
+    /// when its absence would itself be the news.
+    #[test]
+    fn the_count_line_drops_zeros_but_never_ready() {
+        let counts = |tickets| super::ticket_counts(&tickets, Style::PLAIN);
+        assert_eq!(
+            counts(json!({
+                "ready": 0, "held": 0, "blocked": 0, "claimed": 1,
+                "merged": 77, "failed": 0, "needs_review": 1
+            })),
+            "tickets: 0 ready, 1 claimed, 1 needs_review, 77 merged"
+        );
+        // `merged` last, and every non-zero state in the fixed order.
+        assert_eq!(
+            counts(json!({
+                "ready": 3, "held": 1, "blocked": 2, "claimed": 4,
+                "merged": 5, "failed": 6, "needs_review": 7
+            })),
+            "tickets: 3 ready, 1 held, 2 blocked, 4 claimed, 6 failed, 7 needs_review, 5 merged"
+        );
+        assert_eq!(counts(json!({})), "tickets: 0 ready");
     }
 
     #[test]
@@ -1709,5 +1897,130 @@ mod tests {
             "[2026-07-17T12:34:56Z] [agent] hello\n\
              [2026-07-17T12:34:57Z] [stage:test] <binary output>\n"
         );
+    }
+
+    /// A ticket waiting on a human is invisible on the dashboard once it ages
+    /// out of the recent window — a digit in the count line and nothing else.
+    /// The section names it and says why; with nothing waiting it is absent
+    /// rather than empty, because an empty heading reads as a fact.
+    #[test]
+    fn the_dashboard_surfaces_tickets_waiting_on_a_human() {
+        let dashboard = |attention: Value| {
+            ResponseEnvelope::success(
+                None,
+                json!({
+                    "kind": "dashboard",
+                    "daemon": {"pid": 3760, "paused": false, "draining": false},
+                    "gate": {"active_agents": 1, "max_agents": 2},
+                    "tickets": {"ready": 0, "held": 0, "blocked": 0, "claimed": 1,
+                                "merged": 77, "failed": 0, "needs_review": 1},
+                    "runs": [],
+                    "attention": attention,
+                    "recent": [{"id": "TICK-91", "name": "Group the CLI presentation layer",
+                                "project": "default", "state": "merged", "run": null,
+                                "reason": null}],
+                    "recent_total": 78,
+                }),
+            )
+        };
+
+        let waiting = dashboard(json!([{
+            "id": "TICK-64", "name": "Split the run store", "project": "default",
+            "state": "needs_review", "run": null,
+            "reason": "merge conflict in src/db/mod.rs"
+        }]));
+        assert_eq!(
+            render(Some("show"), &waiting),
+            concat!(
+                "daemon: pid 3760 running - 1/2 agents active\n",
+                "tickets: 0 ready, 1 claimed, 1 needs_review, 77 merged\n",
+                "\n",
+                "attention:\n",
+                "  TICK-64  needs_review  Split the run store  — merge conflict in src/db/mod.rs\n",
+                "\n",
+                "recent:\n",
+                "  TICK-91  merged  Group the CLI presentation layer\n",
+                "\n",
+                "77 more - `sloop show -78` for all - `sloop show <ref>` for detail\n",
+            )
+        );
+
+        let calm = render(Some("show"), &dashboard(json!([])));
+        assert!(!calm.contains("attention:"), "{calm}");
+    }
+
+    /// Drops every `ESC [ ... m` sequence, so a styled rendering can be
+    /// compared against the plain one it decorates.
+    fn strip_ansi(text: &str) -> String {
+        let mut plain = String::new();
+        let mut characters = text.chars();
+        while let Some(character) = characters.next() {
+            if character != '\u{1b}' {
+                plain.push(character);
+                continue;
+            }
+            for escape in characters.by_ref() {
+                if escape == 'm' {
+                    break;
+                }
+            }
+        }
+        plain
+    }
+
+    /// Color is a decoration over the plain rendering and nothing more: the
+    /// same words in the same columns, escapes only around the tokens worth
+    /// looking at. Padding sits outside the escapes, so stripping them has to
+    /// give the plain rendering back byte for byte — that equality is what
+    /// proves a colored column still lines up.
+    #[test]
+    fn color_wraps_only_the_tokens_worth_flagging() {
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "ref": "TICK-1",
+                "kind": "ticket",
+                "value": {
+                    "id": "TICK-1", "name": "cooldown", "state": "needs_review",
+                    "blocked_by": [],
+                    "runs": [
+                        {
+                            "alias": "TICK-1-r2", "state": "merged",
+                            "started_at_ms": today_at(0),
+                            "finished_at_ms": today_at(360_000),
+                            "stages": [{"stage": "build", "state": "passed"}],
+                        },
+                        {
+                            "alias": "TICK-1-r1", "state": "needs_review",
+                            "started_at_ms": today_at(-3_600_000),
+                            "finished_at_ms": today_at(-3_240_000),
+                            "stages": [
+                                {"stage": "build", "state": "passed"},
+                                {"stage": "lint", "state": "failed", "advisory": true},
+                                {"stage": "test", "state": "failed"},
+                                {"stage": "merge", "state": "pending"},
+                            ],
+                        },
+                    ],
+                }
+            }),
+        );
+
+        let plain = super::render(Some("show"), &response, Style::PLAIN);
+        let colored = super::render(Some("show"), &response, Style::COLOR);
+
+        assert!(!plain.contains('\u{1b}'), "{plain}");
+        assert!(
+            colored.contains("\u{1b}[33mneeds_review\u{1b}[0m"),
+            "{colored:?}"
+        );
+        assert!(colored.contains("\u{1b}[2mmerged\u{1b}[0m"), "{colored:?}");
+        assert!(colored.contains("\u{1b}[32mok\u{1b}[0m"), "{colored:?}");
+        assert!(colored.contains("\u{1b}[33mwarn\u{1b}[0m"), "{colored:?}");
+        assert!(colored.contains("\u{1b}[31mFAIL\u{1b}[0m"), "{colored:?}");
+        // Unremarkable tokens stay unstyled: `-` for a stage never reached,
+        // and the ticket ids and names around them.
+        assert!(!colored.contains("\u{1b}[31m-\u{1b}[0m"), "{colored:?}");
+        assert_eq!(strip_ansi(&colored), plain);
     }
 }
