@@ -378,7 +378,26 @@ fn render_logs(data: &Value) -> String {
         let line = entry["text"].as_str().unwrap_or("<binary output>");
         let _ = writeln!(text, "[{timestamp}] [{origin}] {line}");
     }
+    if let Some(notice) = logs_window_notice(entries.len(), data["elided"].as_u64().unwrap_or(0)) {
+        let _ = writeln!(text, "{notice}");
+    }
     text
+}
+
+/// States what a trailing window hid, or `None` when the page showed
+/// everything: silence here claims the operator saw the whole log.
+///
+/// `complete` is deliberately not rendered. Every CLI read a human sees is
+/// tail-anchored and so reaches EOF, and `--follow` drains incomplete pages
+/// in its own loop. JSON consumers still get both fields.
+fn logs_window_notice(shown: usize, elided: u64) -> Option<String> {
+    if elided == 0 {
+        return None;
+    }
+    let total = shown as u64 + elided;
+    Some(format!(
+        "showing the last {shown} of {total} entries; --tail N or --follow for more"
+    ))
 }
 
 fn render_reindex(data: &Value) -> String {

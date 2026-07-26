@@ -150,6 +150,35 @@ fn settled_multi_stage_run(world: &World, ticket: &str) -> String {
     run
 }
 
+/// Appends `count` single-entry records to a settled run's log, numbered from
+/// 1 and tagged with `stage`.
+///
+/// Entries are pipe-read boundaries, not lines, so a process cannot be asked
+/// for an exact number of them. Writing the records the way the daemon writes
+/// them fixes the boundaries a windowing test needs to count.
+fn extend_log(world: &World, run: &str, stage: &str, count: usize) {
+    let log = world
+        .state_dir()
+        .join("runs")
+        .join(run)
+        .join("output.ndjson");
+    let existing = fs::read_to_string(&log).expect("read run log");
+    let captured = existing
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|record| record["sequence"].as_u64())
+        .max()
+        .expect("the run captured output");
+    let mut appended = String::new();
+    for index in 1..=count {
+        let sequence = captured + index as u64;
+        appended.push_str(&format!(
+            "{{\"sequence\":{sequence},\"timestamp\":\"2026-07-20T00:00:00Z\",\"source\":\"stage\",\"stage\":\"{stage}\",\"stream\":\"stdout\",\"encoding\":\"utf8\",\"text\":\"tail line {index}\\n\"}}\n"
+        ));
+    }
+    fs::write(&log, format!("{existing}{appended}")).expect("extend run log");
+}
+
 /// Concatenates the `text` of every returned entry, so a test can assert on
 /// what an operator would read without depending on chunk boundaries.
 fn entry_text(data: &serde_json::Value) -> String {
@@ -282,29 +311,7 @@ fn tail_returns_exactly_the_last_matching_entries() {
     let world = World::configured();
     let run = settled_multi_stage_run(&world, "tailed.md");
 
-    // Entries are pipe-read boundaries, not lines, so a process cannot be
-    // asked for an exact number of them. Appending to the settled run's log
-    // fixes the boundaries the way the daemon itself would write them.
-    let log = world
-        .state_dir()
-        .join("runs")
-        .join(&run)
-        .join("output.ndjson");
-    let existing = fs::read_to_string(&log).expect("read run log");
-    let captured = existing
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter_map(|record| record["sequence"].as_u64())
-        .max()
-        .expect("the run captured output");
-    let mut appended = String::new();
-    for index in 1..=8 {
-        let sequence = captured + index;
-        appended.push_str(&format!(
-            "{{\"sequence\":{sequence},\"timestamp\":\"2026-07-20T00:00:0{index}Z\",\"source\":\"stage\",\"stage\":\"check\",\"stream\":\"stdout\",\"encoding\":\"utf8\",\"text\":\"tail line {index}\\n\"}}\n"
-        ));
-    }
-    fs::write(&log, format!("{existing}{appended}")).expect("extend run log");
+    extend_log(&world, &run, "check", 8);
 
     let output = world.sloop(&["logs", &run, "--stage", "check", "--tail", "5"]);
 
@@ -405,4 +412,108 @@ fn follow_on_a_settled_run_prints_what_exists_and_exits() {
     assert_eq!(data["terminal"], true);
     assert_eq!(data["complete"], true);
     assert!(entry_text(&data).contains("agent stage speaking"));
+}
+
+/// The bug this replaces: a bare read showed the *oldest* page and said
+/// nothing, so a busy run looked identical to a hung one.
+#[test]
+fn a_bare_read_tails_and_states_what_the_window_hid() {
+    let world = World::configured();
+    let run = settled_multi_stage_run(&world, "windowed.md");
+    extend_log(&world, &run, "check", 100);
+
+    let output = world.sloop_plain(&["logs", &run]);
+
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("utf8 output");
+    assert!(
+        text.contains("tail line 100") && !text.contains("tail line 1\n"),
+        "a bare read must anchor at the newest entries: {text}"
+    );
+    assert!(
+        text.contains("showing the last 64 of"),
+        "a windowed page must say what it hid: {text}"
+    );
+}
+
+#[test]
+fn a_bare_read_that_shows_everything_adds_no_notice() {
+    let world = World::configured();
+    let run = settled_multi_stage_run(&world, "short.md");
+
+    let output = world.sloop_plain(&["logs", &run]);
+
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("utf8 output");
+    assert!(text.contains("agent stage speaking"), "{text}");
+    assert!(
+        !text.contains("showing the last"),
+        "a complete page must not claim a window: {text}"
+    );
+}
+
+/// The symptom that caused the false stall diagnosis: repeated bare reads of
+/// a growing log returned byte-identical output.
+#[test]
+fn a_second_bare_read_shows_entries_the_first_could_not() {
+    let world = World::configured();
+    let run = settled_multi_stage_run(&world, "growing.md");
+    extend_log(&world, &run, "check", 70);
+    let first = world.sloop_plain(&["logs", &run]);
+    let first = String::from_utf8(first.stdout).expect("utf8 output");
+
+    extend_log(&world, &run, "check", 80);
+    let second = world.sloop_plain(&["logs", &run]);
+    let second = String::from_utf8(second.stdout).expect("utf8 output");
+
+    assert_ne!(
+        first, second,
+        "a bare read of a grown log must not repeat itself"
+    );
+    assert!(
+        second.contains("tail line 80"),
+        "the second read must reach the newest entry: {second}"
+    );
+}
+
+#[test]
+fn a_windowed_stage_page_states_the_window_and_keeps_the_filter() {
+    let world = World::configured();
+    let run = settled_multi_stage_run(&world, "windowed-stage.md");
+    extend_log(&world, &run, "check", 100);
+
+    let output = world.sloop_plain(&["logs", &run, "--stage", "check"]);
+
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("utf8 output");
+    // 100 appended, plus the exec stage's own line: the total is what the
+    // filter matched, not what the run captured.
+    assert!(
+        text.contains("showing the last 64 of 101 entries"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("agent stage speaking"),
+        "the stage filter must still apply: {text}"
+    );
+}
+
+/// The window is reported, not just rendered: a machine consumer sees how
+/// much the tail dropped, and `complete`/`next_cursor` keep their meaning.
+#[test]
+fn json_mode_reports_what_the_window_dropped() {
+    let world = World::configured();
+    let run = settled_multi_stage_run(&world, "windowed-json.md");
+    extend_log(&world, &run, "check", 100);
+
+    let output = world.sloop(&["logs", &run, "--stage", "check", "--tail", "10"]);
+
+    let data = World::json_stdout(&output)["data"].clone();
+    assert_eq!(data["entries"].as_array().expect("entries").len(), 10);
+    // 100 appended plus the exec stage's own line, less the 10 kept.
+    assert_eq!(data["elided"], 91);
+    assert_eq!(
+        data["complete"], true,
+        "a tail reads to the end however much it drops"
+    );
 }

@@ -181,8 +181,11 @@ Patterns that fall out of the verbs:
 - **Read or stream one run's output** — `logs` takes `{"run": <ref>}` plus
   optional `stage`, `tail` (keep the last N matching entries), and
   `after` (a cursor). It returns the page along with `next_cursor`,
-  `complete`, and `terminal`. Poll with `{"after": <cursor>}` to follow a
-  live run and stop once a response is both `complete` and `terminal`;
+  `complete`, `elided`, and `terminal`. `complete` is false when records
+  remain ahead of the cursor; `elided` counts matching records a `tail`
+  dropped behind it, which `complete` cannot report because a tail reads to
+  the end however much it discards. Poll with `{"after": <cursor>}` to follow
+  a live run and stop once a response is both `complete` and `terminal`;
   `sloop logs --follow` is exactly this loop. Filtering is server-side, so a
   dashboard tailing one stage of a large log transfers only that stage. Use
   `show` for the run's derived outcome and stage summary before reading its
@@ -280,9 +283,9 @@ emits `v: 1` only:
 - `verdict.confidence` is a new optional request field. A client that predates
   it simply omits it and is read as `medium`, so every older caller keeps
   working unchanged.
-- `value.halt` on a run, and `attempt`, `advisory`, `confidence`, and
-  `reviewers` on a stage row, are new response fields. Nothing existing was
-  repurposed to make room for them.
+- `value.halt` on a run, `attempt`, `advisory`, `confidence`, and `reviewers`
+  on a stage row, and `elided` on a `logs` page are new response fields.
+  Nothing existing was repurposed to make room for them.
 - `logs.stage` is the one field whose accepted *values* widened: it took a bare
   stage name and now also takes `<stage>#<attempt>`. A bare name still means
   what it always did — every execution of that stage — so no request that was

@@ -73,6 +73,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `complete` having run nothing. It is now a config-load error like any other
   invalid flow.
 
+- **`sloop logs` showed the oldest 64 entries and did not say so.** A bare read
+  returned one page anchored at the *start* of the capture, so on any run of
+  real length an operator saw the agent's first few seconds and nothing else —
+  and on a live run the same 64 lines came back every time, which is exactly
+  what a hung run looks like. A bare read now tails, like `tail` and
+  `journalctl`, and any page that hides output says so:
+
+  ```
+  showing the last 64 of 312 entries; --tail N or --follow for more
+  ```
+
+  `--tail N` and `--follow` are unchanged, and `--follow` still streams from
+  the run's first entry. The default belongs to the CLI alone: on the socket an
+  omitted `tail` still reads forward from the cursor. `logs` responses carry a
+  new `elided` count for what a tail dropped behind it, which the existing
+  `complete` flag cannot report — a tail reads to the end of the file however
+  much older output it discards, so it is always `complete`.
+
 ## [0.4.0-rc.1] - 2026-07-25
 
 ### Added

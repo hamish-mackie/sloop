@@ -16,6 +16,13 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::clock::format_timestamp;
 
+/// One socket page of records, and the window a bare `sloop logs` tails.
+pub const PAGE_LIMIT: usize = 64;
+
+/// An explicit `tail` may ask for more than one default page — that is the
+/// point of asking — but not for an unbounded slice of an untrusted log.
+pub const TAIL_LIMIT: usize = 1000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputSource {
@@ -302,6 +309,10 @@ pub struct OutputPage {
     pub next_cursor: u64,
     /// True when the page reached the end of the captured records.
     pub complete: bool,
+    /// Matching records a trailing window dropped off the front. `complete`
+    /// cannot carry this: a tail reads to the end, so it is always complete
+    /// however much older output it discarded.
+    pub elided: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -466,6 +477,7 @@ pub fn read_filtered_page(path: &Path, query: &PageQuery) -> io::Result<OutputPa
                 entries: Vec::new(),
                 next_cursor: query.after,
                 complete: true,
+                elided: 0,
             });
         }
         Err(error) => return Err(error),
@@ -477,6 +489,7 @@ pub fn read_filtered_page(path: &Path, query: &PageQuery) -> io::Result<OutputPa
     let mut entries = VecDeque::new();
     let mut next_cursor = query.after;
     let mut complete = true;
+    let mut elided = 0;
     for line in BufReader::new(file).lines() {
         // An unparsable line is an incomplete tail, not corruption of the
         // records before it.
@@ -497,12 +510,14 @@ pub fn read_filtered_page(path: &Path, query: &PageQuery) -> io::Result<OutputPa
         entries.push_back(record);
         if entries.len() > window {
             entries.pop_front();
+            elided += 1;
         }
     }
     Ok(OutputPage {
         entries: entries.into(),
         next_cursor,
         complete,
+        elided,
     })
 }
 
