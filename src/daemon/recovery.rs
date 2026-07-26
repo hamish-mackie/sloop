@@ -388,11 +388,17 @@ pub(super) fn restore_worker_socket(
     // one to the run row. A panel reviewer's credential is minted per seat and
     // never persisted, so nothing here can restore one — which is right, since
     // recovery re-runs the stage and its panel from the top.
+    //
+    // Naming the stage from the checkpoint is sound here in a way it is not at
+    // launch: recovery runs with nothing spawning, so the row cannot be one
+    // stage behind the worker holding the token.
+    let stage = executing_stage(&state.run_store, &run.id, run.flow_json.as_deref());
+    let attempt = executing_attempt(&state.run_store, &run.id);
     state.worker_tokens.insert(
         run.id.clone(),
         super::dispatcher::IssuedWorker {
             token: token.clone(),
-            scope: crate::runner::WorkerScope::Stage,
+            scope: crate::runner::WorkerScope::Stage { stage, attempt },
         },
     );
     state

@@ -2512,8 +2512,7 @@ fn a_two_agent_flow_supervises_both_stages_with_separate_worker_tokens() {
     post_and_run(&world, "two-agents.md");
 
     // Two agent stages spawn a process each before the merge runs, so this waits
-    // on more real work than the 10-second probe is meant for; a loaded macOS
-    // runner overran it.
+    // on more real work than the 10-second probe is meant for.
     wait_until_slow("the two-agent flow merges", || {
         tickets(&world)["merged"] == 1
     });
@@ -2560,6 +2559,78 @@ fn a_two_agent_flow_supervises_both_stages_with_separate_worker_tokens() {
             .any(|entry| entry["source"] == "agent" && entry["stage"] == "review"),
         "no supervised review-stage output in {entries:?}"
     );
+}
+
+/// Like [`REVIEWING_AGENT`], but the reviewer saves the daemon's reply so the
+/// test can wait on the report having *landed* rather than on the process
+/// having started.
+const RECORDING_REVIEWER: &str = concat!(
+    "root=\"$(dirname \"$0\")\"\n",
+    "count=$(cat \"$root/agent-invocations\" 2>/dev/null || echo 0)\n",
+    "count=$((count + 1))\n",
+    "printf '%s' \"$count\" > \"$root/agent-invocations\"\n",
+    "if [ \"$count\" = 1 ]; then\n",
+    "  echo done > work.txt\n",
+    "  git add work.txt\n",
+    "  git -c user.name=agent -c user.email=agent@example.invalid commit --quiet -m 'agent work'\n",
+    "else\n",
+    "  \"$SLOOP_BIN\" --json verdict pass --reason reviewed > \"$root/verdict.out\" 2>&1 || true\n",
+    "fi\n",
+    "exit 0\n",
+);
+
+/// A worker's verdict is credited to the stage its credential names, even when
+/// it reports before the driver has checkpointed that stage's process.
+///
+/// The driver clears the `stage_process` row between stages and writes the next
+/// one only after that stage's child is spawned, so for the width of the launch
+/// window there is no row at all. A reviewer that reported inside it used to be
+/// refused with `conflict` — and because a reviewer's report is fire-and-forget,
+/// nothing surfaced the refusal: the `reported` check went on waiting for a
+/// report that had already been thrown away, and the run sat unsettled until
+/// its lease expired. The window is real but narrow, so this holds it open
+/// rather than racing it — on Linux the daemon wins by default and the bug is
+/// invisible, which is how it reached a release.
+#[test]
+fn a_verdict_reported_before_the_stage_checkpoint_lands_on_the_reporting_stage() {
+    let world = World::configured();
+    configure(&world, RECORDING_REVIEWER, None);
+    write_flow(
+        &world,
+        "stages:\n  - { name: build, action: agent }\n  - { name: review, action: agent, result_check: reported }\n  - { name: merge, action: { builtin: merge } }\n",
+    );
+    world.commit_all("initial");
+    // Fires after the review child is spawned and before its `stage_process`
+    // row is written, so the reviewer reports while the row still says `build`.
+    world.arm_test_hook("before-stage-process-checkpoint-review");
+    world.start_daemon();
+    post_and_run(&world, "checkpoint-window.md");
+
+    wait_until_slow("the reviewer reports inside the launch window", || {
+        fs::read_to_string(world.root().join("verdict.out"))
+            .ok()
+            .is_some_and(|text| serde_json::from_str::<serde_json::Value>(&text).is_ok())
+    });
+    let reply: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(world.root().join("verdict.out")).unwrap())
+            .unwrap();
+    assert_eq!(
+        reply["ok"], true,
+        "the reviewer's report was refused: {reply}"
+    );
+
+    world.release_test_hook("before-stage-process-checkpoint-review");
+
+    wait_until_slow("the flow merges after the delayed checkpoint", || {
+        tickets(&world)["merged"] == 1
+    });
+    let review = stage_evidence(&world, 1, "review");
+    assert_eq!(
+        review["verdict_source"], "reported",
+        "the report must be credited to `review`, not to the stage the \
+         checkpoint still named"
+    );
+    assert_eq!(review["reason"], "reviewed");
 }
 
 /// An agent stage need not open a flow. One that follows an exec stage is

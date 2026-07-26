@@ -58,13 +58,16 @@ pub struct WorkerCredentials {
 }
 
 /// The authority a worker token carries.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerScope {
-    /// The stage's own worker. A verdict it reports lands on whichever stage
-    /// execution the driver has checkpointed a process for — there is exactly
-    /// one, so the answer is unambiguous without the token saying it.
-    #[default]
-    Stage,
+    /// The stage's own worker, named by the credential the same way a panel
+    /// seat is. The stage cannot be read back off the checkpointed process
+    /// instead: the driver clears the `stage_process` row when a stage ends and
+    /// writes the next one only after that stage's child is already spawned, so
+    /// between those two points there is no row to read. A worker that reported
+    /// inside the window was refused outright, and the check it was answering
+    /// never saw the report it was waiting for.
+    Stage { stage: String, attempt: u32 },
     /// One seat on a panel. A panel runs several workers against one stage
     /// execution, so "the executing stage" no longer picks out a report row:
     /// the seat is named by the credential instead, and a reviewer holding it

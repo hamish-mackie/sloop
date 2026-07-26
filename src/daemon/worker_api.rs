@@ -52,7 +52,7 @@ pub(super) fn dispatch_worker(
         },
         Request::Note(args) => handle_note(state, run_id, &args.text),
         Request::Verdict(args) => match &scope {
-            WorkerScope::Stage => handle_verdict(state, run_id, &scope, &args),
+            WorkerScope::Stage { .. } => handle_verdict(state, run_id, &scope, &args),
             WorkerScope::PanelReviewer {
                 stage_index,
                 reviewer_index,
@@ -89,24 +89,18 @@ struct ExecutingStage {
     check: Check,
 }
 
-/// Resolves the stage the caller is executing, from the source its own scope
-/// makes authoritative.
+/// Resolves the stage the caller is executing. Every scope answers from its own
+/// credential, minted for one stage execution and never read off a request, so
+/// a worker's authority is exactly the stage its token names.
 ///
-/// A stage worker's answer comes from the live `stage_process` row — the
-/// driver checkpoints exactly one per run, so "the stage currently executing"
-/// picks out one answer whatever kind of stage it is. A panel seat's comes
-/// from its credential, because a panel runs several workers against a single
-/// stage execution and the row no longer distinguishes them.
-///
-/// Neither scope reads the other's source. That is load-bearing: a reviewer's
-/// authority is exactly the seat its token was minted for, and letting it fall
-/// back to the executing row would hand it whatever the driver happens to be
-/// running.
-fn executing_stage(
-    state: &DispatcherState,
-    run: &RunRecord,
-    scope: &WorkerScope,
-) -> Result<ExecutingStage, ErrorBody> {
+/// Nothing here consults the checkpointed `stage_process` row. That is
+/// load-bearing rather than incidental: the driver clears that row between
+/// stages and writes the next one only after the stage's child is spawned, so
+/// a worker quick enough to report inside the window found no row and was
+/// refused — leaving the `reported` check it was answering waiting for a report
+/// that had already been thrown away. The flow snapshot is still read, but only
+/// to look up what the named stage turns on.
+fn executing_stage(run: &RunRecord, scope: &WorkerScope) -> Result<ExecutingStage, ErrorBody> {
     if !matches!(run.state.as_str(), "running" | "driving") {
         return Err(conflict("the run has no stage currently executing"));
     }
@@ -117,7 +111,7 @@ fn executing_stage(
     let flow: Flow = serde_json::from_str(snapshot)
         .map_err(|error| internal(&format!("the run's flow snapshot is invalid: {error}")))?;
     let (name, attempt) = match scope {
-        WorkerScope::Stage => stage_process(state, &run.id)?,
+        WorkerScope::Stage { stage, attempt } => (stage.clone(), *attempt),
         WorkerScope::PanelReviewer { stage, attempt, .. } => (stage.clone(), *attempt),
     };
     let stage = flow
@@ -130,26 +124,6 @@ fn executing_stage(
         attempt,
         check: stage.result_check.clone(),
     })
-}
-
-/// The stage and attempt the driver last checkpointed a process for. Only a
-/// [`WorkerScope::Stage`] credential may be answered from it.
-fn stage_process(state: &DispatcherState, run_id: &str) -> Result<(String, u32), ErrorBody> {
-    let rows = run_lookup(state, |run_store| run_store.run_evidence(run_id))?;
-    let executing = rows
-        .iter()
-        .find(|(kind, _)| kind == super::driver::STAGE_PROCESS)
-        .and_then(|(_, data)| serde_json::from_str::<serde_json::Value>(data).ok())
-        .ok_or_else(|| conflict("the run has no stage process currently executing"))?;
-    let stage = executing["stage"]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| conflict("the run has no stage process currently executing"))?;
-    let attempt = executing["attempt"]
-        .as_u64()
-        .and_then(|attempt| u32::try_from(attempt).ok())
-        .unwrap_or(1);
-    Ok((stage, attempt))
 }
 
 /// Everything the agent needs to work, re-readable after a compaction: the
@@ -191,9 +165,9 @@ fn handle_brief(
     // The assignment is this stage execution, not the run: what a worker owes
     // is a property of the stage it is running, and the role its credential
     // gives it there.
-    let executing = executing_stage(state, &run, scope)?;
+    let executing = executing_stage(&run, scope)?;
     let role = match scope {
-        WorkerScope::Stage => WorkerRole::Stage,
+        WorkerScope::Stage { .. } => WorkerRole::Stage,
         WorkerScope::PanelReviewer { .. } => WorkerRole::PanelReviewer,
     };
     let definition_of_done = definition_of_done(role, &executing.check);
@@ -334,7 +308,7 @@ fn handle_panel_report(
 ) -> Result<serde_json::Value, ErrorBody> {
     let run = run_lookup(state, |run_store| run_store.run(run_id))?
         .ok_or_else(|| internal("the run for this token no longer exists"))?;
-    let executing = executing_stage(state, &run, scope)?;
+    let executing = executing_stage(&run, scope)?;
     // A panel report is what the whole stage turns on, and an unexplained one
     // is worth nothing to the operator reading `sloop show` afterwards.
     let reason = args
@@ -394,7 +368,7 @@ fn handle_verdict(
         .ok_or_else(|| internal("the run for this token no longer exists"))?;
     // A worker can only ever report for the stage it is running, and the
     // resolver is the only thing that decides which stage that is.
-    let executing = executing_stage(state, &run, scope)?;
+    let executing = executing_stage(&run, scope)?;
     let stage_name = executing.name;
     let attempt = executing.attempt;
     if executing.check != Check::Reported {

@@ -190,6 +190,13 @@ pub fn launch_agent<H: StageHooks>(
         worker,
         started_at_ms,
     };
+    // The child is already running; its stage_process row is not written yet.
+    // The exec path exposes the same window, and a test that means to hold it
+    // open has to be able to hold it here too.
+    wait_for_test_hook(&format!(
+        "before-stage-process-checkpoint-{}",
+        checkpoint.stage
+    ));
     if let Err(error) = hooks.record_agent_process(&checkpoint) {
         kill_process_group(process);
         let _ = child.wait();

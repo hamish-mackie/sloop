@@ -751,7 +751,10 @@ impl RunDriver<'_> {
             },
             Actor::Exec { cmd } => {
                 let worker = if stage.result_check == Check::Reported {
-                    Some(self.issue_worker_credentials().map_err(WalkError::Stage)?)
+                    Some(
+                        self.issue_worker_credentials(run)
+                            .map_err(WalkError::Stage)?,
+                    )
                 } else {
                     None
                 };
@@ -793,7 +796,9 @@ impl RunDriver<'_> {
                 finished_at_ms: now,
             }));
         }
-        let worker = self.issue_worker_credentials().map_err(WalkError::Stage)?;
+        let worker = self
+            .issue_worker_credentials(run)
+            .map_err(WalkError::Stage)?;
         let order = self
             .agent_stage_order(run, worker)
             .map_err(WalkError::Stage)?;
@@ -1477,8 +1482,11 @@ impl RunDriver<'_> {
     ///
     /// The socket path stays per-run — macOS caps Unix socket paths at 104
     /// bytes and the run's short id is already most of the budget.
-    fn issue_worker_credentials(&self) -> Result<WorkerCredentials, String> {
-        self.issue_credentials(WorkerScope::Stage)
+    fn issue_worker_credentials(&self, run: &StageRun) -> Result<WorkerCredentials, String> {
+        self.issue_credentials(WorkerScope::Stage {
+            stage: run.stage.name.clone(),
+            attempt: run.attempt,
+        })
     }
 
     fn issue_credentials(&self, scope: WorkerScope) -> Result<WorkerCredentials, String> {
