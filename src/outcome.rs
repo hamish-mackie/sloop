@@ -4,7 +4,7 @@
 
 use serde::Serialize;
 
-use crate::vendor_error::VendorErrorClass;
+use crate::vendor::VendorErrorClass;
 
 /// Classification of how the agent process ended. This is the adapter-level
 /// reading of the raw wait status; vendor-specific classifications such as

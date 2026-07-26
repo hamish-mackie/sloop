@@ -49,7 +49,7 @@ use crate::runner::{
     ProcessIdentity, RunnerError, StageExecution, StageHooks, StageOrder, WorkerCredentials,
     WorkerScope,
 };
-use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
+use crate::vendor::{VendorErrorClassifier, VendorErrorMatch};
 use crate::worker::{
     BACKWARD_CONTEXT_LINES, FailureContext, compose_worker_prompt, panel_prompt,
     previous_attempt_block,

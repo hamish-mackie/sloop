@@ -29,7 +29,7 @@ use crate::protocol::{
 use crate::run_ref::{RandomRunIds, RunIdSource};
 use crate::run_store::RunStore;
 use crate::runner::local::{process_identity_matches, process_start_time};
-use crate::vendor_error::{CatalogError, VendorErrorClassifier};
+use crate::vendor::{CatalogError, VendorErrorClassifier};
 use crate::work_state::TicketFeeder;
 use crate::work_state::local::LocalSqlite;
 

@@ -23,7 +23,7 @@ use crate::run_store::{
 use crate::runner::local::{
     process_start_time, run_output_path, wait_for_test_hook, worker_socket_path,
 };
-use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
+use crate::vendor::{VendorErrorClassifier, VendorErrorMatch};
 
 use super::dispatcher::{
     DispatcherState, RunEvent, close_worker_socket, disposition_for_outcome, mark_storage_full,

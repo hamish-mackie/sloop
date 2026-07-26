@@ -23,6 +23,6 @@ pub mod run_store;
 pub mod runner;
 pub mod sources;
 pub mod templates;
-pub mod vendor_error;
+pub mod vendor;
 pub mod work_state;
 pub mod worker;

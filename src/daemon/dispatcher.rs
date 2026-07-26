@@ -21,7 +21,7 @@ use crate::run_ref::RunIdSource;
 use crate::run_store::{CooldownUpdate, EvidenceRecord, RunStore};
 use crate::runner::local::worker_socket_path;
 use crate::runner::{WorkerCredentials, WorkerScope};
-use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
+use crate::vendor::{VendorErrorClassifier, VendorErrorMatch};
 use crate::work_state::local::LocalSqlite;
 use crate::work_state::{SourceError, TicketFeeder, WorkState};
 

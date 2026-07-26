@@ -143,7 +143,7 @@ pub(crate) mod tx {
         exit_code: Option<i32>,
         capture_complete: bool,
         commits_json: &str,
-        vendor_error: Option<&crate::vendor_error::VendorErrorMatch>,
+        vendor_error: Option<&crate::vendor::VendorErrorMatch>,
         cooldown_until_ms: Option<i64>,
         now_ms: i64,
     ) -> rusqlite::Result<()> {
@@ -644,7 +644,7 @@ impl RunStore {
     pub(crate) fn vendor_error_for_run(
         &self,
         run_id: &str,
-    ) -> Result<Option<crate::vendor_error::VendorErrorMatch>, StoreError> {
+    ) -> Result<Option<crate::vendor::VendorErrorMatch>, StoreError> {
         let data = vendor_error_for_run(&self.db.lock(), run_id)?;
         Ok(data.and_then(|data| serde_json::from_str(&data).ok()))
     }
@@ -652,7 +652,7 @@ impl RunStore {
     pub(crate) fn latest_vendor_error_for_ticket(
         &self,
         ticket_id: &str,
-    ) -> Result<Option<crate::vendor_error::VendorErrorMatch>, StoreError> {
+    ) -> Result<Option<crate::vendor::VendorErrorMatch>, StoreError> {
         let data = latest_vendor_error_for_ticket(&self.db.lock(), ticket_id)?;
         Ok(data.and_then(|data| serde_json::from_str(&data).ok()))
     }
@@ -671,7 +671,7 @@ mod tests {
         Exit, ExitClaim, ExitDenial, RunExit, RunStart, RunState, RunStore, StagePhase,
         StageRecord, Start,
     };
-    use crate::vendor_error::{VendorErrorClass, VendorErrorMatch};
+    use crate::vendor::{VendorErrorClass, VendorErrorMatch};
 
     fn stage_row(
         stage_index: usize,

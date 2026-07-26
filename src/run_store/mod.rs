@@ -91,7 +91,7 @@ pub struct RunExit<'a> {
     pub exit_code: Option<i32>,
     pub capture_complete: bool,
     pub commits_json: &'a str,
-    pub vendor_error: Option<&'a crate::vendor_error::VendorErrorMatch>,
+    pub vendor_error: Option<&'a crate::vendor::VendorErrorMatch>,
     pub cooldown_until_ms: Option<i64>,
 }
 
@@ -371,7 +371,7 @@ impl RunStore {
         exit_code: Option<i32>,
         capture_complete: bool,
         commits_json: &str,
-        vendor_error: Option<&crate::vendor_error::VendorErrorMatch>,
+        vendor_error: Option<&crate::vendor::VendorErrorMatch>,
         cooldown_until_ms: Option<i64>,
         now_ms: i64,
     ) -> Result<ExitClaim, StoreError> {

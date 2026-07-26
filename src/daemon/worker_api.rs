@@ -7,7 +7,7 @@ use crate::flow::{Check, Confidence, Flow};
 use crate::protocol::{ErrorBody, Request, RequestId, ResponseEnvelope, VerdictArgs, VerdictValue};
 use crate::run_store::{PanelReportRecord, RunRecord};
 use crate::runner::WorkerScope;
-use crate::vendor_error::VendorErrorMatch;
+use crate::vendor::VendorErrorMatch;
 use crate::worker::{WorkerRole, check_label, definition_of_done};
 
 use crate::work_state::local::TicketRecord;
