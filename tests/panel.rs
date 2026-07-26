@@ -537,8 +537,15 @@ fn a_reviewers_token_cannot_report_for_a_later_stage_or_another_run() {
     let first = post(&world, "panel-stale-token.md");
     assert!(world.sloop(&["run", &first]).status.success());
 
+    // `> signed.out` creates the file when the redirection opens, before
+    // `sloop` has written a byte into it, so waiting on existence alone races
+    // the write and can read an empty file. Parseable JSON is the first state
+    // that actually means the command finished. It is also the last write the
+    // script makes, so `stale.err` is complete by the time this passes.
     wait_until_slow("the first run finishes its sign-off", || {
-        world.run_worktree(1).join("signed.out").is_file()
+        fs::read_to_string(world.run_worktree(1).join("signed.out"))
+            .ok()
+            .is_some_and(|text| serde_json::from_str::<Value>(&text).is_ok())
     });
 
     // A later stage of the very same run cannot use the reviewer's token: the
