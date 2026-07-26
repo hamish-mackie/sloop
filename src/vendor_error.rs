@@ -597,6 +597,12 @@ rules:
                 VendorErrorClass::RateLimited,
                 "claude.rate-limit.usage-limit",
             ),
+            (
+                br#"API Error: 529 Overloaded. This is a server-side issue, usually temporary"#
+                    .as_slice(),
+                VendorErrorClass::RateLimited,
+                "claude.rate-limit.api-overloaded",
+            ),
         ];
         for (stderr, class, id) in cases {
             let matched = classifier.classify(Some(1), b"", stderr).unwrap();

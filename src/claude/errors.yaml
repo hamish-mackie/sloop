@@ -30,3 +30,17 @@ rules:
       # up to that qualifier is what stays constant.
       message_signatures:
         - You've hit your
+  - id: claude.rate-limit.api-overloaded
+    class: rate_limited
+    diagnostic: Claude API overloaded
+    match:
+      # Observed as `API Error: 529 Overloaded. This is a server-side issue,
+      # usually temporary — try again in a moment.` A transient server-side
+      # overload, not a usage limit, but it earns the same conservative
+      # treatment: back off and retry later.
+      record_any_of:
+        - is_api_error_message: true
+        - type: result
+          is_error: true
+      message_signatures:
+        - 529 Overloaded
