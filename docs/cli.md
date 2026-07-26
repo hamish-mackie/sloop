@@ -383,6 +383,15 @@ underlying file is `runs/<run-id>/output.ndjson` in the state directory.
 Use [`sloop show`](#sloop-show) first for the run's derived outcome, timeline,
 and stage summary; use `logs` for the captured output behind that evidence.
 
+A bare read shows the last 64 entries, the way `tail` does, and states what it
+left out:
+
+```
+showing the last 64 of 312 entries; --tail N or --follow for more
+```
+
+A page with no such line showed everything that matched.
+
 `--stage` narrows the output to one flow stage, named exactly as the flow
 names it: `--stage build` is the agent's own output, `--stage test` is that
 exec stage's. A stage the run's flow does not define is an error listing the
@@ -403,20 +412,21 @@ can be pasted back. An attempt the stage never reached is an empty page, since
 the stage exists and how often it ran is exactly what was asked; a malformed
 one (`--stage build#two`) is a usage error rather than a silent miss.
 
-`--tail N` keeps the last N matching entries instead of the first. An entry is
-one captured chunk, matching how the NDJSON file is stored, so `--tail 50` is
-"the last 50 records" rather than "the last 50 lines".
+`--tail N` widens or narrows that window, up to 1000. An entry is one captured
+chunk, matching how the NDJSON file is stored, so `--tail 50` is "the last 50
+records" rather than "the last 50 lines".
 
-`--follow` streams entries as they are appended and exits when the run reaches
-a terminal state. On a run that has already settled it prints what exists and
-exits. All three combine: `sloop logs <RUN> --stage test#2 --tail 50` answers
+`--follow` streams the run from its first entry as more are appended, and exits
+when the run reaches a terminal state. On a run that has already settled it
+prints what exists and exits. All three combine: `sloop logs <RUN> --stage test#2 --tail 50` answers
 "why did the second pass of the test stage fail" in one command, and
 `--stage test --follow` streams only that stage.
 
 Filtering happens in the daemon, so any client of the socket gets it — the
 attempt suffix included: this is the `logs` verb with `stage`, `tail`, and
-`after` arguments, returning a page plus `next_cursor`, `complete`, and
-`terminal`. `--follow` is a client-side loop over that cursor, like
+`after` arguments, returning a page plus `next_cursor`, `complete`, `elided`,
+and `terminal`. The tail default is the CLI's own: on the socket, an omitted
+`tail` still reads forward from the cursor. `--follow` is a client-side loop over that cursor, like
 `show --follow` over `events`.
 
 ### Deprecated read aliases

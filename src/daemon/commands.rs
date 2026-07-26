@@ -21,10 +21,7 @@ use crate::runner::local::run_output_path;
 use crate::work_state::local::{LocalSqlite, ProjectRecord, TicketRecord};
 use crate::work_state::trigger::{Duplicates, EnqueueRequest};
 
-use super::dispatcher::{
-    DispatcherState, LOGS_PAGE_LIMIT, LOGS_TAIL_LIMIT, conflict, internal, invalid_arguments,
-    not_found,
-};
+use super::dispatcher::{DispatcherState, conflict, internal, invalid_arguments, not_found};
 use super::recovery::{
     PersistedProcessStop, stage_process_identity, stop_agent_process_group,
     stop_persisted_process_group,
@@ -846,7 +843,9 @@ pub(super) fn handle_logs(
     let terminal = is_terminal(&resolved.run.state);
     let query = crate::run_log::PageQuery {
         after: args.after.unwrap_or(0),
-        limit: tail.map_or(LOGS_PAGE_LIMIT, |tail| tail.min(LOGS_TAIL_LIMIT)),
+        limit: tail.map_or(crate::run_log::PAGE_LIMIT, |tail| {
+            tail.min(crate::run_log::TAIL_LIMIT)
+        }),
         stage,
         tail,
     };
@@ -871,6 +870,7 @@ pub(super) fn handle_logs(
         "entries": entries,
         "next_cursor": page.next_cursor,
         "complete": page.complete,
+        "elided": page.elided,
         "terminal": terminal,
     }))
 }

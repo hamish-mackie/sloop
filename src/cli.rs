@@ -176,7 +176,7 @@ pub enum Command {
         /// `<stage>#<attempt>` for one execution of a re-run stage.
         #[arg(long, value_name = "STAGE[#ATTEMPT]")]
         stage: Option<String>,
-        /// Show only the last N matching entries.
+        /// Show the last N matching entries instead of the default 64.
         #[arg(long, value_name = "N")]
         tail: Option<u32>,
         /// Stream new output until the run reaches a terminal state.
@@ -266,6 +266,12 @@ high.";
 /// a backward edge re-entered has more than one page of output under one name.
 const LOGS_LONG_ABOUT: &str = "\
 Show output from a run — stdout and stderr, in capture order.
+
+A bare read shows the last 64 entries, the way `tail` does: on a live run that
+is the part worth reading. `--tail N` widens or narrows that window, and
+`--follow` streams the run from its first entry instead. Whenever a window
+hides output, the last line of the page says so — a page that says nothing
+showed everything.
 
 `--stage` narrows to one stage, named exactly as its flow names it. Add
 `#<attempt>` to narrow further to a single execution: `--stage build#2` is the
@@ -400,6 +406,21 @@ impl Cli {
     }
 }
 
+/// Shared by the dispatch path and `into_request` so the two cannot disagree
+/// about which end of the log a bare read anchors to.
+///
+/// A one-shot read tails: it answers what a run is doing now. `--follow` pages
+/// forward from the first entry, so it must stay head-anchored. The default is
+/// the client's; on the socket `tail: null` still means "from the cursor".
+fn logs_args(run: String, stage: Option<String>, tail: Option<u32>, follow: bool) -> LogsArgs {
+    LogsArgs {
+        run,
+        stage,
+        tail: tail.or((!follow).then_some(crate::run_log::PAGE_LIMIT as u32)),
+        after: None,
+    }
+}
+
 impl TryFrom<Command> for Request {
     type Error = RequestConstructionError;
 
@@ -429,16 +450,12 @@ impl TryFrom<Command> for Request {
             Command::Resume => Self::Resume(empty()),
             Command::Stop { force } => Self::Stop(StopArgs { force }),
             Command::Cancel { run } => Self::Cancel(RunReferenceArgs { run }),
-            // `--follow` is a client-side loop over this request, so it has
-            // no field in the args the daemon sees.
             Command::Logs {
-                run, stage, tail, ..
-            } => Self::Logs(LogsArgs {
                 run,
                 stage,
                 tail,
-                after: None,
-            }),
+                follow,
+            } => Self::Logs(logs_args(run, stage, tail, follow)),
             Command::Watch { r#ref, tail } => Self::Events(EventsArgs {
                 after: None,
                 tail: Some(tail),
@@ -805,12 +822,7 @@ fn run_command(
             tail,
             follow,
         } => run_logs(
-            LogsArgs {
-                run,
-                stage,
-                tail,
-                after: None,
-            },
+            logs_args(run, stage, tail, follow),
             follow,
             mode,
             stdout,
