@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-26
+
 ### Changed
 
 - **`sloop brief` is keyed on the stage the caller is executing, not on the
@@ -63,11 +65,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[]` on every reply, so no client could ever have read a value out of it, and
   nothing in Sloop wrote one. It is part of the documented brief shape, so its
   removal is recorded here rather than left to be discovered.
-
-## [0.4.0-rc.2] - 2026-07-26
-
-### Removed
-
 - **The legacy `kind` / `cmd` / `verdict` stage grammar.** `0.3.x` named a
   stage's work with `kind` and graded it with `verdict`; `0.4.0` names the same
   two things with `action` and `result_check`, and the old keys no longer parse.
