@@ -16,10 +16,6 @@ use super::walk::Verdict;
 /// or relative to whatever the daemon's working directory happens to be.
 pub const PANEL_PROMPT_ROOT: &str = ".agents/sloop";
 
-/// The bootstrap prepended to a panel reviewer's prompt. A reviewer is not the
-/// ticket's worker: it reads, it does not write, and its one job is the report.
-pub const PANEL_REVIEWER_INSTRUCTION: &str = "You are one reviewer on a panel judging the work in this git worktree. Run `sloop brief` to read the assignment under review. Read and run whatever you need, but change nothing. Report your verdict with `sloop verdict pass|fail --reason <text> [--confidence low|medium|high]` exactly once; that call, not your prose, is your report, and finishing without it counts as a fail.";
-
 /// The reason a reviewer that never reported is credited with.
 pub const NO_VERDICT_REPORTED: &str = "no verdict reported";
 

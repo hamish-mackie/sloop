@@ -25,3 +25,4 @@ pub mod sources;
 pub mod templates;
 pub mod vendor_error;
 pub mod work_state;
+pub mod worker;

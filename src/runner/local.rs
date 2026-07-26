@@ -18,8 +18,6 @@ use super::{
 use crate::clock::Clock;
 use crate::run_log::{OutputSource, OutputStream, RunLogWriter};
 
-const WORKER_BOOTSTRAP_PROMPT: &str = include_str!("../worker-instructions.md").trim_ascii();
-
 /// An agent process under supervision: spawned, checkpointed, and being
 /// drained of output until it exits.
 pub struct LaunchedAgent {
@@ -466,17 +464,6 @@ fn join_readers(readers: Vec<std::thread::JoinHandle<bool>>) -> bool {
     })
 }
 
-pub fn compose_worker_prompt(root: &Path) -> Result<String, String> {
-    let path = root.join(".agents/sloop/instructions.md");
-    match fs::read_to_string(&path) {
-        Ok(instructions) => Ok(format!("{WORKER_BOOTSTRAP_PROMPT}\n\n{instructions}")),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            Ok(WORKER_BOOTSTRAP_PROMPT.to_owned())
-        }
-        Err(error) => Err(format!("cannot read {}: {error}", path.display())),
-    }
-}
-
 fn generate_worker_token() -> Result<String, String> {
     let mut bytes = [0u8; 32];
     let mut urandom = fs::File::open("/dev/urandom").map_err(|error| error.to_string())?;
@@ -584,11 +571,10 @@ pub fn wait_for_test_hook(_name: &str) {}
 #[cfg(test)]
 mod tests {
     use std::convert::Infallible;
-    use std::fs;
 
     use tempfile::tempdir;
 
-    use super::{WORKER_BOOTSTRAP_PROMPT, compose_worker_prompt, run_exec_stage};
+    use super::run_exec_stage;
     use crate::clock::SystemClock;
     use crate::config::{AgentTarget, expand_agent_cmd};
     use crate::runner::{
@@ -714,32 +700,6 @@ mod tests {
         assert_eq!(evidence.exit_code, Some(0));
         assert!(evidence.output_capture_complete);
         assert!(evidence.process.is_some());
-    }
-
-    #[test]
-    fn worker_prompt_uses_the_builtin_when_instructions_are_absent() {
-        let root = tempdir().unwrap();
-
-        assert_eq!(
-            compose_worker_prompt(root.path()).unwrap(),
-            WORKER_BOOTSTRAP_PROMPT
-        );
-    }
-
-    #[test]
-    fn worker_prompt_appends_repository_instructions() {
-        let root = tempdir().unwrap();
-        fs::create_dir_all(root.path().join(".agents/sloop")).unwrap();
-        fs::write(
-            root.path().join(".agents/sloop/instructions.md"),
-            "Use repository conventions.\n",
-        )
-        .unwrap();
-
-        assert_eq!(
-            compose_worker_prompt(root.path()).unwrap(),
-            format!("{WORKER_BOOTSTRAP_PROMPT}\n\nUse repository conventions.\n")
-        );
     }
 
     #[test]

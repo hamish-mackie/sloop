@@ -8,6 +8,7 @@ use crate::protocol::{ErrorBody, Request, RequestId, ResponseEnvelope, VerdictAr
 use crate::run_store::PanelReportRecord;
 use crate::runner::WorkerScope;
 use crate::vendor_error::VendorErrorMatch;
+use crate::worker::definition_of_done;
 
 use crate::work_state::local::TicketRecord;
 
@@ -112,10 +113,7 @@ fn handle_brief(state: &DispatcherState, run_id: &str) -> Result<serde_json::Val
         }
     };
 
-    let mut definition_of_done = vec!["Commit your work to the run branch".to_owned()];
-    if state.flow_test_cmd.is_some() {
-        definition_of_done.push("The configured test command passes".to_owned());
-    }
+    let definition_of_done = definition_of_done(state.flow_test_cmd.is_some());
 
     Ok(json!({
         "run": run_id,

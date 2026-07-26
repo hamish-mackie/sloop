@@ -69,7 +69,7 @@ pub fn init(root: &Path) -> Result<InitOutcome, InitError> {
     ensure_directory(root, ".agents/sloop/prompts", &mut outcome, true)?;
     ensure_file(
         root,
-        crate::flow::REVIEW_PROMPT_PATH,
+        crate::worker::REVIEW_PROMPT_PATH,
         DEFAULT_REVIEW_PROMPT,
         &mut outcome,
     )?;
@@ -309,7 +309,7 @@ mod tests {
         );
         assert!(
             cmd.iter()
-                .any(|arg| arg.contains(crate::flow::REVIEW_PROMPT_PATH)),
+                .any(|arg| arg.contains(crate::worker::REVIEW_PROMPT_PATH)),
             "review command must point the reviewer at the shipped prompt: {cmd:?}"
         );
     }

@@ -18,7 +18,7 @@ mod walk;
 
 pub use panel::{
     Confidence, MAX_PANEL_REVIEWERS, MIN_PANEL_REVIEWERS, NO_VERDICT_REPORTED, PANEL_PROMPT_ROOT,
-    PANEL_REVIEWER_INSTRUCTION, Panel, PanelOutcome, Reviewer, ReviewerReport, aggregate,
+    Panel, PanelOutcome, Reviewer, ReviewerReport, aggregate,
 };
 pub use parse::parse;
 pub use walk::{
@@ -29,8 +29,6 @@ pub use walk::{
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_FLOW_NAME: &str = "default";
-pub const REVIEW_PROMPT_PATH: &str = ".agents/sloop/prompts/review.md";
-pub const REVIEW_PROMPT_INSTRUCTION: &str = "Review the completed work for correctness and regressions. Run relevant tests, then report the verdict with `sloop verdict pass|fail --reason <text>` exactly once.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Flow {

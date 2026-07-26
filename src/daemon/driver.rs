@@ -29,10 +29,9 @@ use crate::config::{AgentConfig, expand_agent_cmd};
 use crate::db::{Db, StoreError};
 use crate::domain::ticket::TicketSnapshot;
 use crate::flow::{
-    Actor, Builtin, Check, Confidence, FailAction, Flow, PANEL_PROMPT_ROOT,
-    PANEL_REVIEWER_INSTRUCTION, Panel, PanelOutcome, Reported, Reviewer, ReviewerReport, Stage,
-    StageEvidence, Step, Verdict, VerdictSource, aggregate, next_step, resolve_verdict,
-    return_trigger,
+    Actor, Builtin, Check, Confidence, FailAction, Flow, Panel, PanelOutcome, Reported, Reviewer,
+    ReviewerReport, Stage, StageEvidence, Step, Verdict, VerdictSource, aggregate, next_step,
+    resolve_verdict, return_trigger,
 };
 use crate::logging::{LogLevel, OperationalLog};
 use crate::outcome::{ExitClass, FlowHalt, MergeOutcome, classify_exit};
@@ -42,8 +41,8 @@ use crate::run_store::{
     StartDenial,
 };
 use crate::runner::local::{
-    compose_worker_prompt, create_run_worktree, launch_agent, mint_worker_credentials,
-    process_start_time, run_exec_stage, run_output_path, wait_for_test_hook, worker_socket_path,
+    create_run_worktree, launch_agent, mint_worker_credentials, process_start_time, run_exec_stage,
+    run_output_path, wait_for_test_hook, worker_socket_path,
 };
 use crate::runner::{
     AgentLaunch, AgentProcessCheckpoint, ExecLaunch, ExecProcessCheckpoint, ExecutionEvidence,
@@ -51,6 +50,10 @@ use crate::runner::{
     WorkerScope,
 };
 use crate::vendor_error::{VendorErrorClassifier, VendorErrorMatch};
+use crate::worker::{
+    BACKWARD_CONTEXT_LINES, FailureContext, compose_worker_prompt, panel_prompt,
+    previous_attempt_block,
+};
 
 use super::dispatcher::{DispatcherState, RunEvent};
 use super::recovery::{
@@ -155,11 +158,6 @@ impl StageHooks for StoreStageHooks<'_> {
     }
 }
 
-/// How many lines of a failed stage's output a re-entered stage is shown. Long
-/// enough for a test failure's tail, short enough that the block cannot crowd
-/// the ticket out of the prompt.
-const BACKWARD_CONTEXT_LINES: usize = 100;
-
 /// One stage execution the driver is about to perform, as the walk named it.
 ///
 /// `index` and `attempt` together are the log key the execution will record
@@ -170,43 +168,6 @@ struct StageRun {
     index: usize,
     attempt: u32,
     context: Option<FailureContext>,
-}
-
-/// The failure a backward edge jumped on, recovered from the run's persisted
-/// evidence.
-///
-/// A re-entered agent must be told why it is running again or the loop cannot
-/// converge — it would reproduce the same work and fail the same check. The
-/// facts are read back from the stage log and the captured output rather than
-/// carried in memory, so a daemon that resumes mid-loop composes byte-for-byte
-/// the prompt the daemon that took the jump would have.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FailureContext {
-    stage: String,
-    attempt: u32,
-    reason: String,
-    /// The tail of that execution's captured output, already capped.
-    output: String,
-}
-
-/// The "previous attempt failed" block appended to a re-entered agent's
-/// prompt. Delimited on both sides because everything inside it is untrusted
-/// process output that must not read as further instructions.
-fn previous_attempt_block(context: &FailureContext) -> String {
-    let mut block = format!(
-        "--- previous attempt failed ---\n\
-         Stage `{}` (attempt {}) failed: {}\n\
-         You are running again to address that failure.",
-        context.stage, context.attempt, context.reason,
-    );
-    if !context.output.is_empty() {
-        block.push_str(&format!(
-            "\n\nThe last {BACKWARD_CONTEXT_LINES} lines of that stage's output:\n{}",
-            context.output,
-        ));
-    }
-    block.push_str("\n--- end previous attempt ---");
-    block
 }
 
 /// One thing the driver ran and watched: a stage's action, or the independent
@@ -1362,7 +1323,7 @@ impl RunDriver<'_> {
         panel: &Panel,
     ) -> Result<(PanelOutcome, StageResult), String> {
         let started_at_ms = self.clock().now_ms();
-        let prompt = self.panel_prompt(panel)?;
+        let prompt = panel_prompt(&self.environment.root, panel)?;
         // A crash part-way through a panel re-runs the stage, but the seats
         // that already reported are append-only and one-shot: their reports
         // stand, and re-spawning those reviewers could only burn tokens to be
@@ -1423,21 +1384,6 @@ impl RunDriver<'_> {
             finished_at_ms: self.clock().now_ms(),
         };
         Ok((outcome, judged))
-    }
-
-    /// The prompt every seat is handed, read from the committed file the panel
-    /// names. One prompt for the whole panel: reviewers who were asked
-    /// different questions do not produce comparable answers, so a quorum over
-    /// them would count nothing in particular.
-    fn panel_prompt(&self, panel: &Panel) -> Result<String, String> {
-        let path = self
-            .environment
-            .root
-            .join(PANEL_PROMPT_ROOT)
-            .join(&panel.prompt);
-        let text = std::fs::read_to_string(&path)
-            .map_err(|error| format!("cannot read panel prompt {}: {error}", path.display()))?;
-        Ok(format!("{PANEL_REVIEWER_INSTRUCTION}\n\n{text}"))
     }
 
     /// Spawns one reviewer in the run worktree, holding a credential that
@@ -2111,10 +2057,7 @@ pub(super) fn shared_checkout_has_git_operation(root: &Path) -> Result<bool, Str
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        FailureContext, FlowHalt, StagePhase, StageRecord, failure_reason, flow_with_implicit_test,
-        previous_attempt_block,
-    };
+    use super::{FlowHalt, StagePhase, StageRecord, failure_reason, flow_with_implicit_test};
     use crate::flow::{Actor, Flow, Stage};
 
     fn flow(names: &[&str]) -> Flow {
@@ -2202,54 +2145,6 @@ mod tests {
         assert_eq!(
             failure_reason(&resolved(None, None)),
             "the process was killed before it exited"
-        );
-    }
-
-    /// The block is delimited on both sides because everything between the
-    /// markers is untrusted process output.
-    #[test]
-    fn the_previous_attempt_block_names_the_failure_and_fences_its_output() {
-        let block = previous_attempt_block(&FailureContext {
-            stage: "test".into(),
-            attempt: 2,
-            reason: "exit 101".into(),
-            output: "assertion failed\n  left: 1".into(),
-        });
-
-        assert_eq!(
-            block,
-            concat!(
-                "--- previous attempt failed ---\n",
-                "Stage `test` (attempt 2) failed: exit 101\n",
-                "You are running again to address that failure.\n",
-                "\n",
-                "The last 100 lines of that stage's output:\n",
-                "assertion failed\n",
-                "  left: 1\n",
-                "--- end previous attempt ---",
-            )
-        );
-    }
-
-    /// A stage that failed silently still explains itself; an empty output
-    /// section would only be noise.
-    #[test]
-    fn the_previous_attempt_block_omits_an_empty_output_section() {
-        let block = previous_attempt_block(&FailureContext {
-            stage: "review".into(),
-            attempt: 1,
-            reason: "no verdict reported".into(),
-            output: String::new(),
-        });
-
-        assert_eq!(
-            block,
-            concat!(
-                "--- previous attempt failed ---\n",
-                "Stage `review` (attempt 1) failed: no verdict reported\n",
-                "You are running again to address that failure.\n",
-                "--- end previous attempt ---",
-            )
         );
     }
 }

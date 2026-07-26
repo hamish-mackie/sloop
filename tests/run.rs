@@ -204,7 +204,7 @@ fn agent_receives_composed_prompt_and_sloop_binary_environment() {
     let worktree = world.run_worktree(1);
 
     let prompt = fs::read_to_string(worktree.join("prompt.txt")).unwrap();
-    let bootstrap = include_str!("../src/worker-instructions.md").trim_ascii();
+    let bootstrap = include_str!("../src/worker/instructions.md").trim_ascii();
     assert_eq!(
         prompt,
         format!("{bootstrap}\n\nFollow the repository's launch-time instructions.\n")
