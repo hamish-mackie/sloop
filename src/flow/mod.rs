@@ -54,9 +54,9 @@ pub struct Stage {
     /// as `{ builtin: merge, ff_only: true }`. It is refused on every other
     /// action, so a `true` here always describes a merge stage.
     ///
-    /// It rides on the stage rather than inside `Actor` so that a snapshot
-    /// written before the option existed still reads: `Builtin::Merge` keeps
-    /// its wire shape, and an absent key is the old behaviour exactly.
+    /// It rides on the stage rather than inside `Actor`, keeping
+    /// `Builtin::Merge`'s unit wire shape: an absent key is simply the mode
+    /// switched off, in the flow file and in the snapshot alike.
     #[serde(default, skip_serializing_if = "is_false")]
     pub ff_only: bool,
 }

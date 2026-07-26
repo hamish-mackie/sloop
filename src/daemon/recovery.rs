@@ -645,6 +645,11 @@ async fn park_unresumable_run(
                 "unresumable_run_park_failed",
                 json!({"run_id": run.id, "error": store_error.to_string()}),
             );
+            // The run stays `active` — the lease holds its capacity until a
+            // park actually lands — but it must leave `recovering`, or the
+            // liveness pass skips it forever and a transient storage error
+            // strands the run instead of retrying the park.
+            state.recovering.remove(&run.id);
             return;
         }
     };
