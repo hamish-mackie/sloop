@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::Duration;
 
-use support::{World, process_alive, revert_trigger_rename, wait_until};
+use support::{World, process_alive, revert_trigger_rename, wait_until, wait_until_slow};
 
 /// Writes a scripted fake agent and a repository config pointing at it, with
 /// an optional flow test command. The agent script is committed before
@@ -2511,7 +2511,10 @@ fn a_two_agent_flow_supervises_both_stages_with_separate_worker_tokens() {
     world.start_daemon();
     post_and_run(&world, "two-agents.md");
 
-    wait_until("the two-agent flow merges", || {
+    // Two agent stages spawn a process each before the merge runs, so this waits
+    // on more real work than the 10-second probe is meant for; a loaded macOS
+    // runner overran it.
+    wait_until_slow("the two-agent flow merges", || {
         tickets(&world)["merged"] == 1
     });
     assert!(default_branch_has(&world, "work.txt"));
