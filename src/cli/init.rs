@@ -219,7 +219,7 @@ mod tests {
             flow.stages[3].fail_action,
             crate::flow::FailAction::ReturnTo {
                 stage: "sync".into(),
-                attempts: 3,
+                attempts: 10,
             }
         );
         assert_eq!(flow.stages[3].result_check, crate::flow::Check::None);

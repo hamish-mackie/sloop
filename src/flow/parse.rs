@@ -854,13 +854,13 @@ mod tests {
 
     #[test]
     fn return_to_rejects_out_of_range_attempts() {
-        for attempts in ["0", "4"] {
+        for attempts in ["0", "11"] {
             let error = error(&format!(
                 "- {{ name: build, action: agent }}\n- {{ name: test, action: {{ exec: ['true'] }}, fail_action: {{ return_to: build, attempts: {attempts} }} }}\n",
             ));
             assert!(error.contains("stage `test`"), "{error}");
             assert!(
-                error.contains("return_to attempts must be between 1 and 3"),
+                error.contains("return_to attempts must be between 1 and 10"),
                 "{error}"
             );
         }
@@ -875,15 +875,15 @@ mod tests {
             ));
         }
         yaml.push_str(
-            "- { name: last, action: { exec: ['true'] }, fail_action: { return_to: build, attempts: 3 } }\n",
+            "- { name: last, action: { exec: ['true'] }, fail_action: { return_to: build, attempts: 10 } }\n",
         );
 
         let error = error(&yaml);
         assert!(
-            error.contains("at most 32 stages in the worst case"),
+            error.contains("at most 48 stages in the worst case"),
             "{error}"
         );
-        assert!(error.contains("imply 40"), "{error}");
+        assert!(error.contains("imply 110"), "{error}");
     }
 
     #[test]

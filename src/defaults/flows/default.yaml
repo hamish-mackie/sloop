@@ -25,5 +25,12 @@ stages:
         - "Read .agents/sloop/prompts/review.md and follow its instructions."
   - name: merge
     # The merge builtin's own outcome is its verdict, so it takes no check.
+    #
+    # This stage order needs no rearranging: without `ff_only` the merge
+    # never loses to a default branch that moved mid-run — it just lands a
+    # merge commit. The trade is that the merged tree is one no stage
+    # tested. If you restructure this flow you take that gap on yourself;
+    # the `train` flow already closes it with sync, verify, and an
+    # `ff_only` merge, so prefer `flow: train` over rebuilding it here.
     action: { builtin: merge }
     result_check: none

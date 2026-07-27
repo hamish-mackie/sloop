@@ -46,8 +46,8 @@
 #   - `ff_only` is only meaningful on the merge stage, and writing it on any
 #     other action is an error rather than an ignored key.
 #   - Stage names must be unique.
-#   - `return_to` must name an earlier stage, `attempts` must be 1..=3, and
-#     the worst case a flow's budgets imply may not exceed 32 executions.
+#   - `return_to` must name an earlier stage, `attempts` must be 1..=10, and
+#     the worst case a flow's budgets imply may not exceed 48 executions.
 #     Panel reviewers are spawns and count towards that budget.
 stages:
   # ---- an agent action -------------------------------------------------

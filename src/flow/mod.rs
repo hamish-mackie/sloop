@@ -66,12 +66,12 @@ fn is_false(value: &bool) -> bool {
 }
 
 /// The inclusive upper bound on a `return_to` edge's attempt budget.
-pub const MAX_RETURN_ATTEMPTS: u32 = 3;
+pub const MAX_RETURN_ATTEMPTS: u32 = 10;
 
 /// The worst-case number of stage executions a flow may imply once every
 /// `return_to` budget is spent. A flow that could exceed it is rejected at
 /// parse time rather than discovered at runtime.
-pub const MAX_FLOW_EXECUTIONS: u64 = 32;
+pub const MAX_FLOW_EXECUTIONS: u64 = 48;
 
 /// Something that can be run within a stage. The same vocabulary serves
 /// both positions: an `Actor` is either the stage's action or the

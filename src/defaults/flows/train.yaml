@@ -45,7 +45,12 @@ stages:
   # merge is the one irreversible act in the flow, and nothing that runs
   # after it could un-take it, so its own outcome is the only verdict it
   # can honestly carry.
+  #
+  # The attempts budget is generous because a lost race is cheap: a lap
+  # re-runs only `sync` and `verify` — git and the test command, never an
+  # agent — so riding out a burst of simultaneous finishers costs no
+  # model spawns.
   - name: merge
     action: { builtin: merge, ff_only: true }
     result_check: none
-    fail_action: { return_to: sync, attempts: 3 }
+    fail_action: { return_to: sync, attempts: 10 }

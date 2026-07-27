@@ -361,11 +361,11 @@ stages:
 `return_to` must name an *earlier* stage: edges only ever point backwards, so a
 flow can neither skip forward past work nor loop forever.
 
-**Attempt budgets.** `attempts` defaults to 1 and may not exceed 3. Each edge's
+**Attempt budgets.** `attempts` defaults to 1 and may not exceed 10. Each edge's
 budget is counted per run: the third failing `test` above finds its budget spent
 and halts. Beyond the per-edge budget there is a whole-flow cap — Sloop
 multiplies each edge's budget by the length of the span it re-runs and refuses
-at parse time any flow whose worst case could exceed **32 stage executions**.
+at parse time any flow whose worst case could exceed **48 stage executions**.
 Panel seats count towards that cap, since each is a spawn. A flow that could run
 away is rejected when it is written, not discovered when it is running.
 
@@ -413,7 +413,7 @@ stages:
   - name: merge
     action: { builtin: merge, ff_only: true }
     result_check: none
-    fail_action: { return_to: sync, attempts: 3 }
+    fail_action: { return_to: sync, attempts: 10 }
 ```
 
 The problem it solves is that what lands on the default branch is not the run
@@ -428,11 +428,14 @@ produces, and `ff_only` makes the merge a fast-forward — which can only succee
 while the default branch is still the commit `sync` integrated. If it moved in
 between, the fast-forward is impossible, the merge fails without touching
 anything, and `return_to: sync` runs the train around again. Each lap is one
-more chance to converge, and `attempts: 3` bounds how many the train gets before
-the ticket parks for a human. Note where the two edges point: a failing `sync`
-or `verify` goes back to `build`, because something about the work needs
-changing, while a failed fast-forward goes back to `sync`, because nothing about
-the work was wrong — only what it was sitting on.
+more chance to converge, and `attempts: 10` bounds how many the train gets
+before the ticket parks for a human. The budget is generous because a lost race
+is cheap: a lap re-runs only `sync` and `verify` — git and the test command,
+never an agent — so even a burst of runs finishing together converges without
+spending model time. Note where the two edges point: a failing `sync` or
+`verify` goes back to `build`, because something about the work needs changing,
+while a failed fast-forward goes back to `sync`, because nothing about the work
+was wrong — only what it was sitting on.
 
 Two details are load-bearing rather than stylistic.
 

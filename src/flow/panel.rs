@@ -402,7 +402,7 @@ mod tests {
     fn panel_seats_count_towards_the_worst_case_execution_budget() {
         let flow = |seats: &str| {
             format!(
-                "- name: build\n  action: agent\n  result_check:\n    panel:\n      prompt: prompts/review.md\n      reviewers: {seats}\n- {{ name: lint, action: {{ exec: ['true'] }} }}\n- {{ name: audit, action: {{ exec: ['true'] }} }}\n- {{ name: test, action: {{ exec: ['true'] }}, fail_action: {{ return_to: build, attempts: 3 }} }}\n",
+                "- name: build\n  action: agent\n  result_check:\n    panel:\n      prompt: prompts/review.md\n      reviewers: {seats}\n- {{ name: lint, action: {{ exec: ['true'] }} }}\n- {{ name: audit, action: {{ exec: ['true'] }} }}\n- {{ name: test, action: {{ exec: ['true'] }}, fail_action: {{ return_to: build, attempts: 5 }} }}\n",
             )
         };
 
@@ -413,10 +413,10 @@ mod tests {
             "[{target: a}, {target: b}, {target: c}, {target: d}, {target: e}]",
         ));
         assert!(
-            error.contains("at most 32 stages in the worst case"),
+            error.contains("at most 48 stages in the worst case"),
             "{error}"
         );
-        assert!(error.contains("imply 36"), "{error}");
+        assert!(error.contains("imply 54"), "{error}");
     }
 
     /// The whole aggregation, enumerated. Three states per seat — `Pass`,

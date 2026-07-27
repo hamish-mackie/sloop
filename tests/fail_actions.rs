@@ -576,7 +576,7 @@ fn a_flow_whose_return_budgets_exceed_the_cap_is_rejected_at_post_time() {
         ));
     }
     flow.push_str(
-        "- { name: last, action: { exec: ['true'] }, fail_action: { return_to: build, attempts: 3 } }\n",
+        "- { name: last, action: { exec: ['true'] }, fail_action: { return_to: build, attempts: 10 } }\n",
     );
     configure(&world, &flow, &script);
     world.commit_all("initial");
@@ -584,8 +584,8 @@ fn a_flow_whose_return_budgets_exceed_the_cap_is_rejected_at_post_time() {
     let output = world.sloop(&["daemon"]);
     let message = World::json_stdout_or_stderr(&output).to_string();
     assert!(!output.status.success(), "{message}");
-    assert!(message.contains("at most 32 stages"), "{message}");
-    assert!(message.contains("imply 40"), "{message}");
+    assert!(message.contains("at most 48 stages"), "{message}");
+    assert!(message.contains("imply 110"), "{message}");
 }
 
 /// The advisory and looping forms are usable through the shipped template's
