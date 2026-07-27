@@ -437,6 +437,19 @@ spending model time. Note where the two edges point: a failing `sync` or
 while a failed fast-forward goes back to `sync`, because nothing about the work
 was wrong — only what it was sitting on.
 
+**Stage order prices the laps.** A backward edge re-runs only the span from its
+target through the stage that owns it, so `return_to: sync` never touches a
+stage ordered before `sync`. That makes the boundary between "before the loop"
+and "inside it" the train's cost lever: a review panel placed before `sync` is
+judged once no matter how many laps a contested merge takes, while the same
+panel between `sync` and `merge` re-spawns every reviewer on every lap. Put
+judgment stages — reviews, panels — before `sync`, and leave the loop to the
+cheap mechanical pair of git and the test command. The trade is real but
+usually right: a reviewer before `sync` sees the pre-merge tree rather than the
+exact one that lands, and `verify` still gates the merged tree. Reserve a place
+inside the loop for a check that must judge the landing tree itself, and budget
+for it re-running.
+
 Two details are load-bearing rather than stylistic.
 
 **Verification precedes the irreversible step.** The merge is the one act in a

@@ -21,6 +21,26 @@ stages:
     result_check: { builtin: commits }
     fail_action: fail
 
+  # To review work before it lands, add a stage like the `default` flow's
+  # review here — *before* `sync`, not between `sync` and `merge`. A failed
+  # fast-forward re-runs only the span from `sync` through `merge`, so a
+  # stage in this position is judged once however many laps the train
+  # takes, while one inside the loop re-runs — and re-spawns its model —
+  # every lap. The trade is that a reviewer here sees the pre-merge tree;
+  # `verify` still gates the merged one. Only a check that must judge the
+  # exact landing tree belongs inside the loop, priced accordingly.
+  #
+  # - name: review
+  #   action:
+  #     exec:
+  #       - claude
+  #       - --print
+  #       - --allowedTools
+  #       - Bash
+  #       - --
+  #       - "Read .agents/sloop/prompts/review.md and follow its instructions."
+  #   result_check: reported
+
   # Merges the default branch into the run branch, inside the run worktree.
   # Passes when that commits cleanly or there was nothing to integrate;
   # fails on a conflict, leaving no in-progress merge behind, so the stage
