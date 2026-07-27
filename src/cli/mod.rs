@@ -116,9 +116,9 @@ pub enum Command {
     /// nothing is written. Redirect it where you want the file, for example
     /// `sloop template ticket > .agents/sloop/tickets/my-ticket.md`.
     Template {
-        /// The file kind to print.
+        /// The file kind to print; omit it to list the kinds.
         #[arg(value_name = "KIND")]
-        kind: TemplateKind,
+        kind: Option<TemplateKind>,
     },
     /// Ensure the daemon is running.
     Daemon(DaemonCliArgs),
@@ -893,7 +893,28 @@ fn write_plain_or(
 /// daemon — unlike `stop`, it never contacts one at all, because the answer
 /// is static content baked into the binary. Plain mode writes the template
 /// verbatim so it can be redirected straight into a file.
-fn run_template(kind: TemplateKind, mode: OutputMode, stdout: &mut impl Write) -> ExitCode {
+///
+/// Without a kind it prints the subcommand's long help instead, whose
+/// possible-values list is where each kind's one-line purpose lives; the
+/// help goes to stdout as a success because asking for the list is a
+/// question, not a mistake.
+fn run_template(kind: Option<TemplateKind>, mode: OutputMode, stdout: &mut impl Write) -> ExitCode {
+    let Some(kind) = kind else {
+        let mut root = Cli::command().bin_name("sloop");
+        root.build();
+        let help = root
+            .find_subcommand_mut("template")
+            .expect("the template subcommand is statically defined")
+            .render_long_help()
+            .to_string();
+        let help = help.trim_end();
+        return write_plain_or(
+            mode,
+            stdout,
+            help,
+            &ResponseEnvelope::success(None, json!({"kind": "help", "text": help})),
+        );
+    };
     let text = kind.text();
     match mode {
         OutputMode::Json => write_response(
@@ -1892,6 +1913,18 @@ mod tests {
                 .expect("kind is accepted")
                 .text();
             assert_eq!(printed, expected, "`sloop template {kind}` was rewritten");
+        }
+    }
+
+    /// Asking for the list is a question, not a mistake: the bare verb
+    /// answers on stdout with a success, and the answer names every kind
+    /// with its purpose rather than demanding an argument.
+    #[test]
+    fn a_bare_template_lists_every_kind_and_succeeds() {
+        let printed = stdout_of(&["template"]);
+        assert!(printed.contains("Usage: sloop template"), "{printed}");
+        for kind in ["ticket:", "flow:", "project:", "config:"] {
+            assert!(printed.contains(kind), "missing {kind} in: {printed}");
         }
     }
 

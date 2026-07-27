@@ -25,9 +25,13 @@ const CONFIG: &str = include_str!("templates/config.yaml");
 /// the accepted values, so an unknown kind fails with the valid list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum TemplateKind {
+    /// A work item: frontmatter fields plus the prompt the agent runs with
     Ticket,
+    /// A stage list a run walks: actions, checks, and failure edges
     Flow,
+    /// A ticket group and scheduling scope with its own description
     Project,
+    /// The repository's `.agents/sloop/config.yaml`: targets, gates, limits
     Config,
 }
 
