@@ -366,6 +366,7 @@ pub async fn handle(
             return Err(PostError::UnknownBlockedBy {
                 ticket: ticket_id.clone(),
                 blocker: blocker.clone(),
+                named: work_state.ticket_by_name(blocker)?.map(|ticket| ticket.id),
             });
         }
     }
@@ -389,12 +390,14 @@ pub async fn handle(
             })?
         }
     };
-    let final_content = frontmatter::stamp(&content, &ticket_id, &project, &worktree, &flow_name)
-        .map_err(|error| PostError::InvalidTicket {
+    let stamp = frontmatter::stamp(&content, &ticket_id, &project, &worktree, &flow_name).map_err(
+        |error| PostError::InvalidTicket {
             path: relative_str.clone(),
             error,
-        })?
-        .unwrap_or_else(|| content.clone());
+        },
+    )?;
+    let file_rewritten = stamp.is_some();
+    let final_content = stamp.unwrap_or_else(|| content.clone());
     let terminal_state = existing
         .as_ref()
         .map(|ticket| ticket.state.clone())
@@ -486,6 +489,7 @@ pub async fn handle(
             "flow": ticket.flow,
         },
         "created": created,
+        "file_rewritten": file_rewritten,
         "trigger": trigger,
         "trigger_suppressed": terminal_state.map(|state| json!({
             "reason": "terminal_ticket",
@@ -748,6 +752,10 @@ pub enum PostError {
     UnknownBlockedBy {
         ticket: String,
         blocker: String,
+        /// The id of a ticket whose *name* matches the unknown blocker, when
+        /// one exists: the likeliest authoring mistake is naming a ticket
+        /// where its stamped id belongs, and the error can say so.
+        named: Option<String>,
     },
     DependencyCycle(Vec<String>),
     UnknownProject(String),
@@ -821,10 +829,23 @@ impl fmt::Display for PostError {
             Self::InvalidWorktreeStem { path, reason } => {
                 write!(formatter, "{path}: {reason}")
             }
-            Self::UnknownBlockedBy { ticket, blocker } => write!(
-                formatter,
-                "ticket `{ticket}` field `blocked_by` references unknown ticket `{blocker}`"
-            ),
+            Self::UnknownBlockedBy {
+                ticket,
+                blocker,
+                named,
+            } => {
+                write!(
+                    formatter,
+                    "ticket `{ticket}` field `blocked_by` references unknown ticket `{blocker}`"
+                )?;
+                if let Some(id) = named {
+                    write!(
+                        formatter,
+                        "; a ticket named `{blocker}` has id `{id}`, and `blocked_by` takes ids"
+                    )?;
+                }
+                Ok(())
+            }
             Self::DependencyCycle(chain) => write!(
                 formatter,
                 "field `blocked_by` creates a dependency cycle: {}",

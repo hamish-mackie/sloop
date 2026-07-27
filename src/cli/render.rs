@@ -111,6 +111,12 @@ fn render_post(data: &Value) -> String {
         ticket["project"].as_str().unwrap_or("?"),
         ticket["state"].as_str().unwrap_or("?"),
     );
+    if data["file_rewritten"] == Value::Bool(true) {
+        let _ = writeln!(
+            text,
+            "the post stamped the file's frontmatter; commit it — `sloop reindex` reads only committed files"
+        );
+    }
     if let Some(state) = data["trigger_suppressed"]["state"].as_str() {
         let _ = write!(text, "no trigger queued: {id} is {state}");
         if state == "failed" {

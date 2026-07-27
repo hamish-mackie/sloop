@@ -216,6 +216,64 @@ fn post_rejects_unknown_blocked_by_reference() {
     assert!(message.contains("TICK-99"), "{message}");
 }
 
+/// The likeliest way to write an unknown blocker is to name a ticket where
+/// its stamped id belongs, so the rejection looks the name up and answers
+/// with the id instead of leaving the operator to guess.
+#[test]
+fn an_unknown_blocker_matching_a_ticket_name_suggests_its_id() {
+    let world = World::configured();
+    world.start_daemon();
+    let first = raw_ticket(
+        &world,
+        "first.md",
+        "---\nname: game-state\nblocked_by: []\n---\nfirst body\n",
+    );
+    assert!(
+        world
+            .sloop(&["post", first.to_str().unwrap(), "--manual"])
+            .status
+            .success()
+    );
+    let second = raw_ticket(
+        &world,
+        "second.md",
+        "---\nname: Integration\nblocked_by: [game-state]\n---\nsecond body\n",
+    );
+
+    let error = post_error(&world, &second);
+    assert_eq!(error["error"]["code"], "not_found");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("a ticket named `game-state` has id `TICK-1`"),
+        "{message}"
+    );
+    assert!(message.contains("`blocked_by` takes ids"), "{message}");
+}
+
+/// `post` rewrites the file it registers, and an uncommitted stamp is lost
+/// to the next reindex — so the human output says to commit exactly when
+/// the file changed, and stays quiet on an idempotent repost.
+#[test]
+fn post_reminds_to_commit_only_when_it_rewrote_the_file() {
+    let world = World::configured();
+    world.start_daemon();
+    let ticket = raw_ticket(
+        &world,
+        "stamp-me.md",
+        "---\nname: Stamp me\nblocked_by: []\n---\nbody\n",
+    );
+
+    let first = world.sloop_plain(&["post", ticket.to_str().unwrap(), "--manual"]);
+    assert!(first.status.success());
+    let text = String::from_utf8_lossy(&first.stdout).to_string();
+    assert!(text.contains("commit it"), "{text}");
+
+    let second = world.sloop_plain(&["post", ticket.to_str().unwrap(), "--manual"]);
+    assert!(second.status.success());
+    let text = String::from_utf8_lossy(&second.stdout).to_string();
+    assert!(!text.contains("commit it"), "{text}");
+}
+
 #[test]
 fn repost_rejects_a_dependency_cycle_and_keeps_the_previous_edges() {
     let world = World::configured();
