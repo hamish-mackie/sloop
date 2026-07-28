@@ -147,7 +147,10 @@ Enqueue a run. Naming a ticket or a project says *which* work, not
 *whether* the gates apply:
 
 - With a ticket — run exactly that ticket. Held or blocked tickets are
-  rejected until released.
+  rejected until released. `merged` and `needs_review` tickets are refused
+  outright: dispatch only ever selects a `ready` ticket, neither state has a
+  path back there, and `post` already refuses to queue on them for the same
+  reason.
 - With `--project` — select only from that project's ready tickets.
 - With neither — select from all ready work.
 - `--only T1,T2` — restrict selection to the listed ticket IDs.
@@ -499,7 +502,8 @@ restores merged and review-needed states. Runtime history is preserved for
 tickets that still exist, while rows belonging to removed tickets are dropped.
 If SQLite was deleted, tickets without Git evidence return as ready; holds,
 notes, attempts, and other runtime-only history cannot be recovered. The daemon
-must be idle before reindexing.
+must be idle before reindexing; `--wait` polls until it is instead of failing
+on active runs, giving up after `--timeout` seconds (default 3600).
 
 A `needs_review` ticket whose preserved run branch an operator merges into the
 default branch by hand no longer needs a reindex: the running daemon settles it

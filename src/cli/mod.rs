@@ -210,7 +210,14 @@ pub enum Command {
     },
     /// Rebuild local state from committed files and Git.
     #[command(hide = true)]
-    Reindex,
+    Reindex {
+        /// Poll until the daemon is idle instead of failing on active runs.
+        #[arg(long)]
+        wait: bool,
+        /// Give up waiting after this many seconds.
+        #[arg(long, default_value_t = 3600, requires = "wait")]
+        timeout: u64,
+    },
     /// Show the current worker's assignment.
     #[command(hide = true)]
     Brief,
@@ -453,7 +460,7 @@ impl TryFrom<Command> for Request {
                 scope: r#ref,
             }),
             Command::Wait { run, .. } => Self::Wait(RunReferenceArgs { run }),
-            Command::Reindex => Self::Reindex(empty()),
+            Command::Reindex { .. } => Self::Reindex(empty()),
             Command::Brief => Self::Brief(empty()),
             Command::Show(args) => Self::Show(ShowArgs {
                 reference: args.reference,
@@ -880,11 +887,11 @@ fn run_command(
         | Command::Ready { .. }
         | Command::Pause
         | Command::Resume
-        | Command::Cancel { .. }
-        | Command::Reindex) => match Request::try_from(command) {
+        | Command::Cancel { .. }) => match Request::try_from(command) {
             Ok(request) => run_daemon_request(request, false, mode, stdout, stderr),
             Err(error) => write_cli_error(mode, stderr, error.to_string()),
         },
+        Command::Reindex { wait, timeout } => run_reindex(wait, timeout, mode, stdout, stderr),
         command @ (Command::Brief | Command::Note { .. } | Command::Verdict { .. }) => {
             match Request::try_from(command) {
                 Ok(request) => run_worker_request(request, mode, stdout, stderr),
@@ -1072,6 +1079,75 @@ fn run_show(
 /// Polls the daemon until the run is terminal. The exit code is the outcome
 /// (`0` only for `merged`), so scripts and CI can gate on a run directly.
 /// Client-side wall-clock polling; the daemon stays stateless.
+/// Client-side polling, same as `wait`: the daemon stays stateless and only
+/// ever answers "not while runs are active", so idleness is observed by
+/// retrying rather than by a daemon-held queue.
+fn run_reindex(
+    wait: bool,
+    timeout_secs: u64,
+    mode: OutputMode,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> ExitCode {
+    let attempt = || crate::daemon::request(Request::Reindex(EmptyArgs::default()));
+    let busy = |response: &ResponseEnvelope| {
+        !response.ok
+            && response
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == ErrorCode::Conflict)
+    };
+    if !wait {
+        return run_daemon_request(
+            Request::Reindex(EmptyArgs::default()),
+            false,
+            mode,
+            stdout,
+            stderr,
+        );
+    }
+    // Only the active-runs conflict is retried; any other failure is final
+    // and reported exactly as the non-wait path would. On timeout the
+    // daemon's own last answer is what gets written out — it names the runs
+    // still in the way, which is more useful than a bare "gave up".
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        match attempt() {
+            Ok(result) if result.response.ok => {
+                return write_response(
+                    mode,
+                    Some("reindex"),
+                    stdout,
+                    &result.response,
+                    ExitCode::SUCCESS,
+                );
+            }
+            Ok(result) => {
+                if busy(&result.response) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    continue;
+                }
+                return write_response(
+                    mode,
+                    Some("reindex"),
+                    stderr,
+                    &result.response,
+                    ExitCode::FAILURE,
+                );
+            }
+            Err(error) => {
+                return write_response(
+                    mode,
+                    Some("reindex"),
+                    stderr,
+                    &ResponseEnvelope::failure(None, error.error_body()),
+                    ExitCode::FAILURE,
+                );
+            }
+        }
+    }
+}
+
 fn run_wait(
     run: String,
     timeout_secs: u64,

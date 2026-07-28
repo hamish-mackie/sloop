@@ -639,6 +639,51 @@ fn reindex_is_rejected_while_an_agent_is_active() {
 }
 
 #[test]
+fn reindex_wait_polls_until_the_daemon_is_idle() {
+    let world = World::configured();
+    world.configure_fake_agent(
+        FakeAgent::new()
+            .block_until_released("waited")
+            .commit("released work")
+            .exit(0),
+    );
+    write_ticket(
+        &world,
+        "waited.md",
+        "id: T1\nproject: default\nname: Waited\nblocked_by: []\n",
+        "# Stay active",
+    );
+    world.commit_all("waited ticket");
+    world.start_daemon();
+    post_manual(&world, "waited.md");
+    assert!(world.sloop(&["run", "T1"]).status.success());
+    wait_until("the fake agent is active", || {
+        world.fake_agent_reached("waited")
+    });
+
+    // The daemon is provably busy: a plain reindex still conflicts.
+    let refused = world.sloop(&["reindex"]);
+    assert!(!refused.status.success());
+    assert_eq!(
+        World::json_stdout_or_stderr(&refused)["error"]["code"],
+        "conflict"
+    );
+
+    // `--wait` keeps polling through that conflict and succeeds once the
+    // released agent finishes and the daemon goes idle.
+    let waiting = world.spawn_sloop(&["reindex", "--wait"]);
+    world.release("waited");
+    let output = waiting.wait_with_output().expect("waiting reindex exits");
+    assert!(
+        output.status.success(),
+        "reindex --wait failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).expect("stdout is JSON");
+    assert_eq!(response["ok"], true);
+}
+
+#[test]
 fn reindex_preserves_project_scoped_run_history_when_a_ticket_moves() {
     let world = World::configured();
     world.configure_fake_agent(
