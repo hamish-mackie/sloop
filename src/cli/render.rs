@@ -2049,8 +2049,10 @@ mod tests {
     /// names the gate and counts what is waiting behind it.
     #[test]
     fn closed_hours_report_the_opening_and_the_waiting_posts() {
+        // The extra half second absorbs the wall-clock ticks between this
+        // read and the renderer's own, keeping the truncation stable.
         let deadline =
-            crate::clock::format_timestamp(super::now_ms() + 35_280_000).expect("rfc3339");
+            crate::clock::format_timestamp(super::now_ms() + 35_280_500).expect("rfc3339");
         let response = ResponseEnvelope::success(
             None,
             json!({
@@ -2074,8 +2076,10 @@ mod tests {
     /// "the weekly post is a week out" reads as configured, not stalled.
     #[test]
     fn a_scheduled_post_names_its_ticket() {
+        // The extra half second absorbs the wall-clock ticks between this
+        // read and the renderer's own, keeping the truncation stable.
         let deadline =
-            crate::clock::format_timestamp(super::now_ms() + 601_200_000).expect("rfc3339");
+            crate::clock::format_timestamp(super::now_ms() + 601_200_500).expect("rfc3339");
         let response = ResponseEnvelope::success(
             None,
             json!({
