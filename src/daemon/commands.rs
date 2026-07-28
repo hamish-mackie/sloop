@@ -593,6 +593,20 @@ pub(super) fn handle_run(
                 "ticket `{ticket_id}` is held; release it with `sloop ready {ticket_id}`"
             )));
         }
+        // A pinned trigger only fires on a `ready` ticket, and neither of
+        // these states has a path back there — accepting one would queue
+        // demand that can never be met.
+        if ticket.state == TicketState::Merged.as_str() {
+            return Err(conflict(&format!(
+                "ticket `{ticket_id}` is merged; post a new ticket for follow-up work"
+            )));
+        }
+        if ticket.state == TicketState::NeedsReview.as_str() {
+            return Err(conflict(&format!(
+                "ticket `{ticket_id}` is needs_review; resolve its preserved branch by hand — \
+                 merged into the default branch it settles to `merged` on its own"
+            )));
+        }
     }
     if let Some(project) = &args.project
         && !local_lookup(state, |work_state| work_state.project_exists(project))?
@@ -1281,7 +1295,7 @@ pub(super) fn handle_reindex(state: &mut DispatcherState) -> Result<serde_json::
     let active = active_run_aliases(state)?;
     if !active.is_empty() {
         return Err(conflict(&format!(
-            "{} active run(s): {}; reindex requires an idle daemon — wait for them to finish or cancel with `sloop cancel <run>`",
+            "{} active run(s): {}; reindex requires an idle daemon — retry with `sloop reindex --wait`, or cancel with `sloop cancel <run>`; an externally merged review branch settles on its own without reindex",
             active.len(),
             aliases_of(&active).join(", "),
         )));

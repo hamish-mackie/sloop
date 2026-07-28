@@ -504,15 +504,19 @@ fn a_ready_ticket_reports_its_own_missing_trigger() {
         String::from_utf8_lossy(&human.stdout)
     );
 
-    // The masking case. A merged ticket, pinned by a trigger that can
-    // never fire, leaves the queue non-empty; the global question answered
+    // The masking case. A blocked ticket, pinned by a trigger that cannot
+    // fire, leaves the queue non-empty; the global question answered
     // `true` for every ticket in the repository and reported no reason at all.
+    // (`run` now refuses a merged ticket outright, so a blocked one is the
+    // way to hold a never-firing trigger in the queue.)
     let merged = post_manual(&world, "merged-elsewhere.md", "# Merged elsewhere\n");
     assert!(world.sloop(&["run", &merged]).status.success());
     wait_until_slow("the other ticket merges", || {
         status(&world)["tickets"]["merged"] == 1
     });
-    assert!(world.sloop(&["run", &merged]).status.success());
+    let blocker = post_manual(&world, "mask-blocker.md", "# Mask blocker\n");
+    let blocked = post_manual_blocked(&world, "mask-dependent.md", &[blocker.as_str()]);
+    assert!(world.sloop(&["run", &blocked]).status.success());
     wait_until("the dead trigger settles in the queue", || {
         status(&world)["queued_triggers"].as_array().unwrap().len() == 1
     });
@@ -1674,6 +1678,66 @@ fn a_hand_merged_review_branch_settles_to_merged_and_releases_its_dependent() {
         .unwrap();
     assert_ne!(row["state"], "blocked");
     assert_eq!(external_merge_count(&world), 1);
+}
+
+/// A pinned trigger only ever fires on a `ready` ticket, and neither
+/// `needs_review` nor `merged` has a path back there — so `run` must refuse
+/// at enqueue time rather than accept demand that can never be met.
+#[test]
+fn run_refuses_tickets_whose_triggers_could_never_fire() {
+    let world = World::configured();
+    configure_review_agent(&world);
+    world.commit_all("initial");
+    world.start_daemon();
+
+    let ticket = post_manual(&world, "review-refuse.md", "# Review refuse\n");
+    assert!(world.sloop(&["run", &ticket]).status.success());
+    wait_until("the ticket halts at needs_review", || {
+        status(&world)["tickets"]["needs_review"] == 1
+    });
+
+    let rejected = world.sloop(&["run", &ticket]);
+    assert!(!rejected.status.success());
+    let error: serde_json::Value =
+        serde_json::from_slice(&rejected.stderr).expect("stderr is JSON");
+    assert_eq!(error["error"]["code"], "conflict");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("needs_review"), "{message}");
+
+    // An operator resolves the preserved branch by hand; the daemon settles
+    // the ticket to `merged` on its own, and `run` still refuses.
+    advance_default_branch(&world, "refuse-unrelated.txt");
+    let branch = format!("sloop/{ticket}-a1-{}", short_run_id(&world, 1));
+    let merged = git_root(
+        &world,
+        &[
+            "-c",
+            "user.name=operator",
+            "-c",
+            "user.email=operator@example.invalid",
+            "merge",
+            "--no-ff",
+            "-m",
+            "operator merges the run branch",
+            &branch,
+        ],
+    );
+    assert!(
+        merged.status.success(),
+        "hand merge failed: {}",
+        String::from_utf8_lossy(&merged.stderr)
+    );
+    wait_until_slow("the daemon reconciles the external merge", || {
+        status(&world)["tickets"]["merged"] == 1
+    });
+
+    let rejected = world.sloop(&["run", &ticket]);
+    assert!(!rejected.status.success());
+    let error: serde_json::Value =
+        serde_json::from_slice(&rejected.stderr).expect("stderr is JSON");
+    assert_eq!(error["error"]["code"], "conflict");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("merged"), "{message}");
 }
 
 #[test]
