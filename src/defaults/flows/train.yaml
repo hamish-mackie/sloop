@@ -45,7 +45,13 @@ stages:
   # Passes when that commits cleanly or there was nothing to integrate;
   # fails on a conflict, leaving no in-progress merge behind, so the stage
   # this returns to starts from a clean tree. The conflict itself lands in
-  # the run log, and so in the re-entered agent's prompt.
+  # the run log, and so in the re-entered agent's prompt — as a report,
+  # never as conflict markers in the tree. That means this edge recovers
+  # work that can be *reshaped* around what the default branch now holds;
+  # it cannot resolve a conflict in place, so two independently correct
+  # changes to the same lines usually conflict again, spend the budget,
+  # and park the ticket in `needs_review` for a human to resolve the
+  # preserved branch by hand.
   - name: sync
     action: { builtin: sync }
     result_check: none

@@ -155,7 +155,9 @@ stages:
   # the shared default-branch checkout is only ever read. Passes when the
   # merge commits or there was nothing to integrate, and fails on a
   # conflict — leaving no in-progress merge behind, so a `return_to` target
-  # would start from a clean tree. Any number, anywhere before the merge.
+  # would start from a clean tree: the conflict reaches the re-entered
+  # stage as a report in its prompt, never as markers it could resolve.
+  # Any number, anywhere before the merge.
   #
   # Placed here it is only half the pattern: stages *after* a sync judge the
   # tree that will actually land, so a sync belongs before them rather than

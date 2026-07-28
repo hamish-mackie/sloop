@@ -469,9 +469,16 @@ A sync that conflicts fails and aborts its own merge, so the stage it returns to
 gets a clean worktree rather than one wedged on `MERGE_HEAD`. Git's conflict
 output is captured in the run log like any stage's, so a re-entered agent is
 handed the conflicting paths in its prompt and can rework its commits to avoid
-them. The builtin never resolves a conflict itself and has no rebase mode; if
-you want a conflict resolved rather than avoided, route it to an agent stage
-with `return_to`.
+them. Be clear about what that edge can and cannot recover: the conflict
+arrives as a report, never as markers in the tree, so the agent can only
+*avoid* it by reshaping its work around what the default branch now holds —
+it is never put in front of a conflicted merge to resolve. That handles a
+build that went stale or wrong; when two independently correct changes touch
+the same lines, the rework usually reproduces the same conflict, the budget is
+spent, and the ticket parks in `needs_review`. From there the preserved run
+branch is resolved by hand and merged into the default branch externally,
+which the daemon notices on its own (see the ticket lifecycle in concepts.md).
+The builtin never resolves a conflict itself and has no rebase mode.
 
 If your repository sets `flow.test_cmd`, `sloop init` uses that command for the
 train's `verify` stage. Prefer naming it there rather than in `flow.test_cmd`
