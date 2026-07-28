@@ -184,8 +184,8 @@ fn documented_verbs_are_exposed_by_the_real_binary() {
     assert_eq!(response["data"]["kind"], "help");
     let help = response["data"]["text"].as_str().expect("help text");
     for verb in [
-        "init", "daemon", "post", "run", "retry", "hold", "ready", "list", "status", "pause",
-        "resume", "cancel", "logs", "reindex", "brief", "show", "note", "verdict",
+        "init", "daemon", "post", "run", "retry", "hold", "ready", "status", "pause", "resume",
+        "cancel", "logs", "reindex", "brief", "show", "note", "verdict",
     ] {
         assert!(help.contains(verb), "help did not contain {verb:?}");
     }
@@ -236,8 +236,7 @@ fn default_help_only_shows_common_commands() {
         );
     }
     for verb in [
-        "run", "retry", "pause", "cancel", "list", "status", "watch", "wait", "reindex", "brief",
-        "note",
+        "run", "retry", "pause", "cancel", "status", "watch", "wait", "reindex", "brief", "note",
     ] {
         assert!(
             !help.contains(&format!("  {verb}")),

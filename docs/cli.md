@@ -203,7 +203,7 @@ sloop show [REF_OR_PATTERN] [-N] [--follow] [--quiet]
 ```
 
 Without an argument, `sloop show` is a dashboard with daemon and gate
-state, ticket counts, the next wake time, active runs, everything waiting on a
+state, ticket counts, the next dispatch, active runs, everything waiting on a
 human, and the 10 newest tickets. Queue depth is not a line of its own: each
 recent ticket carries the scheduler's reason instead, so a ticket with no
 queued trigger says so where you are already looking. The `--json` payload does
@@ -212,7 +212,7 @@ recent tickets; `-n N` and `--limit N` are equivalent. A limit of zero or a
 non-numeric limit is a usage error.
 
 ```
-daemon: pid 3760 running - 1/2 agents active - next wake in 4m12s
+daemon: pid 3760 running - 1/2 agents active - dispatch in 4m12s (cooldown ends)
 tickets: 0 ready, 1 claimed, 1 needs_review, 77 merged
 
 runs:
@@ -229,8 +229,13 @@ recent:
 
 The count line prints a state only when its count is non-zero, except `ready`,
 which always appears because an empty queue is itself a signal; `merged` sits
-last. `next wake` is a countdown rather than an instant — the `--json` envelope
-keeps it as an RFC3339 timestamp. A run or stage that has not finished shows an
+last. `dispatch` says when the daemon will next start work and why — a
+countdown with its cause (`cooldown ends`, `hours open, 2 posts waiting`,
+`scheduled post <ticket>`), or `idle — new posts dispatch immediately` when
+nothing is time-gated. Only causes that start work appear; internal
+housekeeping such as worktree cleanup never counts down here. The `--json`
+envelope carries the instant as an RFC3339 timestamp under `dispatch.at`. A
+run or stage that has not finished shows an
 open span with the time elapsed so far, `19:51-... (9m0s)`; no end time is
 invented for it.
 
@@ -472,15 +477,18 @@ and `terminal`. The tail default is the CLI's own: on the socket, an omitted
 
 ### Deprecated read aliases
 
-`status`, `list`, `watch`, and `wait` remain accepted as hidden deprecated
-aliases. They do not appear in normal help, and each invocation, including
-`--json`, writes a note to stderr naming its replacement and warning that the
-alias will be removed in a future release:
+`status`, `watch`, and `wait` remain accepted as hidden aliases for the `show`
+surface. They do not appear in normal help and add no output of their own:
 
-- `status` and `list` name `sloop show` as the replacement. `list` keeps its
-  old all-ticket and limit behavior while the alias remains.
-- `watch` names `sloop show --follow`; its optional scope and tail still work.
-- `wait` names `sloop show --follow --quiet`; its run and timeout still work.
+- `status` behaves as a bare `sloop show`.
+- `watch` behaves as `sloop show --follow`; its optional scope and tail still
+  work.
+- `wait` behaves as `sloop show --follow --quiet`; its run and timeout still
+  work.
+
+`list` has been removed; `sloop show` with a pattern is its replacement, and
+typing `list` earns a tip pointing there. Typo suggestions always name the
+current verbs, never these aliases.
 
 ### sloop reindex
 

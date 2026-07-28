@@ -405,7 +405,7 @@ fn the_dashboard_lists_every_ticket_waiting_on_a_human() {
     // Piped output carries no escape sequences, whatever the palette says.
     assert!(!text.contains('\u{1b}'), "{text}");
     // And no raw UTC instant survives in the human dashboard.
-    assert!(!text.contains("next wake 2"), "{text}");
+    assert!(!text.contains("dispatch 2"), "{text}");
 }
 
 #[test]
@@ -499,16 +499,18 @@ fn bare_sloop_prints_help_and_patterns_filter_before_limiting() {
     let status_alias = world.sloop_plain(&["status"]);
     let status_new = world.sloop_plain(&["show"]);
     assert_eq!(status_alias.stdout, status_new.stdout);
-    assert_eq!(
-        String::from_utf8_lossy(&status_alias.stderr),
-        "note: 'sloop status' is now 'sloop show'; this alias will be removed in a future release\n"
+    assert!(
+        status_alias.stderr.is_empty(),
+        "the status alias should be silent: {}",
+        String::from_utf8_lossy(&status_alias.stderr)
     );
-    let list_alias = world.sloop_plain(&["list", "-2"]);
-    let list_new = world.sloop_plain(&["show", ".*", "-2"]);
-    assert_eq!(list_alias.stdout, list_new.stdout);
-    assert_eq!(
-        String::from_utf8_lossy(&list_alias.stderr),
-        "note: 'sloop list' is now 'sloop show'; this alias will be removed in a future release\n"
+    // `list` is gone; typing it earns a tip naming the current verb.
+    let removed = world.sloop_plain(&["list"]);
+    assert!(!removed.status.success());
+    let stderr = String::from_utf8_lossy(&removed.stderr);
+    assert!(
+        stderr.contains("did you mean `show`"),
+        "removed `list` should point at show: {stderr}"
     );
 
     // The exact ticket name wins even though the same text is regex-safe and
@@ -584,8 +586,9 @@ fn show_follow_streams_a_ticket_until_it_settles_and_quiet_is_silent() {
     assert_eq!(watch_alias.status.code(), watch_new.status.code());
     assert_eq!(watch_alias.stdout, watch_new.stdout);
     assert!(
+        watch_alias.stderr.is_empty(),
+        "the watch alias should be silent: {}",
         String::from_utf8_lossy(&watch_alias.stderr)
-            .starts_with("note: 'sloop watch' is now 'sloop show --follow'")
     );
 
     let wait_alias = world.sloop(&["wait", &ticket, "--timeout", "5"]);
@@ -593,7 +596,8 @@ fn show_follow_streams_a_ticket_until_it_settles_and_quiet_is_silent() {
     assert_eq!(wait_alias.status.code(), wait_new.status.code());
     assert_eq!(wait_alias.stdout, wait_new.stdout);
     assert!(
+        wait_alias.stderr.is_empty(),
+        "the wait alias should be silent: {}",
         String::from_utf8_lossy(&wait_alias.stderr)
-            .starts_with("note: 'sloop wait' is now 'sloop show --follow --quiet'")
     );
 }

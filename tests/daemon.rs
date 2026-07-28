@@ -112,8 +112,9 @@ fn status_uses_the_real_socket_and_dispatcher() {
 
     assert!(output.status.success());
     assert!(
+        output.stderr.is_empty(),
+        "the status alias should be silent: {}",
         String::from_utf8_lossy(&output.stderr)
-            .starts_with("note: 'sloop status' is now 'sloop show'")
     );
     let response = World::json_stdout(&output);
     assert!(response["id"].as_str().unwrap().starts_with("req-"));
@@ -154,7 +155,7 @@ fn operational_verbs_survive_an_invalid_flow_and_stop_the_daemon() {
 
     for args in [
         vec!["status"],
-        vec!["list"],
+        vec!["show", ".*"],
         vec!["logs", run.as_str()],
         vec!["pause"],
         vec!["resume"],

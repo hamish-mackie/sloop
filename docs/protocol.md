@@ -111,15 +111,22 @@ Patterns that fall out of the verbs:
 - **Build a dashboard or search tickets** — `show` takes optional `ref` and
   `limit` arguments. With neither, it returns the dashboard. The dashboard
   preserves the status fields (`daemon`, `gate`, `runs`,
-  `queued_triggers`, `tickets`, and optional `next_wake`) and adds
+  `queued_triggers`, `tickets`, and the optional `next_wake` and `dispatch`)
+  and adds
   `kind: "dashboard"`, `attention`, `recent`, `recent_total`, and
   `recent_limit`. `recent` is newest first; `recent_total` is the untruncated
   count and `recent_limit` is the requested limit or the default `10`.
   `attention` is every ticket currently in `needs_review` or `failed`, newest
   first, in the same row shape as `recent`. It is never truncated — `limit`
   applies to `recent` alone — and is `[]` when nothing is waiting. `next_wake`
-  is an RFC3339 timestamp here; only the human rendering shows it as a
-  countdown.
+  is an RFC3339 timestamp for the daemon's next internal timer, whatever its
+  purpose — including housekeeping such as worktree cleanup. `dispatch` is the
+  operator-facing subset: present only when timed *work* is pending, it
+  carries `at` (RFC3339), a `cause` of `"cooldown"`, `"running_hours"`, or
+  `"scheduled_trigger"`, plus `waiting` (posts held behind closed hours) or
+  `trigger` (the ticket or project the scheduled post selects) where the cause
+  has one. Absent `dispatch` means the daemon is idle and dispatches new posts
+  immediately; only the human rendering shows the instant as a countdown.
 
   With `ref`, the daemon first resolves exact ticket, run, ticket-name, and
   project reference forms. Exact references retain their existing detail
@@ -245,8 +252,9 @@ supports) rather than guessing at unknown versions.
 That rule applies to the optional `show.ref` and `show.limit` arguments and to
 the dashboard and match fields above: they are additive protocol-v1 changes.
 The existing status fields and top-level ticket rows keep their meanings.
-Existing v1 `status`, `list`, and `wait` requests remain accepted, although
-the CLI names are hidden deprecated aliases for the `show` surface.
+Existing v1 `status`, `list`, and `wait` requests remain accepted over the
+socket, although on the CLI `status` and `wait` are hidden aliases for the
+`show` surface and the `list` verb has been removed.
 
 `post`'s `created` and `trigger_suppressed` are additive in the same sense.
 `trigger` keeps its meaning; it was already null whenever no trigger was

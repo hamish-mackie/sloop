@@ -129,7 +129,7 @@ so does a ticket whose run failed and which `sloop retry` returned to `ready`.
 ## Watch it run
 
 ```sh
-sloop show                               # dashboard: running work, ticket counts, next wake
+sloop show                               # dashboard: running work, ticket counts, next dispatch
 sloop logs <run-id>                      # a run's captured output
 sloop show <run-id> --follow --quiet     # block until the run finishes; exit 0 only on merge
 ```

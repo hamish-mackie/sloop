@@ -383,7 +383,7 @@ fn list_explains_paused_failed_held_and_claimed_tickets() {
         .unwrap()
         .to_owned();
 
-    let output = world.sloop(&["list"]);
+    let output = world.sloop(&["show", ".*"]);
     assert!(
         output.status.success(),
         "list failed: {}",
@@ -415,7 +415,7 @@ fn list_explains_paused_failed_held_and_claimed_tickets() {
         format!("claimed by run {}", world.run_alias(2))
     );
 
-    let human = world.sloop_plain(&["list"]);
+    let human = world.sloop_plain(&["show", ".*"]);
     assert!(human.status.success());
     let human = String::from_utf8(human.stdout).unwrap();
     let human = human
@@ -589,21 +589,21 @@ fn list_orders_tickets_newest_first_and_honours_a_row_limit() {
     };
 
     assert_eq!(
-        listed_ids(&["list"]),
+        listed_ids(&["show", ".*"]),
         [third.clone(), second.clone(), first.clone()]
     );
     // Every spelling of the limit keeps the same newest-first prefix.
     for limited in [
-        listed_ids(&["list", "-2"]),
-        listed_ids(&["list", "--limit", "2"]),
-        listed_ids(&["list", "-n", "2"]),
+        listed_ids(&["show", ".*", "-2"]),
+        listed_ids(&["show", ".*", "--limit", "2"]),
+        listed_ids(&["show", ".*", "-n", "2"]),
     ] {
         assert_eq!(limited, [third.clone(), second.clone()]);
     }
-    assert_eq!(listed_ids(&["list", "-99"]).len(), 3);
+    assert_eq!(listed_ids(&["show", ".*", "-99"]).len(), 3);
 
     // Human output carries the same order and count as `--json`.
-    let human = world.sloop_plain(&["list", "-2"]);
+    let human = world.sloop_plain(&["show", ".*", "-2"]);
     assert!(human.status.success());
     let human = String::from_utf8(human.stdout).unwrap();
     let lines: Vec<&str> = human.lines().collect();
@@ -613,9 +613,9 @@ fn list_orders_tickets_newest_first_and_honours_a_row_limit() {
 
     // A zero or non-numeric limit is a usage error, not an empty list.
     for arguments in [
-        ["list", "-0"].as_slice(),
-        ["list", "-abc"].as_slice(),
-        ["list", "--limit", "abc"].as_slice(),
+        ["show", ".*", "-0"].as_slice(),
+        ["show", ".*", "-abc"].as_slice(),
+        ["show", ".*", "--limit", "abc"].as_slice(),
     ] {
         let output = world.sloop_plain(arguments);
         assert!(!output.status.success(), "{arguments:?} should have failed");
@@ -651,7 +651,7 @@ fn blocked_dependencies_are_reported_and_release_after_every_blocker_merges() {
     assert_eq!(snapshot["tickets"]["blocked"], 1);
     assert_eq!(snapshot["queued_triggers"].as_array().unwrap().len(), 2);
 
-    let listed = World::json_stdout(&world.sloop(&["list"]));
+    let listed = World::json_stdout(&world.sloop(&["show", ".*"]));
     let row = listed["data"]["tickets"]
         .as_array()
         .unwrap()
@@ -669,7 +669,7 @@ fn blocked_dependencies_are_reported_and_release_after_every_blocker_merges() {
     wait_until("the first blocker merges", || {
         status(&world)["tickets"]["merged"] == 1
     });
-    let listed = World::json_stdout(&world.sloop(&["list"]));
+    let listed = World::json_stdout(&world.sloop(&["show", ".*"]));
     let row = listed["data"]["tickets"]
         .as_array()
         .unwrap()
@@ -913,6 +913,8 @@ fn running_hours_hold_queued_work_until_the_opening_boundary() {
     let data = status(&world);
     assert_eq!(data["gate"]["running_hours"]["open"], false);
     assert!(data["next_wake"].is_string());
+    assert_eq!(data["dispatch"]["cause"], "running_hours");
+    assert_eq!(data["dispatch"]["waiting"], 1);
     assert!(!worktree_marker(&world, 1).exists());
 
     world.tick(Duration::from_secs(2 * 60));
@@ -1061,10 +1063,12 @@ fn at_dispatches_only_once_its_scheduled_time_passes() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(World::json_stdout(&output)["data"]["trigger"]["kind"], "at");
+    let scheduled = status(&world);
     assert!(
-        status(&world)["next_wake"].is_string(),
+        scheduled["next_wake"].is_string(),
         "the dispatcher schedules a deadline instead of polling"
     );
+    assert_eq!(scheduled["dispatch"]["cause"], "scheduled_trigger");
 
     world.tick(Duration::from_secs(60));
     assert!(!worktree_marker(&world, 1).exists());
@@ -1661,7 +1665,7 @@ fn a_hand_merged_review_branch_settles_to_merged_and_releases_its_dependent() {
     );
     assert_eq!(snapshot["tickets"]["ready"], 1);
 
-    let listed = World::json_stdout(&world.sloop(&["list"]));
+    let listed = World::json_stdout(&world.sloop(&["show", ".*"]));
     let row = listed["data"]["tickets"]
         .as_array()
         .unwrap()
@@ -1920,10 +1924,6 @@ fn wait_blocks_until_a_run_finishes_and_reports_the_outcome() {
     let output = world.sloop(&["wait", &run_id, "--timeout", "30"]);
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .starts_with("note: 'sloop wait' is now 'sloop show --follow --quiet'")
-    );
 }
 
 #[test]
@@ -1934,7 +1934,6 @@ fn wait_rejects_unknown_runs() {
     let output = world.sloop(&["wait", "R99", "--timeout", "5"]);
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
-    assert!(error.contains("'sloop wait' is now 'sloop show --follow --quiet'"));
     assert!(error.contains(r#""code":"not_found""#), "{error}");
 }
 

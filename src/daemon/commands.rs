@@ -417,6 +417,20 @@ pub(super) fn handle_status(state: &DispatcherState) -> Result<serde_json::Value
     {
         snapshot["next_wake"] = json!(formatted);
     }
+    if let Some(forecast) = super::scheduler::next_dispatch_forecast(state)
+        && let Some(at) = format_timestamp(forecast.at_ms)
+    {
+        use super::scheduler::DispatchCause;
+        snapshot["dispatch"] = match forecast.cause {
+            DispatchCause::CooldownEnds => json!({ "at": at, "cause": "cooldown" }),
+            DispatchCause::HoursOpen { waiting } => {
+                json!({ "at": at, "cause": "running_hours", "waiting": waiting })
+            }
+            DispatchCause::ScheduledTrigger { label } => {
+                json!({ "at": at, "cause": "scheduled_trigger", "trigger": label })
+            }
+        };
+    }
     Ok(snapshot)
 }
 

@@ -930,6 +930,89 @@ pub(super) fn running_hours_open(state: &DispatcherState, now_ms: i64) -> bool {
         .is_none_or(|hours| hours.is_open(state.clock.local_minute(now_ms)))
 }
 
+/// Why the next timed dispatch will happen. This is the operator-facing
+/// subset of [`next_dispatch_deadline`]: housekeeping (worktree cleanup) and
+/// stall probes wake the loop but never dispatch work, so they are excluded —
+/// a status line that counts down a week to a worktree deletion reads as a
+/// stalled daemon.
+pub(super) enum DispatchCause {
+    CooldownEnds,
+    HoursOpen { waiting: usize },
+    ScheduledTrigger { label: Option<String> },
+}
+
+pub(super) struct DispatchForecast {
+    pub(super) at_ms: i64,
+    pub(super) cause: DispatchCause,
+}
+
+pub(super) fn next_dispatch_forecast(state: &DispatcherState) -> Option<DispatchForecast> {
+    let now_ms = state.clock.now_ms();
+    let next_trigger = state
+        .local_work_state
+        .next_trigger_eligible_at_ms(now_ms)
+        .ok()
+        .flatten();
+    let scheduled = next_trigger.map(|at_ms| DispatchForecast {
+        at_ms,
+        cause: DispatchCause::ScheduledTrigger {
+            label: next_trigger_label(state, at_ms),
+        },
+    });
+    if let Some(hours) = state.running_hours.as_ref()
+        && !hours.is_open(state.clock.local_minute(now_ms))
+    {
+        let opening = hours.next_opening_ms(state.clock.as_ref(), now_ms);
+        let waiting = state
+            .local_work_state
+            .dispatchable_triggers(now_ms)
+            .map(|triggers| triggers.len())
+            .unwrap_or(0);
+        if waiting > 0 || next_trigger.is_some_and(|at_ms| at_ms <= opening) {
+            return Some(DispatchForecast {
+                at_ms: opening,
+                cause: DispatchCause::HoursOpen { waiting },
+            });
+        }
+        return scheduled;
+    }
+    let cooldown = state
+        .run_store
+        .next_active_cooldown(now_ms)
+        .ok()
+        .flatten()
+        .map(|at_ms| DispatchForecast {
+            at_ms,
+            cause: DispatchCause::CooldownEnds,
+        });
+    match (cooldown, scheduled) {
+        (Some(first), Some(second)) => Some(if first.at_ms <= second.at_ms {
+            first
+        } else {
+            second
+        }),
+        (cooldown, scheduled) => cooldown.or(scheduled),
+    }
+}
+
+/// The ticket (or project) the next eligible trigger will select, so the
+/// forecast can name what the daemon is waiting to run rather than announce a
+/// bare countdown.
+fn next_trigger_label(state: &DispatcherState, at_ms: i64) -> Option<String> {
+    state
+        .local_work_state
+        .queued_triggers()
+        .ok()?
+        .into_iter()
+        .find(|trigger| trigger.eligible_at_ms == Some(at_ms))
+        .map(|trigger| {
+            trigger
+                .ticket_id
+                .or(trigger.project_id)
+                .unwrap_or(trigger.id)
+        })
+}
+
 pub(super) fn next_dispatch_deadline(state: &DispatcherState) -> Option<i64> {
     let now_ms = state.clock.now_ms();
     let cooldown_deadline = state.run_store.next_active_cooldown(now_ms).ok().flatten();

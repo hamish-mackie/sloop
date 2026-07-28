@@ -85,7 +85,7 @@ pub struct TicketRecord {
     pub attempts: i64,
     pub body: Option<String>,
     pub held_reason: Option<String>,
-    /// When the ticket was registered. `sloop list` orders on this.
+    /// When the ticket was registered. `sloop show` ticket lists order on this.
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }

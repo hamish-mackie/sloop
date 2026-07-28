@@ -2173,7 +2173,7 @@ fn retryable_and_unknown_rejections_release_under_a_target_cooldown() {
             "fake"
         );
 
-        let listed = world.sloop(&["list"]);
+        let listed = world.sloop(&["show", ".*"]);
         let reason = World::json_stdout(&listed)["data"]["tickets"][0]["reason"]
             .as_str()
             .unwrap()
@@ -2265,7 +2265,7 @@ fn cooldown_and_automatic_retry_survive_a_daemon_restart() {
     assert_eq!(run_count, 1, "the cooldown must gate restart dispatch");
     drop(connection);
 
-    let listed = world.sloop(&["list"]);
+    let listed = world.sloop(&["show", ".*"]);
     let rows = World::json_stdout(&listed);
     let row = rows["data"]["tickets"]
         .as_array()

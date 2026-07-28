@@ -120,7 +120,7 @@ fn status_and_list_name_runs_by_ticket_derived_alias() {
     );
     assert!(!human.contains(&world.run_id(1)), "{human}");
 
-    let list = World::json_stdout(&world.sloop(&["list"]))["data"].clone();
+    let list = World::json_stdout(&world.sloop(&["show", ".*"]))["data"].clone();
     let row = list["tickets"]
         .as_array()
         .unwrap()

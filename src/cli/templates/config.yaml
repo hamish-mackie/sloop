@@ -15,7 +15,9 @@ version: 1
 # escape the root with `..` are rejected before the daemon starts. They are
 # repository policy and are never inherited from user configuration.
 
-# Where run worktrees are created.
+# Where run worktrees are created. Each is a full checkout, so exclude
+# this directory in tools that scan the whole tree (linters, type
+# checkers, formatters); many ignore mechanisms do not honour .gitignore.
 worktree_dir: .worktrees
 # Project files.
 project_dir: .agents/sloop/projects

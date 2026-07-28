@@ -20,10 +20,9 @@ mod templates;
 use self::style::Style;
 use self::templates::TemplateKind;
 use crate::protocol::{
-    ConfidenceValue, EmptyArgs, ErrorBody, ErrorCode, EventsArgs, ListArgs, LogsArgs, NoteArgs,
-    PostArgs, PostTrigger, Request, RequestEnvelope, RequestId, ResponseEnvelope, RunArgs,
-    RunReferenceArgs, RunTrigger, ShowArgs, StopArgs, TicketReferenceArgs, VerdictArgs,
-    VerdictValue,
+    ConfidenceValue, EmptyArgs, ErrorBody, ErrorCode, EventsArgs, LogsArgs, NoteArgs, PostArgs,
+    PostTrigger, Request, RequestEnvelope, RequestId, ResponseEnvelope, RunArgs, RunReferenceArgs,
+    RunTrigger, ShowArgs, StopArgs, TicketReferenceArgs, VerdictArgs, VerdictValue,
 };
 
 /// `ready` is the line people misread: it is a precondition, not a promise.
@@ -136,13 +135,6 @@ pub enum Command {
     /// Release a held ticket for dispatch.
     #[command(hide = true)]
     Ready { ticket: String },
-    /// List ticket names, states, and why they are not running.
-    ///
-    /// Tickets are ordered by registration time, newest first, whatever their
-    /// state. Pass `--limit <N>`, `-n <N>`, or the `tail`-style shorthand
-    /// `-<N>` to see only the N newest.
-    #[command(hide = true)]
-    List(ListCliArgs),
     /// Show daemon state.
     #[command(hide = true)]
     Status,
@@ -353,13 +345,6 @@ pub struct PostCliArgs {
     hold: bool,
 }
 
-#[derive(Debug, Args)]
-pub struct ListCliArgs {
-    /// Show only the N newest tickets; `-<N>` is shorthand, as in `tail -10`.
-    #[arg(long, short = 'n', value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
-    limit: Option<u32>,
-}
-
 #[derive(Debug, Default, Args)]
 pub struct ShowCliArgs {
     /// Exact reference or ticket pattern; exact match wins.
@@ -450,7 +435,6 @@ impl TryFrom<Command> for Request {
             Command::Retry { ticket } => Self::Retry(TicketReferenceArgs { ticket }),
             Command::Hold { ticket } => Self::Hold(TicketReferenceArgs { ticket }),
             Command::Ready { ticket } => Self::Ready(TicketReferenceArgs { ticket }),
-            Command::List(args) => Self::List(ListArgs { limit: args.limit }),
             Command::Status => Self::Status(empty()),
             Command::Pause => Self::Pause(empty()),
             Command::Resume => Self::Resume(empty()),
@@ -709,7 +693,7 @@ where
 
 /// Rewrites `sloop show -10` into `sloop show --limit=10`. clap lexes a bare
 /// `-10` as the short flag `-1`, so the `head`/`tail` shorthand has to be
-/// translated before parsing. Only arguments after a leading `show` or `list`
+/// translated before parsing. Only arguments after a leading `show` are
 /// touched, so no other command can have a negative-looking value rewritten,
 /// and only all-digit runs are: `-abc` and `-n` reach clap untouched and earn
 /// its usage error. `-0` becomes `--limit=0`, which the parser's range rejects.
@@ -719,7 +703,7 @@ fn expand_limit_shorthand(args: &mut [OsString]) {
         .skip(1)
         .position(|arg| arg != "--json")
         .map(|offset| offset + 1);
-    let Some(verb) = verb.filter(|index| args[*index] == "show" || args[*index] == "list") else {
+    let Some(verb) = verb.filter(|index| args[*index] == "show") else {
         return;
     };
     for argument in &mut args[verb + 1..] {
@@ -738,30 +722,73 @@ fn expand_limit_shorthand(args: &mut [OsString]) {
 /// that exists. Suggestions are text only — nothing here executes.
 fn subcommand_synonym(attempted: &str) -> Option<&'static str> {
     match attempted {
-        "tickets" | "ls" | "queue" => Some("list"),
-        "ps" => Some("status"),
+        "tickets" | "ls" | "queue" | "list" | "ps" => Some("show"),
         "start" => Some("run"),
         "kill" | "abort" => Some("cancel"),
         _ => None,
     }
 }
 
+/// Hidden deprecated aliases mapped to their current spelling. clap's
+/// edit-distance matcher sees hidden subcommands too, so without this a typo
+/// like `statuss` earns a tip naming the deprecated verb; suggestions must
+/// only ever advertise the current surface.
+fn deprecated_alias_replacement(suggested: &str) -> Option<&'static str> {
+    match suggested {
+        "status" => Some("show"),
+        "watch" => Some("show --follow"),
+        "wait" => Some("show --follow --quiet"),
+        _ => None,
+    }
+}
+
 /// Adds a remedy to clap's "unrecognized subcommand" error. clap already
 /// appends a `tip:` line when the typo is a near-miss of a real verb, and that
-/// text rides through the JSON envelope unchanged, so we leave those alone and
-/// only fill the gap: when similarity matching finds nothing but our synonym
-/// table does, point the caller at the verb they meant.
+/// text rides through the JSON envelope unchanged, so we mostly leave those
+/// alone and fill the gap: when similarity matching finds nothing but our
+/// synonym table does, point the caller at the verb they meant. The one edit
+/// to clap's own tip is rewriting a deprecated alias into its current
+/// spelling, so no suggestion steers anyone onto the hidden legacy surface.
 fn augment_unknown_subcommand(error: &clap::Error, rendered: String) -> String {
-    if error.kind() != ErrorKind::InvalidSubcommand
-        || error.get(ContextKind::SuggestedSubcommand).is_some()
-    {
+    if error.kind() != ErrorKind::InvalidSubcommand {
         return rendered;
     }
     let Some(attempted) = invalid_subcommand(error) else {
         return rendered;
     };
+    let suggestions = suggested_subcommands(error);
+    let clap_tip = match suggestions.as_slice() {
+        [] => None,
+        suggestions => Some(similar_subcommand_tip(suggestions)),
+    };
     let Some(verb) = subcommand_synonym(&attempted) else {
-        return rendered;
+        // No synonym entry: leave clap's tip alone unless it names a
+        // deprecated alias, in which case rewrite it to the current spelling.
+        if !suggestions
+            .iter()
+            .any(|name| deprecated_alias_replacement(name).is_some())
+        {
+            return rendered;
+        }
+        let mut current: Vec<String> = Vec::new();
+        for name in &suggestions {
+            let name = deprecated_alias_replacement(name)
+                .map(str::to_owned)
+                .unwrap_or_else(|| name.clone());
+            if !current.contains(&name) {
+                current.push(name);
+            }
+        }
+        return rendered.replace(
+            &clap_tip.expect("suggestions are non-empty"),
+            &similar_subcommand_tip(&current),
+        );
+    };
+    // The curated table outranks clap's edit-distance guess: drop clap's tip
+    // when both matched so only one remedy is offered.
+    let rendered = match clap_tip {
+        Some(clap_tip) => rendered.replace(&clap_tip, ""),
+        None => rendered,
     };
     let tip = format!(
         "\n\n  tip: `{attempted}` is not a verb; did you mean `{verb}`? run `sloop {verb}`"
@@ -773,6 +800,30 @@ fn augment_unknown_subcommand(error: &clap::Error, rendered: String) -> String {
             augmented
         }
         None => rendered + &tip,
+    }
+}
+
+/// Reconstructs clap's similar-subcommand tip for these names, byte for byte,
+/// so it can be located in the rendered error and replaced.
+fn similar_subcommand_tip(names: &[String]) -> String {
+    match names {
+        [name] => format!("\n\n  tip: a similar subcommand exists: '{name}'"),
+        names => format!(
+            "\n\n  tip: some similar subcommands exist: {}",
+            names
+                .iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn suggested_subcommands(error: &clap::Error) -> Vec<String> {
+    match error.get(ContextKind::SuggestedSubcommand) {
+        Some(ContextValue::String(value)) => vec![value.clone()],
+        Some(ContextValue::Strings(values)) => values.clone(),
+        _ => Vec::new(),
     }
 }
 
@@ -806,18 +857,8 @@ fn run_command(
             run_daemon_request(request, report_started, mode, stdout, stderr)
         }
         Command::Stop { force } => run_stop_request(force, mode, stdout, stderr),
-        Command::Wait { run, timeout } => {
-            if !write_deprecation(stderr, "wait", "show --follow --quiet") {
-                return ExitCode::FAILURE;
-            }
-            run_wait(run, timeout, mode, stdout, stderr)
-        }
-        Command::Watch { r#ref, tail } => {
-            if !write_deprecation(stderr, "watch", "show --follow") {
-                return ExitCode::FAILURE;
-            }
-            run_watch(r#ref, tail, mode, stdout, stderr)
-        }
+        Command::Wait { run, timeout } => run_wait(run, timeout, mode, stdout, stderr),
+        Command::Watch { r#ref, tail } => run_watch(r#ref, tail, mode, stdout, stderr),
         Command::Logs {
             run,
             stage,
@@ -830,24 +871,7 @@ fn run_command(
             stdout,
             stderr,
         ),
-        Command::List(args) => {
-            if !write_deprecation(stderr, "list", "show") {
-                return ExitCode::FAILURE;
-            }
-            run_daemon_request(
-                Request::List(ListArgs { limit: args.limit }),
-                false,
-                mode,
-                stdout,
-                stderr,
-            )
-        }
-        Command::Status => {
-            if !write_deprecation(stderr, "status", "show") {
-                return ExitCode::FAILURE;
-            }
-            run_show(ShowCliArgs::default(), mode, stdout, stderr)
-        }
+        Command::Status => run_show(ShowCliArgs::default(), mode, stdout, stderr),
         Command::Show(args) => run_show(args, mode, stdout, stderr),
         command @ (Command::Post(_)
         | Command::Run(_)
@@ -989,14 +1013,6 @@ fn run_init(mode: OutputMode, stdout: &mut impl Write, stderr: &mut impl Write) 
             )
         }
     }
-}
-
-fn write_deprecation(stderr: &mut impl Write, old: &str, new: &str) -> bool {
-    writeln!(
-        stderr,
-        "note: 'sloop {old}' is now 'sloop {new}'; this alias will be removed in a future release"
-    )
-    .is_ok()
 }
 
 fn run_show(
@@ -1640,7 +1656,7 @@ mod tests {
         serde_json::from_slice(&stderr).expect("stderr carries a JSON envelope")
     }
 
-    /// The rewrite is deliberately narrow: only `list`'s own arguments, and
+    /// The rewrite is deliberately narrow: only `show`'s own arguments, and
     /// only all-digit ones. Everything else has to reach clap untouched, or a
     /// negative-looking value elsewhere would silently become a limit.
     #[test]
@@ -1655,22 +1671,22 @@ mod tests {
         };
 
         assert_eq!(
-            expanded(&["sloop", "list", "-2"]),
-            ["sloop", "list", "--limit=2"]
+            expanded(&["sloop", "show", "-2"]),
+            ["sloop", "show", "--limit=2"]
         );
         assert_eq!(
-            expanded(&["sloop", "--json", "list", "-2"]),
-            ["sloop", "--json", "list", "--limit=2"]
+            expanded(&["sloop", "--json", "show", "-2"]),
+            ["sloop", "--json", "show", "--limit=2"]
         );
-        assert_eq!(expanded(&["sloop", "list", "-0"])[2], "--limit=0");
+        assert_eq!(expanded(&["sloop", "show", "-0"])[2], "--limit=0");
         assert_eq!(
             expanded(&["sloop", "show", "log", "-2"]),
             ["sloop", "show", "log", "--limit=2"]
         );
         for untouched in [
-            ["sloop", "list", "-abc"].as_slice(),
-            ["sloop", "list", "-n"].as_slice(),
-            ["sloop", "post", "list", "-2"].as_slice(),
+            ["sloop", "show2", "-abc"].as_slice(),
+            ["sloop", "show2", "-n"].as_slice(),
+            ["sloop", "post", "show", "-2"].as_slice(),
             ["sloop", "watch", "-2"].as_slice(),
         ] {
             assert_eq!(expanded(untouched), untouched, "{untouched:?}");
@@ -1686,22 +1702,41 @@ mod tests {
             .as_str()
             .expect("error message");
         assert!(
-            message.contains("did you mean `list`") && message.contains("sloop list"),
+            message.contains("did you mean `show`") && message.contains("sloop show"),
             "synonym remedy missing from: {message}"
         );
     }
 
     #[test]
     fn unknown_subcommand_suggests_a_near_miss_spelling() {
-        let envelope = error_envelope(&["statuss"]);
+        let envelope = error_envelope(&["logss"]);
 
         let message = envelope["error"]["message"]
             .as_str()
             .expect("error message");
         assert!(
-            message.contains("status"),
+            message.contains("logs"),
             "near-miss suggestion missing from: {message}"
         );
+    }
+
+    /// A typo near a hidden deprecated alias must be steered to the current
+    /// spelling, never to the legacy verb clap matched.
+    #[test]
+    fn a_near_miss_of_a_deprecated_alias_suggests_the_current_verb() {
+        for (typo, current, legacy) in [
+            ("statuss", "'show'", "'status'"),
+            ("watchh", "'show --follow'", "'watch'"),
+        ] {
+            let envelope = error_envelope(&[typo]);
+            let message = envelope["error"]["message"]
+                .as_str()
+                .expect("error message");
+            assert!(
+                message.contains(current) && !message.contains(legacy),
+                "`{typo}` should suggest {current}, not {legacy}: {message}"
+            );
+        }
     }
 
     #[test]
@@ -1712,7 +1747,9 @@ mod tests {
             .get_subcommands()
             .map(|subcommand| subcommand.get_name().to_owned())
             .collect();
-        for attempted in ["tickets", "ls", "queue", "ps", "start", "kill", "abort"] {
+        for attempted in [
+            "tickets", "ls", "queue", "list", "ps", "start", "kill", "abort",
+        ] {
             let verb = subcommand_synonym(attempted).expect("synonym maps to a verb");
             assert!(
                 verbs.iter().any(|known| known == verb),
@@ -1742,7 +1779,6 @@ mod tests {
             &["sloop", "retry", "T1"],
             &["sloop", "hold", "T1"],
             &["sloop", "ready", "T1"],
-            &["sloop", "list"],
             &["sloop", "status"],
             &["sloop", "pause"],
             &["sloop", "resume"],
@@ -1781,7 +1817,6 @@ mod tests {
             &["sloop", "retry", "T1"],
             &["sloop", "hold", "T1"],
             &["sloop", "ready", "T1"],
-            &["sloop", "list"],
             &["sloop", "status"],
             &["sloop", "pause"],
             &["sloop", "resume"],

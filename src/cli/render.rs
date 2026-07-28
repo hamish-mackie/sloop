@@ -188,9 +188,7 @@ fn render_status(data: &Value, style: Style) -> String {
             hours.get("end").and_then(Value::as_str).unwrap_or("?"),
         );
     }
-    if let Some(next_wake) = data["next_wake"].as_str() {
-        let _ = writeln!(text, "next wake: {}", next_wake_relative(next_wake));
-    }
+    let _ = writeln!(text, "dispatch: {}", dispatch_line(data));
 
     let _ = writeln!(text, "{}", ticket_counts(&data["tickets"], style));
 
@@ -237,19 +235,51 @@ fn render_status(data: &Value, style: Style) -> String {
     text
 }
 
-/// The `next wake` deadline as a countdown. Machines get the instant; a human
-/// reading a dashboard wants the interval, and converting between the two in
-/// their head is exactly the arithmetic this saves. An unparseable string is
-/// passed through rather than swallowed — a timestamp we cannot read is still
+/// A deadline as a countdown. Machines get the instant; a human reading a
+/// dashboard wants the interval, and converting between the two in their head
+/// is exactly the arithmetic this saves. An unparseable string is passed
+/// through rather than swallowed — a timestamp we cannot read is still
 /// information.
-fn next_wake_relative(next_wake: &str) -> String {
-    let Some(deadline_ms) = crate::clock::parse_timestamp(next_wake) else {
-        return next_wake.to_owned();
+fn countdown(deadline: &str) -> String {
+    let Some(deadline_ms) = crate::clock::parse_timestamp(deadline) else {
+        return deadline.to_owned();
     };
     match deadline_ms - now_ms() {
         remaining if remaining > 0 => format!("in {}", duration(remaining)),
         _ => "imminent".to_owned(),
     }
+}
+
+/// The `dispatch` line: when the daemon will next start work, and why. The
+/// point is operator certainty — a countdown only appears attached to its
+/// cause, and the idle case is an affirmative statement that posts dispatch
+/// immediately rather than the absence of a timer.
+fn dispatch_line(data: &Value) -> String {
+    let daemon = &data["daemon"];
+    if daemon["draining"] == Value::Bool(true) {
+        return "held while draining".to_owned();
+    }
+    if daemon["paused"] == Value::Bool(true) {
+        return "paused".to_owned();
+    }
+    let dispatch = &data["dispatch"];
+    let Some(at) = dispatch["at"].as_str() else {
+        return "idle — new posts dispatch immediately".to_owned();
+    };
+    let cause = match dispatch["cause"].as_str() {
+        Some("cooldown") => "cooldown ends".to_owned(),
+        Some("running_hours") => match dispatch["waiting"].as_u64() {
+            Some(1) => "hours open, 1 post waiting".to_owned(),
+            Some(waiting) if waiting > 1 => format!("hours open, {waiting} posts waiting"),
+            _ => "hours open".to_owned(),
+        },
+        Some("scheduled_trigger") => match dispatch["trigger"].as_str() {
+            Some(name) => format!("scheduled post {name}"),
+            None => "scheduled post".to_owned(),
+        },
+        _ => return countdown(at),
+    };
+    format!("{} ({cause})", countdown(at))
 }
 
 /// The ticket counts worth reading. A zero is not news, with one exception:
@@ -465,8 +495,8 @@ fn render_dashboard(data: &Value, style: Style) -> String {
         "daemon: pid {} {state} - {}/{} agents active",
         daemon["pid"], gate["active_agents"], gate["max_agents"]
     );
-    if let Some(next_wake) = data["next_wake"].as_str() {
-        let _ = write!(text, " - next wake {}", next_wake_relative(next_wake));
+    if state == "running" {
+        let _ = write!(text, " - dispatch {}", dispatch_line(data));
     }
     text.push('\n');
 
@@ -728,7 +758,8 @@ fn duration(milliseconds: i64) -> String {
     match (seconds / 3_600, (seconds % 3_600) / 60, seconds % 60) {
         (0, 0, seconds) => format!("{seconds}s"),
         (0, minutes, seconds) => format!("{minutes}m{seconds}s"),
-        (hours, minutes, _) => format!("{hours}h{minutes}m"),
+        (hours, minutes, _) if hours < 24 => format!("{hours}h{minutes}m"),
+        (hours, _, _) => format!("{}d{}h", hours / 24, hours % 24),
     }
 }
 
@@ -985,7 +1016,7 @@ mod tests {
                     "max_agents": 2,
                     "running_hours": {"start": "22:00", "end": "06:00", "open": false}
                 },
-                "next_wake": "2026-07-15T22:00:00Z",
+                "dispatch": {"at": "2026-07-15T22:00:00Z", "cause": "cooldown"},
                 "runs": [{
                     "id": "3f2a9c1b7d4e5061a2b3c4d5e6f70819", "alias": "T1-r1",
                     "state": "running", "ticket": "T1", "ticket_name": "Generalized stages",
@@ -1006,7 +1037,10 @@ mod tests {
             text.contains("running hours: 22:00-06:00 (closed)"),
             "{text}"
         );
-        assert!(text.contains("next wake: imminent"), "{text}");
+        assert!(
+            text.contains("dispatch: imminent (cooldown ends)"),
+            "{text}"
+        );
         assert!(
             text.contains("tickets: 1 ready, 2 held, 1 claimed, 3 merged"),
             "{text}"
@@ -1786,17 +1820,14 @@ mod tests {
     /// The dashboard is otherwise entirely local time; a raw UTC instant in
     /// the middle of it is a reader's context switch for no gain.
     #[test]
-    fn the_next_wake_deadline_renders_as_a_countdown() {
+    fn the_dispatch_deadline_renders_as_a_countdown() {
         let ahead = crate::clock::format_timestamp(super::now_ms() + 252_500).expect("rfc3339");
-        assert_eq!(super::next_wake_relative(&ahead), "in 4m12s");
+        assert_eq!(super::countdown(&ahead), "in 4m12s");
 
         let behind = crate::clock::format_timestamp(super::now_ms() - 5_000).expect("rfc3339");
-        assert_eq!(super::next_wake_relative(&behind), "imminent");
+        assert_eq!(super::countdown(&behind), "imminent");
 
-        assert_eq!(
-            super::next_wake_relative("not a timestamp"),
-            "not a timestamp"
-        );
+        assert_eq!(super::countdown("not a timestamp"), "not a timestamp");
     }
 
     /// Four zeros bury the one number that matters, so a zero only prints
@@ -1927,7 +1958,8 @@ mod tests {
         assert_eq!(
             render(Some("show"), &waiting),
             concat!(
-                "daemon: pid 3760 running - 1/2 agents active\n",
+                "daemon: pid 3760 running - 1/2 agents active",
+                " - dispatch idle — new posts dispatch immediately\n",
                 "tickets: 0 ready, 1 claimed, 1 needs_review, 77 merged\n",
                 "\n",
                 "attention:\n",
@@ -1947,14 +1979,14 @@ mod tests {
     /// A deadline the renderer cannot read is still the daemon's answer, so it
     /// reaches the reader intact rather than vanishing from the header.
     #[test]
-    fn an_unreadable_next_wake_reaches_the_dashboard_verbatim() {
+    fn an_unreadable_dispatch_deadline_reaches_the_dashboard_verbatim() {
         let response = ResponseEnvelope::success(
             None,
             json!({
                 "kind": "dashboard",
                 "daemon": {"pid": 3760, "paused": false, "draining": false},
                 "gate": {"active_agents": 0, "max_agents": 2},
-                "next_wake": "whenever the gate opens",
+                "dispatch": {"at": "whenever the gate opens", "cause": "running_hours"},
                 "tickets": {"ready": 0, "held": 0, "blocked": 0, "claimed": 0,
                             "merged": 0, "failed": 0, "needs_review": 0},
                 "runs": [],
@@ -1966,7 +1998,99 @@ mod tests {
 
         let text = render(Some("show"), &response);
         assert!(
-            text.contains("next wake whenever the gate opens\n"),
+            text.contains("dispatch whenever the gate opens (hours open)\n"),
+            "{text}"
+        );
+    }
+
+    /// The idle case is an affirmative statement about responsiveness, not
+    /// the absence of a timer: a daemon with nothing time-gated still reacts
+    /// to every post the moment it arrives, and the line must say so.
+    #[test]
+    fn an_idle_daemon_announces_that_posts_dispatch_immediately() {
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "daemon": {"pid": 42, "paused": false},
+                "gate": {"active_agents": 0, "max_agents": 2},
+                "runs": [],
+                "queued_triggers": [],
+                "tickets": {}
+            }),
+        );
+
+        let text = render(Some("status"), &response);
+        assert!(
+            text.contains("dispatch: idle — new posts dispatch immediately\n"),
+            "{text}"
+        );
+    }
+
+    /// A paused daemon must not promise immediate dispatch; the line yields
+    /// to the daemon state instead of contradicting it.
+    #[test]
+    fn a_paused_daemon_does_not_promise_immediate_dispatch() {
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "daemon": {"pid": 42, "paused": true},
+                "gate": {"active_agents": 0, "max_agents": 2},
+                "runs": [],
+                "queued_triggers": [],
+                "tickets": {}
+            }),
+        );
+
+        let text = render(Some("status"), &response);
+        assert!(text.contains("dispatch: paused\n"), "{text}");
+    }
+
+    /// The reassurance case: work exists but the clock gates it. The line
+    /// names the gate and counts what is waiting behind it.
+    #[test]
+    fn closed_hours_report_the_opening_and_the_waiting_posts() {
+        let deadline =
+            crate::clock::format_timestamp(super::now_ms() + 35_280_000).expect("rfc3339");
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "daemon": {"pid": 42, "paused": false},
+                "gate": {"active_agents": 0, "max_agents": 2},
+                "dispatch": {"at": deadline, "cause": "running_hours", "waiting": 2},
+                "runs": [],
+                "queued_triggers": [],
+                "tickets": {}
+            }),
+        );
+
+        let text = render(Some("status"), &response);
+        assert!(
+            text.contains("dispatch: in 9h48m (hours open, 2 posts waiting)\n"),
+            "{text}"
+        );
+    }
+
+    /// A long countdown is fine when it names the operator's own schedule:
+    /// "the weekly post is a week out" reads as configured, not stalled.
+    #[test]
+    fn a_scheduled_post_names_its_ticket() {
+        let deadline =
+            crate::clock::format_timestamp(super::now_ms() + 601_200_000).expect("rfc3339");
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "daemon": {"pid": 42, "paused": false},
+                "gate": {"active_agents": 0, "max_agents": 2},
+                "dispatch": {"at": deadline, "cause": "scheduled_trigger", "trigger": "tick-weekly"},
+                "runs": [],
+                "queued_triggers": [],
+                "tickets": {}
+            }),
+        );
+
+        let text = render(Some("status"), &response);
+        assert!(
+            text.contains("dispatch: in 6d23h (scheduled post tick-weekly)\n"),
             "{text}"
         );
     }

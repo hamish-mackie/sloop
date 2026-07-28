@@ -366,7 +366,7 @@ fn reindex_rebuilds_files_and_git_but_not_deleted_runtime_history() {
     });
     commit_ticket_files(&world, "commit stamped ticket files");
 
-    let before_list = World::json_stdout(&world.sloop(&["list"]))["data"].clone();
+    let before_list = World::json_stdout(&world.sloop(&["show", ".*"]))["data"].clone();
     let before_show = World::json_stdout(&world.sloop(&["show", "alpha"]))["data"].clone();
     assert_eq!(
         before_show["value"]["tickets"][0]["notes"]
@@ -419,7 +419,7 @@ fn reindex_rebuilds_files_and_git_but_not_deleted_runtime_history() {
     assert_eq!(first_data["state_changes"], serde_json::json!([]));
     assert_eq!(first_data["rows_dropped"], 0);
     assert_eq!(
-        World::json_stdout(&world.sloop(&["list"]))["data"],
+        World::json_stdout(&world.sloop(&["show", ".*"]))["data"],
         before_list
     );
 
@@ -455,7 +455,7 @@ fn reindex_rebuilds_files_and_git_but_not_deleted_runtime_history() {
     assert!(second.status.success());
     assert_eq!(World::json_stdout(&second)["data"], first_data);
     assert_eq!(
-        World::json_stdout(&world.sloop(&["list"]))["data"],
+        World::json_stdout(&world.sloop(&["show", ".*"]))["data"],
         before_list
     );
 
@@ -750,7 +750,7 @@ fn reindex_derives_the_worktree_from_the_file_stem_and_holds_invalid_stems() {
         "a held ticket must not be stamped with a fallback worktree: {unstamped}"
     );
 
-    let response = World::json_stdout(&world.sloop(&["list"]));
+    let response = World::json_stdout(&world.sloop(&["show", ".*"]));
     let tickets = response["data"]["tickets"].as_array().unwrap();
     let derived = tickets.iter().find(|ticket| ticket["id"] == "T1").unwrap();
     let invalid = tickets.iter().find(|ticket| ticket["id"] == "T2").unwrap();
@@ -782,7 +782,7 @@ fn reindex_holds_a_stale_blocked_by_and_names_the_file_to_edit() {
 
     let output = world.sloop(&["reindex"]);
     assert!(output.status.success());
-    let response = World::json_stdout(&world.sloop(&["list"]));
+    let response = World::json_stdout(&world.sloop(&["show", ".*"]));
     let ticket = &response["data"]["tickets"][0];
     assert_eq!(ticket["state"], "held");
     let message = ticket["reason"].as_str().expect("held reason");
@@ -819,7 +819,7 @@ fn reindex_holds_an_unknown_flow_without_blocking_valid_siblings_and_releases_wh
         "reindex failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let response = World::json_stdout(&world.sloop(&["list"]));
+    let response = World::json_stdout(&world.sloop(&["show", ".*"]));
     let tickets = response["data"]["tickets"].as_array().unwrap();
     let broken = tickets.iter().find(|ticket| ticket["id"] == "T1").unwrap();
     let valid = tickets.iter().find(|ticket| ticket["id"] == "T2").unwrap();
@@ -831,7 +831,7 @@ fn reindex_holds_an_unknown_flow_without_blocking_valid_siblings_and_releases_wh
             .contains("flow `missing` is not defined")
     );
     assert_eq!(valid["state"], "ready");
-    let human = world.sloop_plain(&["list"]);
+    let human = world.sloop_plain(&["show", ".*"]);
     assert!(String::from_utf8_lossy(&human.stdout).contains("flow `missing` is not defined"));
 
     write_ticket(
@@ -843,7 +843,7 @@ fn reindex_holds_an_unknown_flow_without_blocking_valid_siblings_and_releases_wh
     commit_ticket_files(&world, "fix missing flow");
     let output = world.sloop(&["reindex"]);
     assert!(output.status.success());
-    let response = World::json_stdout(&world.sloop(&["list"]));
+    let response = World::json_stdout(&world.sloop(&["show", ".*"]));
     let broken = response["data"]["tickets"]
         .as_array()
         .unwrap()
@@ -882,7 +882,7 @@ fn reindex_holds_an_unknown_target_without_blocking_valid_siblings() {
         "reindex failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let response = World::json_stdout(&world.sloop(&["list"]));
+    let response = World::json_stdout(&world.sloop(&["show", ".*"]));
     let tickets = response["data"]["tickets"].as_array().unwrap();
     let broken = tickets.iter().find(|ticket| ticket["id"] == "T1").unwrap();
     let valid = tickets.iter().find(|ticket| ticket["id"] == "T2").unwrap();
@@ -922,7 +922,7 @@ fn exec_source_pulls_tickets_and_receives_the_final_outcome() {
         "reindex failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let list = World::json_stdout(&world.sloop(&["list"]));
+    let list = World::json_stdout(&world.sloop(&["show", ".*"]));
     assert_eq!(list["data"]["tickets"][0]["id"], "EXT-1");
     assert_eq!(list["data"]["tickets"][0]["state"], "ready");
 

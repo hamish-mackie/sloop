@@ -779,7 +779,7 @@ fn reposting_a_failed_ticket_queues_nothing_and_leaves_retry_predictable() {
     // The point of covering `failed`: `retry` here does exactly what it does
     // on a ticket that was never reposted — ready, and waiting for `sloop run`.
     assert!(world.sloop(&["retry", &id]).status.success());
-    let list = World::json_stdout(&world.sloop(&["list"]));
+    let list = World::json_stdout(&world.sloop(&["show", ".*"]));
     assert_eq!(list["data"]["tickets"][0]["id"], id);
     assert_eq!(list["data"]["tickets"][0]["state"], "ready");
     assert_eq!(

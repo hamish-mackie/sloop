@@ -139,7 +139,10 @@ Explicit IDs in frontmatter are always preserved.
 
 ### Directories
 
-- `worktree_dir` (default `.worktrees`) — where run worktrees are created.
+- `worktree_dir` (default `.worktrees`) — where run worktrees are created. Each
+  is a full checkout, so exclude this directory in tools that scan the whole
+  tree (linters, type checkers, formatters); many ignore mechanisms do not
+  honour `.gitignore`.
 - `worktree_retention` (default `7d`) — how long a settled run's worktree and
   run branch remain available before periodic cleanup. Durations use `s`, `m`,
   `h`, `d`, or `w`; set it to `never` to disable cleanup. Merged runs are

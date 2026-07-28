@@ -346,8 +346,8 @@ pub(crate) fn facts(
     }))
 }
 
-/// The queued triggers, oldest first. This is the queue as `sloop status`
-/// reports it, without the due-ness filter.
+/// The queued triggers, oldest first. This is the queue as the `sloop show`
+/// dashboard reports it, without the due-ness filter.
 pub(crate) fn queued(connection: &Connection) -> Result<Vec<QueuedTrigger>, StoreError> {
     let mut statement = connection.prepare(
         "SELECT id, kind, ticket_id, project_id, eligible_at_ms, interval_ms
