@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-28
+
+### Added
+
+- **`sloop reindex --wait`.** Polls until the daemon is idle instead of
+  failing on active runs, giving up after `--timeout` seconds (default 3600).
+  The busy error now points at it, and notes that a `needs_review` branch
+  merged into the default branch externally settles on its own with no
+  reindex at all.
+
+### Fixed
+
+- **`sloop run` refuses a `merged` or `needs_review` ticket.** It previously
+  accepted the command, exited 0, and queued a trigger that could never fire —
+  dispatch only ever selects a `ready` ticket and neither state has a path
+  back there. The refusal is a `conflict` error naming the state, and the
+  `needs_review` message says how the ticket actually resolves: the preserved
+  branch is merged by hand and the daemon notices.
+
+### Changed
+
+- **`sloop list` is retired into `sloop show`.** A pattern argument to `show`
+  is the replacement, and typing `list` earns a tip pointing there. The
+  dashboard now explains the next dispatch with its cause — running hours,
+  cooldown, or a scheduled trigger — instead of a bare next wake time.
+
+- **The shipped `train` flow's merge budget rises to 10 attempts.** A lost
+  fast-forward race re-runs only `sync` and `verify` — git and the test
+  command, never an agent — so riding out a burst of simultaneous finishers
+  costs no model spawns. The train template and docs now also explain that
+  stage order prices the laps, and that a `return_to` target receives a sync
+  conflict as a report in its prompt, never as conflict markers in its tree —
+  the edge recovers work that can be reshaped, not a conflict to resolve in
+  place.
+
+- **`sloop post` says when follow-through is needed.** A successful post
+  reminds that the stamped frontmatter must be committed, and a `blocked_by`
+  entry naming a ticket by its name suggests the id instead.
+
+- **A bare `sloop template` lists the template kinds with their purposes**
+  rather than failing for want of an argument.
+
+- **The human stage strip joins stages with arrows** — a glyph on a tty,
+  ASCII everywhere else.
+
 ## [0.5.0] - 2026-07-26
 
 ### Added
