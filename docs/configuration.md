@@ -209,7 +209,8 @@ creates `projects/default.md`, and tickets posted without `--project` (or a
 A project file is Markdown with `id` and `title` frontmatter and a
 free-form description; `sloop template project` prints an annotated one.
 Project files never list their tickets — membership lives in ticket
-frontmatter.
+frontmatter. A new project file is picked up by the next `sloop post`, which
+indexes the project directory before it registers the ticket.
 
 `sloop run --project <id>` restricts selection to that project's ready
 tickets. It never bypasses gates or jumps the queue.

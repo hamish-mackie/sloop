@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The scaffolded `default` flow returns a failed review to `build` once.**
+  The review stage now carries `fail_action: { return_to: build, attempts: 1 }`,
+  so the reviewer's reason reaches the agent's prompt and only a second
+  failure parks the ticket in `needs_review`. Existing repositories keep the
+  flow file they scaffolded; add the line to opt in.
+- **`sloop --help` lists the operator commands.** `run`, `retry`, `hold`,
+  `ready`, `pause`, `resume`, `stop`, `cancel`, and `reindex` were hidden
+  behind `--help --all`, which agents reached for on most sessions. The
+  worker verbs and the deprecated read aliases stay hidden.
+- **The default review prompt sends the reviewer to `sloop brief`.** Reviewers
+  were hunting for the ticket file under `.agents/sloop/tickets/<id>.md`,
+  which is not how ticket files are named and is absent from a worktree that
+  does not commit them.
+- **Worker instructions say when a verdict is wanted.** The line about
+  `sloop verdict` now names the condition, `result_check: reported` in the
+  brief, and says a `commits` stage takes no verdict; the rejection a build
+  agent got when it called it anyway now says the same.
+
+### Fixed
+
+- **A settled worktree that Git no longer registers is cleaned up instead of
+  retried forever.** When the directory remained but its registration was
+  gone, `git worktree remove` failed with "is not a working tree" on every
+  reconciliation pass, at over a thousand warnings an hour per run. The
+  daemon now removes such a directory itself, prunes, and records the
+  cleanup.
+- **`sloop post` indexes project files before registering the ticket.** A
+  project file written after the daemon started was `not indexed` until a
+  `sloop reindex`, which refuses to run while any run is active, so a new
+  project could not take tickets until the queue drained.
+- **Restamping a registered ticket file with a new `id` is a `conflict`, not
+  a database error.** It previously surfaced as `UNIQUE constraint failed:
+  tickets.file_path`; the error now names the id the file is registered as.
+
 ## [0.5.1] - 2026-07-28
 
 ### Added

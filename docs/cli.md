@@ -103,7 +103,9 @@ no force mode.
 
 Validate and register a ticket file (which must live below the configured
 ticket directory), stamping the allocated ID and worktree branch back into
-the file. The trigger modes are mutually exclusive:
+the file. Project files are indexed first, so a project written moments ago
+is known to the post without a `sloop reindex`. The trigger modes are
+mutually exclusive:
 
 - `--auto` (default) — queue one run for the next available opportunity.
 - `--manual` — register the ticket as ready without queuing a run.
@@ -581,7 +583,8 @@ per stage execution:
   This is the only thing that can pass such a stage; one that exits without
   calling it fails with `no verdict reported`. `--reason` is optional here.
   A worker on any other stage is refused with `stage \`<name>\` does not use
-  \`result_check: reported\``.
+  \`result_check: reported\`; no verdict is wanted here, commit your work and
+  exit`.
 - **a panel reviewer**, when the stage's check is `result_check: { panel: … }`.
   Its credential names the seat the report lands on, so nothing about the call
   chooses one, and `--reason` is mandatory: a panel's verdict is a tally, and an
