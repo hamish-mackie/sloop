@@ -154,6 +154,7 @@ stages:
         - --
         - "Read .agents/sloop/prompts/review.md and follow its instructions."
     result_check: reported
+    fail_action: { return_to: build, attempts: 1 }
   - name: merge
     action: { builtin: merge }
     result_check: none
@@ -163,7 +164,9 @@ So the agent's own exit code is never the last word. `build` passes only when
 Sloop observes a new commit on the run branch, which is why an unchanged branch
 is kept for review rather than silently merged. `review` must call
 `sloop verdict pass|fail --reason <text>` — a reviewer that merely exits 0 has
-approved nothing. Only then does `merge` apply the branch. A configured
+approved nothing. A failed review sends the walk back to `build` once, with
+the reviewer's reason in the agent's prompt; a second failure parks the ticket
+in `needs_review`. Only then does `merge` apply the branch. A configured
 `flow.test_cmd` is spliced in as an extra stage immediately after the first one.
 
 ## Everyday controls

@@ -11,6 +11,7 @@ stages:
     # it can call `sloop verdict`; without it the stage would pass whenever the
     # command exits 0, which `claude --print` always does.
     result_check: reported
+    fail_action: { return_to: build, attempts: 1 }
     # `--allowedTools Bash` lets the reviewer run tests and `sloop verdict`;
     # without it `claude --print` cannot run any command. It deliberately omits
     # Write/Edit, so the reviewer can read and run but not rewrite the work.
