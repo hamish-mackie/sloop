@@ -877,11 +877,22 @@ fn reconcile_worktree_cleanup(state: &mut DispatcherState, log: &OperationalLog)
 fn remove_run_worktree(root: &Path, candidate: &WorktreeCleanupCandidate) -> Result<(), String> {
     let worktree = Path::new(&candidate.worktree_path);
     if worktree.exists() {
-        git_status(root, "worktree remove", |command| {
+        let removed = git_status(root, "worktree remove", |command| {
             command
                 .args(["worktree", "remove", "--force"])
                 .arg(worktree);
-        })?;
+        });
+        if let Err(error) = removed {
+            if worktree_registered(root, worktree)? {
+                return Err(error);
+            }
+            fs::remove_dir_all(worktree).map_err(|error| {
+                format!(
+                    "cannot remove unregistered worktree {}: {error}",
+                    worktree.display()
+                )
+            })?;
+        }
     }
     git_status(root, "worktree prune", |command| {
         command.args(["worktree", "prune"]);
@@ -900,6 +911,27 @@ fn remove_run_worktree(root: &Path, candidate: &WorktreeCleanupCandidate) -> Res
         Some(1) => Ok(()),
         _ => Err(format!("git show-ref failed: {branch_exists}")),
     }
+}
+
+fn worktree_registered(root: &Path, worktree: &Path) -> Result<bool, String> {
+    let output = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("git worktree list failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("git worktree list failed: {}", output.status));
+    }
+    let canonical = worktree
+        .canonicalize()
+        .unwrap_or_else(|_| worktree.to_path_buf());
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .any(|listed| {
+            let listed = Path::new(listed);
+            listed == worktree || listed.canonicalize().ok().as_deref() == Some(&canonical)
+        }))
 }
 
 fn git_status(

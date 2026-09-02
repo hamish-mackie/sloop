@@ -258,3 +258,27 @@ fn invalid_retention_prevents_daemon_startup_with_a_remedy() {
     assert!(error.contains("use a positive duration"), "{error}");
     assert!(error.contains("never"), "{error}");
 }
+
+#[test]
+fn unregistered_worktree_directory_is_removed_and_recorded() {
+    let world = World::configured();
+    configure(&world, "7d", FakeAgent::new().commit("work").exit(0));
+    world.commit_all("initial");
+    world.start_daemon();
+    post_and_run(&world, "unregistered.md");
+    wait_for_merged(&world);
+    let worktree = world.run_worktree(1);
+    let branch: String = run_value(&world, "branch");
+    let pointer = fs::read_to_string(worktree.join(".git")).unwrap();
+    let gitdir = pointer.trim().strip_prefix("gitdir: ").unwrap().to_owned();
+    fs::remove_dir_all(&gitdir).unwrap();
+    assert!(worktree.exists());
+
+    world.tick(Duration::from_secs(8 * 24 * 60 * 60));
+    trigger_reconcile(&world);
+    wait_until("unregistered worktree cleanup is recorded", || {
+        run_value::<Option<i64>>(&world, "cleaned_at_ms").is_some()
+    });
+    assert!(!worktree.exists());
+    assert!(!branch_exists(world.root(), &branch));
+}
