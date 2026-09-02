@@ -223,21 +223,22 @@ fn expanded_help_explains_every_ticket_state() {
 }
 
 #[test]
-fn default_help_only_shows_common_commands() {
+fn default_help_shows_operator_commands_and_hides_aliases_and_worker_verbs() {
     let world = World::new();
     let output = world.sloop_plain(&["--help"]);
 
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).expect("help is UTF-8");
-    for verb in ["init", "daemon", "post", "show", "logs"] {
+    for verb in [
+        "init", "daemon", "post", "show", "logs", "run", "retry", "hold", "ready", "pause",
+        "resume", "stop", "cancel", "reindex",
+    ] {
         assert!(
             help.contains(&format!("  {verb}")),
             "help did not contain {verb:?}"
         );
     }
-    for verb in [
-        "run", "retry", "pause", "cancel", "status", "watch", "wait", "reindex", "brief", "note",
-    ] {
+    for verb in ["status", "watch", "wait", "brief", "note", "verdict"] {
         assert!(
             !help.contains(&format!("  {verb}")),
             "compact help unexpectedly contained {verb:?}"

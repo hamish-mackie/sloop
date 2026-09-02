@@ -124,35 +124,27 @@ pub enum Command {
     /// Register a ticket file.
     Post(PostCliArgs),
     /// Enqueue a run.
-    #[command(hide = true)]
     Run(RunCliArgs),
     /// Make a failed ticket ready to run again.
-    #[command(hide = true)]
     Retry { ticket: String },
     /// Prevent a ready ticket from being dispatched.
-    #[command(hide = true)]
     Hold { ticket: String },
     /// Release a held ticket for dispatch.
-    #[command(hide = true)]
     Ready { ticket: String },
     /// Show daemon state.
     #[command(hide = true)]
     Status,
     /// Stop spawning new agents.
-    #[command(hide = true)]
     Pause,
     /// Resume spawning agents.
-    #[command(hide = true)]
     Resume,
     /// Stop the daemon.
-    #[command(hide = true)]
     Stop {
         /// Cancel active runs instead of refusing to stop.
         #[arg(long)]
         force: bool,
     },
     /// Cancel a run and preserve its worktree.
-    #[command(hide = true)]
     Cancel {
         /// Run alias, ticket reference, or run-id prefix.
         run: String,
@@ -209,7 +201,6 @@ pub enum Command {
         timeout: u64,
     },
     /// Rebuild local state from committed files and Git.
-    #[command(hide = true)]
     Reindex {
         /// Poll until the daemon is idle instead of failing on active runs.
         #[arg(long)]
