@@ -790,3 +790,60 @@ fn reposting_a_failed_ticket_queues_nothing_and_leaves_retry_predictable() {
     assert_eq!(status["data"]["queued_triggers"], serde_json::json!([]));
     assert_eq!(status["data"]["gate"]["active_agents"], 0);
 }
+
+#[test]
+fn post_rejects_a_registered_file_restamped_with_a_new_id() {
+    let world = World::configured();
+    world.start_daemon();
+    let path = raw_ticket(
+        &world,
+        "reused.md",
+        "---\nname: Reused\nblocked_by: []\n---\nbody\n",
+    );
+    let posted = world.sloop(&["post", path.to_str().unwrap(), "--manual"]);
+    assert!(posted.status.success());
+    let id = World::json_stdout(&posted)["data"]["ticket"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let content = fs::read_to_string(world.root().join(&path)).unwrap();
+    fs::write(
+        world.root().join(&path),
+        content.replace(&format!("id: {id}"), "id: TICK-90"),
+    )
+    .unwrap();
+
+    let error = post_error(&world, &path);
+    assert_eq!(error["error"]["code"], "conflict");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("already registered as"), "{message}");
+    assert!(message.contains(&id), "{message}");
+}
+
+#[test]
+fn post_indexes_a_new_project_file_without_a_reindex() {
+    let world = World::configured();
+    world.start_daemon();
+    fs::write(
+        world.root().join(".agents/sloop/projects/web.md"),
+        "---\nid: web\ntitle: Web\n---\nFront end work.\n",
+    )
+    .unwrap();
+    let path = raw_ticket(
+        &world,
+        "web-ticket.md",
+        "---\nname: Web ticket\nblocked_by: []\nproject: web\n---\nbody\n",
+    );
+
+    let posted = world.sloop(&["post", path.to_str().unwrap(), "--manual"]);
+    assert!(
+        posted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&posted.stderr)
+    );
+    assert_eq!(
+        World::json_stdout(&posted)["data"]["ticket"]["project"],
+        "web"
+    );
+}

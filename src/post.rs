@@ -343,6 +343,11 @@ pub async fn handle(
                     });
                 }
                 (id.to_owned(), Some(existing))
+            } else if let Some(registered) = work_state.ticket_by_file(&relative_str)? {
+                return Err(PostError::FileRegisteredAs {
+                    path: relative_str,
+                    id: registered.id,
+                });
             } else {
                 (id.to_owned(), None)
             }
@@ -778,6 +783,10 @@ pub enum PostError {
         flow: String,
         known: Vec<String>,
     },
+    FileRegisteredAs {
+        path: String,
+        id: String,
+    },
     TicketIdTaken {
         id: String,
         file: String,
@@ -884,6 +893,10 @@ impl fmt::Display for PostError {
             Self::TicketIdTaken { id, file } => write!(
                 formatter,
                 "ticket ID `{id}` is already registered by `{file}`"
+            ),
+            Self::FileRegisteredAs { path, id } => write!(
+                formatter,
+                "`{path}` is already registered as `{id}`; keep that id, or copy the file under a new name for new work"
             ),
             Self::Io { path, source } => write!(formatter, "{path}: {source}"),
             Self::Source(error) => error.fmt(formatter),

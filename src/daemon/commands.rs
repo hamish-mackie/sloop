@@ -1158,7 +1158,7 @@ fn aliases_of(active: &[(String, String)]) -> Vec<&str> {
     active.iter().map(|(_, alias)| alias.as_str()).collect()
 }
 
-fn index_projects(
+pub(super) fn index_projects(
     root: &Path,
     project_dir: &Path,
     work_state: &LocalSqlite,

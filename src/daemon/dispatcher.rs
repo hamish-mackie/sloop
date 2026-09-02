@@ -27,7 +27,7 @@ use crate::work_state::{SourceError, TicketFeeder, WorkState};
 use super::commands::{
     handle_cancel, handle_events, handle_hold, handle_list, handle_logs, handle_operator_show,
     handle_ready, handle_reindex, handle_retry, handle_run, handle_status, handle_stop,
-    handle_wait,
+    handle_wait, index_projects,
 };
 use super::logging::{LogLevel, OperationalLog};
 use super::recovery::{RecoveryClassification, reconcile_run_liveness};
@@ -709,6 +709,20 @@ async fn dispatch(
                 }
                 _ => None,
             };
+            if let Err(error) = index_projects(
+                &state.root,
+                &state.project_dir,
+                &state.local_work_state,
+                now_ms,
+                &state.project_prefix,
+            ) {
+                state.log.emit_with_fields(
+                    LogLevel::Warn,
+                    "sloop::dispatcher",
+                    "project_index_failed",
+                    json!({"error": error}),
+                );
+            }
             match crate::post::handle(
                 &state.root,
                 &state.ticket_dir,
@@ -877,6 +891,7 @@ fn post_error_body(error: &crate::post::PostError) -> ErrorBody {
         PostError::ProjectConflict { .. }
         | PostError::FlowConflict { .. }
         | PostError::TicketIdTaken { .. }
+        | PostError::FileRegisteredAs { .. }
         | PostError::DependencyCycle(_)
         | PostError::Source(crate::work_state::SourceError::Rejected { .. }) => ErrorCode::Conflict,
         PostError::Io { .. }
