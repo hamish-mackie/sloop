@@ -361,7 +361,7 @@ fn handle_verdict(
     let attempt = executing.attempt;
     if executing.check != Check::Reported {
         return Err(unauthorized(&format!(
-            "stage `{stage_name}` does not use `result_check: reported`"
+            "stage `{stage_name}` does not use `result_check: reported`; no verdict is wanted here, commit your work and exit"
         )));
     }
 
