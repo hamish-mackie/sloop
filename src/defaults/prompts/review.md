@@ -2,7 +2,8 @@
 
 Review the completed work on this branch for correctness and regressions. Read
 the diff against the default branch and run the tests that cover it. Do not
-change the implementation.
+change the implementation. Run `sloop brief` to read the ticket this branch
+implements; the diff is judged against it.
 
 Then report the verdict, exactly once, as your final step:
 
