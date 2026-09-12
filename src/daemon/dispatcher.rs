@@ -242,7 +242,7 @@ pub(super) async fn run_dispatcher(
             // Wall-clock is deliberate: this is a liveness probe, not
             // decision logic, so the manual test clock must not gate it.
             _ = liveness_tick.tick() => {
-                if !state.root.join(".git").exists() {
+                if !crate::git::has_repository(&state.root) {
                     log.emit(LogLevel::Error, "sloop::dispatcher", "project_root_missing");
                     let _ = state.shutdown.send(DaemonControl::Stop).await;
                     break;

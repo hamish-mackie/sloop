@@ -287,7 +287,10 @@ ticket settles or its claim is rolled back, so a stale row left behind is
 evidence of an owner that died mid-work.
 
 A lock file guarantees at most one daemon per repository; a second
-`sloop daemon` connects to the first instead of racing it.
+`sloop daemon` connects to the first instead of racing it. Commands run
+inside a linked worktree, including a run's own worktree, resolve to the
+main checkout, so they talk to that daemon rather than starting one of
+their own.
 
 If SQLite reports that its storage is full, the daemon keeps active and
 finished runs reserved, blocks new dispatch, and reports the storage gate in

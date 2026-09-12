@@ -986,6 +986,7 @@ fn run_init(mode: OutputMode, stdout: &mut impl Write, stderr: &mut impl Write) 
                     "repository_root": outcome.repository_root.to_string_lossy(),
                     "created": outcome.created,
                     "existing": outcome.existing,
+                    "warnings": outcome.warnings,
                 }),
             ),
             ExitCode::SUCCESS,

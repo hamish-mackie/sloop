@@ -23,6 +23,7 @@ pub struct InitOutcome {
     pub repository_root: PathBuf,
     pub created: Vec<String>,
     pub existing: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 /// Scaffolds a Sloop repository in `root`: committed configuration, project,
@@ -33,7 +34,14 @@ pub fn init(root: &Path) -> Result<InitOutcome, InitError> {
         repository_root: root.to_path_buf(),
         created: Vec::new(),
         existing: Vec::new(),
+        warnings: Vec::new(),
     };
+    if !crate::git::has_repository(root) {
+        outcome.warnings.push(format!(
+            "{} is not a git repository; sloop runs agents in git worktrees, so run `git init` and commit before starting it",
+            root.display()
+        ));
+    }
 
     ensure_directory(root, ".agents/sloop", &mut outcome, false)?;
     ensure_file(
@@ -356,6 +364,19 @@ mod tests {
         let flow =
             std::fs::read_to_string(root.path().join(".agents/sloop/flows/default.yaml")).unwrap();
         assert!(flow.contains(".agents/sloop/prompts/review.md"));
+    }
+
+    #[test]
+    fn init_warns_when_the_directory_is_not_a_git_repository() {
+        let root = tempdir().unwrap();
+
+        let outcome = init(root.path()).unwrap();
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert!(outcome.warnings[0].contains("not a git repository"));
+
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        let outcome = init(root.path()).unwrap();
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
     }
 
     #[test]

@@ -380,3 +380,17 @@ fn version_output_is_json() {
     assert_eq!(response["data"]["kind"], "version");
     assert!(response["data"]["version"].is_string());
 }
+
+#[test]
+fn commands_refuse_a_repository_that_is_not_a_git_checkout() {
+    let world = World::new();
+    let plain = world.root().join("plain");
+    fs::create_dir_all(plain.join(".agents/sloop")).unwrap();
+    fs::write(plain.join(".agents/sloop/config.yaml"), "version: 1\n").unwrap();
+
+    let output = world.sloop_in(&plain, &["status"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not a git repository"), "{stderr}");
+    assert!(stderr.contains("invalid_arguments"), "{stderr}");
+}

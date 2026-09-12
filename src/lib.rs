@@ -6,6 +6,7 @@ pub mod db;
 pub mod domain;
 pub mod flow;
 pub mod frontmatter;
+pub mod git;
 pub mod ids;
 pub mod outcome;
 pub mod paths;

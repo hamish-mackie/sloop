@@ -67,6 +67,7 @@ pub struct ClientResponse {
 pub fn request(request: Request) -> Result<ClientResponse, DaemonError> {
     let cwd = std::env::current_dir().map_err(DaemonError::CurrentDirectory)?;
     let repository = Repository::discover(&cwd)?;
+    require_git_repository(&repository)?;
     Config::validate_client_essentials(&repository)?;
 
     if matches!(&request, Request::Post(_)) {
@@ -102,6 +103,7 @@ pub fn request(request: Request) -> Result<ClientResponse, DaemonError> {
 pub fn request_running(request: Request) -> Result<Option<ResponseEnvelope>, DaemonError> {
     let cwd = std::env::current_dir().map_err(DaemonError::CurrentDirectory)?;
     let repository = Repository::discover(&cwd)?;
+    require_git_repository(&repository)?;
     Config::validate_client_essentials(&repository)?;
     match send_existing(&repository, request) {
         Ok(response) => Ok(Some(response)),
@@ -144,6 +146,7 @@ enum ServeExit {
 fn serve_current_repository_once() -> Result<ServeExit, DaemonError> {
     let cwd = std::env::current_dir().map_err(DaemonError::CurrentDirectory)?;
     let repository = Repository::discover(&cwd)?;
+    require_git_repository(&repository)?;
     let config = Config::load(&repository)?;
     let classifier = Arc::new(VendorErrorClassifier::built_in().map_err(DaemonError::Catalog)?);
     fs::create_dir_all(&repository.state_dir).map_err(|source| DaemonError::Io {
@@ -624,6 +627,14 @@ fn acquire_daemon_lock(path: &Path) -> Result<File, DaemonError> {
     }
 }
 
+fn require_git_repository(repository: &Repository) -> Result<(), DaemonError> {
+    if crate::git::has_repository(&repository.root) {
+        Ok(())
+    } else {
+        Err(DaemonError::NotAGitRepository(repository.root.clone()))
+    }
+}
+
 fn spawn_daemon(repository: &Repository) -> Result<(), DaemonError> {
     let executable = std::env::current_exe().map_err(DaemonError::CurrentExecutable)?;
     let mut command = Command::new(executable);
@@ -736,6 +747,7 @@ pub enum DaemonError {
         source: io::Error,
     },
     AlreadyRunning,
+    NotAGitRepository(PathBuf),
     Runtime(io::Error),
     Spawn(io::Error),
     Connect(io::Error),
@@ -754,7 +766,7 @@ pub enum DaemonError {
 impl DaemonError {
     pub fn error_body(&self) -> ErrorBody {
         let code = match self {
-            Self::Config(_) => ErrorCode::InvalidArguments,
+            Self::Config(_) | Self::NotAGitRepository(_) => ErrorCode::InvalidArguments,
             _ => ErrorCode::DaemonUnavailable,
         };
         ErrorBody {
@@ -792,6 +804,11 @@ impl std::fmt::Display for DaemonError {
             }
             Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
             Self::AlreadyRunning => formatter.write_str("another sloop daemon holds the lock"),
+            Self::NotAGitRepository(root) => write!(
+                formatter,
+                "{} is not a git repository; sloop runs agents in git worktrees, so run `git init` and commit first",
+                root.display()
+            ),
             Self::Runtime(error) => write!(formatter, "cannot start async runtime: {error}"),
             Self::Spawn(error) => write!(formatter, "cannot spawn daemon: {error}"),
             Self::Connect(error) => write!(formatter, "cannot connect to daemon: {error}"),

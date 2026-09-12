@@ -90,6 +90,9 @@ fn render_init(data: &Value) -> String {
             let _ = writeln!(text, "  {label}: {path}");
         }
     }
+    for warning in string_items(&data["warnings"]) {
+        let _ = writeln!(text, "warning: {warning}");
+    }
     text.push_str(
         "\nwrite a ticket with `sloop template ticket > .agents/sloop/tickets/<name>.md`\n\
          see also `sloop template flow|project|config`\n",

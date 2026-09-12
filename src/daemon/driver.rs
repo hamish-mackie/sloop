@@ -1903,23 +1903,7 @@ fn record_merge_process_checkpoint(
     )
 }
 
-pub(super) fn git_stdout(root: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .map_err(|error| error.to_string())?;
-    match output {
-        output if output.status.success() => {
-            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        }
-        output => Err(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )),
-    }
-}
+pub(super) use crate::git::stdout as git_stdout;
 
 fn merge_checkout_ready(root: &Path) -> Result<bool, String> {
     Ok(!shared_checkout_has_git_operation(root)?

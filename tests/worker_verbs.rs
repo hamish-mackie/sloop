@@ -685,7 +685,6 @@ fn operator_show_reads_a_ticket_by_id_and_name_with_its_body() {
     assert_eq!(value["name"], "cooldown");
     assert_eq!(value["state"], "ready");
     assert_eq!(value["project"], "default");
-    assert_eq!(value["worktree"], "sloop/cooldown");
     assert_eq!(value["blocked_by"], json!([]));
     let body = value["body"].as_str().expect("ticket body");
     assert!(

@@ -42,9 +42,13 @@ impl Repository {
         for directory in start.ancestors() {
             let config_path = directory.join(".agents/sloop/config.yaml");
             if config_path.is_file() {
-                let paths = crate::paths::resolve(directory).map_err(ConfigError::Paths)?;
+                let root = crate::git::main_worktree_root(directory)
+                    .filter(|root| root.join(".agents/sloop/config.yaml").is_file())
+                    .unwrap_or_else(|| directory.to_path_buf());
+                let config_path = root.join(".agents/sloop/config.yaml");
+                let paths = crate::paths::resolve(&root).map_err(ConfigError::Paths)?;
                 return Ok(Self {
-                    root: directory.to_path_buf(),
+                    root,
                     config_path,
                     state_dir: paths.state_dir,
                     runtime_dir: paths.runtime_dir,
@@ -870,6 +874,42 @@ mod tests {
 
         let repository = Repository::discover(&nested).unwrap();
         assert_eq!(repository.root, root.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn a_linked_worktree_discovers_the_main_worktree_as_the_repository() {
+        let root = tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        fs::create_dir_all(root.path().join(".agents/sloop")).unwrap();
+        fs::write(
+            root.path().join(".agents/sloop/config.yaml"),
+            "version: 1\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        git(&["worktree", "add", "-q", ".worktrees/run-1", "-b", "run-1"]);
+        let worktree = root.path().join(".worktrees/run-1");
+        assert!(worktree.join(".agents/sloop/config.yaml").is_file());
+        assert!(worktree.join(".git").is_file());
+
+        let from_root = Repository::discover(root.path()).unwrap();
+        fs::create_dir_all(worktree.join("src")).unwrap();
+        let from_worktree = Repository::discover(&worktree.join("src")).unwrap();
+        assert_eq!(from_worktree, from_root);
+        assert_eq!(from_worktree.root, root.path().canonicalize().unwrap());
     }
 
     #[test]

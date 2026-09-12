@@ -147,18 +147,8 @@ fn patch_equivalent(root: &Path, branch: &str) -> Result<bool, ReindexError> {
 }
 
 fn git_output(root: &Path, args: &[&str], branch: &str) -> Result<String, ReindexError> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .map_err(|source| ReindexError::io(root, source))?;
-    if !output.status.success() {
-        return Err(ReindexError(format!(
-            "cannot inspect Git branch `{branch}`: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    crate::git::stdout(root, args)
+        .map_err(|error| ReindexError(format!("cannot inspect Git branch `{branch}`: {error}")))
 }
 
 /// Folds one branch's derived state into the ticket's, completing the decision
