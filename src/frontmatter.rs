@@ -5,6 +5,7 @@ use std::fmt;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Frontmatter {
     pub id: Option<String>,
+    pub identity: Option<String>,
     pub project: Option<String>,
     pub title: Option<String>,
     pub name: String,
@@ -102,6 +103,7 @@ pub fn parse_collecting(
     };
     let frontmatter = Frontmatter {
         id: string("id"),
+        identity: string("identity"),
         project: string("project"),
         title: string("title"),
         name: string("name").unwrap_or_default(),
@@ -113,6 +115,14 @@ pub fn parse_collecting(
         flow: string("flow"),
         blocked_by_present,
     };
+    if let Some(identity) = &frontmatter.identity
+        && (identity.len() != 32
+            || !identity
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    {
+        problems.push(FrontmatterError::InvalidIdentity);
+    }
     Ok((frontmatter, problems))
 }
 
@@ -157,6 +167,23 @@ pub fn stamp_id(content: &str, id: &str) -> Result<Option<String>, FrontmatterEr
         return Ok(None);
     }
     insert_lines(content, format!("id: {id}\n"))
+}
+
+/// Stamps a ticket's permanent identity alongside its human-facing metadata.
+/// Existing identities survive edits and reposts unchanged.
+pub fn stamp_ticket(
+    content: &str,
+    id: &str,
+    project: &str,
+    flow: &str,
+    identity: &str,
+) -> Result<Option<String>, FrontmatterError> {
+    let stamped = stamp(content, id, project, flow)?;
+    let current = stamped.as_deref().unwrap_or(content);
+    if parse(current)?.identity.is_some() {
+        return Ok(stamped);
+    }
+    insert_lines(current, format!("identity: '{identity}'\n"))
 }
 
 fn insert_lines(content: &str, lines: String) -> Result<Option<String>, FrontmatterError> {
@@ -258,6 +285,7 @@ pub enum FrontmatterError {
         key: String,
     },
     InvalidBlockedBy,
+    InvalidIdentity,
     /// The block contains a line break other than LF (CR, NEL, LS, or PS).
     ForeignLineBreak,
 }
@@ -274,6 +302,9 @@ impl fmt::Display for FrontmatterError {
             Self::InvalidBlockedBy => {
                 formatter.write_str("frontmatter field `blocked_by` must be a YAML list of strings")
             }
+            Self::InvalidIdentity => formatter.write_str(
+                "frontmatter field `identity` must be 32 lowercase hexadecimal characters",
+            ),
             Self::ForeignLineBreak => formatter.write_str(
                 "frontmatter block contains a line break other than LF \
                  (carriage return, NEL, LS, or PS); use Unix line endings",
@@ -287,6 +318,46 @@ impl std::error::Error for FrontmatterError {}
 #[cfg(test)]
 mod tests {
     use super::{FrontmatterError, parse, parse_collecting, stamp, stamp_id};
+
+    #[test]
+    fn ticket_identity_is_validated_and_preserved_when_stamping() {
+        let identity = "0123456789abcdef0123456789abcdef";
+        let content = "---\nname: Example\nblocked_by: []\n---\nTask description.\n";
+        let stamped = super::stamp_ticket(content, "T1", "default", "default", identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parse(&stamped).unwrap().identity.as_deref(), Some(identity));
+        let numeric = "01234567890123456789012345678901";
+        let stamped_numeric = super::stamp_ticket(content, "T2", "default", "default", numeric)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parse(&stamped_numeric).unwrap().identity.as_deref(),
+            Some(numeric)
+        );
+        assert_eq!(
+            super::stamp_ticket(
+                &stamped,
+                "T1",
+                "default",
+                "default",
+                "ffffffffffffffffffffffffffffffff"
+            )
+            .unwrap(),
+            None
+        );
+        for invalid in [
+            "",
+            "1234",
+            "0123456789abcdef0123456789abcdeF",
+            "../0123456789abcdef0123456789abc",
+        ] {
+            assert_eq!(
+                parse(&format!("---\nidentity: '{invalid}'\n---\nbody\n")),
+                Err(FrontmatterError::InvalidIdentity)
+            );
+        }
+    }
 
     #[test]
     fn every_bad_field_is_collected_and_parse_reports_the_first() {

@@ -35,10 +35,14 @@ pub struct RandomRunIds;
 
 impl RunIdSource for RandomRunIds {
     fn mint(&self) -> Result<String, String> {
-        let mut bytes = [0_u8; RUN_ID_HEX_LEN / 2];
-        random_bytes(&mut bytes)?;
-        Ok(hex(&bytes))
+        random_id()
     }
+}
+
+pub(crate) fn random_id() -> Result<String, String> {
+    let mut bytes = [0_u8; RUN_ID_HEX_LEN / 2];
+    random_bytes(&mut bytes)?;
+    Ok(hex(&bytes))
 }
 
 /// A source that hands out a fixed sequence, then refuses. Exists so tests can
@@ -80,7 +84,7 @@ fn random_bytes(buffer: &mut [u8]) -> Result<(), String> {
     }
     File::open("/dev/urandom")
         .and_then(|mut file| file.read_exact(buffer))
-        .map_err(|source| format!("cannot read random bytes for a run id: {source}"))
+        .map_err(|source| format!("cannot read random bytes for an identity: {source}"))
 }
 
 fn hex(bytes: &[u8]) -> String {

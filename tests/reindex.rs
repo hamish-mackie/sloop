@@ -22,6 +22,15 @@ fn write_ticket(world: &World, file: &str, frontmatter: &str, body: &str) {
     .expect("write ticket");
 }
 
+fn ticket_identity(world: &World, file: &str) -> String {
+    let content = fs::read_to_string(world.root().join(".agents/sloop/tickets").join(file))
+        .expect("read ticket");
+    sloop::frontmatter::parse(&content)
+        .unwrap()
+        .identity
+        .expect("stamped identity")
+}
+
 fn post_manual(world: &World, file: &str) {
     let output = world.sloop(&["post", &format!(".agents/sloop/tickets/{file}"), "--manual"]);
     assert!(
@@ -212,6 +221,170 @@ fn squash_branch_onto_default(world: &World, branch: &str, file: &str) {
 }
 
 #[test]
+fn reused_ticket_number_does_not_inherit_old_branches_even_after_database_loss() {
+    let world = World::configured();
+    world.configure_fake_agent(FakeAgent::new().commit("ticket work").exit(0));
+    world.commit_all("initial repository");
+    let pid = world.start_daemon()["data"]["pid"].as_u64().unwrap() as u32;
+    let file = "reused.md";
+    let relative = ".agents/sloop/tickets/reused.md";
+    write_ticket(
+        &world,
+        file,
+        "name: Repeated task\nblocked_by: []\n",
+        "Do the work again.",
+    );
+    post_manual(&world, file);
+    let old_identity = ticket_identity(&world, file);
+    commit_ticket_files(&world, "first ticket");
+    assert!(world.sloop(&["run", "TICK-1"]).status.success());
+    wait_until("the first ticket merges", || {
+        World::json_stdout(&world.sloop(&["show", "TICK-1"]))["data"]["value"]["state"] == "merged"
+    });
+    let old_branch = world.run_branch(1);
+    assert!(old_branch.contains(&format!("-i{old_identity}-a1-")));
+    create_unmerged_worktree(
+        &world,
+        &format!("sloop/TICK-1-i{old_identity}-a2-deadbeef"),
+        "old-attempt",
+    );
+
+    fs::remove_file(world.root().join(relative)).unwrap();
+    assert!(world.sloop(&["reindex"]).status.success());
+    assert_eq!(database_count(&world, "tickets"), 0);
+    assert_eq!(database_count(&world, "runs"), 0);
+    commit_ticket_files(&world, "remove first ticket");
+
+    // Even the path, name, and body can be identical: this is a new incarnation.
+    write_ticket(
+        &world,
+        file,
+        "name: Repeated task\nblocked_by: []\n",
+        "Do the work again.",
+    );
+    post_manual(&world, file);
+    let new_identity = ticket_identity(&world, file);
+    assert_ne!(new_identity, old_identity);
+    assert!(world.sloop(&["reindex"]).status.success());
+    assert_eq!(
+        World::json_stdout(&world.sloop(&["show", "TICK-1"]))["data"]["value"]["state"],
+        "ready"
+    );
+    commit_ticket_files(&world, "new ticket with reused number");
+
+    stop_daemon(&world, pid);
+    for path in [
+        world.db_path(),
+        world.db_path().with_extension("db-wal"),
+        world.db_path().with_extension("db-shm"),
+    ] {
+        let _ = fs::remove_file(path);
+    }
+    let pid = world.start_daemon()["data"]["pid"].as_u64().unwrap() as u32;
+    assert!(world.sloop(&["reindex"]).status.success());
+    assert_eq!(ticket_identity(&world, file), new_identity);
+    assert_eq!(
+        World::json_stdout(&world.sloop(&["show", "TICK-1"]))["data"]["value"]["state"],
+        "ready"
+    );
+    assert!(world.sloop(&["run", "TICK-1"]).status.success());
+    wait_until("the new incarnation merges", || {
+        World::json_stdout(&world.sloop(&["show", "TICK-1"]))["data"]["value"]["state"] == "merged"
+    });
+    assert!(
+        world
+            .run_branch(1)
+            .contains(&format!("-i{new_identity}-a1-"))
+    );
+
+    let content = fs::read_to_string(world.root().join(relative)).unwrap();
+    fs::write(
+        world.root().join(relative),
+        content.replace("Do the work again.", "Updated ticket description."),
+    )
+    .unwrap();
+    post_manual(&world, file);
+    assert_eq!(ticket_identity(&world, file), new_identity);
+    commit_ticket_files(&world, "edit ticket after completion");
+    stop_daemon(&world, pid);
+    for path in [
+        world.db_path(),
+        world.db_path().with_extension("db-wal"),
+        world.db_path().with_extension("db-shm"),
+    ] {
+        let _ = fs::remove_file(path);
+    }
+    world.start_daemon();
+    assert!(world.sloop(&["reindex"]).status.success());
+    assert_eq!(
+        World::json_stdout(&world.sloop(&["show", "TICK-1"]))["data"]["value"]["state"],
+        "merged"
+    );
+}
+
+#[test]
+fn reindex_ignores_legacy_number_only_branches_without_an_explicit_association() {
+    let world = World::configured();
+    world.commit_all("initial repository");
+    create_merged_branch(&world, "sloop/T1-a1-old", "old-merged.txt");
+    create_unmerged_worktree(&world, "sloop/T1-a2-old", "old-review");
+    write_ticket(
+        &world,
+        "new.md",
+        "id: T1\nname: New task\nblocked_by: []\n",
+        "New work with an old number.",
+    );
+    assert!(world.sloop(&["reindex"]).status.success());
+    assert_eq!(
+        World::json_stdout(&world.sloop(&["show", "T1"]))["data"]["value"]["state"],
+        "ready"
+    );
+    let identity = ticket_identity(&world, "new.md");
+    assert!(world.sloop(&["reindex"]).status.success());
+    assert_eq!(ticket_identity(&world, "new.md"), identity);
+    assert_eq!(
+        World::json_stdout(&world.sloop(&["show", "T1"]))["data"]["value"]["state"],
+        "ready"
+    );
+}
+
+#[test]
+fn post_and_reindex_reject_copied_ticket_identities() {
+    let world = World::configured();
+    world.start_daemon();
+    write_ticket(
+        &world,
+        "original.md",
+        "id: T1\nname: Original\nblocked_by: []\n",
+        "Original work.",
+    );
+    post_manual(&world, "original.md");
+    let identity = ticket_identity(&world, "original.md");
+    write_ticket(
+        &world,
+        "copy.md",
+        &format!("id: T2\nidentity: {identity}\nname: Copy\nblocked_by: []\n"),
+        "Different work.",
+    );
+    for args in [
+        vec!["post", ".agents/sloop/tickets/copy.md", "--manual"],
+        vec!["reindex"],
+    ] {
+        let output = world.sloop(&args);
+        assert!(!output.status.success());
+        let error = World::json_stdout_or_stderr(&output);
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("identity"),
+            "{error}"
+        );
+        assert_eq!(database_count(&world, "tickets"), 1);
+    }
+}
+
+#[test]
 fn reindex_derives_merged_for_a_branch_squashed_onto_the_default_branch() {
     let world = World::configured();
     write_ticket(
@@ -264,9 +437,17 @@ fn reindex_keeps_merged_when_a_leftover_attempt_branch_was_squashed() {
         "id: T1\nproject: default\nname: Leftover\nblocked_by: []\nworktree: sloop/T1\n",
         "# Ignore a squashed leftover attempt branch",
     );
+    post_manual(&world, "leftover.md");
     world.commit_all("initial ticket");
     create_merged_branch(&world, "sloop/T1", "merged-evidence.txt");
-    squash_branch_onto_default(&world, "sloop/T1-a1-deadbeef", "attempt-evidence.txt");
+    squash_branch_onto_default(
+        &world,
+        &format!(
+            "sloop/T1-i{}-a1-deadbeef",
+            ticket_identity(&world, "leftover.md")
+        ),
+        "attempt-evidence.txt",
+    );
 
     let output = world.sloop(&["reindex"]);
     assert!(
@@ -538,7 +719,14 @@ fn reindex_drops_history_for_tickets_removed_from_files() {
     fs::remove_file(world.root().join(".agents/sloop/tickets/stale.md"))
         .expect("remove stale ticket file");
     create_merged_branch(&world, "sloop/state", "state-evidence.txt");
-    create_unmerged_worktree(&world, "sloop/T6-a1-deadbeef", "deadbeef");
+    create_unmerged_worktree(
+        &world,
+        &format!(
+            "sloop/T6-i{}-a1-deadbeef",
+            ticket_identity(&world, "orphan.md")
+        ),
+        "deadbeef",
+    );
     let status = Command::new("git")
         .args(["branch", "sloop/bare"])
         .current_dir(world.root())

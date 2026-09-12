@@ -418,6 +418,34 @@ pub(super) async fn reconcile(
                 continue;
             }
         };
+        let identity = if let Some(file_path) = &ticket_record.file_path {
+            match fs::read_to_string(state.root.join(file_path))
+                .map_err(|error| error.to_string())
+                .and_then(|content| {
+                    crate::frontmatter::parse(&content).map_err(|error| error.to_string())
+                })
+                .and_then(|frontmatter| {
+                    if frontmatter.id.as_deref() != Some(ticket_id.as_str()) {
+                        return Err("ticket ID changed; run `sloop reindex`".to_owned());
+                    }
+                    frontmatter
+                        .identity
+                        .ok_or_else(|| "ticket has no identity; run `sloop reindex`".to_owned())
+                }) {
+                Ok(identity) => Some(identity),
+                Err(error) => {
+                    log.emit_with_fields(
+                        LogLevel::Error,
+                        "sloop::dispatcher",
+                        "ticket_identity_resolution_failed",
+                        json!({"ticket_id": ticket_id, "error": error}),
+                    );
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         let fallback_body = ticket_record.body.clone().unwrap_or_else(|| {
             ticket_record
                 .file_path
@@ -555,7 +583,13 @@ pub(super) async fn reconcile(
             run_id: run_id.clone(),
             ticket_id: ticket_id.clone(),
             target,
-            branch: format!("sloop/{}-a{}-{short_id}", ticket.id, claimed.attempt),
+            branch: match identity {
+                Some(identity) => format!(
+                    "sloop/{}-i{identity}-a{}-{short_id}",
+                    ticket.id, claimed.attempt
+                ),
+                None => format!("sloop/{}-a{}-{short_id}", ticket.id, claimed.attempt),
+            },
             worktree: state.worktree_dir.join(short_id),
             flow,
             ticket: Some(ticket_snapshot),

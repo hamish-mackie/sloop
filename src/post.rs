@@ -381,12 +381,35 @@ pub async fn handle(
         return Err(PostError::DependencyCycle(chain));
     }
 
-    let stamp =
-        frontmatter::stamp(&content, &ticket_id, &project, &flow_name).map_err(|error| {
-            PostError::InvalidTicket {
-                path: relative_str.clone(),
-                error,
-            }
+    let identity = stamped.identity.clone().map_or_else(
+        || {
+            crate::run_ref::random_id()
+                .map_err(|message| PostError::Source(SourceError::Corrupt { message }))
+        },
+        Ok,
+    )?;
+    if stamped.identity.is_some() {
+        let authored = crate::work_state::markdown::MarkdownTicketSource::new(root, ticket_dir)
+            .pull()
+            .map_err(|error| SourceError::Corrupt {
+                message: error.to_string(),
+            })?;
+        if let Some(other) = authored.iter().find(|ticket| {
+            ticket.source_ref != relative_str
+                && ticket.frontmatter.identity.as_deref() == Some(identity.as_str())
+        }) {
+            return Err(SourceError::Rejected {
+                message: format!(
+                    "ticket identity `{identity}` is already used by `{}`; remove `identity` from the new ticket before posting",
+                    other.source_ref
+                ),
+            }.into());
+        }
+    }
+    let stamp = frontmatter::stamp_ticket(&content, &ticket_id, &project, &flow_name, &identity)
+        .map_err(|error| PostError::InvalidTicket {
+            path: relative_str.clone(),
+            error,
         })?;
     let file_rewritten = stamp.is_some();
     let final_content = stamp.unwrap_or_else(|| content.clone());
@@ -1673,7 +1696,7 @@ mod tests {
         let (root, store) = world();
         let explicit = root.path().join(".agents/sloop/tickets/explicit.md");
         let explicit_content = ticket(
-            "id: WORK-9\nproject: default\nworktree: custom/work\nflow: default\n",
+            "id: WORK-9\nidentity: '0123456789abcdef0123456789abcdef'\nproject: default\nworktree: custom/work\nflow: default\n",
             "# Explicit\n",
         );
         std::fs::write(&explicit, &explicit_content).unwrap();

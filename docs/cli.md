@@ -116,6 +116,12 @@ Reposting an edited file updates the ticket in place without queuing a
 duplicate run; reposting with a different `--at` time reschedules the
 queued run.
 
+Local tickets also receive an `identity` in frontmatter: a permanent random
+identifier, separate from the human-facing number. Commit it with the ticket
+and keep it when editing or moving that ticket. When copying a file to create
+new work, remove `id`, `identity`, and any legacy `worktree` hint before posting.
+Duplicate identities are rejected.
+
 A run is queued only when the post leaves the ticket ready. A post never
 moves a ticket out of `merged`, `failed`, or `needs_review`, so reposting a
 settled ticket refreshes its indexed content and queues nothing — a run
@@ -504,6 +510,18 @@ If SQLite was deleted, tickets without Git evidence return as ready; holds,
 notes, attempts, and other runtime-only history cannot be recovered. The daemon
 must be idle before reindexing; `--wait` polls until it is instead of failing
 on active runs, giving up after `--timeout` seconds (default 3600).
+
+Run branches include the ticket's permanent `identity`, so a number can be
+reused after removing its old ticket and reindexing without inheriting the old
+ticket's Git outcome. Identity lives in ticket files and Git branch names;
+there is no machine-local number reservation store. Valid older ticket files
+receive an identity when posted or reindexed.
+
+Branches from older Sloop versions that contain only a ticket number are not
+automatically associated with a current local ticket. To recover a known legacy
+branch's outcome, set `worktree: <branch-name>` explicitly in that ticket's
+frontmatter. This is an explicit evidence association: keep it only when the
+branch belongs to that ticket.
 
 A `needs_review` ticket whose preserved run branch an operator merges into the
 default branch by hand no longer needs a reindex: the running daemon settles it

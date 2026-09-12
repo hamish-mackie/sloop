@@ -107,6 +107,7 @@ fn recover_frontmatter(content: &str) -> Frontmatter {
     let mut recovered =
         Frontmatter::sourced(scalar(mapping, "name").unwrap_or_default(), blocked_by);
     recovered.id = scalar(mapping, "id");
+    recovered.identity = scalar(mapping, "identity");
     recovered.project = scalar(mapping, "project");
     recovered.title = scalar(mapping, "title");
     recovered.worktree = scalar(mapping, "worktree");

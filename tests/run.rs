@@ -1635,7 +1635,7 @@ fn a_hand_merged_review_branch_settles_to_merged_and_releases_its_dependent() {
 
     // An operator reviews and merges the preserved run branch by hand.
     advance_default_branch(&world, "unrelated.txt");
-    let branch = format!("sloop/{blocker}-a1-{}", short_run_id(&world, 1));
+    let branch = world.run_branch(1);
     let merged = git_root(
         &world,
         &[
@@ -1707,7 +1707,7 @@ fn run_refuses_tickets_whose_triggers_could_never_fire() {
     // An operator resolves the preserved branch by hand; the daemon settles
     // the ticket to `merged` on its own, and `run` still refuses.
     advance_default_branch(&world, "refuse-unrelated.txt");
-    let branch = format!("sloop/{ticket}-a1-{}", short_run_id(&world, 1));
+    let branch = world.run_branch(1);
     let merged = git_root(
         &world,
         &[
@@ -1755,7 +1755,7 @@ fn a_squash_merged_review_branch_stays_in_needs_review() {
 
     // A squash-merge rewrites the commits, so the run branch tip is not an
     // ancestor of the default branch and ancestry cannot prove integration.
-    let branch = format!("sloop/{blocker}-a1-{}", short_run_id(&world, 1));
+    let branch = world.run_branch(1);
     assert!(
         git_root(&world, &["merge", "--squash", &branch])
             .status
@@ -1812,7 +1812,7 @@ fn a_deleted_review_branch_leaves_the_ticket_and_daemon_untouched() {
         .status
         .success()
     );
-    let branch = format!("sloop/{blocker}-a1-{}", short_run_id(&world, 1));
+    let branch = world.run_branch(1);
     assert!(
         git_root(&world, &["branch", "-D", &branch])
             .status
@@ -1843,7 +1843,7 @@ fn external_merge_reconciliation_survives_a_restart_without_duplicating_evidence
     });
 
     advance_default_branch(&world, "unrelated.txt");
-    let branch = format!("sloop/{blocker}-a1-{}", short_run_id(&world, 1));
+    let branch = world.run_branch(1);
     assert!(
         git_root(
             &world,

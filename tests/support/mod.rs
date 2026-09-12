@@ -463,6 +463,17 @@ impl World {
             .join(id.get(..8).unwrap_or(&id))
     }
 
+    pub fn run_branch(&self, position: usize) -> String {
+        let connection = rusqlite::Connection::open(self.db_path()).expect("open state database");
+        connection
+            .query_row(
+                "SELECT branch FROM runs WHERE id = ?1",
+                [self.run_id(position)],
+                |row| row.get(0),
+            )
+            .expect("read run branch")
+    }
+
     pub fn run_process_id(&self, run_id: &str) -> u32 {
         let connection = rusqlite::Connection::open(self.db_path()).expect("open state database");
         let pid: i64 = connection

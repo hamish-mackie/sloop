@@ -93,6 +93,7 @@ pub struct TicketRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReindexTicket {
     pub id: String,
+    pub identity: Option<String>,
     pub project_id: String,
     pub source: String,
     pub source_ref: String,
@@ -573,7 +574,16 @@ impl LocalSqlite {
             }
         }
         let mut unique_refs = BTreeSet::new();
+        let mut unique_identities = BTreeMap::new();
         for ticket in &authored {
+            if let Some(identity) = &ticket.frontmatter.identity
+                && let Some(previous) = unique_identities.insert(identity, &ticket.source_ref)
+            {
+                return Err(ReindexError(format!(
+                    "duplicate ticket identity `{identity}` in `{previous}` and `{}`; remove `identity` from the new ticket before posting",
+                    ticket.source_ref
+                )));
+            }
             if !unique_refs.insert((&ticket.source, &ticket.source_ref)) {
                 return Err(ReindexError(format!(
                     "duplicate source reference `{}` from `{}`",
@@ -692,15 +702,30 @@ impl LocalSqlite {
                     });
                 }
             }
+            let identity = if authored_ticket.file_path.is_some() && held_reason.is_none() {
+                Some(
+                    authored_ticket
+                        .frontmatter
+                        .identity
+                        .clone()
+                        .map_or_else(|| crate::run_ref::random_id().map_err(ReindexError), Ok)?,
+                )
+            } else {
+                authored_ticket.frontmatter.identity.clone()
+            };
             if held_reason.is_none()
                 && let (Some(path), Some(content)) = (
                     authored_ticket.file_path.as_ref(),
                     authored_ticket.original_content.as_ref(),
                 )
-                && let Some(updated) =
-                    frontmatter::stamp(content, &id, &project, &flow).map_err(|error| {
-                        ReindexError(format!("{}: {error}", authored_ticket.source_ref))
-                    })?
+                && let Some(updated) = frontmatter::stamp_ticket(
+                    content,
+                    &id,
+                    &project,
+                    &flow,
+                    identity.as_deref().expect("local ticket identity"),
+                )
+                .map_err(|error| ReindexError(format!("{}: {error}", authored_ticket.source_ref)))?
             {
                 let absolute = root.join(path);
                 fs::write(&absolute, updated)
@@ -709,6 +734,7 @@ impl LocalSqlite {
 
             tickets.push(ReindexTicket {
                 id,
+                identity,
                 project_id: project,
                 source: authored_ticket.source,
                 source_ref: authored_ticket.source_ref,
@@ -3083,6 +3109,7 @@ mod tests {
         let store = open_seeded(&directory.path().join("sloop.db"));
         let ticket = |held_reason: Option<&str>| ReindexTicket {
             id: "T1".into(),
+            identity: None,
             project_id: "default".into(),
             source: "markdown".into(),
             source_ref: ".agents/sloop/tickets/t1.md".into(),
