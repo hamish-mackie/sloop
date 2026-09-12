@@ -1,6 +1,6 @@
-# The merge train. Bind a ticket to it with `flow: train` or
-# `sloop post --flow train`; the `default` flow is untouched and still what
-# a ticket gets when it names none.
+# The review-free merge train. The default flow uses the same integration
+# loop with a review stage before sync. Bind with `flow: train` or
+# `sloop post --flow train` when a separate reviewer is not needed.
 #
 # The problem it solves: what lands on the default branch is not the run
 # branch, it is the *merge* of the two — a tree no stage ever tested. While
@@ -45,13 +45,8 @@ stages:
   # Passes when that commits cleanly or there was nothing to integrate;
   # fails on a conflict, leaving no in-progress merge behind, so the stage
   # this returns to starts from a clean tree. The conflict itself lands in
-  # the run log, and so in the re-entered agent's prompt — as a report,
-  # never as conflict markers in the tree. That means this edge recovers
-  # work that can be *reshaped* around what the default branch now holds;
-  # it cannot resolve a conflict in place, so two independently correct
-  # changes to the same lines usually conflict again, spend the budget,
-  # and park the ticket in `needs_review` for a human to resolve the
-  # preserved branch by hand.
+  # the run log. The returning agent gets the exact target commit and
+  # instructions to recreate the merge and resolve it in this worktree.
   - name: sync
     action: { builtin: sync }
     result_check: none
@@ -60,7 +55,7 @@ stages:
   # Everything that decides whether the work is good runs *after* the sync,
   # because the merged tree is the one that will land. Replace this command
   # with your own; `sloop init` fills in `flow.test_cmd` from config.yaml
-  # when you have one configured.
+  # when you have one configured; otherwise verification is a no-op.
   - name: verify
     action: { exec: {test_cmd} }
     result_check: none

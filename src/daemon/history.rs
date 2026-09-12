@@ -49,6 +49,7 @@ struct Stage {
     exit_code: Option<i32>,
     verdict_source: Option<String>,
     reason: Option<String>,
+    integration_failure: Option<crate::flow::IntegrationFailure>,
     /// How sure the worker on a `reported` stage said it was. Absent on every
     /// other check, and on a report made before the field existed. A panel's
     /// confidences live on its seats instead.
@@ -82,6 +83,7 @@ impl Stage {
             "exit_code": self.exit_code,
             "verdict_source": self.verdict_source,
             "reason": self.reason,
+            "integration_failure": self.integration_failure,
             "confidence": self.confidence,
             "advisory": self.advisory,
             "silent_for_ms": self.silent_for_ms,
@@ -149,9 +151,11 @@ fn history_with_timeline(
             .flatten()
     });
     let terminal = is_terminal(&run.state);
-    let flow = run
-        .flow_json
-        .as_deref()
+    let flow = evidence
+        .iter()
+        .find(|(kind, _)| kind == "effective_flow")
+        .map(|(_, snapshot)| snapshot.as_str())
+        .or(run.flow_json.as_deref())
         .and_then(|json| serde_json::from_str::<crate::flow::Flow>(json).ok());
     let mut stages = stages(flow.as_ref(), &recorded, &evidence, terminal);
     if run.state == "running"
@@ -288,7 +292,8 @@ impl RunHistory {
     /// explain, or `None` when the failure speaks for itself.
     fn halt_clause(&self) -> Option<&'static str> {
         match self.halt? {
-            crate::flow::HaltReason::FailActionHalt => None,
+            crate::flow::HaltReason::FailActionHalt
+            | crate::flow::HaltReason::IntegrationBlocked => None,
             crate::flow::HaltReason::ReturnBudgetExhausted => Some("return_to budget spent"),
             crate::flow::HaltReason::CorruptLog => {
                 Some("the stage log does not replay against this flow")
@@ -340,6 +345,7 @@ impl RunHistory {
     fn halt_json(&self) -> Option<&'static str> {
         Some(match self.halt? {
             crate::flow::HaltReason::FailActionHalt => "fail_action",
+            crate::flow::HaltReason::IntegrationBlocked => "integration_blocked",
             crate::flow::HaltReason::ReturnBudgetExhausted => "return_budget_exhausted",
             crate::flow::HaltReason::CorruptLog => "corrupt_log",
         })
@@ -425,6 +431,7 @@ fn stages(
                 exit_code: row.exit_code,
                 verdict_source: row.verdict_source.clone(),
                 reason: row.reason.clone(),
+                integration_failure: row.integration_failure.clone(),
                 confidence: reported_confidence(evidence, &name, row.attempt),
                 advisory,
                 silent_for_ms: None,
@@ -460,6 +467,7 @@ fn pending(name: String, state: &'static str, attempt: u32, advisory: bool) -> S
         exit_code: None,
         verdict_source: None,
         reason: None,
+        integration_failure: None,
         confidence: None,
         advisory,
         silent_for_ms: None,

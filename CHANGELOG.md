@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Integration repair is part of the default flow.** The scaffolded flow now
+  runs build, review, sync, verification, and a fast-forward-only merge. Sync
+  conflicts return to the existing agent with the pinned target and instructions
+  to resolve the integration; verification failures also return to build.
+  Lost merge races retry sync without an agent unless repair is needed.
+  Configured tests run after sync, and unconfigured verification is a no-op.
+  Existing committed flows are preserved by `init`.
+- **Merge failures explain themselves in `show` and run logs.** Git stdout and
+  stderr are captured, and typed reasons distinguish checkout changes, ongoing
+  operations, index locks, conflicts, fast-forward refusals, and execution
+  failures. Checkout and execution problems halt instead of spending integration
+  retry budgets, including after daemon restart.
 - **The scaffolded `default` flow returns a failed review to `build` once.**
   The review stage now carries `fail_action: { return_to: build, attempts: 1 }`,
   so the reviewer's reason reaches the agent's prompt and only a second

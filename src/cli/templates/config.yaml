@@ -123,12 +123,11 @@ ids:
   project_prefix: PROJ
 
 # ---- flow --------------------------------------------------------------
-# An argv run inside the worktree after the first stage and before the
-# work can merge. A failure keeps the work out of your branch and leaves
-# the ticket for review. It is inserted as an implicit `exit` stage named
-# `test` at index 1, so it cannot be combined with a flow that already has
-# a stage named `test` — prefer an explicit stage in the flow file
-# (`sloop template flow`) when you need one.
+# An argv run inside the worktree before merge. With sync, it runs after
+# integration and uses the sync stage's failure policy. It fills a no-op
+# verify stage or inserts `test` after sync unless the same command already
+# runs there. Without sync, `test` runs after the first stage and halts on
+# failure. It conflicts with a flow already naming a stage `test`.
 # flow:
 #   test_cmd: [cargo, test, --all-targets]
 

@@ -29,9 +29,10 @@ This scaffolds committed configuration under `.agents/sloop/`:
 - `config.yaml` — scheduler settings and agent commands
 - `projects/default.md` — the default project for unassigned tickets
 - `tickets/` — where your ticket files live
-- `flows/default.yaml` — the default flow (build → review → merge)
-- `flows/train.yaml` — the opt-in merge train (build → sync → verify →
-  fast-forward merge); bind a ticket to it with `flow: train`. See
+- `flows/default.yaml` — build → review → sync → verify → fast-forward merge,
+  with automatic agent repair when integration conflicts or checks fail
+- `flows/train.yaml` — the same integration loop without review;
+  bind a ticket to it with `flow: train`. See
   [the merge train](configuration.md#the-merge-train).
 - `prompts/review.md` — the prompt used by the default review stage
 
@@ -153,9 +154,19 @@ stages:
         - "Read .agents/sloop/prompts/review.md and follow its instructions."
     result_check: reported
     fail_action: { return_to: build, attempts: 1 }
-  - name: merge
-    action: { builtin: merge }
+  - name: sync
+    action: { builtin: sync }
     result_check: none
+    fail_action: { return_to: build, attempts: 1 }
+  - name: verify
+    # Replace with your checks, or configure flow.test_cmd.
+    action: { exec: ["true"] }
+    result_check: none
+    fail_action: { return_to: build, attempts: 1 }
+  - name: merge
+    action: { builtin: merge, ff_only: true }
+    result_check: none
+    fail_action: { return_to: sync, attempts: 10 }
 ```
 
 So the agent's own exit code is never the last word. `build` passes only when
@@ -164,8 +175,16 @@ is kept for review rather than silently merged. `review` must call
 `sloop verdict pass|fail --reason <text>` — a reviewer that merely exits 0 has
 approved nothing. A failed review sends the walk back to `build` once, with
 the reviewer's reason in the agent's prompt; a second failure parks the ticket
-in `needs_review`. Only then does `merge` apply the branch. A configured
-`flow.test_cmd` is spliced in as an extra stage immediately after the first one.
+in `needs_review`. `sync` then integrates the latest local default branch into
+the run's worktree. Conflicts return to the agent with instructions to repair
+the integration; failed verification also returns to build. The repaired work
+goes through review again. If another run lands before the final fast-forward,
+Sloop retries sync and verification without calling an agent unless repair is
+needed. These retries are bounded.
+
+Set `verify` to your repository's checks or configure `flow.test_cmd`. Without
+a command, verification is a no-op. Existing repositories retain their flow
+files; see [adopting the default](configuration.md#adopting-the-default-in-an-existing-repository).
 
 ## Everyday controls
 

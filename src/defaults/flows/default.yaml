@@ -2,9 +2,6 @@ stages:
   - name: build
     # An agent action takes its prompt from the ticket, never from here.
     action: agent
-    # `commits` passes only when the process exits 0 *and* Sloop observes a
-    # new commit on the run branch: an agent is never trusted to grade its
-    # own work by exiting cleanly.
     result_check: { builtin: commits }
   - name: review
     # `reported` keeps SLOOP_SOCKET/SLOOP_TOKEN in the reviewer's environment so
@@ -24,14 +21,19 @@ stages:
         - Bash
         - --
         - "Read .agents/sloop/prompts/review.md and follow its instructions."
-  - name: merge
-    # The merge builtin's own outcome is its verdict, so it takes no check.
-    #
-    # This stage order needs no rearranging: without `ff_only` the merge
-    # never loses to a default branch that moved mid-run — it just lands a
-    # merge commit. The trade is that the merged tree is one no stage
-    # tested. If you restructure this flow you take that gap on yourself;
-    # the `train` flow already closes it with sync, verify, and an
-    # `ff_only` merge, so prefer `flow: train` over rebuilding it here.
-    action: { builtin: merge }
+  - name: sync
+    action: { builtin: sync }
     result_check: none
+    fail_action: { return_to: build, attempts: 1 }
+  - name: verify
+    # init substitutes flow.test_cmd when configured. With no command this
+    # is a no-op; set your repository's checks here to verify the landing tree.
+    action: { exec: ["true"] }
+    result_check: none
+    fail_action: { return_to: build, attempts: 1 }
+  - name: merge
+    action: { builtin: merge, ff_only: true }
+    result_check: none
+    # A lost fast-forward race repeats sync and verification, not review.
+    # Checkout problems halt with their reason instead of spending retries.
+    fail_action: { return_to: sync, attempts: 10 }

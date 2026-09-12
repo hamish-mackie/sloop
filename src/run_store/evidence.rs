@@ -63,6 +63,7 @@ pub struct StageRecord {
     pub output_ref: String,
     pub verdict_source: Option<String>,
     pub reason: Option<String>,
+    pub integration_failure: Option<crate::flow::IntegrationFailure>,
 }
 
 /// One panel reviewer's report, as the storage takes it. The seat's key is
@@ -205,6 +206,7 @@ pub(crate) mod tx {
                 "output": row.output_ref,
                 "verdict_source": row.verdict_source,
                 "reason": row.reason,
+                "integration_failure": row.integration_failure,
             })
             .to_string();
             transaction.execute(
@@ -426,6 +428,19 @@ fn stage_log(connection: &Connection, run_id: &str) -> rusqlite::Result<Vec<Stag
                 verdict_source: field("verdict_source")
                     .or_else(|| state.is_some().then(|| "exit_code".to_owned())),
                 reason: field("reason"),
+                integration_failure: evidence
+                    .as_ref()
+                    .and_then(|value| value.get("integration_failure"))
+                    .filter(|value| !value.is_null())
+                    .map(|value| serde_json::from_value(value.clone()))
+                    .transpose()
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            8,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
                 state,
             })
         })?
@@ -686,6 +701,7 @@ mod tests {
             exit_code: Some(0),
             output_ref: "runs/R1/output.ndjson".into(),
             verdict_source: state.map(|_| "exit_code".to_owned()),
+            integration_failure: None,
             reason: None,
         }
     }

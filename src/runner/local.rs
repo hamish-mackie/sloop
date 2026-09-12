@@ -411,7 +411,7 @@ pub fn run_exec_stage<H: StageHooks>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_output_reader(
+pub(crate) fn spawn_output_reader(
     pipe: impl Read + Send + 'static,
     log: RunLogWriter,
     source: OutputSource,
@@ -459,7 +459,7 @@ fn spawn_output_reader(
     })
 }
 
-fn join_readers(readers: Vec<std::thread::JoinHandle<bool>>) -> bool {
+pub(crate) fn join_readers(readers: Vec<std::thread::JoinHandle<bool>>) -> bool {
     readers.into_iter().fold(true, |complete, reader| {
         complete & reader.join().unwrap_or(false)
     })

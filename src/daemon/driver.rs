@@ -29,19 +29,21 @@ use crate::config::{AgentConfig, expand_agent_cmd};
 use crate::db::{Db, StoreError};
 use crate::domain::ticket::TicketSnapshot;
 use crate::flow::{
-    Actor, Builtin, Check, Confidence, FailAction, Flow, Panel, PanelOutcome, Reported, Reviewer,
-    ReviewerReport, Stage, StageEvidence, Step, Verdict, VerdictSource, aggregate, next_step,
-    resolve_verdict, return_trigger,
+    Actor, Builtin, Check, Confidence, FailAction, Flow, IntegrationFailure,
+    IntegrationFailureKind, Panel, PanelOutcome, Reported, Reviewer, ReviewerReport, Stage,
+    StageEvidence, Step, Verdict, VerdictSource, aggregate, next_step, resolve_verdict,
+    return_trigger,
 };
 use crate::outcome::{ExitClass, FlowHalt, MergeOutcome, classify_exit};
-use crate::run_log::stage_output_tail;
+use crate::run_log::{OutputSource, OutputStream, RunLogWriter, stage_output_tail};
 use crate::run_store::{
     Exit, ExitDenial, RunExit, RunStart, RunState, RunStore, StagePhase, StageRecord, Start,
     StartDenial,
 };
 use crate::runner::local::{
-    create_run_worktree, launch_agent, mint_worker_credentials, process_start_time, run_exec_stage,
-    run_output_path, wait_for_test_hook, worker_socket_path,
+    create_run_worktree, join_readers, kill_straggler_process_group, launch_agent,
+    mint_worker_credentials, process_start_time, run_exec_stage, run_output_path,
+    spawn_output_reader, wait_for_test_hook, worker_socket_path,
 };
 use crate::runner::{
     AgentLaunch, AgentProcessCheckpoint, ExecLaunch, ExecProcessCheckpoint, ExecutionEvidence,
@@ -169,6 +171,7 @@ struct StageRun {
 /// check that judges it. Each is evidence in its own right, and each appends
 /// its own row to the run's stage log.
 struct StageResult {
+    integration_failure: Option<IntegrationFailure>,
     verdict: Verdict,
     exit_code: Option<i32>,
     started_at_ms: i64,
@@ -366,8 +369,8 @@ struct RunDriver<'a> {
     events: &'a mpsc::Sender<RunEvent>,
     run_store: RunStore,
     output_path: PathBuf,
-    /// The run's flow with the configured implicit `test` stage spliced in.
-    /// This is the flow the walk is over; nothing else sees it.
+    /// The effective flow, including configured verification, saved before the
+    /// first stage so recovery and history replay the same walk.
     flow: Flow,
     agent: AgentFacts,
     merge: Option<MergeOutcome>,
@@ -486,8 +489,6 @@ impl RunDriver<'_> {
     /// driver is resuming already has both, so only its recorded facts are
     /// read back.
     fn prepare(&mut self) -> Result<Preparation, WalkError> {
-        self.flow = flow_with_implicit_test(&self.plan.flow, self.environment.test_cmd.as_deref())
-            .map_err(WalkError::Admission)?;
         let run = self
             .run_store
             .run(self.run_id())
@@ -500,6 +501,37 @@ impl RunDriver<'_> {
         if state.is_terminal() {
             return Ok(Preparation::NotOurs);
         }
+        let preparation_error = |error: String| {
+            if state == RunState::Claimed {
+                WalkError::Admission(error)
+            } else {
+                WalkError::Stage(error)
+            }
+        };
+        let evidence = self
+            .run_store
+            .run_evidence(self.run_id())
+            .map_err(|error| preparation_error(error.to_string()))?;
+        self.flow = if let Some((_, snapshot)) =
+            evidence.iter().find(|(kind, _)| kind == "effective_flow")
+        {
+            serde_json::from_str(snapshot).map_err(|error| {
+                preparation_error(format!("cannot read effective flow: {error}"))
+            })?
+        } else {
+            let flow =
+                flow_with_implicit_test(&self.plan.flow, self.environment.test_cmd.as_deref())
+                    .map_err(&preparation_error)?;
+            self.run_store
+                .record_stage_evidence(
+                    self.run_id(),
+                    "effective_flow",
+                    &serde_json::to_string(&flow).expect("flow serializes"),
+                    self.clock().now_ms(),
+                )
+                .map_err(|error| preparation_error(error.to_string()))?;
+            flow
+        };
         if state == RunState::Claimed {
             create_run_worktree(
                 &self.environment.root,
@@ -522,10 +554,6 @@ impl RunDriver<'_> {
             }
             return Ok(Preparation::Ready);
         }
-        let evidence = self
-            .run_store
-            .run_evidence(self.run_id())
-            .map_err(|error| WalkError::Stage(error.to_string()))?;
         self.agent = AgentFacts::from_evidence(&evidence, run.exit_code);
         self.merge = self.recorded_merge();
         Ok(Preparation::Ready)
@@ -579,6 +607,10 @@ impl RunDriver<'_> {
         )
         .unwrap_or_default();
         Some(FailureContext {
+            integration_target: record
+                .integration_failure
+                .as_ref()
+                .and_then(|failure| failure.target.clone()),
             stage: record.stage.clone(),
             attempt,
             reason: failure_reason(record),
@@ -650,6 +682,12 @@ impl RunDriver<'_> {
             ),
             None => resolve_verdict(&stage.result_check, reading, reported),
         };
+        let reason = reason.or_else(|| {
+            action
+                .integration_failure
+                .as_ref()
+                .map(|failure| failure.message.clone())
+        });
         self.append_rows(run, verdict, source, reason, &action, check.as_ref())
             .map_err(WalkError::Stage)?;
         Ok(true)
@@ -726,12 +764,13 @@ impl RunDriver<'_> {
                 self.run_exec(&stage.name, run.attempt, cmd, worker)
             }
             Actor::Builtin(Builtin::Commits) => StageResult {
+                integration_failure: None,
                 verdict: Verdict::Fail,
                 exit_code: Some(1),
                 started_at_ms: now(),
                 finished_at_ms: now(),
             },
-            Actor::Builtin(Builtin::Merge) => self.run_merge(stage, merge_recovery),
+            Actor::Builtin(Builtin::Merge) => self.run_merge(run, merge_recovery),
             Actor::Builtin(Builtin::Sync) => self.run_sync(run),
         }))
     }
@@ -751,6 +790,7 @@ impl RunDriver<'_> {
             self.agent.checkpointed_attempt = None;
             let now = self.clock().now_ms();
             return Ok(Some(StageResult {
+                integration_failure: None,
                 verdict: self.agent_verdict(),
                 exit_code: self.agent.exit_code,
                 started_at_ms: now,
@@ -785,6 +825,7 @@ impl RunDriver<'_> {
                     json!({"run_id": self.run_id(), "stage": stage.name, "error": error.to_string()}),
                 );
                 return Ok(Some(StageResult {
+                    integration_failure: None,
                     verdict: Verdict::Fail,
                     exit_code: None,
                     started_at_ms,
@@ -875,6 +916,7 @@ impl RunDriver<'_> {
             Verdict::Fail
         };
         Ok(Some(StageResult {
+            integration_failure: None,
             verdict,
             exit_code,
             started_at_ms: completion.evidence.started_at_ms,
@@ -1071,6 +1113,7 @@ impl RunDriver<'_> {
             );
         }
         StageResult {
+            integration_failure: None,
             verdict: if evidence.output_capture_complete && evidence.exit_code == Some(0) {
                 Verdict::Pass
             } else {
@@ -1087,52 +1130,77 @@ impl RunDriver<'_> {
     /// so the daemon performs it itself under the global merge lock.
     fn run_merge(
         &mut self,
-        stage: &Stage,
+        run: &StageRun,
         merge_recovery: Option<super::recovery::MergeRecovery>,
     ) -> StageResult {
         let now = self.clock().now_ms();
-        match merge_recovery {
-            Some(super::recovery::MergeRecovery::AlreadyCompleted) => {
-                self.merge = Some(MergeOutcome::Merged);
-                return StageResult {
-                    verdict: Verdict::Pass,
-                    exit_code: Some(0),
-                    started_at_ms: now,
-                    finished_at_ms: now,
-                };
+        let result = match merge_recovery {
+            Some(super::recovery::MergeRecovery::AlreadyCompleted) => Ok(()),
+            Some(super::recovery::MergeRecovery::UnsafePartial) => Err(MergeError::new(
+                IntegrationFailureKind::UnsafeRecovery,
+                "merge refused: interrupted merge left checkout state requiring review",
+            )),
+            Some(super::recovery::MergeRecovery::Retry) | None => attempt_merge(
+                &self.environment.root,
+                &self.plan.branch,
+                self.agent.commit_observation_complete && self.agent.commits.is_empty(),
+                run.stage.ff_only,
+                &run.stage.name,
+                run.attempt,
+                &self.output_path,
+                &self.run_store,
+                self.run_id(),
+                self.clock(),
+                self.log(),
+            ),
+        };
+        self.merge = Some(if result.is_ok() {
+            MergeOutcome::Merged
+        } else {
+            MergeOutcome::Diverged
+        });
+        let (exit_code, integration_failure) = match result {
+            Ok(()) => (Some(0), None),
+            Err(error) => {
+                self.log_integration_failure(run, &error.failure);
+                (error.exit_code, Some(error.failure))
             }
-            Some(super::recovery::MergeRecovery::UnsafePartial) => {
-                self.merge = Some(MergeOutcome::Diverged);
-                return StageResult {
-                    verdict: Verdict::Fail,
-                    exit_code: Some(1),
-                    started_at_ms: now,
-                    finished_at_ms: now,
-                };
-            }
-            Some(super::recovery::MergeRecovery::Retry) | None => {}
-        }
-        let outcome = attempt_merge(
-            &self.environment.root,
-            &self.plan.branch,
-            self.agent.commit_observation_complete && self.agent.commits.is_empty(),
-            stage.ff_only,
-            &stage.name,
-            &self.run_store,
-            self.run_id(),
-            self.clock(),
-            self.log(),
-        );
-        self.merge = Some(outcome);
+        };
         StageResult {
-            verdict: if outcome == MergeOutcome::Merged {
+            verdict: if integration_failure.is_none() {
                 Verdict::Pass
             } else {
                 Verdict::Fail
             },
-            exit_code: Some(i32::from(outcome != MergeOutcome::Merged)),
+            integration_failure,
+            exit_code,
             started_at_ms: now,
             finished_at_ms: self.clock().now_ms(),
+        }
+    }
+
+    fn log_integration_failure(&self, run: &StageRun, failure: &IntegrationFailure) {
+        self.log().emit_with_fields(
+            LogLevel::Warn, "sloop::driver", "integration_failed",
+            json!({"run_id": self.run_id(), "stage": run.stage.name, "attempt": run.attempt, "failure": failure}),
+        );
+        let appended = RunLogWriter::open(&self.output_path).and_then(|writer| {
+            writer.append_at(
+                self.clock().now_ms(),
+                OutputSource::Stage,
+                Some(&run.stage.name),
+                Some(run.attempt),
+                OutputStream::Stderr,
+                format!("{}\n", failure.message).as_bytes(),
+            )
+        });
+        if let Err(error) = appended {
+            self.log().emit_with_fields(
+                LogLevel::Error,
+                "sloop::driver",
+                "integration_log_failed",
+                json!({"run_id": self.run_id(), "error": error.to_string()}),
+            );
         }
     }
 
@@ -1149,13 +1217,23 @@ impl RunDriver<'_> {
     /// the run log — and so in the prompt of whatever a `return_to` re-enters.
     fn run_sync(&self, run: &StageRun) -> StageResult {
         let started_at_ms = self.clock().now_ms();
-        let failed = |code: i32| StageResult {
-            verdict: Verdict::Fail,
-            exit_code: Some(code),
-            started_at_ms,
-            finished_at_ms: self.clock().now_ms(),
+        let failed = |code: Option<i32>, kind, message: String, target| {
+            let failure = IntegrationFailure {
+                kind,
+                message,
+                target,
+            };
+            self.log_integration_failure(run, &failure);
+            StageResult {
+                integration_failure: Some(failure),
+                verdict: Verdict::Fail,
+                exit_code: code,
+                started_at_ms,
+                finished_at_ms: self.clock().now_ms(),
+            }
         };
         let integrated = || StageResult {
+            integration_failure: None,
             verdict: Verdict::Pass,
             exit_code: Some(0),
             started_at_ms,
@@ -1165,7 +1243,12 @@ impl RunDriver<'_> {
 
         let default_head = {
             let Ok(_guard) = MERGE_LOCK.lock() else {
-                return failed(1);
+                return failed(
+                    None,
+                    IntegrationFailureKind::ExecutionError,
+                    "sync failed: merge lock poisoned".into(),
+                    None,
+                );
             };
             match git_stdout(&self.environment.root, &["rev-parse", "HEAD"]) {
                 Ok(head) => head,
@@ -1176,7 +1259,12 @@ impl RunDriver<'_> {
                         "sync_default_branch_unreadable",
                         json!({"run_id": self.run_id(), "error": error}),
                     );
-                    return failed(1);
+                    return failed(
+                        None,
+                        IntegrationFailureKind::ExecutionError,
+                        format!("sync failed: {error}"),
+                        None,
+                    );
                 }
             }
         };
@@ -1199,17 +1287,21 @@ impl RunDriver<'_> {
                     "sync_worktree_unreadable",
                     json!({"run_id": self.run_id(), "error": error}),
                 );
-                return failed(1);
+                return failed(
+                    None,
+                    IntegrationFailureKind::ExecutionError,
+                    format!("sync failed: {error}"),
+                    None,
+                );
             }
         }
-        if !matches!(merge_checkout_ready(worktree), Ok(true)) {
-            self.log().emit_with_fields(
-                LogLevel::Warn,
-                "sloop::driver",
-                "sync_worktree_not_ready",
-                json!({"run_id": self.run_id(), "stage": run.stage.name}),
+        if let Err(error) = check_merge_checkout(worktree, "sync", "run worktree") {
+            return failed(
+                error.exit_code,
+                error.failure.kind,
+                error.failure.message,
+                None,
             );
-            return failed(1);
         }
         match git_is_ancestor(worktree, &default_head, &self.plan.branch) {
             Ok(true) => return integrated(),
@@ -1221,7 +1313,12 @@ impl RunDriver<'_> {
                     "sync_ancestry_unreadable",
                     json!({"run_id": self.run_id(), "error": error}),
                 );
-                return failed(1);
+                return failed(
+                    None,
+                    IntegrationFailureKind::ExecutionError,
+                    format!("sync failed: {error}"),
+                    None,
+                );
             }
         }
 
@@ -1238,14 +1335,31 @@ impl RunDriver<'_> {
                 "Merge the default branch into run branch '{}'",
                 self.plan.branch
             ),
-            default_head,
+            default_head.clone(),
         ];
         let result = self.run_exec(&run.stage.name, run.attempt, &argv, None);
         if result.verdict == Verdict::Pass {
             return result;
         }
+        let conflicts = git_stdout(worktree, &["diff", "--name-only", "--diff-filter=U"]);
         abort_in_progress_merge(worktree);
-        result
+        match conflicts {
+            Ok(paths) if !paths.is_empty() => failed(
+                result.exit_code,
+                IntegrationFailureKind::Conflict,
+                format!(
+                    "sync failed: conflicts integrating default-branch commit {default_head}: {}",
+                    paths.lines().collect::<Vec<_>>().join(", ")
+                ),
+                Some(default_head),
+            ),
+            _ => failed(
+                result.exit_code,
+                IntegrationFailureKind::ExecutionError,
+                "sync failed: git integration failed; see run output".into(),
+                None,
+            ),
+        }
     }
 
     /// Runs a stage's panel and derives its verdict.
@@ -1318,6 +1432,7 @@ impl RunDriver<'_> {
         let reported = self.panel_reports(run, panel.reviewers.len())?;
         let outcome = aggregate(panel, &reported);
         let judged = StageResult {
+            integration_failure: None,
             verdict: outcome.verdict,
             exit_code: None,
             started_at_ms,
@@ -1467,6 +1582,7 @@ impl RunDriver<'_> {
             output_ref: output_ref.clone(),
             verdict_source: resolved.then(|| source.as_str().to_owned()),
             reason: resolved.then(|| reason.clone()).flatten(),
+            integration_failure: result.integration_failure.clone(),
         };
         let rows = match check {
             Some(check) => vec![
@@ -1580,6 +1696,7 @@ pub(super) fn replayable(log: &[StageRecord]) -> Vec<StageEvidence> {
                     _ => VerdictSource::ExitCode,
                 },
                 reason: row.reason.clone(),
+                integration_failure: row.integration_failure.clone(),
             })
         })
         .collect()
@@ -1635,16 +1752,41 @@ pub(super) fn panel_reports(
 fn flow_with_implicit_test(flow: &Flow, test_cmd: Option<&[String]>) -> Result<Flow, String> {
     let mut flow = flow.clone();
     if let Some(cmd) = test_cmd {
+        let sync = flow
+            .stages
+            .iter()
+            .rposition(|stage| stage.action == Actor::Builtin(Builtin::Sync));
+        if let Some(index) = sync
+            && let Some(verify) = flow.stages[index + 1..].iter_mut().find(|stage| {
+                stage.name == "verify"
+                    && stage.action
+                        == (Actor::Exec {
+                            cmd: vec!["true".into()],
+                        })
+            })
+        {
+            verify.action = Actor::Exec { cmd: cmd.to_vec() };
+            return Ok(flow);
+        }
+        if let Some(index) = sync
+            && flow.stages[index + 1..]
+                .iter()
+                .any(|stage| stage.action == (Actor::Exec { cmd: cmd.to_vec() }))
+        {
+            return Ok(flow);
+        }
         if flow.stages.iter().any(|stage| stage.name == "test") {
             return Err("flow.test_cmd conflicts with flow stage `test`".into());
         }
         flow.stages.insert(
-            1.min(flow.stages.len()),
+            sync.map_or(1.min(flow.stages.len()), |index| index + 1),
             Stage {
                 name: "test".into(),
                 action: Actor::Exec { cmd: cmd.to_vec() },
                 result_check: Check::None,
-                fail_action: FailAction::Halt,
+                fail_action: sync.map_or(FailAction::Halt, |index| {
+                    flow.stages[index].fail_action.clone()
+                }),
                 ff_only: false,
             },
         );
@@ -1704,44 +1846,75 @@ pub(super) fn try_commits_on_branch(root: &Path, branch: &str) -> Result<Vec<Str
     .map(|output| output.lines().map(str::to_owned).collect())
 }
 
-/// Attempts the policy merge into the default branch: fast-forward when
-/// possible, otherwise a merge commit. Failed merges leave the exact checkout
-/// state for human review; Sloop never guesses which post-merge edits it owns.
-///
-/// With `ff_only` the merge commit is off the table: the default branch either
-/// fast-forwards to the run branch or the stage fails, and git leaves the
-/// checkout untouched in the second case. That refusal is the point. A
-/// fast-forward can only succeed while the default branch is still the one an
-/// earlier sync integrated, so the run branch a flow verified is provably the
-/// tree that lands — and a default branch that moved in between trips the
-/// stage instead of quietly merging something no stage ever tested.
+struct MergeError {
+    failure: IntegrationFailure,
+    exit_code: Option<i32>,
+}
+
+impl MergeError {
+    fn new(kind: IntegrationFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            failure: IntegrationFailure {
+                kind,
+                message: message.into(),
+                target: None,
+            },
+            exit_code: None,
+        }
+    }
+}
+
+impl From<String> for MergeError {
+    fn from(message: String) -> Self {
+        Self::new(
+            IntegrationFailureKind::ExecutionError,
+            format!("merge failed: {message}"),
+        )
+    }
+}
+
+/// Applies the run branch under the shared merge lock, preserving process
+/// recovery evidence and Git output. With ff_only, divergent histories refuse
+/// to land until the run branch has integrated the current default-branch tip.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn attempt_merge(
+fn attempt_merge(
     root: &Path,
     branch: &str,
     branch_unchanged: bool,
     ff_only: bool,
     stage: &str,
+    attempt: u32,
+    output_path: &Path,
     run_store: &RunStore,
     run_id: &str,
     clock: &dyn Clock,
     operational_log: &OperationalLog,
-) -> MergeOutcome {
+) -> Result<(), MergeError> {
     if branch_unchanged {
-        return MergeOutcome::Merged;
+        return Ok(());
     }
-    let Ok(_guard) = MERGE_LOCK.lock() else {
-        return MergeOutcome::Diverged;
-    };
-    let Ok(true) = merge_checkout_ready(root) else {
-        return MergeOutcome::Diverged;
-    };
-    let Ok(target_head) = git_stdout(root, &["rev-parse", "HEAD"]) else {
-        return MergeOutcome::Diverged;
-    };
-    let Ok(branch_tip) = git_stdout(root, &["rev-parse", branch]) else {
-        return MergeOutcome::Diverged;
-    };
+    let _guard = MERGE_LOCK
+        .lock()
+        .map_err(|_| "merge lock poisoned".to_owned())?;
+    check_merge_checkout(root, "merge", "default-branch checkout")?;
+    let target_head = git_stdout(root, &["rev-parse", "HEAD"])?;
+    let branch_tip = git_stdout(root, &["rev-parse", branch])?;
+    let output_log = RunLogWriter::open(output_path)
+        .map_err(|error| format!("cannot open merge output: {error}"))?;
+    output_log
+        .append_at(
+            clock.now_ms(),
+            OutputSource::Stage,
+            Some(stage),
+            Some(attempt),
+            OutputStream::Stdout,
+            format!(
+                "git merge {}{branch_tip} (default-branch tip {target_head})\n",
+                if ff_only { "--ff-only " } else { "" }
+            )
+            .as_bytes(),
+        )
+        .map_err(|error| format!("cannot record merge command: {error}"))?;
     let message = format!("Merge run branch '{branch}'");
     let mut command = Command::new("sh");
     command
@@ -1766,13 +1939,14 @@ pub(super) fn attempt_merge(
     command
         .arg(&branch_tip)
         .current_dir(root)
+        .env("LC_ALL", "C")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .process_group(0);
-    let Ok(mut child) = command.spawn() else {
-        return MergeOutcome::Diverged;
-    };
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("cannot start git: {error}"))?;
     let pid = child.id();
     let mut gate = child.stdin.take().expect("merge gate stdin was piped");
     let Some(pid_start_time) = process_start_time(pid) else {
@@ -1780,7 +1954,7 @@ pub(super) fn attempt_merge(
             libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
         }
         let _ = child.wait();
-        return MergeOutcome::Diverged;
+        return Err("cannot identify merge process".to_owned().into());
     };
     let checkpoint = MergeProcessCheckpoint {
         target_head,
@@ -1806,7 +1980,7 @@ pub(super) fn attempt_merge(
             libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
         }
         let _ = child.wait();
-        return MergeOutcome::Diverged;
+        return Err(format!("cannot checkpoint merge process: {error}").into());
     }
     wait_for_test_hook(&format!("after-stage-process-checkpoint-{stage}"));
     if cancelled(run_store, run_id, operational_log) {
@@ -1814,18 +1988,56 @@ pub(super) fn attempt_merge(
             libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
         }
         let _ = child.wait();
-        return MergeOutcome::Diverged;
+        return Err(MergeError::new(
+            IntegrationFailureKind::Cancelled,
+            "merge cancelled before execution",
+        ));
     }
+    let readers = vec![
+        spawn_output_reader(
+            child.stdout.take().expect("stdout was piped"),
+            output_log.clone(),
+            OutputSource::Stage,
+            Some(stage.into()),
+            attempt,
+            OutputStream::Stdout,
+            None,
+            None,
+        ),
+        spawn_output_reader(
+            child.stderr.take().expect("stderr was piped"),
+            output_log,
+            OutputSource::Stage,
+            Some(stage.into()),
+            attempt,
+            OutputStream::Stderr,
+            None,
+            None,
+        ),
+    ];
     if gate.write_all(b"run\n").is_err() {
         unsafe {
             libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
         }
         let _ = child.wait();
-        return MergeOutcome::Diverged;
+        join_readers(readers);
+        return Err("cannot release merge process".to_owned().into());
     }
     drop(gate);
-    match child.wait() {
-        Ok(status) if status.success() => {
+    let status = child.wait();
+    kill_straggler_process_group(pid);
+    let captured = join_readers(readers);
+    if !captured {
+        operational_log.emit_with_fields(
+            LogLevel::Error,
+            "sloop::driver",
+            "merge_output_capture_incomplete",
+            json!({"run_id": run_id, "stage": stage, "attempt": attempt}),
+        );
+    }
+    let status = status.map_err(|error| format!("cannot wait for git: {error}"))?;
+    match status {
+        status if status.success() => {
             if let Ok(completed_target) = git_stdout(root, &["rev-parse", "HEAD"]) {
                 let completed = MergeProcessCheckpoint {
                     completed_target: Some(completed_target),
@@ -1849,11 +2061,63 @@ pub(super) fn attempt_merge(
                 }
             }
             wait_for_test_hook("after-successful-merge-process-exit");
-            MergeOutcome::Merged
+            Ok(())
         }
-        _ => {
+        status => {
             wait_for_test_hook("after-failed-merge-process-exit");
-            MergeOutcome::Diverged
+            let output = stage_output_tail(output_path, stage, attempt, BACKWARD_CONTEXT_LINES)
+                .unwrap_or_default();
+            let ff_refused = ff_only
+                && git_stdout(root, &["rev-parse", "HEAD"]).is_ok_and(|head| {
+                    matches!(
+                        git_is_ancestor(root, &head, &checkpoint.branch_tip),
+                        Ok(false)
+                    ) && matches!(
+                        git_is_ancestor(root, &checkpoint.branch_tip, &head),
+                        Ok(false)
+                    )
+                });
+            let mut error = if cancelled(run_store, run_id, operational_log) {
+                MergeError::new(IntegrationFailureKind::Cancelled, "merge cancelled")
+            } else if git_stdout(root, &["diff", "--name-only", "--diff-filter=U"])
+                .is_ok_and(|paths| !paths.is_empty())
+            {
+                MergeError::new(
+                    IntegrationFailureKind::Conflict,
+                    "merge failed: conflicts in the default-branch checkout; see run output",
+                )
+            } else if let Err(error) =
+                check_merge_checkout(root, "merge", "default-branch checkout")
+            {
+                error
+            } else if ff_refused && captured && status.code().is_some() {
+                MergeError::new(
+                    IntegrationFailureKind::FfOnlyRefused,
+                    "merge refused: run branch does not contain the current default-branch tip (ff-only)",
+                )
+            } else if output.contains("would be overwritten by merge")
+                || output.contains("would be overwritten by checkout")
+            {
+                MergeError::new(
+                    IntegrationFailureKind::LocalChanges,
+                    "merge refused: local changes would be overwritten in the default-branch checkout",
+                )
+            } else {
+                let detail = output
+                    .lines()
+                    .rev()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or("git process failed");
+                MergeError::new(
+                    IntegrationFailureKind::ExecutionError,
+                    format!(
+                        "merge failed: {}",
+                        detail.chars().take(500).collect::<String>()
+                    ),
+                )
+            };
+            error.exit_code = status.code();
+            Err(error)
         }
     }
 }
@@ -1905,10 +2169,35 @@ fn record_merge_process_checkpoint(
 
 pub(super) use crate::git::stdout as git_stdout;
 
-fn merge_checkout_ready(root: &Path) -> Result<bool, String> {
-    Ok(!shared_checkout_has_git_operation(root)?
-        && !git_index_lock_path(root)?.exists()
-        && git_index_matches_head(root)?)
+fn check_merge_checkout(root: &Path, action: &str, checkout: &str) -> Result<(), MergeError> {
+    let execution_error = |error| {
+        MergeError::new(
+            IntegrationFailureKind::ExecutionError,
+            format!("{action} failed: {error}"),
+        )
+    };
+    if let Some(operation) = git_operation(root).map_err(&execution_error)? {
+        return Err(MergeError::new(
+            IntegrationFailureKind::OperationInProgress,
+            format!("{action} refused: {operation} in progress in the {checkout}"),
+        ));
+    }
+    if git_index_lock_path(root)
+        .map_err(&execution_error)?
+        .exists()
+    {
+        return Err(MergeError::new(
+            IntegrationFailureKind::CheckoutLocked,
+            format!("{action} refused: index locked in the {checkout}"),
+        ));
+    }
+    if !git_index_matches_head(root).map_err(execution_error)? {
+        return Err(MergeError::new(
+            IntegrationFailureKind::StagedChanges,
+            format!("{action} refused: staged changes in the {checkout}"),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn git_is_ancestor(
@@ -1958,22 +2247,26 @@ fn git_path(root: &Path, name: &str) -> Result<PathBuf, String> {
 }
 
 pub(super) fn shared_checkout_has_git_operation(root: &Path) -> Result<bool, String> {
-    for state in [
-        "MERGE_HEAD",
-        "AUTO_MERGE",
-        "MERGE_MODE",
-        "CHERRY_PICK_HEAD",
-        "REVERT_HEAD",
-        "REBASE_HEAD",
-        "rebase-merge",
-        "rebase-apply",
-        "sequencer",
+    git_operation(root).map(|operation| operation.is_some())
+}
+
+fn git_operation(root: &Path) -> Result<Option<&'static str>, String> {
+    for (state, operation) in [
+        ("rebase-merge", "rebase"),
+        ("rebase-apply", "rebase or am"),
+        ("REBASE_HEAD", "rebase"),
+        ("MERGE_HEAD", "merge"),
+        ("AUTO_MERGE", "merge"),
+        ("MERGE_MODE", "merge"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("REVERT_HEAD", "revert"),
+        ("sequencer", "sequenced git operation"),
     ] {
         if git_path(root, state)?.exists() {
-            return Ok(true);
+            return Ok(Some(operation));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -2038,6 +2331,7 @@ mod tests {
 
     fn resolved(exit_code: Option<i32>, reason: Option<&str>) -> StageRecord {
         StageRecord {
+            integration_failure: None,
             stage_index: 1,
             stage: "test".into(),
             attempt: 1,

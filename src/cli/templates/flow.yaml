@@ -155,13 +155,13 @@ stages:
   # the shared default-branch checkout is only ever read. Passes when the
   # merge commits or there was nothing to integrate, and fails on a
   # conflict — leaving no in-progress merge behind, so a `return_to` target
-  # would start from a clean tree: the conflict reaches the re-entered
-  # stage as a report in its prompt, never as markers it could resolve.
+  # starts from a clean tree. A returning agent gets the target commit and
+  # instructions to recreate the merge and resolve its conflicts.
   # Any number, anywhere before the merge.
   #
   # Placed here it is only half the pattern: stages *after* a sync judge the
   # tree that will actually land, so a sync belongs before them rather than
-  # after. See the `train` flow `sloop init` writes beside this one for the
+  # after. See the default and train flows `sloop init` writes for the
   # whole shape, including the `ff_only` merge that makes the verified tree
   # provably the one that lands.
   - name: sync
@@ -189,5 +189,7 @@ stages:
     fail_action: fail
 
 # A configured `flow.test_cmd` in config.yaml is inserted as an implicit
-# `result_check: none` stage named `test` at index 1, so it cannot be
-# combined with a flow that already has a stage named `test`.
+# `result_check: none` stage named `test` after sync (or after the first
+# stage when there is no sync). It fills a no-op verify or skips an identical
+# explicit command after sync, and cannot be combined with a flow that
+# already has a stage named `test`.

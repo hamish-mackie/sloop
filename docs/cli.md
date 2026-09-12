@@ -76,7 +76,7 @@ flow and the schema.
 
 `sloop template ticket`'s `flow:` comment names the two flows that ship inside
 the binary and are written out by `sloop init`: `default` (build, review,
-merge) and `train` (build, sync, verify, `ff_only` merge).
+sync, verify, `ff_only` merge) and `train` (the same loop without review).
 
 ### sloop daemon
 

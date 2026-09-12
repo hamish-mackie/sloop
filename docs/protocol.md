@@ -317,6 +317,14 @@ emits `v: 1` only:
 - `value.halt` on a run, `attempt`, `advisory`, `confidence`, and `reviewers`
   on a stage row, and `elided` on a `logs` page are new response fields.
   Nothing existing was repurposed to make room for them.
+- Stage rows also expose nullable `integration_failure`: an object with
+  `kind`, `message`, and an optional pinned `target` commit. Kinds include
+  `staged_changes`, `local_changes`, `operation_in_progress`, `checkout_locked`,
+  `conflict`, `ff_only_refused`, `execution_error`, `cancelled`, and
+  `unsafe_recovery`. The readable message also appears in the stage's `reason`.
+  `halt: integration_blocked` means an integration failure cannot use the
+  configured backward edge: only sync conflicts and merge fast-forward refusals
+  take integration retries. Ordinary exec/check failures use their flow policy.
 - `logs.stage` is the one field whose accepted *values* widened: it took a bare
   stage name and now also takes `<stage>#<attempt>`. A bare name still means
   what it always did — every execution of that stage — so no request that was

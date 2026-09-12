@@ -249,7 +249,8 @@ fn a_sync_conflict_returns_to_build_with_the_conflict_in_the_prompt() {
     configure(&world, &train_flow("true"), &script);
     world.commit_all("initial");
     world.arm_test_hook("after-stage-build");
-    world.start_daemon();
+    world.arm_test_hook("after-stage-sync");
+    let daemon = world.start_daemon();
     let ticket = post(&world, "train-conflict.md");
     assert!(world.sloop(&["run", &ticket]).status.success());
 
@@ -257,7 +258,15 @@ fn a_sync_conflict_returns_to_build_with_the_conflict_in_the_prompt() {
         world.test_hook_reached("after-stage-build")
     });
     advance_default_branch(&world, "contested.txt", "from the default branch\n");
+    let target = git(world.root(), &["rev-parse", "HEAD"]);
     world.release_test_hook("after-stage-build");
+    wait_until_slow("the failed sync is recorded", || {
+        world.test_hook_reached("after-stage-sync")
+    });
+    world.kill_daemon(daemon["data"]["pid"].as_u64().unwrap() as u32);
+    advance_default_branch(&world, "later.txt", "a later target\n");
+    world.release_test_hook("after-stage-sync");
+    world.start_daemon();
 
     // The agent reproduces the same conflicting commit, so the single return
     // is spent and the walk halts on the sync it could not get past. The
@@ -276,6 +285,10 @@ fn a_sync_conflict_returns_to_build_with_the_conflict_in_the_prompt() {
     assert!(rerun.contains("Stage `sync` (attempt 1) failed"), "{rerun}");
     assert!(rerun.contains("contested.txt"), "{rerun}");
     assert!(rerun.contains("CONFLICT"), "{rerun}");
+    assert!(
+        rerun.contains(&format!("git merge --no-edit {target}")),
+        "{rerun}"
+    );
 
     // The merge stage was never requested, and both sync executions are on
     // the record.
@@ -402,4 +415,281 @@ fn a_default_branch_that_moves_before_the_merge_trips_ff_only_and_loops_the_trai
     );
     assert!(world.root().join("agent.txt").is_file());
     assert!(world.root().join("landed-after-verify.txt").is_file());
+    let shown = world.show_snapshot(&world.run_alias(1));
+    let refused = shown["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stage| stage["stage"] == "merge" && stage["attempt"] == 1)
+        .unwrap();
+    assert_eq!(refused["integration_failure"]["kind"], "ff_only_refused");
+    assert!(refused["reason"].as_str().unwrap().contains("ff-only"));
+    let output = world.sloop(&["logs", &world.run_alias(1), "--stage", "merge"]);
+    let log = String::from_utf8_lossy(&output.stdout);
+    assert!(log.contains("Not possible to fast-forward"), "{log}");
+}
+
+/// Exercise the materialized default, replacing only the model and repository
+/// check commands. Both agents finish against the same base before either lands.
+#[test]
+fn the_default_flow_heals_two_concurrent_conflicting_runs() {
+    let world = World::configured();
+    let script = world.root().join("fake-agent.sh");
+    let log_prefix = world.root().join("prompt-");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -eu
+printf '\001PROMPT\001\n%s\n' "$1" >> {log}"$SLOOP_TICKET_ID"
+export GIT_AUTHOR_NAME=agent GIT_COMMITTER_NAME=agent
+export GIT_AUTHOR_EMAIL=agent@example.invalid GIT_COMMITTER_EMAIL=agent@example.invalid
+case "$1" in
+  *"Integration repair:"*)
+    target=$(printf '%s\n' "$1" | sed -n 's/.*`git merge --no-edit \([0-9a-f]*\)`.*/\1/p')
+    test -n "$target"
+    git merge --no-edit "$target" || test -n "$(git ls-files --unmerged)"
+    {{ git show HEAD:contested.txt; git show "$target:contested.txt"; }} | sort -u > contested.txt
+    ;;
+  *) printf '%s\n' "$SLOOP_TICKET_ID" > contested.txt ;;
+esac
+git add contested.txt
+git -c user.name=agent -c user.email=agent@example.invalid commit --quiet -m 'integrated work'
+"#,
+            log = shell_quote(&log_prefix.to_string_lossy())
+        ),
+    )
+    .unwrap();
+    configure(&world, &train_flow("true"), &script);
+    fs::remove_file(world.root().join(".agents/sloop/flows/default.yaml")).unwrap();
+    let config = world.root().join(".agents/sloop/config.yaml");
+    fs::write(
+        &config,
+        fs::read_to_string(&config)
+            .unwrap()
+            .replace("max_parallel_tasks: 1", "max_parallel_tasks: 2"),
+    )
+    .unwrap();
+    assert!(world.sloop(&["init"]).status.success());
+    let flow_path = world.root().join(".agents/sloop/flows/default.yaml");
+    let mut flow: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(&flow_path).unwrap()).unwrap();
+    flow["stages"][1]["action"]["exec"] = serde_yaml::to_value([
+        env!("CARGO_BIN_EXE_sloop"),
+        "verdict",
+        "pass",
+        "--reason",
+        "reviewed",
+    ])
+    .unwrap();
+    flow["stages"][3]["action"]["exec"] =
+        serde_yaml::to_value(["git", "diff", "--exit-code", "HEAD", "--"]).unwrap();
+    fs::write(flow_path, serde_yaml::to_string(&flow).unwrap()).unwrap();
+    fs::write(world.root().join("contested.txt"), "base\n").unwrap();
+    world.commit_all("initial");
+    world.arm_test_hook("after-stage-build");
+    world.start_daemon();
+    let first = post(&world, "first.md");
+    let second = post(&world, "second.md");
+    assert!(world.sloop(&["run", &first]).status.success());
+    assert!(world.sloop(&["run", &second]).status.success());
+    wait_until_slow("both builds finish before integration", || {
+        [1, 2].iter().all(|position| {
+            let shown = world.show_snapshot(&world.run_alias(*position));
+            shown["stages"].as_array().is_some_and(|stages| {
+                stages
+                    .iter()
+                    .any(|stage| stage["stage"] == "build" && stage["state"] == "passed")
+            })
+        })
+    });
+    world.release_test_hook("after-stage-build");
+    wait_until_slow("both conflicting runs heal and land", || {
+        let state = status(&world);
+        if state["tickets"]["needs_review"].as_u64().unwrap_or(0) > 0
+            || state["tickets"]["failed"].as_u64().unwrap_or(0) > 0
+        {
+            panic!(
+                "unexpected failure: {state}\n{}\n{}\n{}\n{}",
+                world.show_snapshot(&world.run_alias(1)),
+                world.show_snapshot(&world.run_alias(2)),
+                String::from_utf8_lossy(&world.sloop(&["logs", &world.run_alias(1)]).stdout),
+                String::from_utf8_lossy(&world.sloop(&["logs", &world.run_alias(2)]).stdout)
+            );
+        }
+        state["tickets"]["merged"] == 2
+    });
+    let contents = fs::read_to_string(world.root().join("contested.txt")).unwrap();
+    assert!(contents.lines().any(|line| line == first), "{contents}");
+    assert!(contents.lines().any(|line| line == second), "{contents}");
+    let launches: Vec<_> = [&first, &second]
+        .iter()
+        .flat_map(|ticket| prompts(&world.root().join(format!("prompt-{ticket}"))))
+        .collect();
+    assert_eq!(
+        launches.len(),
+        3,
+        "only the conflicting run needs an extra agent"
+    );
+    assert_eq!(
+        launches
+            .iter()
+            .filter(|prompt| prompt.contains("Integration repair:"))
+            .count(),
+        1
+    );
+    assert!(!merge_in_progress(world.root()));
+    for position in [1, 2] {
+        let shown = world.show_snapshot(&world.run_alias(position));
+        let stages = shown["stages"].as_array().unwrap();
+        let builds = stages
+            .iter()
+            .filter(|stage| stage["stage"] == "build")
+            .count();
+        let reviews = stages
+            .iter()
+            .filter(|stage| stage["stage"] == "review")
+            .count();
+        assert_eq!(builds, reviews, "repairs are reviewed again: {shown}");
+    }
+}
+
+#[test]
+fn checkout_refusals_explain_themselves_and_do_not_retry_the_train() {
+    for (kind, reason) in [
+        ("staged_changes", "staged changes"),
+        ("operation_in_progress", "merge in progress"),
+        ("checkout_locked", "index locked"),
+        ("local_changes", "local changes would be overwritten"),
+    ] {
+        let world = World::configured();
+        let prompt_log = world.root().join("prompts.log");
+        let script = agent_writing(&world, &prompt_log, "agent.txt", "agent work");
+        configure(&world, &train_flow("true"), &script);
+        world.commit_all("initial");
+        world.arm_test_hook("after-stage-verify");
+        world.arm_test_hook("after-stage-merge");
+        let daemon = world.start_daemon();
+        let ticket = post(&world, "checkout-refused.md");
+        assert!(world.sloop(&["run", &ticket]).status.success());
+        wait_until_slow("verification finishes", || {
+            world.test_hook_reached("after-stage-verify")
+        });
+        let before = git(world.root(), &["rev-parse", "HEAD"]);
+        match kind {
+            "staged_changes" => {
+                fs::write(world.root().join("operator.txt"), "operator work\n").unwrap();
+                git(world.root(), &["add", "operator.txt"]);
+            }
+            "operation_in_progress" => {
+                fs::write(world.root().join(".git/MERGE_HEAD"), format!("{before}\n")).unwrap();
+            }
+            "checkout_locked" => {
+                fs::write(world.root().join(".git/index.lock"), "").unwrap();
+            }
+            "local_changes" => {
+                fs::write(world.root().join("agent.txt"), "operator work\n").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        world.release_test_hook("after-stage-verify");
+        wait_until_slow("the refusal is persisted", || {
+            world.test_hook_reached("after-stage-merge")
+        });
+        // Recovery must replay the typed failure rather than retry the old
+        // blanket return_to rule after forgetting in-memory diagnostics.
+        world.kill_daemon(daemon["data"]["pid"].as_u64().unwrap() as u32);
+        world.release_test_hook("after-stage-merge");
+        world.start_daemon();
+        wait_until_slow("the checkout refusal halts", || {
+            status(&world)["tickets"]["needs_review"] == 1
+        });
+        let shown = world.show_snapshot(&world.run_alias(1));
+        let merges: Vec<_> = shown["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|stage| stage["stage"] == "merge")
+            .collect();
+        assert_eq!(merges.len(), 1, "{shown}");
+        assert_eq!(merges[0]["integration_failure"]["kind"], kind, "{shown}");
+        assert!(
+            merges[0]["reason"].as_str().unwrap().contains(reason),
+            "{shown}"
+        );
+        assert_eq!(git(world.root(), &["rev-parse", "HEAD"]), before);
+        assert_eq!(prompts(&prompt_log).len(), 1);
+        let output = world.sloop(&["logs", &world.run_alias(1), "--stage", "merge"]);
+        let log = String::from_utf8_lossy(&output.stdout);
+        assert!(log.contains(reason), "{log}");
+    }
+}
+
+#[test]
+fn configured_checks_run_after_sync_and_return_to_the_agent_for_repair() {
+    let world = World::configured();
+    let script = world.root().join("fake-agent.sh");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+set -eu
+case "$1" in
+  *'Stage `test` (attempt 1) failed'*)
+    test -f landed.txt
+    printf 'fixed\n' > repaired.txt
+    git add repaired.txt
+    ;;
+  *) printf 'implementation\n' > work.txt; git add work.txt ;;
+esac
+git -c user.name=agent -c user.email=agent@example.invalid commit --quiet -m 'agent work'
+"#,
+    )
+    .unwrap();
+    configure(&world, &train_flow("true"), &script);
+    fs::remove_file(world.root().join(".agents/sloop/flows/default.yaml")).unwrap();
+    let config = world.root().join(".agents/sloop/config.yaml");
+    let mut contents = fs::read_to_string(&config).unwrap();
+    contents
+        .push_str("flow:\n  test_cmd: [sh, -c, 'test -f landed.txt && test -f repaired.txt']\n");
+    fs::write(&config, contents).unwrap();
+    world.commit_all("initial");
+    world.arm_test_hook("after-stage-build");
+    world.arm_test_hook("after-stage-test");
+    let daemon = world.start_daemon();
+    let ticket = post(&world, "verify-repair.md");
+    assert!(world.sloop(&["run", &ticket]).status.success());
+    wait_until_slow("build completes", || {
+        world.test_hook_reached("after-stage-build")
+    });
+    advance_default_branch(&world, "landed.txt", "another run's work\n");
+    world.release_test_hook("after-stage-build");
+    wait_until_slow("the failed check is recorded", || {
+        world.test_hook_reached("after-stage-test")
+    });
+    world.kill_daemon(daemon["data"]["pid"].as_u64().unwrap() as u32);
+    let updated = fs::read_to_string(&config).unwrap().replace(
+        "test_cmd: [sh, -c, 'test -f landed.txt && test -f repaired.txt']",
+        "test_cmd: ['false']",
+    );
+    fs::write(config, updated).unwrap();
+    world.release_test_hook("after-stage-test");
+    world.start_daemon();
+    wait_until_slow("verification is repaired and the run lands", || {
+        status(&world)["tickets"]["merged"] == 1
+    });
+    assert!(world.root().join("repaired.txt").is_file());
+    assert!(world.show_snapshot(&world.run_alias(1))["halt"].is_null());
+    let stages = shown_stages(&world, &world.run_alias(1));
+    assert!(
+        stages.contains(&("test".into(), "failed".into())),
+        "{stages:?}"
+    );
+    assert!(
+        stages.contains(&("test#2".into(), "passed".into())),
+        "{stages:?}"
+    );
+    assert!(
+        stages.contains(&("build#2".into(), "passed".into())),
+        "{stages:?}"
+    );
 }

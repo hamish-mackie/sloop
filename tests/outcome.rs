@@ -1868,6 +1868,22 @@ fn a_conflicting_merge_parks_the_ticket_and_preserves_the_conflict() {
     let conflict = fs::read_to_string(world.root().join("work.txt")).unwrap();
     assert!(conflict.contains("agent-version"));
     assert!(conflict.contains("main-version"));
+    let shown = world.show_snapshot(&world.run_alias(1));
+    let merge = shown["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stage| stage["stage"] == "merge")
+        .unwrap();
+    assert_eq!(merge["integration_failure"]["kind"], "conflict");
+    assert!(
+        merge["reason"]
+            .as_str()
+            .unwrap()
+            .contains("merge failed: conflicts")
+    );
+    let logs = world.sloop(&["logs", &world.run_alias(1), "--stage", "merge"]);
+    assert!(String::from_utf8_lossy(&logs.stdout).contains("CONFLICT"));
 }
 
 #[test]

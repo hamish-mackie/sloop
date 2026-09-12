@@ -56,6 +56,7 @@ pub fn panel_prompt(root: &Path, panel: &Panel) -> Result<String, String> {
 /// the prompt the daemon that took the jump would have.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailureContext {
+    pub integration_target: Option<String>,
     pub stage: String,
     pub attempt: u32,
     pub reason: String,
@@ -80,6 +81,15 @@ pub fn previous_attempt_block(context: &FailureContext) -> String {
         ));
     }
     block.push_str("\n--- end previous attempt ---");
+    if let Some(target) = &context.integration_target {
+        block.push_str(&format!(
+            "\n\nIntegration repair: your existing implementation must be integrated with default-branch commit {target}. \
+             Sloop aborted the failed sync, so recreate it in this run's worktree with `git merge --no-edit {target}`. \
+             Resolve the conflicts while preserving both your ticket's intent and the changes already landed. \
+             Stage the resolutions and complete the merge commit, then run the repository's checks. \
+             Stay on this run's branch; Sloop owns the final merge into the default branch."
+        ));
+    }
     block
 }
 
@@ -124,6 +134,7 @@ mod tests {
     #[test]
     fn the_previous_attempt_block_names_the_failure_and_fences_its_output() {
         let block = previous_attempt_block(&FailureContext {
+            integration_target: None,
             stage: "test".into(),
             attempt: 2,
             reason: "exit 101".into(),
@@ -150,6 +161,7 @@ mod tests {
     #[test]
     fn the_previous_attempt_block_omits_an_empty_output_section() {
         let block = previous_attempt_block(&FailureContext {
+            integration_target: None,
             stage: "review".into(),
             attempt: 1,
             reason: "no verdict reported".into(),

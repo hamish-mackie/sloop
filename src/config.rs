@@ -84,7 +84,7 @@ pub struct Config {
     /// overridden by a repository file.
     pub flows: BTreeMap<String, Flow>,
     pub default_flow: String,
-    /// The implicit `test` stage spliced into every flow at index 1: an argv
+    /// The test command applied after sync, or after the first stage without sync: an argv
     /// run in the worktree. Absent means the run branch merges without a test
     /// gate; an unchanged branch completes as a no-op.
     pub flow_test_cmd: Option<Vec<String>>,
@@ -1566,7 +1566,7 @@ mod tests {
                 .iter()
                 .map(|stage| stage.name.as_str())
                 .collect::<Vec<_>>(),
-            ["build", "merge"]
+            ["build", "sync", "merge"]
         );
     }
 
@@ -1588,7 +1588,7 @@ mod tests {
                 .iter()
                 .map(|stage| stage.name.as_str())
                 .collect::<Vec<_>>(),
-            ["build", "merge"]
+            ["build", "sync", "merge"]
         );
     }
 

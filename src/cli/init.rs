@@ -13,10 +13,8 @@ pub const DEFAULT_FLOW: &str = include_str!("../defaults/flows/default.yaml");
 pub const TRAIN_FLOW_TEMPLATE: &str = include_str!("../defaults/flows/train.yaml");
 pub const DEFAULT_REVIEW_PROMPT: &str = include_str!("../defaults/prompts/review.md");
 
-/// The verify command the train flow falls back to when the repository has
-/// configured none. Named here rather than buried in the template so the
-/// fallback is one thing to find and change.
-const FALLBACK_TEST_CMD: [&str; 2] = ["cargo", "test"];
+/// Repositories without a test command still integrate, but do not run tests.
+const FALLBACK_TEST_CMD: [&str; 1] = ["true"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitOutcome {
@@ -62,7 +60,7 @@ pub fn init(root: &Path) -> Result<InitOutcome, InitError> {
     ensure_file(
         root,
         ".agents/sloop/flows/default.yaml",
-        DEFAULT_FLOW,
+        &render_default_flow(configured_test_cmd(root).as_deref()),
         &mut outcome,
     )?;
     ensure_file(
@@ -92,6 +90,16 @@ pub fn render_train_flow(test_cmd: Option<&[String]>) -> String {
     let cmd = test_cmd.filter(|cmd| !cmd.is_empty()).unwrap_or(&fallback);
     let rendered = serde_json::to_string(cmd).expect("an argv of strings serializes");
     TRAIN_FLOW_TEMPLATE.replace("{test_cmd}", &rendered)
+}
+
+pub fn render_default_flow(test_cmd: Option<&[String]>) -> String {
+    match test_cmd.filter(|cmd| !cmd.is_empty()) {
+        Some(cmd) => DEFAULT_FLOW.replace(
+            "[\"true\"]",
+            &serde_json::to_string(cmd).expect("argv serializes"),
+        ),
+        None => DEFAULT_FLOW.into(),
+    }
 }
 
 /// The repository's `flow.test_cmd`, read straight from the config file rather
@@ -194,7 +202,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DEFAULT_CONFIG, DEFAULT_FLOW, DEFAULT_REVIEW_PROMPT, InitError, init, render_train_flow,
+        DEFAULT_CONFIG, DEFAULT_FLOW, DEFAULT_REVIEW_PROMPT, InitError, init, render_default_flow,
+        render_train_flow,
     };
 
     /// The shipped train is the pattern the docs describe, so what it parses
@@ -219,7 +228,7 @@ mod tests {
         assert_eq!(
             flow.stages[2].action,
             crate::flow::Actor::Exec {
-                cmd: vec!["cargo".into(), "test".into()],
+                cmd: vec!["true".into()],
             }
         );
         assert!(flow.stages[3].ff_only, "the merge stage must be ff_only");
@@ -262,7 +271,10 @@ mod tests {
 
         let default =
             std::fs::read_to_string(root.path().join(".agents/sloop/flows/default.yaml")).unwrap();
-        assert_eq!(default, DEFAULT_FLOW, "the default flow is not replaced");
+        assert_eq!(
+            default,
+            render_default_flow(Some(&["make".into(), "check".into()]))
+        );
         let train =
             std::fs::read_to_string(root.path().join(".agents/sloop/flows/train.yaml")).unwrap();
         let flow = crate::flow::parse("train", &train).expect("materialized train flow parses");
@@ -282,7 +294,7 @@ mod tests {
             .iter()
             .map(|stage| stage.name.as_str())
             .collect();
-        assert_eq!(names, ["build", "review", "merge"]);
+        assert_eq!(names, ["build", "review", "sync", "verify", "merge"]);
     }
 
     /// The shipped review stage must be a real gate. Under the exec default

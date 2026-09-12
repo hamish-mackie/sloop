@@ -30,6 +30,29 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_FLOW_NAME: &str = "default";
 
+/// Machine-observed integration failures, independent of Git's diagnostic text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationFailureKind {
+    StagedChanges,
+    LocalChanges,
+    OperationInProgress,
+    CheckoutLocked,
+    Conflict,
+    FfOnlyRefused,
+    ExecutionError,
+    Cancelled,
+    UnsafeRecovery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationFailure {
+    pub kind: IntegrationFailureKind,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Flow {
     pub name: String,
@@ -143,11 +166,24 @@ pub(crate) fn built_in_default() -> Flow {
             ff_only: false,
         },
         Stage {
+            name: "sync".into(),
+            action: Actor::Builtin(Builtin::Sync),
+            result_check: Check::None,
+            fail_action: FailAction::ReturnTo {
+                stage: "build".into(),
+                attempts: 1,
+            },
+            ff_only: false,
+        },
+        Stage {
             name: "merge".into(),
             action: Actor::Builtin(Builtin::Merge),
             result_check: Check::None,
-            fail_action: FailAction::Halt,
-            ff_only: false,
+            fail_action: FailAction::ReturnTo {
+                stage: "sync".into(),
+                attempts: 10,
+            },
+            ff_only: true,
         },
     ];
     Flow {

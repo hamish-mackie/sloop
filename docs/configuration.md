@@ -78,10 +78,10 @@ ids:
 
 ### flow
 
-- `test_cmd` — an argv run inside the worktree after the flow's first stage
-  and before its work can merge. A failing command keeps the work out of your
-  branch and leaves the ticket for review. Omit it to merge without another
-  qualification step. See [the implicit test stage](#the-implicit-test-stage).
+- `test_cmd` — an argv run inside the worktree before its work can merge.
+  In a flow with `sync`, it runs after integration, and failures follow the
+  sync stage's repair policy. Otherwise it runs after the first stage and
+  halts on failure. See [the implicit test stage](#the-implicit-test-stage).
 
 ### agent
 
@@ -223,6 +223,11 @@ frontmatter or `sloop post --flow <name>`, and the binding is validated against
 the flow files that exist; a ticket that names none gets `default`.
 
 `sloop init` scaffolds two working flows, `default.yaml` and `train.yaml`.
+The default is **build → review → sync → verify → ff-only merge**. Concurrent
+runs integrate the latest local default branch in their own worktrees; a
+conflict returns to the agent for repair. `train` uses the same integration
+loop without the review stage. Configure `verify` or `flow.test_cmd` to run
+your repository's checks; without a command, verification is a no-op.
 `sloop template flow` prints a fully commented file exercising every action,
 every result check, and every fail action.
 
@@ -236,13 +241,19 @@ stages:
   - name: build
     action: agent
     result_check: { builtin: commits }
-  - name: merge
-    action: { builtin: merge }
+  - name: sync
+    action: { builtin: sync }
     result_check: none
+    fail_action: { return_to: build, attempts: 1 }
+  - name: merge
+    action: { builtin: merge, ff_only: true }
+    result_check: none
+    fail_action: { return_to: sync, attempts: 10 }
 ```
 
-This flow is also built into the binary: it is what a run walks when the
-repository has no flow file at all.
+This minimal fallback is built into the binary for repositories with no flow
+file. A configured `flow.test_cmd` runs after sync. Use `sloop init` for the
+default with review and an editable verification stage.
 
 ### The three parts of a stage
 
@@ -394,10 +405,9 @@ ever ran once do not read the same.
 
 ### The merge train
 
-The worked example of a backward edge is the `train` flow, which `sloop init`
-writes to `.agents/sloop/flows/train.yaml` beside `default.yaml`. Bind a ticket
-to it with `flow: train` or `sloop post --flow train`; the `default` flow is
-unchanged and is still what a ticket gets when it names none.
+Both shipped flows use this integration loop. `default` includes a review
+before sync; `train` omits that review. The example below uses `cargo test`;
+replace it with your repository's checks.
 
 ```yaml
 stages:
@@ -428,14 +438,14 @@ stage nonetheless passed.
 The train closes that gap with nothing but ordinary stages. `sync` integrates
 the default branch into the run branch, `verify` runs against the tree that
 produces, and `ff_only` makes the merge a fast-forward — which can only succeed
-while the default branch is still the commit `sync` integrated. If it moved in
-between, the fast-forward is impossible, the merge fails without touching
-anything, and `return_to: sync` runs the train around again. Each lap is one
+when the current default-branch tip is an ancestor of the verified run branch.
+If another run lands in between and breaks that ancestry, the merge refuses
+the fast-forward, and `return_to: sync` runs the train around again. Each lap is one
 more chance to converge, and `attempts: 10` bounds how many the train gets
 before the ticket parks for a human. The budget is generous because a lost race
 is cheap: a lap re-runs only `sync` and `verify` — git and the test command,
-never an agent — so even a burst of runs finishing together converges without
-spending model time. Note where the two edges point: a failing `sync` or
+never an agent unless integration or verification needs repair. Note where
+the two edges point: a conflicting `sync` or failing
 `verify` goes back to `build`, because something about the work needs changing,
 while a failed fast-forward goes back to `sync`, because nothing about the work
 was wrong — only what it was sitting on.
@@ -465,26 +475,32 @@ run already, which puts `verify` after `sync` and both before `merge`.
 anything. The merge's own outcome is the only thing it can honestly be judged
 by, which is why the grammar refuses every other check there.
 
-A sync that conflicts fails and aborts its own merge, so the stage it returns to
-gets a clean worktree rather than one wedged on `MERGE_HEAD`. Git's conflict
-output is captured in the run log like any stage's, so a re-entered agent is
-handed the conflicting paths in its prompt and can rework its commits to avoid
-them. Be clear about what that edge can and cannot recover: the conflict
-arrives as a report, never as markers in the tree, so the agent can only
-*avoid* it by reshaping its work around what the default branch now holds —
-it is never put in front of a conflicted merge to resolve. That handles a
-build that went stale or wrong; when two independently correct changes touch
-the same lines, the rework usually reproduces the same conflict, the budget is
-spent, and the ticket parks in `needs_review`. From there the preserved run
-branch is resolved by hand and merged into the default branch externally,
-which the daemon notices on its own (see the ticket lifecycle in concepts.md).
-The builtin never resolves a conflict itself and has no rebase mode.
+A conflicting sync aborts its merge in the isolated worktree. The returning
+agent receives the exact target commit, conflict output, and instructions to
+recreate the merge, resolve it while preserving both changes, and complete
+the merge commit. It repairs the existing run branch; Sloop owns the final
+default-branch update. The target and failure survive daemon restart.
+Returning to build also repeats review in the default flow. Repair budgets
+are separate from the merge's ten lost-race retries.
 
-If your repository sets `flow.test_cmd`, `sloop init` uses that command for the
-train's `verify` stage. Prefer naming it there rather than in `flow.test_cmd`
-when you use the train: the implicit `test` stage is spliced in immediately
-after the first stage, which is *before* the sync, and so tests the tree the
-train exists to stop trusting.
+Checkout problems do not spend those retry budgets. Staged changes, an index
+lock, an ongoing Git operation, or execution failures halt with a specific
+reason in `sloop show` and the run log. Git's stdout and stderr are captured
+for merge stages as well as sync stages. Because default-flow conflicts occur
+in isolated worktrees, one conflict does not leave the shared checkout
+mid-merge and block the next run.
+
+If your repository sets `flow.test_cmd`, `sloop init` uses it for both flows'
+`verify` stages. With no command configured, those stages run `true`; Sloop
+does not guess a language-specific test command.
+
+#### Adopting the default in an existing repository
+
+`sloop init` preserves existing files. To adopt the integration loop, replace
+your active flow's final merge stage with the `sync`, `verify`, and `merge`
+stages above, keeping your build and review stages before them. Use your own
+test command and adjust `return_to: build` if your agent stage has another name.
+Commit the updated flow. Runs already admitted retain their flow snapshots.
 
 ### Panels: several reviewers, one deterministic verdict
 
@@ -581,11 +597,18 @@ stages:
 
 ### The implicit test stage
 
-A `flow.test_cmd` configured in `config.yaml` is spliced into every flow as an
-implicit stage named `test` at index 1 — immediately after the first stage,
-before the flow's own later stages. It is an `exec` action with
-`result_check: none` and `fail_action: fail`. A flow that already has a stage
-called `test` conflicts with it and is rejected.
+A `flow.test_cmd` configured in `config.yaml` runs after the last `sync` in a
+flow, so it checks the integrated tree. A no-op `verify` stage (`exec: [true]`)
+after sync is filled with that command. If the same argv already runs as an
+explicit action after sync, no duplicate test stage is inserted. Otherwise an
+implicit stage named `test` is inserted immediately after sync, using its
+`fail_action` so the default can return verification failures to build.
+The effective flow, including this command, is saved before execution; changing
+configuration during a run or restarting the daemon does not change its checks.
+
+Flows without sync retain an implicit `test` immediately after the first
+stage, with `result_check: none` and `fail_action: fail`. A flow already naming
+a stage `test` conflicts with `flow.test_cmd` and is rejected.
 
 ## Worker instructions
 

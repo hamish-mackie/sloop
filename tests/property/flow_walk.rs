@@ -14,6 +14,7 @@ fn verdict() -> impl Strategy<Value = Verdict> {
 
 fn row(flow: &Flow, index: usize, attempt: u32, verdict: Verdict) -> StageEvidence {
     StageEvidence {
+        integration_failure: None,
         stage: flow.stages[index].name.clone(),
         stage_index: index,
         attempt,

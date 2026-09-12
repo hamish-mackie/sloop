@@ -1,9 +1,11 @@
 //! The replay: a left fold over a run's ordered evidence log that derives
-//! where the walk stands. It reads exactly three things from the flow —
-//! `Flow::stages`, `Stage::name`, and `Stage::fail_action` — and touches no
-//! clock, process, or store, so the same log always yields the same step.
+//! where the walk stands. Flow failure policy and typed integration evidence
+//! determine retries; no clock, process, or store is consulted, so the same
+//! log always yields the same step.
 
-use super::{Check, FailAction, Flow, Stage};
+use super::{
+    Actor, Builtin, Check, FailAction, Flow, IntegrationFailure, IntegrationFailureKind, Stage,
+};
 
 /// A stage's pass/fail reading. Richer verdicts (e.g. `changes-requested`)
 /// are a later phase; v1 is strictly binary.
@@ -64,6 +66,7 @@ pub struct StageEvidence {
     pub verdict: Verdict,
     pub source: VerdictSource,
     pub reason: Option<String>,
+    pub integration_failure: Option<IntegrationFailure>,
 }
 
 /// Resolves a stage's verdict, source, and reason from the evidence selected
@@ -106,6 +109,8 @@ pub enum Step<'a> {
 /// Why a replay stopped short of the end of the flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HaltReason {
+    /// Integration was refused for a reason that a flow retry cannot repair.
+    IntegrationBlocked,
     /// The stage failed and its `fail_action` is `Halt`.
     FailActionHalt,
     /// The stage failed with a `return_to`, but that edge's attempt budget
@@ -156,6 +161,23 @@ pub fn next_step<'a>(flow: &'a Flow, evidence: &[StageEvidence]) -> Step<'a> {
                     stage: target,
                     attempts,
                 } => {
+                    if let Some(failure) = &row.integration_failure {
+                        let retryable = match stage.action {
+                            Actor::Builtin(Builtin::Merge) => {
+                                failure.kind == IntegrationFailureKind::FfOnlyRefused
+                            }
+                            Actor::Builtin(Builtin::Sync) => {
+                                failure.kind == IntegrationFailureKind::Conflict
+                            }
+                            _ => true,
+                        };
+                        if !retryable {
+                            return Step::Halted {
+                                failed_stage: stage.name.clone(),
+                                reason: HaltReason::IntegrationBlocked,
+                            };
+                        }
+                    }
                     let Some(target_index) = flow
                         .stages
                         .iter()
@@ -318,6 +340,7 @@ mod tests {
             verdict,
             source: VerdictSource::ExitCode,
             reason: None,
+            integration_failure: None,
         }
     }
 
