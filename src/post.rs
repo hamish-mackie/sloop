@@ -94,7 +94,7 @@ impl Drop for StagedWrite {
 struct MarkdownWorkStateAuthor<'a> {
     root: &'a Path,
     file_path: &'a str,
-    worktree: &'a str,
+    worktree: Option<&'a str>,
     work_state: &'a LocalSqlite,
     original_content: &'a str,
     final_content: &'a str,
@@ -381,26 +381,13 @@ pub async fn handle(
         return Err(PostError::DependencyCycle(chain));
     }
 
-    let worktree = match stamped.worktree.clone() {
-        Some(worktree) => worktree,
-        None => {
-            let stem = Path::new(&relative_str)
-                .file_stem()
-                .and_then(|stem| stem.to_str());
-            crate::ids::default_worktree(stem, &ticket_id).map_err(|reason| {
-                PostError::InvalidWorktreeStem {
-                    path: relative_str.clone(),
-                    reason,
-                }
-            })?
-        }
-    };
-    let stamp = frontmatter::stamp(&content, &ticket_id, &project, &worktree, &flow_name).map_err(
-        |error| PostError::InvalidTicket {
-            path: relative_str.clone(),
-            error,
-        },
-    )?;
+    let stamp =
+        frontmatter::stamp(&content, &ticket_id, &project, &flow_name).map_err(|error| {
+            PostError::InvalidTicket {
+                path: relative_str.clone(),
+                error,
+            }
+        })?;
     let file_rewritten = stamp.is_some();
     let final_content = stamp.unwrap_or_else(|| content.clone());
     let terminal_state = existing
@@ -440,7 +427,6 @@ pub async fn handle(
         blocked_by: stamped.blocked_by.clone(),
         attempts: existing.as_ref().map_or(0, |ticket| ticket.attempts as u32),
         hints: ExecutionHints {
-            worktree: Some(worktree.clone()),
             trigger_id: None,
             target,
             model: stamped.model.clone(),
@@ -452,7 +438,7 @@ pub async fn handle(
     let author = MarkdownWorkStateAuthor {
         root,
         file_path: &relative_str,
-        worktree: &worktree,
+        worktree: stamped.worktree.as_deref(),
         work_state,
         original_content: &content,
         final_content: &final_content,
@@ -487,7 +473,6 @@ pub async fn handle(
             "state": ticket.state,
             "name": ticket.name,
             "blocked_by": ticket.blocked_by,
-            "worktree": ticket.worktree,
             "target": ticket.target,
             "model": ticket.model,
             "effort": ticket.effort,
@@ -750,10 +735,6 @@ pub enum PostError {
         path: String,
         problems: Vec<TicketProblem>,
     },
-    InvalidWorktreeStem {
-        path: String,
-        reason: String,
-    },
     UnknownBlockedBy {
         ticket: String,
         blocker: String,
@@ -835,9 +816,6 @@ impl fmt::Display for PostError {
                     Ok(())
                 }
             },
-            Self::InvalidWorktreeStem { path, reason } => {
-                write!(formatter, "{path}: {reason}")
-            }
             Self::UnknownBlockedBy {
                 ticket,
                 blocker,
@@ -1231,7 +1209,7 @@ mod tests {
         let author = MarkdownWorkStateAuthor {
             root: root.path(),
             file_path: relative,
-            worktree: "cas",
+            worktree: None,
             work_state: &store,
             original_content: &original,
             final_content: &replacement,
@@ -1249,7 +1227,6 @@ mod tests {
             blocked_by: Vec::new(),
             attempts: 0,
             hints: ExecutionHints {
-                worktree: Some("sloop/TICK-1".into()),
                 trigger_id: None,
                 target: None,
                 model: None,

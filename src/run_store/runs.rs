@@ -1222,7 +1222,6 @@ mod tests {
             id: "T1".into(),
             name: "Ticket one".into(),
             blocked_by: vec![],
-            worktree: Some("sloop/T1".into()),
             target: Some("claude".into()),
             model: Some("sonnet".into()),
             effort: Some("medium".into()),

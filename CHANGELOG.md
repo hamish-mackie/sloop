@@ -27,6 +27,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   brief, and says a `commits` stage takes no verdict; the rejection a build
   agent got when it called it anyway now says the same.
 
+### Removed
+
+- **The ticket-level `worktree:` field.** `sloop post` and `sloop reindex`
+  stamped a branch name such as `sloop/add-request-logging` into every ticket
+  file, and `brief` and `show` echoed it under a key called `worktree`. No
+  run ever used it: each run gets its own `sloop/<ticket>-a<n>-<short>`
+  branch and a `.worktrees/<short>` directory, which `sloop brief` reports
+  as `branch` and `worktree`. Agents kept reading the ticket's value as a
+  path that did not exist. The field is no longer stamped, derived, or
+  reported, and a file stem no longer has to be an `abc-def` slug. An
+  existing `worktree:` line is left untouched and still lets `reindex`
+  recognise a branch of that name.
+
 ### Fixed
 
 - **A settled worktree that Git no longer registers is cleaned up instead of

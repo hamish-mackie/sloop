@@ -99,7 +99,7 @@ pub struct ReindexTicket {
     pub file_path: Option<String>,
     pub name: String,
     pub blocked_by: Vec<String>,
-    pub worktree: String,
+    pub worktree: Option<String>,
     pub target: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -128,7 +128,7 @@ pub(crate) struct LocalTicketWrite<'a> {
     pub file_path: &'a str,
     pub name: &'a str,
     pub blocked_by: &'a [String],
-    pub worktree: &'a str,
+    pub worktree: Option<&'a str>,
     pub target: Option<&'a str>,
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
@@ -473,7 +473,7 @@ impl LocalSqlite {
         file_path: &str,
         name: &str,
         blocked_by: &[String],
-        worktree: &str,
+        worktree: Option<&str>,
         target: Option<&str>,
         model: Option<&str>,
         effort: Option<&str>,
@@ -513,7 +513,7 @@ impl LocalSqlite {
         id: &str,
         name: &str,
         blocked_by: &[String],
-        worktree: &str,
+        worktree: Option<&str>,
         target: Option<&str>,
         model: Option<&str>,
         effort: Option<&str>,
@@ -692,32 +692,13 @@ impl LocalSqlite {
                     });
                 }
             }
-            let worktree = match authored_ticket.frontmatter.worktree.clone() {
-                Some(worktree) => worktree,
-                None => {
-                    let stem = authored_ticket
-                        .file_path
-                        .as_deref()
-                        .and_then(Path::file_stem)
-                        .and_then(|stem| stem.to_str());
-                    match crate::ids::default_worktree(stem, &id) {
-                        Ok(branch) => branch,
-                        Err(reason) => {
-                            held_reason.get_or_insert_with(|| {
-                                format!("{}: {reason}", authored_ticket.source_ref)
-                            });
-                            format!("sloop/{id}")
-                        }
-                    }
-                }
-            };
             if held_reason.is_none()
                 && let (Some(path), Some(content)) = (
                     authored_ticket.file_path.as_ref(),
                     authored_ticket.original_content.as_ref(),
                 )
-                && let Some(updated) = frontmatter::stamp(content, &id, &project, &worktree, &flow)
-                    .map_err(|error| {
+                && let Some(updated) =
+                    frontmatter::stamp(content, &id, &project, &flow).map_err(|error| {
                         ReindexError(format!("{}: {error}", authored_ticket.source_ref))
                     })?
             {
@@ -736,7 +717,7 @@ impl LocalSqlite {
                     .map(|path| path.to_string_lossy().into_owned()),
                 name: authored_ticket.frontmatter.name,
                 blocked_by: authored_ticket.frontmatter.blocked_by,
-                worktree,
+                worktree: authored_ticket.frontmatter.worktree,
                 target,
                 model: authored_ticket.frontmatter.model,
                 effort: authored_ticket.frontmatter.effort,
@@ -1530,7 +1511,6 @@ fn work_ticket(
         blocked_by: record.blocked_by,
         attempts,
         hints: ExecutionHints {
-            worktree: record.worktree,
             trigger_id: None,
             target: record.target,
             model: record.model,
@@ -1968,7 +1948,7 @@ mod tests {
                 ".agents/sloop/tickets/t1.md",
                 "Ticket one",
                 &[],
-                "sloop/T1",
+                None,
                 Some("claude"),
                 Some("sonnet"),
                 Some("medium"),
@@ -2111,7 +2091,7 @@ mod tests {
                 ".agents/sloop/tickets/t1.md",
                 "Ticket one",
                 &[],
-                "sloop/T1",
+                None,
                 Some("claude"),
                 Some("sonnet"),
                 Some("medium"),
@@ -2317,7 +2297,7 @@ mod tests {
                 &format!(".agents/sloop/tickets/{}.md", id.to_lowercase()),
                 "Another ticket",
                 &[],
-                &format!("sloop/{id}"),
+                None,
                 Some("claude"),
                 Some("sonnet"),
                 Some("medium"),
@@ -2712,7 +2692,7 @@ mod tests {
                 ".agents/sloop/tickets/t0.md",
                 "Ticket zero",
                 &[],
-                "sloop/T0",
+                None,
                 None,
                 None,
                 None,
@@ -2801,7 +2781,7 @@ mod tests {
                 ".agents/sloop/tickets/t0.md",
                 "Ticket zero",
                 &[],
-                "sloop/T0",
+                None,
                 None,
                 None,
                 None,
@@ -2861,7 +2841,7 @@ mod tests {
                 ".agents/sloop/tickets/t2.md",
                 "Ticket two",
                 &["T1".into()],
-                "sloop/T2",
+                None,
                 Some("claude"),
                 Some("sonnet"),
                 Some("medium"),
@@ -2928,7 +2908,7 @@ mod tests {
                 ".agents/sloop/tickets/t2.md",
                 "Ticket two",
                 &["T1".into()],
-                "sloop/T2",
+                None,
                 Some("claude"),
                 None,
                 None,
@@ -2996,7 +2976,7 @@ mod tests {
         assert_eq!(ticket.effort.as_deref(), Some("medium"));
         assert_eq!(ticket.name, "Ticket one");
         assert!(ticket.blocked_by.is_empty());
-        assert_eq!(ticket.worktree.as_deref(), Some("sloop/T1"));
+        assert_eq!(ticket.worktree, None);
     }
 
     #[test]
@@ -3011,7 +2991,7 @@ mod tests {
                 ".agents/sloop/tickets/t2.md",
                 "Ticket two",
                 &["T1".to_owned()],
-                "feature/t2",
+                Some("feature/t2"),
                 None,
                 None,
                 None,
@@ -3049,7 +3029,7 @@ mod tests {
                     &format!(".agents/sloop/tickets/{}.md", id.to_lowercase()),
                     id,
                     &[],
-                    &format!("sloop/{id}"),
+                    None,
                     None,
                     None,
                     None,
@@ -3109,7 +3089,7 @@ mod tests {
             file_path: Some(".agents/sloop/tickets/t1.md".into()),
             name: "Ticket one".into(),
             blocked_by: Vec::new(),
-            worktree: "sloop/T1".into(),
+            worktree: None,
             target: Some("claude".into()),
             model: Some("sonnet".into()),
             effort: Some("medium".into()),

@@ -583,9 +583,6 @@ fn render_ticket_show(data: &Value, style: Style) -> String {
     if let Some(project) = value["project"].as_str() {
         let _ = writeln!(text, "project: {project}");
     }
-    if let Some(worktree) = value["worktree"].as_str() {
-        let _ = writeln!(text, "worktree: {worktree}");
-    }
     let blocked_by = string_items(&value["blocked_by"]).collect::<Vec<_>>();
     if !blocked_by.is_empty() {
         let _ = writeln!(text, "blocked_by: {}", blocked_by.join(", "));
@@ -1302,7 +1299,6 @@ mod tests {
                     "name": "cooldown",
                     "state": "ready",
                     "project": "default",
-                    "worktree": "sloop/TICK-1",
                     "blocked_by": ["TICK-0"],
                     "target": "claude",
                     "model": "opus",
@@ -1317,7 +1313,6 @@ mod tests {
             concat!(
                 "TICK-1  cooldown  (ready)\n",
                 "project: default\n",
-                "worktree: sloop/TICK-1\n",
                 "blocked_by: TICK-0\n",
                 "target: claude\n",
                 "model: opus\n",

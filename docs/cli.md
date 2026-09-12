@@ -102,8 +102,7 @@ no force mode.
 ### sloop post <FILE> [--project P] [--flow F] [--auto | --at TIME | --manual | --hold]
 
 Validate and register a ticket file (which must live below the configured
-ticket directory), stamping the allocated ID and worktree branch back into
-the file. Project files are indexed first, so a project written moments ago
+ticket directory), stamping the allocated ID back into the file. Project files are indexed first, so a project written moments ago
 is known to the post without a `sloop reindex`. The trigger modes are
 mutually exclusive:
 
@@ -266,8 +265,7 @@ exact reference always wins, even when the same text is also a valid pattern.
 Exact references render full detail:
 
 - **Ticket** (`TICK-5` or its name) — the frontmatter summary (id, name,
-  state, project, worktree, and `blocked_by`/`target`/`model`/`effort` when
-  set), then a `runs:` section, then the ticket body read from its committed
+  state, project, and `blocked_by`/`target`/`model`/`effort` when set), then a `runs:` section, then the ticket body read from its committed
   file. A ticket that has never run prints `runs: none`.
 - **Run** (`TICK-5-r1`) — the run's ticket, state, branch, worktree, timeline,
   agent exit, derived reason, and per-stage table.
@@ -499,7 +497,7 @@ current verbs, never these aliases.
 
 Rebuild the derivable SQLite index from the configured project and ticket
 directories, Git branches, and orphaned worktrees. Project and ticket files
-remain authoritative for membership, blockers, and worktree branches; Git
+remain authoritative for membership and blockers; Git
 restores merged and review-needed states. Runtime history is preserved for
 tickets that still exist, while rows belonging to removed tickets are dropped.
 If SQLite was deleted, tickets without Git evidence return as ready; holds,

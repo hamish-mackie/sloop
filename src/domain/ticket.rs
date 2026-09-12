@@ -7,7 +7,6 @@ pub struct TicketSnapshot {
     pub id: String,
     pub name: String,
     pub blocked_by: Vec<String>,
-    pub worktree: Option<String>,
     pub target: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,

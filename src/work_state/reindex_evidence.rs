@@ -71,7 +71,8 @@ fn git_branches(root: &Path) -> Result<Vec<String>, ReindexError> {
 
 fn ticket_for_branch(tickets: &[ReindexTicket], branch: &str) -> Option<usize> {
     tickets.iter().position(|ticket| {
-        branch == ticket.worktree || branch.starts_with(&format!("sloop/{}-a", ticket.id))
+        ticket.worktree.as_deref() == Some(branch)
+            || branch.starts_with(&format!("sloop/{}-a", ticket.id))
     })
 }
 
@@ -165,8 +166,8 @@ fn git_output(root: &Path, args: &[&str], branch: &str) -> Result<String, Reinde
 ///
 /// Per branch: an ancestor of HEAD is `Merged`; otherwise a branch whose unique
 /// commits are all patch-equivalent upstream is `Merged`; otherwise
-/// `NeedsReview`. Across a ticket's branches — its recorded worktree branch and
-/// every `sloop/<id>-a*` attempt branch — `NeedsReview` wins over `Merged`,
+/// `NeedsReview`. Across a ticket's branches — every `sloop/<id>-a*` attempt
+/// branch, plus a legacy `worktree:` branch when the file names one — `NeedsReview` wins over `Merged`,
 /// because a branch that survives both landing tests carries work an operator
 /// has not seen. Patch equivalence is what keeps that precedence honest:
 /// without it a leftover attempt branch whose changes were squashed onto the

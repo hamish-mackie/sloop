@@ -99,11 +99,8 @@ agent; omitted values fall back to the config's `default_target` and that
 target's configured `model:` and `effort:`. The scaffolded config runs
 `claude` with `opus` at `high` effort, so the ticket above works as-is;
 the `codex` target defaults are filled in too, while `opencode` has
-provider-qualified model names you set yourself. Sloop
-stamps an `id` and a worktree branch derived from the filename
-(`add-request-logging.md` → `sloop/add-request-logging`) for you unless you
-set your own. That default requires the file stem to be a lowercase
-`abc-def` slug; a ticket named otherwise must set `worktree:` explicitly.
+provider-qualified model names you set yourself. Sloop stamps an `id` for
+you unless you set your own.
 
 ## Post it
 
@@ -114,11 +111,12 @@ sloop post .agents/sloop/tickets/add-request-logging.md
 Ticket files must live below the configured ticket directory
 (`.agents/sloop/tickets/` by default). Posting validates the ticket, writes
 the allocated ID back into the file, and queues one run. The daemon picks it
-up at the next opportunity, creates an isolated worktree on the ticket's
-branch, and spawns the agent there.
+up at the next opportunity, creates a fresh branch and an isolated worktree
+under `.worktrees/` for that run, and spawns the agent there. The agent
+reads both from `sloop brief`.
 
 Editing the file and posting it again updates the ticket in place — same ID,
-refreshed name, blockers, and worktree — without queuing a duplicate run.
+refreshed name and blockers — without queuing a duplicate run.
 
 That queued run is a **trigger**, and it is what actually makes the ticket run.
 A ticket registered with `--manual` is `ready` but has no trigger, so it waits;

@@ -155,7 +155,7 @@ impl Harness {
                     &format!("tickets/{ticket}.md"),
                     &format!("Ticket {ticket}"),
                     &[],
-                    &format!("sloop/{ticket}"),
+                    None,
                     Some("opencode"),
                     None,
                     None,

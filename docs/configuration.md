@@ -176,7 +176,6 @@ project: default               # optional, defaults to `default`
 target: claude                 # optional, defaults to agent.default_target
 model: sonnet                  # optional, filled into {model}
 effort: medium                 # optional, filled into {effort}
-worktree: sloop/add-request-logging  # optional branch, from the file stem if omitted
 flow: default                  # optional, defaults to the default flow
 ---
 
@@ -196,8 +195,8 @@ all is still reported on its own: nothing after it can be read.
 
 `target`, `model`, and `effort` are snapshotted when the ticket is posted:
 later config changes do not retroactively change an already-posted ticket.
-Reposting an edited file refreshes `name`, `blocked_by`, and `worktree`
-without changing the ID or queuing a duplicate run.
+Reposting an edited file refreshes `name` and `blocked_by` without changing
+the ID or queuing a duplicate run.
 
 ## Projects
 

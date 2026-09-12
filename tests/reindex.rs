@@ -442,12 +442,10 @@ fn reindex_rebuilds_files_and_git_but_not_deleted_runtime_history() {
     assert_eq!(finished["project"], "alpha");
     assert_eq!(finished["state"], "merged");
     assert_eq!(finished["blocked_by"], serde_json::json!([]));
-    assert_eq!(finished["worktree"], "topic/finished");
     let follow_up = World::json_stdout(&world.sloop(&["show", "T2"]))["data"]["value"].clone();
     assert_eq!(follow_up["project"], "alpha");
     assert_eq!(follow_up["state"], "ready");
     assert_eq!(follow_up["blocked_by"], serde_json::json!(["T1"]));
-    assert_eq!(follow_up["worktree"], "topic/follow-up");
     assert_eq!(database_count(&world, "runs"), 0);
     assert_eq!(database_count(&world, "notes"), 0);
 
@@ -496,13 +494,13 @@ fn reindex_drops_history_for_tickets_removed_from_files() {
     write_ticket(
         &world,
         "state.md",
-        "id: T3\nproject: default\nname: State\nblocked_by: []\n",
+        "id: T3\nproject: default\nname: State\nblocked_by: []\nworktree: sloop/state\n",
         "# Derive this ticket state from Git",
     );
     write_ticket(
         &world,
         "bare.md",
-        "id: T4\nproject: default\nname: Bare\nblocked_by: []\n",
+        "id: T4\nproject: default\nname: Bare\nblocked_by: []\nworktree: sloop/bare\n",
         "# A bare branch is not completed work",
     );
     write_ticket(
@@ -750,7 +748,7 @@ fn reindex_preserves_project_scoped_run_history_when_a_ticket_moves() {
 }
 
 #[test]
-fn reindex_derives_the_worktree_from_the_file_stem_and_holds_invalid_stems() {
+fn reindex_stamps_no_branch_and_accepts_any_file_stem() {
     let world = World::configured();
     write_ticket(
         &world,
@@ -766,11 +764,11 @@ fn reindex_derives_the_worktree_from_the_file_stem_and_holds_invalid_stems() {
     );
     write_ticket(
         &world,
-        "explicit.md",
-        "id: T3\nproject: default\nname: Explicit\nblocked_by: []\nworktree: topic/explicit\n",
-        "# An explicit worktree always wins",
+        "legacy.md",
+        "id: T3\nproject: default\nname: Legacy\nblocked_by: []\nworktree: topic/legacy\n",
+        "# A legacy worktree key is left alone",
     );
-    world.commit_all("worktree derivation tickets");
+    world.commit_all("stem tickets");
 
     let output = world.sloop(&["reindex"]);
     assert!(
@@ -778,40 +776,23 @@ fn reindex_derives_the_worktree_from_the_file_stem_and_holds_invalid_stems() {
         "reindex failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stamped = fs::read_to_string(
-        world
-            .root()
-            .join(".agents/sloop/tickets/persist-cooldowns.md"),
-    )
-    .expect("read stamped ticket");
-    assert!(
-        stamped.contains("worktree: sloop/persist-cooldowns"),
-        "stem-derived worktree was not stamped: {stamped}"
-    );
-    let unstamped = fs::read_to_string(world.root().join(".agents/sloop/tickets/Fix_Login.md"))
-        .expect("read held ticket");
-    assert!(
-        !unstamped.contains("worktree:"),
-        "a held ticket must not be stamped with a fallback worktree: {unstamped}"
-    );
+    for file in ["persist-cooldowns.md", "Fix_Login.md"] {
+        let stamped = fs::read_to_string(world.root().join(".agents/sloop/tickets").join(file))
+            .expect("read stamped ticket");
+        assert!(
+            !stamped.contains("worktree:"),
+            "a branch hint was stamped into {file}: {stamped}"
+        );
+    }
+    let legacy = fs::read_to_string(world.root().join(".agents/sloop/tickets/legacy.md")).unwrap();
+    assert_eq!(legacy.matches("worktree:").count(), 1);
 
     let response = World::json_stdout(&world.sloop(&["show", ".*"]));
     let tickets = response["data"]["tickets"].as_array().unwrap();
-    let derived = tickets.iter().find(|ticket| ticket["id"] == "T1").unwrap();
-    let invalid = tickets.iter().find(|ticket| ticket["id"] == "T2").unwrap();
-    let explicit = tickets.iter().find(|ticket| ticket["id"] == "T3").unwrap();
-    assert_eq!(derived["state"], "ready");
-    assert_eq!(explicit["state"], "ready");
-    assert_eq!(invalid["state"], "held");
-    let reason = invalid["reason"].as_str().expect("held reason");
-    assert!(
-        reason.contains("`Fix_Login` is not a valid worktree slug"),
-        "diagnostic changed: {reason}"
-    );
-    assert!(
-        reason.contains("Fix_Login.md"),
-        "remedy does not name the file to edit: {reason}"
-    );
+    for id in ["T1", "T2", "T3"] {
+        let ticket = tickets.iter().find(|ticket| ticket["id"] == id).unwrap();
+        assert_eq!(ticket["state"], "ready", "{id}: {ticket}");
+    }
 }
 
 #[test]

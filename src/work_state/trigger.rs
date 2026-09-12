@@ -738,7 +738,7 @@ mod tests {
                     &format!("tickets/{ticket}.md"),
                     ticket,
                     &[],
-                    &format!("sloop/{ticket}"),
+                    None,
                     Some("claude"),
                     None,
                     None,

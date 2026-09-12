@@ -124,10 +124,9 @@ pub fn body(content: &str) -> Result<&str, FrontmatterError> {
     })
 }
 
-/// Writes `id`, `project`, `worktree`, and `flow` into the frontmatter
-/// without disturbing any other byte of the file. Returns `None` when the
-/// file already carries all four values, so callers can skip the write
-/// entirely.
+/// Writes `id`, `project`, and `flow` into the frontmatter without
+/// disturbing any other byte of the file. Returns `None` when the file
+/// already carries all three values, so callers can skip the write entirely.
 ///
 /// Callers must resolve conflicts first: stamping never overwrites an
 /// existing `id`, `project`, or `flow` value.
@@ -135,7 +134,6 @@ pub fn stamp(
     content: &str,
     id: &str,
     project: &str,
-    worktree: &str,
     flow: &str,
 ) -> Result<Option<String>, FrontmatterError> {
     let current = parse(content)?;
@@ -145,9 +143,6 @@ pub fn stamp(
     }
     if current.project.is_none() {
         lines.push_str(&format!("project: {project}\n"));
-    }
-    if current.worktree.is_none() {
-        lines.push_str(&format!("worktree: {worktree}\n"));
     }
     if current.flow.is_none() {
         lines.push_str(&format!("flow: {flow}\n"));
@@ -345,40 +340,31 @@ mod tests {
 
     #[test]
     fn stamping_a_bare_file_prepends_a_complete_block() {
-        let stamped = stamp(
-            "# Persist cooldowns\n",
-            "cooldown",
-            "default",
-            "sloop/cooldown",
-            "default",
-        )
-        .unwrap()
-        .unwrap();
+        let stamped = stamp("# Persist cooldowns\n", "cooldown", "default", "default")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             stamped,
-            "---\nid: cooldown\nproject: default\nworktree: sloop/cooldown\nflow: default\n---\n# Persist cooldowns\n"
+            "---\nid: cooldown\nproject: default\nflow: default\n---\n# Persist cooldowns\n"
         );
     }
 
     #[test]
     fn stamping_preserves_existing_keys_and_body_bytes() {
         let content = "---\ntitle: Cooldowns\nid: T9\n---\nbody stays   untouched\n";
-        let stamped = stamp(content, "ignored", "default", "sloop/T9", "default")
+        let stamped = stamp(content, "ignored", "default", "default")
             .unwrap()
             .unwrap();
         assert_eq!(
             stamped,
-            "---\ntitle: Cooldowns\nid: T9\nproject: default\nworktree: sloop/T9\nflow: default\n---\nbody stays   untouched\n"
+            "---\ntitle: Cooldowns\nid: T9\nproject: default\nflow: default\n---\nbody stays   untouched\n"
         );
     }
 
     #[test]
     fn a_fully_stamped_file_needs_no_rewrite() {
         let content = "---\nid: T1\nproject: default\nworktree: topic/t1\nflow: default\n---\n";
-        assert_eq!(
-            stamp(content, "T1", "default", "sloop/T1", "default").unwrap(),
-            None
-        );
+        assert_eq!(stamp(content, "T1", "default", "default").unwrap(), None);
     }
 
     #[test]
@@ -396,10 +382,7 @@ mod tests {
             let parsed = parse(content).unwrap();
             assert!(parsed.has_blocked_by());
             assert_eq!(parsed.blocked_by, expected);
-            assert_eq!(
-                stamp(content, "T3", "default", "sloop/T3", "default").unwrap(),
-                None
-            );
+            assert_eq!(stamp(content, "T3", "default", "default").unwrap(), None);
         }
     }
 
@@ -412,33 +395,24 @@ mod tests {
     }
 
     #[test]
-    fn explicit_worktree_is_left_byte_for_byte_untouched() {
+    fn a_legacy_worktree_key_is_left_byte_for_byte_untouched() {
         let content = "---\nid: T1\nproject: default\nworktree: releases/T1\nflow: default\n---\nbody stays untouched\n";
-        assert_eq!(
-            stamp(content, "T1", "default", "sloop/T1", "default").unwrap(),
-            None
-        );
+        assert_eq!(stamp(content, "T1", "default", "default").unwrap(), None);
     }
 
     #[test]
     fn an_explicit_flow_is_left_byte_for_byte_untouched() {
-        let content =
-            "---\nid: T1\nproject: default\nworktree: sloop/T1\nflow: release\n---\nbody\n";
-        assert_eq!(
-            stamp(content, "T1", "default", "sloop/T1", "default").unwrap(),
-            None
-        );
+        let content = "---\nid: T1\nproject: default\nflow: release\n---\nbody\n";
+        assert_eq!(stamp(content, "T1", "default", "default").unwrap(), None);
     }
 
     #[test]
     fn a_missing_flow_is_stamped_with_the_default() {
-        let content = "---\nid: T1\nproject: default\nworktree: sloop/T1\n---\nbody\n";
-        let stamped = stamp(content, "T1", "default", "sloop/T1", "release")
-            .unwrap()
-            .unwrap();
+        let content = "---\nid: T1\nproject: default\n---\nbody\n";
+        let stamped = stamp(content, "T1", "default", "release").unwrap().unwrap();
         assert_eq!(
             stamped,
-            "---\nid: T1\nproject: default\nworktree: sloop/T1\nflow: release\n---\nbody\n"
+            "---\nid: T1\nproject: default\nflow: release\n---\nbody\n"
         );
     }
 
@@ -479,7 +453,7 @@ mod tests {
         ] {
             assert_eq!(parse(content), Err(FrontmatterError::ForeignLineBreak));
             assert_eq!(
-                stamp(content, "id-1", "default", "sloop/t", "default"),
+                stamp(content, "id-1", "default", "default"),
                 Err(FrontmatterError::ForeignLineBreak)
             );
         }
@@ -499,7 +473,7 @@ mod tests {
         }
         for content in ["---\n---\n", "---\n\n---\n", "---\n# note\n---\nbody\n"] {
             assert!(parse(content).is_ok(), "blank-ish block: {content:?}");
-            let stamped = stamp(content, "id-1", "default", "sloop/t", "default")
+            let stamped = stamp(content, "id-1", "default", "default")
                 .unwrap()
                 .unwrap();
             assert_eq!(parse(&stamped).unwrap().id.as_deref(), Some("id-1"));
@@ -512,6 +486,6 @@ mod tests {
     fn unstampable_blocks_error_instead_of_corrupting() {
         let content = "---\n{title: Flow style}\n---\nbody\n";
         assert!(parse(content).is_ok());
-        assert!(stamp(content, "id-1", "default", "sloop/t", "default").is_err());
+        assert!(stamp(content, "id-1", "default", "default").is_err());
     }
 }

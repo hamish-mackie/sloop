@@ -885,7 +885,6 @@ fn post_error_body(error: &crate::post::PostError) -> ErrorBody {
         | PostError::OutsideTicketDirectory { .. }
         | PostError::InvalidTicket { .. }
         | PostError::InvalidTicketFields { .. }
-        | PostError::InvalidWorktreeStem { .. }
         | PostError::UnknownTarget(_)
         | PostError::MissingTargetValue { .. } => ErrorCode::InvalidArguments,
         PostError::ProjectConflict { .. }

@@ -30,13 +30,12 @@ proptest! {
         // stamped file still parses, now carries the values it lacked, and
         // `None` means every value was already present.
         if parsed.is_ok() {
-            match frontmatter::stamp(&contents, "id-1", "proj-1", "wt-1", "flow-1") {
+            match frontmatter::stamp(&contents, "id-1", "proj-1", "flow-1") {
                 Ok(Some(stamped)) => {
                     let after = frontmatter::parse(&stamped)
                         .expect("stamping must never corrupt a parseable file");
                     prop_assert!(after.id.is_some());
                     prop_assert!(after.project.is_some());
-                    prop_assert!(after.worktree.is_some());
                     prop_assert!(after.flow.is_some());
                 }
                 Ok(None) => {

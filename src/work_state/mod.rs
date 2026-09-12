@@ -348,7 +348,6 @@ mod tests {
             blocked_by: Vec::new(),
             attempts: 0,
             hints: ExecutionHints {
-                worktree: None,
                 trigger_id: None,
                 target: None,
                 model: None,

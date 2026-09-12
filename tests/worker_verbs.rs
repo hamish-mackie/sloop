@@ -245,7 +245,6 @@ fn a_running_agent_reads_its_brief_and_records_a_note() {
     assert_eq!(brief["data"]["ticket"]["id"], ticket.as_str());
     assert_eq!(brief["data"]["ticket"]["name"], "cooldown");
     assert_eq!(brief["data"]["ticket"]["blocked_by"], serde_json::json!([]));
-    assert_eq!(brief["data"]["ticket"]["worktree"], "sloop/cooldown");
     assert_eq!(brief["data"]["ticket"]["target"], "fake");
     let body = brief["data"]["ticket"]["body"].as_str().expect("body");
     assert!(body.contains("Persist cooldowns"), "brief body: {body}");
@@ -283,7 +282,6 @@ fn a_running_agent_reads_its_brief_and_records_a_note() {
     assert_eq!(show["data"]["kind"], "ticket");
     assert_eq!(show["data"]["value"]["name"], "cooldown");
     assert_eq!(show["data"]["value"]["blocked_by"], serde_json::json!([]));
-    assert_eq!(show["data"]["value"]["worktree"], "sloop/cooldown");
     assert_eq!(show["data"]["value"]["target"], "fake");
     // The worker's `show` is unchanged: it never gained the operator's body.
     assert!(
@@ -645,7 +643,6 @@ fn project_show_groups_notes_and_git_commits_without_writing_source_files() {
     assert_eq!(ticket_show["data"]["kind"], "ticket");
     assert_eq!(ticket_show["data"]["value"]["name"], "first");
     assert_eq!(ticket_show["data"]["value"]["blocked_by"], json!([]));
-    assert_eq!(ticket_show["data"]["value"]["worktree"], "sloop/first");
     assert_eq!(ticket_show["data"]["value"]["target"], "fake");
 
     let human = world.sloop_plain(&["show", "activity"]);
