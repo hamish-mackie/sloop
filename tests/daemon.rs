@@ -4,7 +4,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
 use serde_json::Value;
-use support::{FakeAgent, World, process_alive, wait_until, wait_until_slow};
+use support::{
+    FakeAgent, World, process_alive, wait_until, wait_until_slow, wait_until_slow_or_report,
+};
 
 fn status(world: &World) -> Value {
     let output = world.sloop(&["status"]);
@@ -24,6 +26,15 @@ fn stop_daemon(world: &World, pid: u32) {
         String::from_utf8_lossy(&output.stderr)
     );
     wait_until("the daemon stops", || !process_alive(pid));
+}
+
+fn daemon_log_events(world: &World) -> Vec<String> {
+    fs::read_to_string(world.daemon_log())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|record| record["event"].as_str().map(str::to_owned))
+        .collect()
 }
 
 fn log_event_count(world: &World, event: &str) -> usize {
@@ -245,13 +256,23 @@ fn restart_drains_active_stages_before_resuming_the_queue() {
     assert!(String::from_utf8_lossy(&human.stdout).contains("draining - 1/1 agents active"));
 
     world.release("drain");
-    wait_until_slow("the daemon restarts and drains the queue", || {
-        let snapshot = status(&world);
-        log_event_count(&world, "daemon_started") >= 2
-            && snapshot["daemon"]["pid"] == pid
-            && snapshot["daemon"]["draining"] == false
-            && snapshot["tickets"]["merged"] == 2
-    });
+    wait_until_slow_or_report(
+        "the daemon restarts and drains the queue",
+        || {
+            let snapshot = status(&world);
+            log_event_count(&world, "daemon_started") >= 2
+                && snapshot["daemon"]["pid"] == pid
+                && snapshot["daemon"]["draining"] == false
+                && snapshot["tickets"]["merged"] == 2
+        },
+        || {
+            format!(
+                "expected pid {pid}, daemon_started >= 2, draining false, merged 2\nstatus: {}\ndaemon log events: {}",
+                status(&world),
+                daemon_log_events(&world).join(" ")
+            )
+        },
+    );
     assert!(world.run_worktree(2).exists());
 }
 

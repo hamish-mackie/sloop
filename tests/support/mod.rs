@@ -763,7 +763,17 @@ pub fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
 
 /// Like `wait_until`, with a 20-second deadline for probes on multi-second
 /// timers such as the daemon liveness tick.
-pub fn wait_until_slow(what: &str, mut condition: impl FnMut() -> bool) {
+pub fn wait_until_slow(what: &str, condition: impl FnMut() -> bool) {
+    wait_until_slow_or_report(what, condition, String::new);
+}
+
+/// Like `wait_until_slow`, but a timeout also prints `report()` so the failure
+/// says which part of the condition never held.
+pub fn wait_until_slow_or_report(
+    what: &str,
+    mut condition: impl FnMut() -> bool,
+    report: impl FnOnce() -> String,
+) {
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(20) * deadline_scale();
     while std::time::Instant::now() < deadline {
@@ -772,7 +782,7 @@ pub fn wait_until_slow(what: &str, mut condition: impl FnMut() -> bool) {
         }
         thread::sleep(std::time::Duration::from_millis(100));
     }
-    panic!("timed out waiting until {what}");
+    panic!("timed out waiting until {what}\n{}", report());
 }
 
 /// Puts a database back into the shape it had before triggers were called
