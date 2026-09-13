@@ -88,6 +88,7 @@ pub enum Request {
     Retry(TicketReferenceArgs),
     Hold(TicketReferenceArgs),
     Ready(TicketReferenceArgs),
+    Remove(RemoveArgs),
     List(ListArgs),
     Status(EmptyArgs),
     Pause(EmptyArgs),
@@ -115,6 +116,7 @@ impl Request {
             Self::Retry(_) => "retry",
             Self::Hold(_) => "hold",
             Self::Ready(_) => "ready",
+            Self::Remove(_) => "remove",
             Self::List(_) => "list",
             Self::Status(_) => "status",
             Self::Pause(_) => "pause",
@@ -151,6 +153,7 @@ impl Request {
                 | "retry"
                 | "hold"
                 | "ready"
+                | "remove"
                 | "list"
                 | "status"
                 | "pause"
@@ -284,6 +287,14 @@ pub struct ListArgs {
 #[serde(deny_unknown_fields)]
 pub struct TicketReferenceArgs {
     pub ticket: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveArgs {
+    pub ticket: String,
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

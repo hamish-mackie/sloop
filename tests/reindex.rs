@@ -1154,3 +1154,140 @@ fn exec_source_pulls_tickets_and_receives_the_final_outcome() {
     assert_eq!(report["ticket"], "EXT-1");
     assert_eq!(report["outcome"], "failed");
 }
+
+#[test]
+fn remove_forgets_a_settled_ticket_but_a_surviving_file_reindexes_it() {
+    let world = World::configured();
+    world.configure_fake_agent(FakeAgent::new().note("gone soon").commit("work").exit(0));
+    write_ticket(
+        &world,
+        "done.md",
+        "id: T1\nproject: default\nname: Done\nblocked_by: []\n",
+        "# Landed elsewhere",
+    );
+    write_ticket(
+        &world,
+        "after.md",
+        "id: T2\nproject: default\nname: After\nblocked_by: [T1]\n",
+        "# Waits on T1",
+    );
+    world.commit_all("tickets");
+    world.start_daemon();
+    post_manual(&world, "done.md");
+    post_manual(&world, "after.md");
+    assert!(world.sloop(&["run", "T1"]).status.success());
+    wait_until("the ticket run finishes", || {
+        World::json_stdout(&world.sloop(&["status"]))["data"]["tickets"]["merged"] == 1
+    });
+    let branch = world.run_branch(1);
+    assert_eq!(database_count(&world, "runs"), 1);
+    assert_eq!(database_count(&world, "notes"), 1);
+
+    let removed = world.sloop(&["remove", "T1"]);
+    assert!(
+        removed.status.success(),
+        "remove failed: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let data = World::json_stdout(&removed)["data"].clone();
+    assert_eq!(data["ticket"], "T1");
+    assert_eq!(data["previous_state"], "merged");
+    assert_eq!(data["file"]["path"], ".agents/sloop/tickets/done.md");
+    assert_eq!(data["file"]["exists"], true);
+    assert_eq!(data["file"]["deleted"], false);
+    assert_eq!(data["runs"][0]["branch"], branch);
+    assert_eq!(data["dependents"], serde_json::json!(["T2"]));
+    assert!(data["rows_dropped"].as_u64().unwrap() >= 3, "{data}");
+    assert!(world.root().join(".agents/sloop/tickets/done.md").is_file());
+    assert_eq!(database_count(&world, "runs"), 0);
+    assert_eq!(database_count(&world, "notes"), 0);
+    let shown = World::json_stdout(&world.sloop(&["show", "T1"]));
+    assert_eq!(shown["data"]["tickets"], serde_json::json!([]));
+
+    let rendered = world.sloop_plain(&["remove", "T1"]);
+    assert!(!rendered.status.success());
+    let reindexed = world.sloop(&["reindex"]);
+    assert!(reindexed.status.success());
+    let shown = World::json_stdout(&world.sloop(&["show", "T1"]));
+    assert_eq!(shown["data"]["kind"], "ticket");
+    assert_eq!(shown["data"]["value"]["state"], "merged");
+}
+
+#[test]
+fn remove_force_deletes_the_file_so_reindex_leaves_the_ticket_gone() {
+    let world = World::configured();
+    write_ticket(
+        &world,
+        "stale.md",
+        "id: T1\nproject: default\nname: Stale\nblocked_by: []\n",
+        "# Never ran",
+    );
+    world.commit_all("tickets");
+    world.start_daemon();
+    let held = world.sloop(&["post", ".agents/sloop/tickets/stale.md", "--hold"]);
+    assert!(held.status.success());
+
+    let removed = world.sloop(&["remove", "T1", "--force"]);
+    assert!(
+        removed.status.success(),
+        "remove failed: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let data = World::json_stdout(&removed)["data"].clone();
+    assert_eq!(data["previous_state"], "held");
+    assert_eq!(data["file"]["deleted"], true);
+    assert_eq!(data["file"]["exists"], false);
+    assert_eq!(data["runs"], serde_json::json!([]));
+    assert!(!world.root().join(".agents/sloop/tickets/stale.md").exists());
+
+    let reindexed = world.sloop(&["reindex"]);
+    assert!(reindexed.status.success());
+    assert_eq!(World::json_stdout(&reindexed)["data"]["tickets_indexed"], 0);
+    let shown = World::json_stdout(&world.sloop(&["show", "T1"]));
+    assert_eq!(shown["data"]["tickets"], serde_json::json!([]));
+}
+
+#[test]
+fn remove_refuses_a_claimed_ticket_and_an_unknown_one() {
+    let world = World::configured();
+    world.configure_fake_agent(FakeAgent::new().block_until_released("removal").exit(0));
+    write_ticket(
+        &world,
+        "busy.md",
+        "id: T1\nproject: default\nname: Busy\nblocked_by: []\n",
+        "# Running",
+    );
+    world.commit_all("tickets");
+    world.start_daemon();
+    post_manual(&world, "busy.md");
+    assert!(world.sloop(&["run", "T1"]).status.success());
+    wait_until("the agent is running", || {
+        world.fake_agent_reached("removal")
+    });
+
+    let refused = world.sloop(&["remove", "T1"]);
+    assert!(!refused.status.success());
+    let error = World::json_stdout_or_stderr(&refused);
+    assert_eq!(error["error"]["code"], "conflict");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("claimed by run T1-r1"),
+        "{error}"
+    );
+    assert_eq!(database_count(&world, "runs"), 1);
+
+    let missing = world.sloop(&["remove", "T9"]);
+    assert!(!missing.status.success());
+    assert_eq!(
+        World::json_stdout_or_stderr(&missing)["error"]["code"],
+        "not_found"
+    );
+
+    world.release("removal");
+    wait_until("the run settles", || {
+        World::json_stdout(&world.sloop(&["status"]))["data"]["tickets"]["merged"] == 1
+    });
+    assert!(world.sloop(&["remove", "T1"]).status.success());
+}

@@ -351,6 +351,12 @@ impl World {
         self.sloop_command(args).output().expect("run sloop")
     }
 
+    pub fn sloop_plain_in(&self, directory: &Path, args: &[&str]) -> Output {
+        self.sloop_command_in(directory, args)
+            .output()
+            .expect("run sloop")
+    }
+
     fn with_json<'a>(args: &[&'a str]) -> Vec<&'a str> {
         // Prepended so verbs with trailing arguments (`note`) cannot
         // swallow the flag.

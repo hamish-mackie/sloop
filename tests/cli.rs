@@ -13,6 +13,83 @@ fn world_is_an_isolated_git_repository() {
 }
 
 #[test]
+fn show_and_logs_identify_the_repository_searched_from_a_nested_directory() {
+    let intended = World::configured();
+    intended.write_ticket(
+        "work.md",
+        "---\nid: T1\n---\nWork in the intended repository.\n",
+    );
+    intended.commit_all("ticket");
+    intended.start_daemon();
+    let posted = intended.sloop(&["post", ".agents/sloop/tickets/work.md", "--manual"]);
+    assert!(posted.status.success(), "{posted:?}");
+    assert_eq!(
+        World::json_stdout(&intended.sloop(&["show", "T1"]))["data"]["kind"],
+        "ticket"
+    );
+
+    let wrong = World::configured();
+    wrong.start_daemon();
+    let nested = wrong.root().join("nested/directory");
+    fs::create_dir_all(&nested).unwrap();
+    let root = wrong.root().canonicalize().unwrap();
+    for args in [vec!["show"], vec!["show", "T1"], vec!["show", "default"]] {
+        let output = wrong.sloop_plain_in(&nested, &args);
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("no tickets"), "{text}");
+        if args == ["show", "T1"] {
+            assert!(text.contains("no tickets matching \"T1\""), "{text}");
+        }
+        assert!(
+            text.contains(&format!("repository: {}", root.display())),
+            "{text}"
+        );
+        assert!(text.contains("current directory"), "{text}");
+        assert!(text.contains("change to the intended repository"), "{text}");
+        let response = World::json_stdout(&wrong.sloop_in(&nested, &args));
+        assert_eq!(response["data"]["repository_root"], root.to_str().unwrap());
+    }
+    for args in [vec!["logs", "T1"], vec!["logs", "T1", "--follow"]] {
+        let output = wrong.sloop_plain_in(&nested, &args);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let text = String::from_utf8(output.stderr).unwrap();
+        assert!(text.contains("not_found"), "{text}");
+        assert!(
+            text.contains(&format!("repository: {}", root.display())),
+            "{text}"
+        );
+        assert!(text.contains("current directory"), "{text}");
+        assert!(text.contains("change to the intended repository"), "{text}");
+        let response = World::json_stdout_or_stderr(&wrong.sloop_in(&nested, &args));
+        assert_eq!(response["error"]["code"], "not_found");
+        assert_eq!(
+            response["error"]["details"]["repository_root"],
+            root.to_str().unwrap()
+        );
+    }
+}
+
+#[test]
+fn show_and_logs_outside_a_sloop_repository_explain_the_current_directory() {
+    let world = World::new();
+    let root = world.root().canonicalize().unwrap();
+    for args in [vec!["show"], vec!["logs", "T1"]] {
+        let output = world.sloop_plain(&args);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let text = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            text.contains(&format!("current directory {}", root.display())),
+            "{text}"
+        );
+        assert!(text.contains("change to the intended repository"), "{text}");
+        assert!(text.contains("sloop init"), "{text}");
+    }
+}
+
+#[test]
 fn init_does_not_modify_gitignore() {
     let world = World::new();
     fs::write(world.root().join(".gitignore"), "target/\n").unwrap();
@@ -184,8 +261,8 @@ fn documented_verbs_are_exposed_by_the_real_binary() {
     assert_eq!(response["data"]["kind"], "help");
     let help = response["data"]["text"].as_str().expect("help text");
     for verb in [
-        "init", "daemon", "post", "run", "retry", "hold", "ready", "status", "pause", "resume",
-        "cancel", "logs", "reindex", "brief", "show", "note", "verdict",
+        "init", "daemon", "post", "run", "retry", "hold", "ready", "remove", "status", "pause",
+        "resume", "cancel", "logs", "reindex", "brief", "show", "note", "verdict",
     ] {
         assert!(help.contains(verb), "help did not contain {verb:?}");
     }
@@ -217,7 +294,7 @@ fn expanded_help_explains_every_ticket_state() {
         );
     }
     assert!(
-        help.contains("Terminal: the run could not be merged; inspect manually."),
+        help.contains("Terminal: the run left a branch for a human to judge."),
         "needs_review meaning missing"
     );
 }
@@ -230,8 +307,8 @@ fn default_help_shows_operator_commands_and_hides_aliases_and_worker_verbs() {
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).expect("help is UTF-8");
     for verb in [
-        "init", "daemon", "post", "show", "logs", "run", "retry", "hold", "ready", "pause",
-        "resume", "stop", "cancel", "reindex",
+        "init", "daemon", "post", "show", "logs", "run", "retry", "hold", "ready", "remove",
+        "pause", "resume", "stop", "cancel", "reindex",
     ] {
         assert!(
             help.contains(&format!("  {verb}")),

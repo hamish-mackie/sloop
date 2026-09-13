@@ -68,6 +68,13 @@ pub struct LocalTicketFile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedTicket {
+    pub ticket: TicketRecord,
+    pub dependents: Vec<String>,
+    pub rows_dropped: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketRecord {
     pub id: String,
     pub project_id: String,
@@ -812,6 +819,82 @@ impl LocalSqlite {
         }))
     }
 
+    /// Removes tickets and every row that hangs off them: queued triggers,
+    /// filters, leases, blocker edges, and (through `drop_runs`) their runs.
+    /// Used by reindex for tickets whose files are gone and by `remove` for
+    /// one ticket on request.
+    fn delete_tickets_on<DropRuns>(
+        transaction: &Transaction<'_>,
+        ticket_ids: &[String],
+        project_ids: &[String],
+        drop_runs: &mut DropRuns,
+    ) -> Result<usize, StoreError>
+    where
+        DropRuns:
+            FnMut(&Transaction<'_>, &[String], &BTreeSet<String>) -> Result<usize, StoreError>,
+    {
+        let plan = trigger::deletion_plan(transaction, ticket_ids, project_ids)?;
+        let mut rows_dropped = drop_runs(transaction, ticket_ids, &plan.doomed)?;
+        rows_dropped += trigger::apply_deletion(transaction, &plan)?;
+        for ticket_id in ticket_ids {
+            rows_dropped += trigger::delete_filters_for_ticket(transaction, ticket_id)?;
+            rows_dropped += transaction.execute(
+                "DELETE FROM leases WHERE ticket_id = ?1",
+                params![ticket_id],
+            )?;
+            rows_dropped += transaction.execute(
+                "DELETE FROM ticket_blockers WHERE ticket_id = ?1 OR blocker_id = ?1",
+                params![ticket_id],
+            )?;
+            rows_dropped +=
+                transaction.execute("DELETE FROM tickets WHERE id = ?1", params![ticket_id])?;
+        }
+        Ok(rows_dropped)
+    }
+
+    /// Forgets one ticket on operator request. A claimed ticket is refused:
+    /// its run owns a worktree and a lease, and `cancel` is the verb for that.
+    /// The ticket file is untouched here; the caller decides its fate.
+    pub(crate) fn remove_ticket<DropRuns>(
+        &self,
+        id: &str,
+        mut drop_runs: DropRuns,
+    ) -> Result<RemovedTicket, StoreError>
+    where
+        DropRuns:
+            FnMut(&Transaction<'_>, &[String], &BTreeSet<String>) -> Result<usize, StoreError>,
+    {
+        let mut connection = self.db.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ticket =
+            Self::ticket_on(&transaction, id)?.ok_or_else(|| StoreError::TicketNotFound {
+                ticket_id: id.into(),
+            })?;
+        if ticket.state == TicketState::Claimed.as_str() {
+            return Err(StoreError::TicketStateConflict {
+                ticket_id: id.into(),
+                state: ticket.state,
+                requested: "removed".into(),
+            });
+        }
+        let dependents = {
+            let mut statement = transaction.prepare(
+                "SELECT ticket_id FROM ticket_blockers WHERE blocker_id = ?1 ORDER BY ticket_id",
+            )?;
+            statement
+                .query_map(params![id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let rows_dropped =
+            Self::delete_tickets_on(&transaction, &[id.to_owned()], &[], &mut drop_runs)?;
+        transaction.commit()?;
+        Ok(RemovedTicket {
+            ticket,
+            dependents,
+            rows_dropped,
+        })
+    }
+
     /// Applies a complete authored ticket snapshot without disturbing runtime
     /// history for IDs that remain present. Cross-store cleanup is supplied by
     /// coordination and runs in this transaction.
@@ -858,23 +941,12 @@ impl LocalSqlite {
                 .collect::<Vec<_>>()
         };
 
-        let plan = trigger::deletion_plan(&transaction, &stale_tickets, &stale_projects)?;
-
-        let mut rows_dropped = drop_runs(&transaction, &stale_tickets, &plan.doomed)?;
-        rows_dropped += trigger::apply_deletion(&transaction, &plan)?;
-        for ticket_id in &stale_tickets {
-            rows_dropped += trigger::delete_filters_for_ticket(&transaction, ticket_id)?;
-            rows_dropped += transaction.execute(
-                "DELETE FROM leases WHERE ticket_id = ?1",
-                params![ticket_id],
-            )?;
-            rows_dropped += transaction.execute(
-                "DELETE FROM ticket_blockers WHERE ticket_id = ?1 OR blocker_id = ?1",
-                params![ticket_id],
-            )?;
-            rows_dropped +=
-                transaction.execute("DELETE FROM tickets WHERE id = ?1", params![ticket_id])?;
-        }
+        let mut rows_dropped = Self::delete_tickets_on(
+            &transaction,
+            &stale_tickets,
+            &stale_projects,
+            &mut drop_runs,
+        )?;
         let mut state_changes = Vec::new();
         for ticket in tickets {
             let previous = existing.get(&ticket.id);

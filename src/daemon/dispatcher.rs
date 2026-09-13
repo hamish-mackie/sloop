@@ -26,8 +26,8 @@ use crate::work_state::{SourceError, TicketFeeder, WorkState};
 
 use super::commands::{
     handle_cancel, handle_events, handle_hold, handle_list, handle_logs, handle_operator_show,
-    handle_ready, handle_reindex, handle_retry, handle_run, handle_status, handle_stop,
-    handle_wait, index_projects,
+    handle_ready, handle_reindex, handle_remove, handle_retry, handle_run, handle_status,
+    handle_stop, handle_wait, index_projects,
 };
 use super::logging::{LogLevel, OperationalLog};
 use super::recovery::{RecoveryClassification, reconcile_run_liveness};
@@ -633,7 +633,10 @@ async fn dispatch(
 ) -> ResponseEnvelope {
     let data = match request {
         Request::Show(args) => match handle_operator_show(state, &args) {
-            Ok(data) => data,
+            Ok(mut data) => {
+                data["repository_root"] = json!(state.root);
+                data
+            }
             Err(error) => return ResponseEnvelope::failure(Some(id), error),
         },
         Request::Run(args) => match handle_run(state, &args) {
@@ -805,6 +808,10 @@ async fn dispatch(
             Err(error) => return ResponseEnvelope::failure(Some(id), error),
         },
         Request::Ready(args) => match handle_ready(state, &args) {
+            Ok(data) => data,
+            Err(error) => return ResponseEnvelope::failure(Some(id), error),
+        },
+        Request::Remove(args) => match handle_remove(state, &args) {
             Ok(data) => data,
             Err(error) => return ResponseEnvelope::failure(Some(id), error),
         },

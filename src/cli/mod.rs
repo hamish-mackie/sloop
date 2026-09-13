@@ -21,8 +21,9 @@ use self::style::Style;
 use self::templates::TemplateKind;
 use crate::protocol::{
     ConfidenceValue, EmptyArgs, ErrorBody, ErrorCode, EventsArgs, LogsArgs, NoteArgs, PostArgs,
-    PostTrigger, Request, RequestEnvelope, RequestId, ResponseEnvelope, RunArgs, RunReferenceArgs,
-    RunTrigger, ShowArgs, StopArgs, TicketReferenceArgs, VerdictArgs, VerdictValue,
+    PostTrigger, RemoveArgs, Request, RequestEnvelope, RequestId, ResponseEnvelope, RunArgs,
+    RunReferenceArgs, RunTrigger, ShowArgs, StopArgs, TicketReferenceArgs, VerdictArgs,
+    VerdictValue,
 };
 
 /// `ready` is the line people misread: it is a precondition, not a promise.
@@ -37,7 +38,8 @@ const TICKET_STATES_HELP: &str = "Ticket states:
   merged        Terminal: completed work was integrated into the default branch.
   failed        Terminal: the run did not succeed; `sloop retry` returns it to
                 ready, and `sloop run` is what starts it again.
-  needs_review  Terminal: the run could not be merged; inspect manually.";
+  needs_review  Terminal: the run left a branch for a human to judge. Merge it
+                to accept the work, or `sloop remove` the ticket to retire it.";
 
 const SHOW_LONG_ABOUT: &str =
     "Show the daemon, tickets, runs, and projects - sloop's one read verb.
@@ -131,6 +133,14 @@ pub enum Command {
     Hold { ticket: String },
     /// Release a held ticket for dispatch.
     Ready { ticket: String },
+    /// Forget a ticket that is not running; --force deletes its file too.
+    Remove {
+        /// The ticket id, as `sloop show` prints it.
+        ticket: String,
+        /// Also delete the ticket file, so a reindex cannot bring it back.
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Show daemon state.
     #[command(hide = true)]
     Status,
@@ -433,6 +443,7 @@ impl TryFrom<Command> for Request {
             Command::Retry { ticket } => Self::Retry(TicketReferenceArgs { ticket }),
             Command::Hold { ticket } => Self::Hold(TicketReferenceArgs { ticket }),
             Command::Ready { ticket } => Self::Ready(TicketReferenceArgs { ticket }),
+            Command::Remove { ticket, force } => Self::Remove(RemoveArgs { ticket, force }),
             Command::Status => Self::Status(empty()),
             Command::Pause => Self::Pause(empty()),
             Command::Resume => Self::Resume(empty()),
@@ -876,6 +887,7 @@ fn run_command(
         | Command::Retry { .. }
         | Command::Hold { .. }
         | Command::Ready { .. }
+        | Command::Remove { .. }
         | Command::Pause
         | Command::Resume
         | Command::Cancel { .. }) => match Request::try_from(command) {

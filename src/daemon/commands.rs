@@ -733,6 +733,97 @@ pub(super) fn handle_hold(
     }))
 }
 
+/// Forgets a ticket the daemon is not running: its rows, triggers, leases,
+/// and run history go in one transaction, exactly as reindex drops a ticket
+/// whose file disappeared. The file is left alone unless `force` is set,
+/// because a file that survives re-registers the ticket on the next post or
+/// reindex; the response says so. Run branches and worktrees are never
+/// touched: they are evidence, and Git owns them.
+pub(super) fn handle_remove(
+    state: &mut DispatcherState,
+    args: &crate::protocol::RemoveArgs,
+) -> Result<serde_json::Value, ErrorBody> {
+    let runs = run_lookup(state, |run_store| run_store.runs_for_ticket(&args.ticket))?;
+    if let Some(run) = runs.iter().find(|run| state.active.contains(&run.id)) {
+        return Err(conflict(&format!(
+            "ticket `{}` is claimed by run {}; cancel it first with `sloop cancel`",
+            args.ticket,
+            crate::run_ref::alias(&run.ticket_id, run.attempt)
+        )));
+    }
+    let removed = state
+        .local_work_state
+        .remove_ticket(&args.ticket, drop_reindex_runs)
+        .map_err(|error| match error {
+            StoreError::TicketNotFound { .. } => not_found(&error.to_string()),
+            StoreError::TicketStateConflict { .. } => conflict(&format!(
+                "ticket `{}` is claimed; cancel its run first with `sloop cancel`",
+                args.ticket
+            )),
+            _ => {
+                mark_storage_full(state, &error);
+                internal(&error.to_string())
+            }
+        })?;
+    let file = removed.ticket.file_path.as_deref().map(|relative| {
+        let path = state.root.join(relative);
+        let existed = path.is_file();
+        let deleted = existed
+            && args.force
+            && match std::fs::remove_file(&path) {
+                Ok(()) => true,
+                Err(error) => {
+                    state.log.emit_with_fields(
+                        LogLevel::Warn,
+                        "sloop::daemon",
+                        "ticket_file_delete_failed",
+                        json!({"ticket": args.ticket, "path": relative, "error": error.to_string()}),
+                    );
+                    false
+                }
+            };
+        json!({
+            "path": relative,
+            "exists": existed && !deleted,
+            "deleted": deleted,
+        })
+    });
+    let git = runs
+        .iter()
+        .filter_map(|run| {
+            run.branch.as_ref().map(|branch| {
+                json!({
+                    "run": crate::run_ref::alias(&run.ticket_id, run.attempt),
+                    "branch": branch,
+                    "worktree": run
+                        .worktree_path
+                        .as_deref()
+                        .filter(|path| Path::new(path).is_dir()),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    state.log.emit_with_fields(
+        LogLevel::Info,
+        "sloop::daemon",
+        "ticket_removed",
+        json!({
+            "ticket": args.ticket,
+            "previous_state": removed.ticket.state,
+            "rows_dropped": removed.rows_dropped,
+            "force": args.force,
+        }),
+    );
+    Ok(json!({
+        "ticket": args.ticket,
+        "previous_state": removed.ticket.state,
+        "rows_dropped": removed.rows_dropped,
+        "file": file,
+        "runs": git,
+        "dependents": removed.dependents,
+    }))
+}
+
 pub(super) fn handle_ready(
     state: &mut DispatcherState,
     args: &crate::protocol::TicketReferenceArgs,
@@ -836,7 +927,12 @@ pub(super) fn handle_logs(
     state: &DispatcherState,
     args: &crate::protocol::LogsArgs,
 ) -> Result<serde_json::Value, ErrorBody> {
-    let resolved = resolve_run(state, &args.run)?;
+    let resolved = resolve_run(state, &args.run).map_err(|mut error| {
+        if error.code == crate::protocol::ErrorCode::NotFound {
+            error.details["repository_root"] = json!(state.root);
+        }
+        error
+    })?;
     let stage = args
         .stage
         .as_deref()
@@ -1052,7 +1148,7 @@ pub(super) fn handle_cancel(
     let run = resolved.run.clone();
     if !matches!(run.state.as_str(), "running" | "driving") || run.exited_at_ms.is_some() {
         return Err(conflict(&format!(
-            "run `{}` is `{}` and cannot be cancelled",
+            "run `{}` is `{}` and cannot be cancelled; only a running run can be — `sloop remove <ticket>` retires a settled ticket",
             resolved.alias, run.state
         )));
     }

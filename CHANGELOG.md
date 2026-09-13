@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`sloop remove <ticket> [--force]` retires a ticket without a reindex.**
+  Runs, notes, evidence, triggers, and leases go in one transaction, the same
+  cleanup reindex applies to a ticket whose file disappeared, and a claimed
+  ticket is refused until its run is cancelled. The output names the ticket
+  file, which re-registers the ticket on the next post or reindex unless it is
+  deleted (`--force` does that), plus any run branches, worktrees, and
+  dependents left behind.
+
 ### Changed
 
 - **Integration repair is part of the default flow.** The scaffolded flow now
@@ -54,6 +64,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `needs_review` ticket now says how to resolve it.** `sloop show` prints
+  both exits beside the ticket — merge its run branch to accept the work, or
+  `sloop remove` it — the same way a held ticket points at `sloop ready`. The
+  states help says the same, and `sloop cancel` on a settled run explains that
+  only a running run can be cancelled and points at `remove` instead of just
+  refusing.
 - **A settled worktree that Git no longer registers is cleaned up instead of
   retried forever.** When the directory remained but its registration was
   gone, `git worktree remove` failed with "is not a working tree" on every

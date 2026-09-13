@@ -814,7 +814,7 @@ impl fmt::Display for ConfigError {
         match self {
             Self::RepositoryNotFound(start) => write!(
                 formatter,
-                "no .agents/sloop/config.yaml found from {}",
+                "no .agents/sloop/config.yaml found from current directory {}; change to the intended repository, or run `sloop init` to initialize this one",
                 start.display()
             ),
             Self::Paths(error) => write!(formatter, "cannot resolve Sloop runtime paths: {error}"),

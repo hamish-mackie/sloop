@@ -226,6 +226,15 @@ idempotent across restarts. Squash- and rebase-merges rewrite the commits, so
 the branch tip is no longer an ancestor and the integration cannot be proven by
 ancestry; those still require `sloop reindex`.
 
+The other exit is to retire the ticket: a review branch whose work landed some
+other way, or a held ticket that is no longer wanted. `sloop remove <ticket>`
+drops it and its runtime rows so it leaves `show` and the `attention:` list;
+`--force` deletes the ticket file as well, and without it the surviving file
+re-registers the ticket on the next post or reindex. Deleting the file and
+running `sloop reindex` reaches the same end. The run branch and worktree are
+left as evidence either way; remove them by hand with `git worktree remove`
+and `git branch -D` when you no longer want them.
+
 A worker's `sloop note "done, merged, ship it"` stores a note and moves
 nothing.
 

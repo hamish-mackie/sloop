@@ -10,6 +10,8 @@ use serde_json::Value;
 use super::style::{Style, Tone, marker_tone, state_tone};
 use crate::protocol::{ErrorBody, ResponseEnvelope};
 
+const REPOSITORY_HINT: &str = "hint: sloop selects a repository from the current directory; change to the intended repository and try again.\n";
+
 /// Renders a response envelope as human-readable text. `verb` selects a
 /// verb-specific layout; unknown or absent verbs fall back to pretty JSON so
 /// no response is ever silently dropped.
@@ -32,6 +34,7 @@ pub fn render(verb: Option<&str>, response: &ResponseEnvelope, style: Style) -> 
         Some("post") => render_post(data),
         Some("run") => render_run(data),
         Some("retry" | "hold" | "ready") => render_ticket_transition(data),
+        Some("remove") => render_remove(data),
         Some("list") => render_list(data, style),
         Some("status") => render_status(data, style),
         Some("pause" | "resume") => render_scheduler_transition(data),
@@ -51,8 +54,15 @@ pub fn render_error(error: &ErrorBody) -> String {
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| "error".into());
     let mut text = format!("error ({code}): {}\n", error.message);
-    if error.details.as_object().is_some_and(|map| !map.is_empty()) {
-        let _ = writeln!(text, "  details: {}", error.details);
+    let mut details = error.details.clone();
+    if let Some(fields) = details.as_object_mut()
+        && let Some(Value::String(root)) = fields.remove("repository_root")
+    {
+        let _ = writeln!(text, "repository: {root}");
+        text.push_str(REPOSITORY_HINT);
+    }
+    if details.as_object().is_some_and(|map| !map.is_empty()) {
+        let _ = writeln!(text, "  details: {details}");
     }
     text
 }
@@ -315,6 +325,9 @@ fn render_list(data: &Value, style: Style) -> String {
         .map(Vec::as_slice)
         .unwrap_or_default();
     if tickets.is_empty() {
+        if let Some(reference) = data["ref"].as_str() {
+            return format!("no tickets matching {reference:?}\n");
+        }
         return "no tickets\n".into();
     }
 
@@ -366,6 +379,49 @@ fn render_ticket_transition(data: &Value) -> String {
         data["previous_state"].as_str().unwrap_or("?"),
         data["state"].as_str().unwrap_or("?"),
     )
+}
+
+fn render_remove(data: &Value) -> String {
+    let ticket = data["ticket"].as_str().unwrap_or("?");
+    let mut text = format!(
+        "ticket {ticket} removed (was {})\n",
+        data["previous_state"].as_str().unwrap_or("?")
+    );
+    if let Some(path) = data["file"]["path"].as_str() {
+        if data["file"]["deleted"] == Value::Bool(true) {
+            let _ = writeln!(text, "deleted {path}; commit the removal");
+        } else if data["file"]["exists"] == Value::Bool(true) {
+            let _ = writeln!(
+                text,
+                "{path} still exists: delete it and commit, or the next `sloop post` or `sloop reindex` registers {ticket} again"
+            );
+        }
+    }
+    for run in data["runs"].as_array().into_iter().flatten() {
+        let branch = run["branch"].as_str().unwrap_or("?");
+        match run["worktree"].as_str() {
+            Some(worktree) => {
+                let _ = writeln!(
+                    text,
+                    "kept branch {branch} and worktree {worktree}; `git worktree remove` and `git branch -D` discard them"
+                );
+            }
+            None => {
+                let _ = writeln!(text, "kept branch {branch}; `git branch -D` discards it");
+            }
+        }
+    }
+    let dependents = string_items(&data["dependents"]).collect::<Vec<_>>();
+    if !dependents.is_empty() {
+        let _ = writeln!(
+            text,
+            "{} still list{} {ticket} in blocked_by; edit and repost {}",
+            dependents.join(", "),
+            if dependents.len() == 1 { "s" } else { "" },
+            if dependents.len() == 1 { "it" } else { "them" }
+        );
+    }
+    text
 }
 
 fn render_scheduler_transition(data: &Value) -> String {
@@ -474,14 +530,27 @@ fn render_reindex(data: &Value) -> String {
 }
 
 fn render_show(data: &Value, style: Style) -> String {
-    match data["kind"].as_str() {
+    let mut text = match data["kind"].as_str() {
         Some("dashboard") => render_dashboard(data, style),
         Some("matches") => render_list(data, style),
         Some("ticket") => render_ticket_show(data, style),
         Some("run") => render_run_show(data, style),
         Some("project") => render_project_show(data, style),
         _ => fallback(data),
+    };
+    let tickets = match data["kind"].as_str() {
+        Some("dashboard") => &data["recent"],
+        Some("matches") => &data["tickets"],
+        Some("project") => &data["value"]["tickets"],
+        _ => &Value::Null,
+    };
+    if tickets.as_array().is_some_and(Vec::is_empty)
+        && let Some(root) = data["repository_root"].as_str()
+    {
+        let _ = writeln!(text, "repository: {root}");
+        text.push_str(REPOSITORY_HINT);
     }
+    text
 }
 
 fn render_dashboard(data: &Value, style: Style) -> String {
@@ -1157,6 +1226,45 @@ mod tests {
         for verb in ["hold", "ready"] {
             assert_eq!(render(Some(verb), &response), "ticket T1: held -> ready\n");
         }
+    }
+
+    #[test]
+    fn remove_renders_what_is_left_behind() {
+        let response = ResponseEnvelope::success(
+            None,
+            json!({
+                "ticket": "T1",
+                "previous_state": "needs_review",
+                "rows_dropped": 7,
+                "file": {"path": ".agents/sloop/tickets/t1.md", "exists": true, "deleted": false},
+                "runs": [{"run": "T1-r1", "branch": "sloop/T1-a1-abcd", "worktree": ".worktrees/abcd"}],
+                "dependents": ["T2"],
+            }),
+        );
+
+        assert_eq!(
+            render(Some("remove"), &response),
+            "ticket T1 removed (was needs_review)\n\
+             .agents/sloop/tickets/t1.md still exists: delete it and commit, or the next `sloop post` or `sloop reindex` registers T1 again\n\
+             kept branch sloop/T1-a1-abcd and worktree .worktrees/abcd; `git worktree remove` and `git branch -D` discard them\n\
+             T2 still lists T1 in blocked_by; edit and repost it\n"
+        );
+
+        let forced = ResponseEnvelope::success(
+            None,
+            json!({
+                "ticket": "T1",
+                "previous_state": "held",
+                "rows_dropped": 1,
+                "file": {"path": ".agents/sloop/tickets/t1.md", "exists": false, "deleted": true},
+                "runs": [],
+                "dependents": [],
+            }),
+        );
+        assert_eq!(
+            render(Some("remove"), &forced),
+            "ticket T1 removed (was held)\ndeleted .agents/sloop/tickets/t1.md; commit the removal\n"
+        );
     }
 
     #[test]

@@ -18,6 +18,11 @@ The commands split into two sets, and the split is enforced by the daemon:
 Two verbs answer without a socket at all: `init` writes files, and `template`
 prints compiled-in text. Neither starts a daemon.
 
+Operator commands select a repository by walking up from the current directory
+to find `.agents/sloop/config.yaml`. Empty `show` results and missing-run errors
+from `logs` name the repository searched. If it is not the one you intended,
+change to the intended repository and rerun the command.
+
 `show` is available on both sockets: an operator can inspect any ticket,
 run, or project, while a worker's `show` is scoped to its own ticket. The
 verb is read-only on either socket.
@@ -205,6 +210,27 @@ TICK-4  ready  Broken ticket  — ready but no queued trigger; enqueue with `slo
 
 Hold a ready ticket so it cannot be dispatched; release it again. Held
 tickets are skipped by selection and rejected by named runs.
+
+### sloop remove <TICKET> [--force]
+
+Forget a ticket that is not running. Its runs, notes, evidence, queued
+triggers, and leases are dropped in one transaction, exactly as `reindex`
+drops a ticket whose file has disappeared, and it leaves `show`. Any state but
+`claimed` qualifies: a `needs_review` run whose work landed some other way, a
+held ticket nobody wants, or a merged one you would rather not keep. A claimed
+ticket is refused; `sloop cancel` its run first.
+
+The ticket file is the source of truth, so a file that survives brings the
+ticket back on the next `sloop post` or `sloop reindex`. `remove` says so, and
+`--force` deletes the file for you; commit the removal either way. Run
+branches and worktrees are never touched: the output names them, and
+`git worktree remove` and `git branch -D` discard them when you are sure.
+
+```
+ticket TICK-69 removed (was needs_review)
+.agents/sloop/tickets/latency.md still exists: delete it and commit, or the next `sloop post` or `sloop reindex` registers TICK-69 again
+kept branch sloop/TICK-69-i…-a1-deaea085 and worktree .worktrees/deaea085; `git worktree remove` and `git branch -D` discard them
+```
 
 ### sloop show
 
@@ -530,6 +556,11 @@ releasing any `blocked_by` dependents. This works only when the branch tip is a
 strict ancestor of the default branch tip. Squash- and rebase-merges rewrite the
 commits, so ancestry cannot prove them, and those still require `sloop reindex`
 with the daemon idle.
+
+Reindex also retires tickets whose files are gone: delete a ticket file,
+commit, and reindex, and the ticket and its runtime rows are dropped whatever
+state it was in. `sloop remove` does the same for one ticket without waiting
+for an idle daemon.
 
 ## Worker commands
 

@@ -29,6 +29,7 @@ pub enum Ineligible {
     Held,
     Blocked { blockers: Vec<String> },
     Claimed { run: String },
+    NeedsReview,
     NoAgentConfigured,
     Paused,
     Draining,
@@ -49,6 +50,10 @@ impl Ineligible {
                 format!("blocked by unmerged {}", blockers.join(", "))
             }
             Self::Claimed { run } => format!("claimed by run {run}"),
+            Self::NeedsReview => {
+                "needs review; merge its run branch to accept it, or retire it with `sloop remove`"
+                    .into()
+            }
             Self::NoAgentConfigured => "no agent targets configured".into(),
             Self::Paused => "scheduler is paused; resume with `sloop resume`".into(),
             Self::Draining => {
@@ -91,7 +96,8 @@ pub fn ticket_ineligibility(
                 run: active_run.unwrap_or("?").to_owned(),
             });
         }
-        "merged" | "needs_review" => return None,
+        "needs_review" => return Some(Ineligible::NeedsReview),
+        "merged" => return None,
         _ => {}
     }
     if !unmerged_blockers.is_empty() {
@@ -180,10 +186,8 @@ mod tests {
     }
 
     #[test]
-    fn terminal_states_need_no_reason() {
-        let gates = open_gates();
-        assert!(ineligibility("merged", 1, None, &gates).is_none());
-        assert!(ineligibility("needs_review", 1, None, &gates).is_none());
+    fn a_merged_ticket_needs_no_reason() {
+        assert!(ineligibility("merged", 1, None, &open_gates()).is_none());
     }
 
     #[test]
@@ -254,5 +258,20 @@ mod tests {
             Ineligible::NoTrigger.describe(),
             "ready but no queued trigger; enqueue with `sloop run`"
         );
+        assert_eq!(
+            Ineligible::NeedsReview.describe(),
+            "needs review; merge its run branch to accept it, or retire it with `sloop remove`"
+        );
+    }
+
+    #[test]
+    fn a_review_ticket_names_both_exits_regardless_of_gates() {
+        let mut gates = open_gates();
+        gates.paused = true;
+        assert!(matches!(
+            ineligibility("needs_review", 0, None, &gates),
+            Some(Ineligible::NeedsReview)
+        ));
+        assert!(ineligibility("merged", 0, None, &gates).is_none());
     }
 }

@@ -91,8 +91,8 @@ Patterns that fall out of the verbs:
   `sloop show <run> --follow --quiet`; it exits `0` only for `merged`. Socket
   clients poll `show` and the scoped `events` feed themselves.
 - **Drive a queue from your own tool** — `post` tickets, `hold`/`ready` to
-  sequence them, then `show` a ticket pattern to observe why work is not
-  running.
+  sequence them, `remove` the ones you abandon, then `show` a ticket pattern
+  to observe why work is not running.
 - **Register or refresh a ticket** — `post` returns `ticket`, `created`,
   `trigger`, and `trigger_suppressed`. `created` is `false` when the
   file was already registered and the post only refreshed its indexed
@@ -109,7 +109,10 @@ Patterns that fall out of the verbs:
   `trigger_suppressed`, not a null `trigger`, to tell "none requested"
   apart from "requested and refused".
 - **Build a dashboard or search tickets** — `show` takes optional `ref` and
-  `limit` arguments. With neither, it returns the dashboard. The dashboard
+  `limit` arguments. Every successful operator `show` response includes `repository_root`,
+  the absolute root of the repository searched. A `logs` lookup that fails with
+  `not_found` includes the same field in `error.details`.
+  With neither argument, `show` returns the dashboard. The dashboard
   preserves the status fields (`daemon`, `gate`, `runs`,
   `queued_triggers`, `tickets`, and the optional `next_wake` and `dispatch`)
   and adds
